@@ -1,0 +1,164 @@
+Date: Sun, 9 Jan 2000 19:32:30 -0800
+From: Zack Weinberg <>
+Subject: an experiment in pipe bandwidth improvement
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/1/10/13
+
+I attempted to improve the bandwidth of a pipe by enlarging the kernelside
+buffer if a writer offers more data than there's room.  Currently a pipe
+write is broken up into one-page chunks.  The theory was that this would
+reduce the number of context switches and system calls, and therefore improve
+performance.
+The results are quite surprising: bandwidth is reduced by about 100 MB/sec.
+Here are some numbers:
+2.2.14:
+bw_pipe		353.97	MB/sec
+bw_unix		139.80	MB/sec
+lat_pipe	6.47	usec
+lat_unix	13.24	usec
+2.3.38:
+bw_pipe		243.94	MB/sec
+bw_unix		137.54	MB/sec
+lat_pipe	6.69	usec
+lat_unix	13.33	usec
+2.3.38-fatpipe:
+bw_pipe		159.11	MB/sec
+bw_unix		137.39	MB/sec
+lat_pipe	6.84	usec
+lat_unix	12.83	usec
+These are the microbenchmarks from lmbench-2alpha11. Each test was run
+five times and the results averaged.  The bandwidth tests do 64k writes,
+the latency tests do 1-byte writes.
+I don't know why 2.2.14 does better than 2.3.38, but I am guessing that 
+the -fatpipe patch makes things worse because now we are copying
+64k of data in and out of the kernel on each cycle, which is slow.
+Notice that AF_UNIX bandwidth in the unpatched kernel is much worse than
+pipe bandwidth, but in the patched version they are almost the same.  An
+AF_UNIX socket has always consumed up to 128k of data in one write.
+The patch is appended.
+zw
+--- linux-2.3.38/fs/fifo.c	Sun Jan  9 00:29:32 2000
++++ linux-2.3.38-fatpipe/fs/fifo.c	Sun Jan  9 17:52:05 2000
+@@ -38,6 +38,7 @@
+ 		inode->i_pipe = info;
+ 
+ 		init_waitqueue_head(PIPE_WAIT(*inode));
++		PIPE_ORDER(*inode) = 0;
+ 		PIPE_BASE(*inode) = (char *) page;
+ 		PIPE_START(*inode) = PIPE_LEN(*inode) = 0;
+ 		PIPE_READERS(*inode) = PIPE_WRITERS(*inode) = 0;
+--- linux-2.3.38/fs/pipe.c	Sun Dec  5 08:42:03 1999
++++ linux-2.3.38-fatpipe/fs/pipe.c	Sun Jan  9 18:33:18 2000
+@@ -29,6 +29,9 @@
+  * 
+  * Reads with count = 0 should always return 0.
+  * -- Julian Bradfield 1999-06-07.
++ *
++ * Enlarge pipe buffers if we're being fed data in bigger chunks.
++ * -- Zack Weinberg, 2000-01-09.
+  */
+ 
+ /* Drop the inode semaphore and wait for a pipe event, atomically */
+@@ -108,7 +111,7 @@
+ 
+ 		read += chars;
+ 		PIPE_START(*inode) += chars;
+-		PIPE_START(*inode) &= (PIPE_SIZE - 1);
++		PIPE_START(*inode) &= (PIPE_SIZE(*inode) - 1);
+ 		PIPE_LEN(*inode) -= chars;
+ 		count -= chars;
+ 		buf += chars;
+@@ -167,6 +170,29 @@
+ 	if (!PIPE_READERS(*inode))
+ 		goto sigpipe;
+ 
++	/* If the buffer is empty and can't hold the entire write,
++	   get a bigger buffer.  (But don't go higher than PIPE_MAX.)  */
++	if (PIPE_LEN(*inode) == 0 &&
++	    count > PIPE_SIZE(*inode) && count <= PIPE_MAX) {
++		unsigned long new = 0;
++		unsigned int order;
++
++		order = PIPE_ORDER(*inode) + 1;
++		while ((1<<(order+PAGE_SHIFT)) < count)
++		     order++;
++
++		while (order > PIPE_ORDER(*inode)
++		       && !(new = __get_free_pages(GFP_USER, order)))
++		       order--;
++		if (new) {
++			free_pages((unsigned long) PIPE_BASE(*inode),
++				   PIPE_ORDER(*inode));
++			PIPE_ORDER(*inode) = order;
++			PIPE_BASE(*inode) = (char *) new;
++			PIPE_START(*inode) = 0;
++		}
++	}
++
+ 	/* If count <= PIPE_BUF, we have to make it atomic.  */
+ 	free = (count <= PIPE_BUF ? count : 1);
+ 
+@@ -390,7 +416,7 @@
+ 	if (!PIPE_READERS(*inode) && !PIPE_WRITERS(*inode)) {
+ 		struct pipe_inode_info *info = inode->i_pipe;
+ 		inode->i_pipe = NULL;
+-		free_page((unsigned long) info->base);
++		free_pages((unsigned long) info->base, info->order);
+ 		kfree(info);
+ 	} else {
+ 		wake_up_interruptible(PIPE_WAIT(*inode));
+@@ -579,6 +605,7 @@
+ 	inode->i_op = &pipe_inode_operations;
+ 
+ 	init_waitqueue_head(PIPE_WAIT(*inode));
++	PIPE_ORDER(*inode) = 0;
+ 	PIPE_BASE(*inode) = (char *) page;
+ 	PIPE_START(*inode) = PIPE_LEN(*inode) = 0;
+ 	PIPE_READERS(*inode) = PIPE_WRITERS(*inode) = 1;
+--- linux-2.3.38/include/linux/pipe_fs_i.h	Sun Nov 21 11:17:45 1999
++++ linux-2.3.38-fatpipe/include/linux/pipe_fs_i.h	Sun Jan  9 18:18:19 2000
+@@ -4,6 +4,7 @@
+ struct pipe_inode_info {
+ 	wait_queue_head_t wait;
+ 	char *base;
++	unsigned int order;
+ 	unsigned int start;
+ 	unsigned int readers;
+ 	unsigned int writers;
+@@ -13,7 +14,11 @@
+ 
+ /* Differs from PIPE_BUF in that PIPE_SIZE is the length of the actual
+    memory allocation, whereas PIPE_BUF makes atomicity guarantees.  */
+-#define PIPE_SIZE		PAGE_SIZE
++#define PIPE_ORDER(inode)	((inode).i_pipe->order)
++#define PIPE_SIZE(inode)	(1 << (PIPE_ORDER(inode)+PAGE_SHIFT))
++
++/* Limit on the space in kernel buffers.  */
++#define PIPE_MAX		(128*1024)
+ 
+ #define PIPE_SEM(inode)		(&(inode).i_sem)
+ #define PIPE_WAIT(inode)	(&(inode).i_pipe->wait)
+@@ -26,10 +31,10 @@
+ #define PIPE_WAITING_WRITERS(inode)	((inode).i_pipe->waiting_writers)
+ 
+ #define PIPE_EMPTY(inode)	(PIPE_LEN(inode) == 0)
+-#define PIPE_FULL(inode)	(PIPE_LEN(inode) == PIPE_SIZE)
+-#define PIPE_FREE(inode)	(PIPE_SIZE - PIPE_LEN(inode))
+-#define PIPE_END(inode)	((PIPE_START(inode) + PIPE_LEN(inode)) & (PIPE_SIZE-1))
+-#define PIPE_MAX_RCHUNK(inode)	(PIPE_SIZE - PIPE_START(inode))
+-#define PIPE_MAX_WCHUNK(inode)	(PIPE_SIZE - PIPE_END(inode))
++#define PIPE_FULL(inode)	(PIPE_LEN(inode) == PIPE_SIZE(inode))
++#define PIPE_FREE(inode)	(PIPE_SIZE(inode) - PIPE_LEN(inode))
++#define PIPE_END(inode)	((PIPE_START(inode) + PIPE_LEN(inode)) & (PIPE_SIZE(inode)-1))
++#define PIPE_MAX_RCHUNK(inode)	(PIPE_SIZE(inode) - PIPE_START(inode))
++#define PIPE_MAX_WCHUNK(inode)	(PIPE_SIZE(inode) - PIPE_END(inode))
+ 
+ #endif
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

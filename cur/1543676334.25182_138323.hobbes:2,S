@@ -1,0 +1,159 @@
+Date: Fri, 6 Jun 2003 11:44:07 +0530
+From: Ameya Mitragotri <>
+Subject: [RFC][PATCH 2.5.70] dynamically tunable semmnu and semume
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2003/6/6/15
+
+Find below the patch (RFC) that makes semmnu and semume dynamically
+tunable through /proc. 
+Please comment/suggest.
+thanks
+ameya
+diff -Nur linux-2.5.70/include/linux/sem.h linux-2.5.70patched/include/linux/sem.h
+--- linux-2.5.70/include/linux/sem.h    Tue May 27 06:30:38 2003
++++ linux-2.5.70patched/include/linux/sem.h     Wed Jun  4 21:57:03 2003
+@@ -70,10 +70,9 @@
+ #define SEMOPM  32             /* <= 1 000 max num of ops per semop call */
+ #define SEMVMX  32767           /* <= 32767 semaphore maximum value */
+ #define SEMAEM  SEMVMX          /* adjust on exit max value */
+-
++#define SEMUME  0x7fffffff      /* max num of undo entries per process */
++#define SEMMNU  0x7fffffff      /* num of undo structures system wide */
+ /* unused */
+-#define SEMUME  SEMOPM          /* max num of undo entries per process */
+-#define SEMMNU  SEMMNS          /* num of undo structures system wide */
+ #define SEMMAP  SEMMNS          /* # of entries in semaphore map */
+ #define SEMUSZ  20             /* sizeof struct sem_undo */
+diff -Nur linux-2.5.70/ipc/sem.c linux-2.5.70patched/ipc/sem.c
+--- linux-2.5.70/ipc/sem.c      Tue May 27 06:30:38 2003
++++ linux-2.5.70patched/ipc/sem.c       Thu Jun  5 15:49:22 2003
+@@ -96,13 +96,17 @@
+  *
+  */
+-int sem_ctls[4] = {SEMMSL, SEMMNS, SEMOPM, SEMMNI};
++int sem_ctls[6] = {SEMMSL, SEMMNS, SEMOPM, SEMMNI,SEMMNU, SEMUME};
+ #define sc_semmsl      (sem_ctls[0])
+ #define sc_semmns      (sem_ctls[1])
+ #define sc_semopm      (sem_ctls[2])
+ #define sc_semmni      (sem_ctls[3])
++#define sc_semmnu      (sem_ctls[4])
++#define sc_semume      (sem_ctls[5])
+ static int used_sems;
++static unsigned int sem_undo_count;
++static spinlock_t sem_undo_lock;
+ void __init sem_init (void)
+ {
+@@ -483,9 +487,9 @@
+                seminfo.semmsl = sc_semmsl;
+                seminfo.semopm = sc_semopm;
+                seminfo.semvmx = SEMVMX;
+-               seminfo.semmnu = SEMMNU;
++               seminfo.semmnu = sc_semmnu;
+                seminfo.semmap = SEMMAP;
+-               seminfo.semume = SEMUME;
++               seminfo.semume = sc_semume;
+                down(&sem_ids.sem);
+                if (cmd == SEM_INFO) {
+                        seminfo.semusz = sem_ids.in_use;
+@@ -900,6 +904,10 @@
+                if(un==u) {
+                        un=u->proc_next;
+                        *up=un;
++                       spin_lock(&sem_undo_lock);
++                       sem_undo_count--;
++                       current->sysvsem.undo_list->add_count--;
++                       spin_unlock(&sem_undo_lock);
+                        kfree(u);
+                        return un;
+                }
+@@ -960,8 +968,21 @@
+                kfree(un);
+                return error;
+        }
+-
+-
++       spin_lock(&sem_undo_lock);
++       if(sem_undo_count >= sc_semmnu)
++       {
++               unlock_semundo();
++               kfree(un);
++               spin_unlock(&sem_undo_lock);
++               return -ENOSPC;
++       }
++       if(current->sysvsem.undo_list->add_count >= sc_semume)
++       {
++                unlock_semundo();
++                kfree(un);
++                spin_unlock(&sem_undo_lock);
++                return -EAGAIN;
++       }
+        /* alloc_undo has just
+         * released all locks and reacquired them.
+         * But, another thread may have
+@@ -978,10 +999,13 @@
+        if (new_un != NULL) {
+                if (sma->undo != new_un)
+                        BUG();
++               spin_unlock(&sem_undo_lock);
+                kfree(un);
+                un = new_un;
+        } else {
+                current->sysvsem.undo_list->add_count++;
++               sem_undo_count++;
++               spin_unlock(&sem_undo_lock);
+                un->semadj = (short *) &un[1];
+                un->semid = semid;
+                un->proc_next = undo_list->proc_list;
+@@ -1254,6 +1278,10 @@
+         */
+        for (up = &undo_list->proc_list; (u = *up); *up = u->proc_next, kfree(u)) {
+                int semid = u->semid;
++               spin_lock(&sem_undo_lock);
++               sem_undo_count--;
++               current->sysvsem.undo_list->add_count--;
++               spin_unlock(&sem_undo_lock);
+                if(semid == -1)
+                        continue;
+                sma = sem_lock(semid);
+diff -Nur linux-2.5.70/kernel/sysctl.c linux-2.5.70patched/kernel/sysctl.c
+--- linux-2.5.70/kernel/sysctl.c        Tue May 27 06:30:23 2003
++++ linux-2.5.70patched/kernel/sysctl.c Thu Jun  5 16:27:12 2003
+@@ -61,6 +61,11 @@
+ /* this is needed for the proc_dointvec_minmax for [fs_]overflow UID and GID */
+ static int maxolduid = 65535;
+ static int minolduid;
++static int zero = 0;
++static int sem_zero_array[]={0,0,0,0,0,0};
++static int sem_maxint_array[]={0x7fffffff,0x7fffffff,0x7fffffff,0x7fffffff,0x7fffffff,0x7fffffff};
++static int one = 1;
++static int one_hundred = 100;
+ #ifdef CONFIG_KMOD
+ extern char modprobe_path[];
+@@ -235,8 +240,8 @@
+         0644, NULL, &proc_dointvec},
+        {KERN_MSGMNB, "msgmnb", &msg_ctlmnb, sizeof (int),
+         0644, NULL, &proc_dointvec},
+-       {KERN_SEM, "sem", &sem_ctls, 4*sizeof (int),
+-        0644, NULL, &proc_dointvec},
++       {KERN_SEM, "sem", &sem_ctls, 6*sizeof (int),
++        0644, NULL, &proc_dointvec_minmax, NULL, NULL, sem_zero_array, sem_maxint_array},
+ #endif
+ #ifdef CONFIG_MAGIC_SYSRQ
+        {KERN_SYSRQ, "sysrq", &sysrq_enabled, sizeof (int),
+@@ -270,9 +275,6 @@
+ /* Constants for minimum and maximum testing in vm_table.
+    We use these as one-element integer vectors. */
+-static int zero = 0;
+-static int one = 1;
+-static int one_hundred = 100;
+ static ctl_table vm_table[] = {
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+More majordomo info at  
+http://vger.kernel.org/majordomo-info.html
+Please read the FAQ at  
+http://www.tux.org/lkml/

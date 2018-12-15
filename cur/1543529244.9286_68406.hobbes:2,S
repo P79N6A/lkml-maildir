@@ -1,0 +1,597 @@
+Date: Fri, 10 Mar 2000 03:56:29 +0000 (GMT)
+From: "Stephen C. Tweedie" <>
+Subject: [PATCH] New kiobuf mapping functions for 2.3.50
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/3/9/169
+
+Hi all,
+This patch is relative to the bugfix diff I just posted.  It does not
+include any bug fixes, but rather adds a couple of extra functions
+requested for kiobufs.  Specifically:
+ * map_kernel_kiobuf allows kernel-space vmalloced areas to be mapped
+   into kiobufs just as map_user_kiobuf works for user-space areas.
+ * mmap_kiobuf is a helper function that can be used by a device
+   driver's mmap method to mmap a kiobuf into user space.
+ * Documentation/kiobuf.sample.c is a sample driver using the
+   mmap_kiobuf interface, showing how a driver can vmalloc() into a
+   kiobuf and mmap that into user space.
+ * Incidentally, prevent the swapper from touching any vmas with VM_IO
+   set.  
+--Stephen
+----------------------------------------------------------------
+--- linux-2.3.50/Documentation/kiobuf.sample.c.~1~	Fri Mar 10 01:54:06 2000
++++ linux-2.3.50/Documentation/kiobuf.sample.c	Fri Mar 10 01:54:06 2000
+@@ -0,0 +1,216 @@
++/*
++ * Example code for using kiobufs within a device driver for memory
++ * mapping of kernel memory into user space.
++ *
++ * This module creates a device driver which allocates memory in the
++ * kernel from arbitrary pages via vmalloc(), and then uses kiobufs to
++ * map those into user space. 
++ *
++ * This module registers a misc char device driver called "test".  Its
++ * major number will be 10; the minor number is registered dynamically
++ * and can be found by looking up /proc/misc (the usual minor number
++ * will be 63 unless other misc devices have already been registered).
++ * 
++ * The device driver here can be opened, but read and write functions
++ * are not declared.  However, the file descriptor to the driver can be
++ * mmap()ed, and the driver will use the kiobuf mmaping routines to map
++ * an area of kernel memory into a process's address space.
++ *
++ * Any number of processes may map the same memory at once, and it will
++ * act as shared memory.  The kiobuf_vmap code will track the number of
++ * references to the memory, and the driver's module reference count is
++ * adjusted to make sure that the driver can be unloaded only when there
++ * are no users active.
++ *
++ * Written by Stephen C. Tweedie, 2000
++ * (C) Red Hat, Inc. 2000 
++ */
++
++#include <linux/module.h>
++#include <linux/fs.h>
++#include <linux/vmalloc.h>
++#include <linux/miscdevice.h>
++#include <linux/iobuf.h>
++#include <asm/semaphore.h>
++
++#if 1
++#define dprintk(x...)
++#else
++#define dprintk printk
++#endif
++
++static int kiomap_mmap(struct file * file, struct vm_area_struct * vma);
++static int kiomap_open(struct inode * inode, struct file * file);
++static int kiomap_release(struct inode * inode, struct file * file);
++
++
++static struct file_operations kiomap_fops = {
++	mmap:	kiomap_mmap,
++	open:	kiomap_open,
++	release:kiomap_release,
++};
++
++static struct miscdevice kiomap_device = {
++	minor:	MISC_DYNAMIC_MINOR,
++	name:	"kiomap",
++	fops:	&kiomap_fops
++};
++
++
++static void * local_data_area;
++#define DATA_SIZE (100 * PAGE_SIZE)
++
++static struct kiobuf local_kiobuf;
++static struct kiobuf_vmap local_vmap;
++
++
++/* A pointer to the kiomap_finished function will be stored in the
++ * kiobuf_vmap we use for mmap()ing, and this function will be called
++ * once there are no more users of the kvmap.  */
++
++static void kiomap_finished(struct kiobuf_vmap *vmap)
++{
++	MOD_DEC_USE_COUNT;
++	dprintk(KERN_INFO __FUNCTION__ ": decremented module count\n");
++}
++
++
++/* The initialisation function here creates three data structures.
++ * First of all it uses vmalloc() to reserve an area of memory.
++ * Secondly, it initialises a kiobuf into which that vmalloced memory is
++ * mapped.  Finally, it initialises a kiobuf_vmap which can be used to
++ * mmap that kiobuf into user space. */
++
++void __init create_local_heap(void)
++{
++	int err;
++	
++	/* Get our kernel memory for the data heap first */
++
++	local_data_area = vmalloc(DATA_SIZE);
++	if (!local_data_area)
++		return;
++
++	/* Now initialise a kiobuf and kiobuf_vmap structure */
++
++	kiobuf_init(&local_kiobuf);
++	kvmap_init(&local_vmap, &local_kiobuf);
++	local_vmap.kiobuf = &local_kiobuf;
++	local_vmap.deref_callback = kiomap_finished;
++	
++	/* map_kernel_kiobuf will find all of the physical pages
++	 * referred to by the vmalloc()ed virtual memory area, and will
++	 * map those physical pages into the kiobuf we have just
++	 * prepared. */
++
++	err = map_kernel_kiobuf(&local_kiobuf, 
++				(unsigned long) local_data_area, 
++				DATA_SIZE);
++	if (err) {
++		vfree(local_data_area);
++		local_data_area = 0;
++	}
++
++	/* Initialise the vmalloced area --- we don't want users mapping
++	 * this memory and peeking into stale kernel data! */
++
++	memset(local_data_area, 0xff, DATA_SIZE);
++}
++
++
++/* All we have to do on device open/close is to maintain the module
++ * reference counts. */
++
++static int kiomap_open(struct inode * inode, struct file * file)
++{
++	MOD_INC_USE_COUNT;
++	dprintk(KERN_INFO __FUNCTION__ ": incremented module count\n");
++	return 0;
++}
++
++static int kiomap_release(struct inode * inode, struct file * file)
++{
++	MOD_DEC_USE_COUNT;
++	dprintk(KERN_INFO __FUNCTION__ ": decremented module count\n");
++	return 0;
++}
++
++/* This is our example device's mmap function, as declared to the rest
++ * of the VM.  All we have to do in our case is call mmap_kiobuf()
++ * supplying the pre-initialised kiobuf_vmap struct that we created in
++ * create_local_heap() above.
++ * 
++ * We have to be careful to take the vmap semaphore here before calling
++ * mmap_kiobuf --- that's something all callers of that function will
++ * always have to do to be safe on SMP systems.  While we hold that
++ * semaphore we can change the module reference count safely, since the
++ * same semaphore will protect the call to MOD_DEC_USE_COUNT in the
++ * kvmap close function above.
++ */
++
++static int kiomap_mmap(struct file * file, struct vm_area_struct * vma)
++{
++	int err;
++
++	dprintk (KERN_INFO __FUNCTION__ ": begin(file %p, vma %p)\n", 
++		 file, vma);
++
++	/* A quick check to make sure we were initialised properly... */
++
++	if (!local_data_area)
++		return -ENOMEM;
++
++	/* Now we can take the kvmap semaphore and perform the mmap. */
++
++	down(&local_vmap.sem);
++	dprintk (KERN_INFO __FUNCTION__ ": Attempting mmap.\n");
++	err = mmap_kiobuf(&local_vmap, vma);
++	dprintk (KERN_INFO __FUNCTION__ ": mmap_kiobuf returned %d\n", err);
++
++	/* A return value of one means the kvmap was not in use when we
++	 * called mmap_kiobuf() */
++
++	if (err == 1) {
++		MOD_INC_USE_COUNT;
++		dprintk(KERN_INFO __FUNCTION__ ": incremented module count\n");
++	}
++	up(&local_vmap.sem);
++
++	/* and a negative return value means an error. */
++
++	if (err < 0)
++		return err;
++
++	return 0;
++}
++
++
++/* The module initialisation and cleanup functions just create and
++ * destroy our local kvmap data structures, and register and deregister
++ * the testing character device driver. */
++
++int kiomap_init_module(void)
++{
++	int err;
++	
++	create_local_heap();
++	if (!local_data_area)
++		return -ENOMEM;
++	
++	err = misc_register(&kiomap_device);
++	return err;
++}
++
++int kiomap_destroy_module(void)
++{
++	int err;
++
++	vfree(local_data_area);
++	err = misc_deregister(&kiomap_device);
++	return err;
++}
++
++module_init(kiomap_init_module);
++module_exit(kiomap_destroy_module);
++
++MODULE_DESCRIPTION("kiobuf vmap test driver");
+--- linux-2.3.50/include/linux/iobuf.h.~1~	Thu Mar  9 17:49:15 2000
++++ linux-2.3.50/include/linux/iobuf.h	Fri Mar 10 02:39:24 2000
+@@ -58,12 +58,44 @@
+ };
+ 
+ 
++/* For true mmap() of kiobufs, we need to be able to refcount the number
++ * of vmas accessing the kiobuf to be able to clean up properly when the
++ * entire kiobuf is no longer being accessed. 
++ *
++ * The kvmap semaphore is necessary to synchronise reference counting in
++ * all cases.  It is not sufficient to rely on the mm semaphore for
++ * this, as vmap references are inherited over fork() and we need to do
++ * the right thing for vmaps which end up shared as a result.
++ */
++
++struct kiobuf_vmap;
++typedef void kvmap_deref_fn (struct kiobuf_vmap *);
++
++struct kiobuf_vmap 
++{
++	struct kiobuf * kiobuf;
++	void *		private_data;
++	
++	struct semaphore sem;
++
++	/* The following are always protected by the semaphore mutex */
++	int		refcount;
++	kvmap_deref_fn	*deref_callback;
++};
++
++
+ /* mm/memory.c */
+ 
+ int	map_user_kiobuf(int rw, struct kiobuf *, unsigned long va, size_t len);
++int	map_kernel_kiobuf(struct kiobuf *, unsigned long va, size_t len);
+ void	unmap_kiobuf(struct kiobuf *iobuf);
+ int	lock_kiovec(int nr, struct kiobuf *iovec[], int wait);
+ int	unlock_kiovec(int nr, struct kiobuf *iovec[]);
++
++/* mm/iomap.c */
++
++int	mmap_kiobuf(struct kiobuf_vmap *iobuf, struct vm_area_struct * vma);
++void	kvmap_init(struct kiobuf_vmap *, struct kiobuf *);
+ 
+ /* fs/iobuf.c */
+ 
+--- linux-2.3.50/kernel/ksyms.c~	Thu Mar  9 17:49:15 2000
++++ linux-2.3.50/kernel/ksyms.c	Fri Mar 10 02:50:13 2000
+@@ -355,12 +355,17 @@
+ 
+ /* Kiobufs */
+ EXPORT_SYMBOL(kiobuf_init);
++EXPORT_SYMBOL(kvmap_init);
+ 
+ EXPORT_SYMBOL(alloc_kiovec);
+ EXPORT_SYMBOL(free_kiovec);
+ EXPORT_SYMBOL(expand_kiobuf);
+ 
+ EXPORT_SYMBOL(map_user_kiobuf);
++EXPORT_SYMBOL(map_kernel_kiobuf);
++EXPORT_SYMBOL(unmap_kiobuf);
++EXPORT_SYMBOL(mmap_kiobuf);
++
+ EXPORT_SYMBOL(lock_kiovec);
+ EXPORT_SYMBOL(unlock_kiovec);
+ EXPORT_SYMBOL(brw_kiovec);
+--- linux-2.3.50/mm/Makefile.~1~	Fri Dec 10 15:24:41 1999
++++ linux-2.3.50/mm/Makefile	Fri Mar 10 01:54:06 2000
+@@ -10,7 +10,7 @@
+ O_TARGET := mm.o
+ O_OBJS	 := memory.o mmap.o filemap.o mprotect.o mlock.o mremap.o \
+ 	    vmalloc.o slab.o bootmem.o swap.o vmscan.o page_io.o \
+-	    page_alloc.o swap_state.o swapfile.o numa.o
++	    page_alloc.o swap_state.o swapfile.o numa.o iomap.o
+ 
+ ifeq ($(CONFIG_HIGHMEM),y)
+ O_OBJS += highmem.o
+--- linux-2.3.50/mm/iomap.c.~1~	Fri Mar 10 01:54:06 2000
++++ linux-2.3.50/mm/iomap.c	Fri Mar 10 01:54:06 2000
+@@ -0,0 +1,144 @@
++/*
++ * iomap.c
++ *
++ * Perform mmap()ing of arbitrary kiobufs.  
++ *
++ * Written by Stephen C. Tweedie, 2000
++ * (C) Red Hat, Inc.  2000
++ *
++ * Refer to Documentation/kiobuf* for instructions.
++ *
++ * The kiobuf_vmap structure contains the information necessary to track
++ * the mmap of a kiobuf into user space.  The rest of this file defines
++ * functions necessary to maintain that mapping.
++ */
++
++#include <linux/iobuf.h>
++#include <linux/pagemap.h>
++#include <asm/atomic.h>
++
++#define dprintk(x...)
++
++/*
++ * Open/close methods for the kvmap only need to track the reference counts. 
++ *
++ * Both open and close will be called with the vma mm semaphore held,
++ * but without the mm page lock.
++ */
++
++static void kvmap_open(struct vm_area_struct *vma) 
++{
++	struct kiobuf_vmap *vmap;
++	vmap = (struct kiobuf_vmap *) vma->vm_private_data;
++
++	/* Just increment the refcount on open: there has been an unmap
++	 * or fork increasing the number of vmas on this kvmap. */
++	down(&vmap->sem);
++	vmap->refcount++;
++	up(&vmap->sem);
++}
++
++static void kvmap_close(struct vm_area_struct *vma) 
++{
++	struct kiobuf_vmap *vmap;
++	vmap = (struct kiobuf_vmap *) vma->vm_private_data;
++	
++	down(&vmap->sem);
++	if (--vmap->refcount == 0) {
++		if (vmap->deref_callback)
++			vmap->deref_callback(vmap);
++	}
++	up(&vmap->sem);
++}
++
++
++static struct page * kvmap_nopage(struct vm_area_struct * vma,
++				  unsigned long address, 
++				  int no_share)
++{
++	unsigned long pgoff;
++	struct kiobuf_vmap *vmap;
++	struct kiobuf *iobuf;
++	struct page *page;
++
++	vmap = (struct kiobuf_vmap *) vma->vm_private_data;
++	iobuf = vmap->kiobuf;
++	pgoff = ((address - vma->vm_start) >> PAGE_CACHE_SHIFT) + vma->vm_pgoff;
++	dprintk(KERN_INFO __FUNCTION__ "(%p, %p, %d): offset %lu\n",
++	       vma, (void *) address, no_share, pgoff);
++	
++	if (no_share)
++		BUG();
++
++	/* mmap() of a larger region than specified by the kiobuf
++	 * results in a SIGBUS, as does faulting on a page not present
++	 * in the kiobuf. */
++	
++	if (pgoff > iobuf->nr_pages) {
++		dprintk(KERN_INFO __FUNCTION__ ": no such page in iobuf\n");
++		return NULL;
++	}
++	
++	page = iobuf->maplist[pgoff];
++	dprintk(KERN_INFO __FUNCTION__ ": found page %p\n", page);
++	if (!page)
++		return NULL;
++	
++	/* We need to obey the same rules as copy_page_range() when it
++	 * comes to maintaining reference counts on pages in the kvmap.
++	 * We only increment the refcount for normal, physically
++	 * present, unreserved pages. */
++	
++	if ((page-mem_map) < max_mapnr && ! PageReserved(page)) {
++		get_page(page);
++		dprintk(KERN_INFO __FUNCTION__ ": page count now %d\n",
++		       atomic_read(&page->count));
++	}
++
++	return page;
++}
++
++
++static struct vm_operations_struct kio_vmops = 
++{
++	open:	kvmap_open,
++	close:	kvmap_close,
++	nopage:	kvmap_nopage,
++};
++
++void kvmap_init(struct kiobuf_vmap *vmap, struct kiobuf *iobuf)
++{
++	memset(vmap, 0, sizeof(*vmap));
++	vmap->kiobuf = iobuf;
++	init_MUTEX(&vmap->sem);
++}
++
++/*
++ * This routine is intended to be called by the mmap_* methods of other
++ * device drivers.  
++ * 
++ * Returns <0 on error, 1 if this is the first reference to the vmap, else 0.
++ *
++ * The vmap semaphore must be held before calling this.
++ */
++
++int mmap_kiobuf(struct kiobuf_vmap *vmap, struct vm_area_struct * vma) 
++{
++	int retval = 0;
++	
++	dprintk(KERN_INFO __FUNCTION__ "(vmap %p, vma %p)\n", vmap, vma);
++
++	vma->vm_ops = &kio_vmops;
++	vma->vm_private_data = vmap;
++	vma->vm_flags |= VM_LOCKED;	/* Don't swap out kvmaps! */
++	
++	/* This is supposed to be a shared map --- reject COW mappings. */
++	if ((vma->vm_flags & VM_WRITE) && !(vma->vm_flags & VM_SHARED))
++		return -EINVAL;
++
++	vmap->refcount++;
++	if (vmap->refcount == 1)
++		retval = 1;
++
++	return retval;
++}
+--- linux-2.3.50/mm/memory.c.~1~	Thu Mar  9 17:49:15 2000
++++ linux-2.3.50/mm/memory.c	Fri Mar 10 02:45:47 2000
+@@ -494,6 +494,110 @@
+ 
+ 
+ /*
++ * Force in an entire range of pages from the current process's kernel
++ * VA.  We do not expect to see unmapped pages here, so no page faults
++ * will be taken.  The map_kernel_kiobuf() routine should work happily
++ * both for ioremap()ed and vmalloc()ed regions.  
++ */
++
++static inline int map_pte_range(struct page **pmap, pmd_t * pmd, unsigned long va, unsigned long end)
++{
++	pte_t * pte;
++	int nr_pages = 0;
++	struct page *page;
++	
++	if (pmd_none(*pmd))
++		return 0;	
++
++	pte = pte_offset(pmd, va);
++
++	do {
++		if (pte_none(*pte))
++			page = NULL;
++		else {
++			page = pte_page(*pte);
++			atomic_inc(&page->count);
++		}
++		*pmap++ = page;
++
++		va += PAGE_SIZE;
++		pte++;
++		nr_pages++;
++	} while (va < end && (va && PMD_MASK));
++	
++	return nr_pages;
++}
++
++static inline int map_pmd_range(struct page **pmap, pgd_t * dir, unsigned long va, unsigned long end)
++{
++	pmd_t * pmd;
++	int total_pages = 0;
++	int nr_pages;
++	
++	if (pgd_none(*dir))
++		return 0;
++	pmd = pmd_offset(dir, va);
++	
++	do {
++		nr_pages = map_pte_range(pmap, pmd, va, end);
++		pmd++;
++		pmap += nr_pages;
++		va += (nr_pages << PAGE_SHIFT);
++		total_pages += nr_pages;
++	} while (nr_pages && va < end && (va && PGDIR_MASK));
++	return total_pages;
++}
++
++int map_kernel_kiobuf(struct kiobuf *iobuf, unsigned long va, size_t len)
++{
++	unsigned long		ptr, end;
++	int			err;
++	struct mm_struct *	mm;
++	struct page **		pmap;
++	int			nr_pages;
++	pgd_t *			dir;
++	
++	/* Make sure the iobuf is not already mapped somewhere. */
++	if (iobuf->nr_pages)
++		return -EINVAL;
++
++	mm = current->mm;
++	dprintk ("map_kernel_kiobuf: begin\n");
++	
++	ptr = va & PAGE_MASK;
++	end = (va + len + PAGE_SIZE - 1) & PAGE_MASK;
++	err = expand_kiobuf(iobuf, (end - ptr) >> PAGE_SHIFT);
++	if (err)
++		return err;
++
++	err = -EFAULT;
++	iobuf->locked = 0;
++	iobuf->nr_pages = 0;
++	iobuf->offset = va & ~PAGE_MASK;
++	iobuf->length = len;
++	
++	spin_lock(&mm->page_table_lock);
++
++	dir = pgd_offset(mm, va);
++	pmap = iobuf->maplist;
++	
++	while (ptr < end) {
++		nr_pages = map_pmd_range(pmap, dir, ptr, end);
++		if (!nr_pages) 
++			break;
++		dir++;
++		ptr += (nr_pages << PAGE_SHIFT);
++		pmap += nr_pages;
++		iobuf->nr_pages += nr_pages;
++	}
++	
++	spin_unlock(&mm->page_table_lock);
++	dprintk ("map_kernel_kiobuf: end OK\n");
++	return 0;
++}
++
++
++/*
+  * Unmap all of the pages referenced by a kiobuf.  We release the pages,
+  * and unlock them if they were locked. 
+  */
+--- linux-2.3.50/mm/vmscan.c.~1~	Thu Mar  9 17:48:18 2000
++++ linux-2.3.50/mm/vmscan.c	Fri Mar 10 01:54:06 2000
+@@ -260,7 +260,7 @@
+ 	unsigned long end;
+ 
+ 	/* Don't swap out areas which are locked down */
+-	if (vma->vm_flags & VM_LOCKED)
++	if (vma->vm_flags & (VM_LOCKED | VM_IO))
+ 		return 0;
+ 
+ 	pgdir = pgd_offset(vma->vm_mm, address);
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

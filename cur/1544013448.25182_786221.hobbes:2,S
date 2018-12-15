@@ -1,0 +1,59 @@
+Date: Sat, 3 Jan 2009 17:45:44 +0100
+From: Oleg Nesterov <>
+Subject: Re: RFC: Fix f_flags races without the BKL
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2009/1/3/88
+
+On 01/02, Al Viro wrote:
+>
+> FWIW, it's still bloody tempting to try.  How about hlist from struct file
+> through fasync_struct?  Possibly with reference from fasync_struct back
+> to the queue it's on, while we are at it - would make fasync_helper simpler...
+Well, don't ask me ;) I don't know whether this change is good or bad...
+Let's forget about files with several fasync_struct's, suppose we have a
+pointer ->f_xxx to fasync_struct in struct file. Now __fput() can check
+f_xxx != NULL and call ->fasync() if true. But how can we ensure that
+(->f_flags & FASYNC) matches (->f_xxx != NULL) ? Looks like we should
+kill FASYNC and uglify the code which sets/gets ->f_flags, for example
+do_fcntl(F_GETFL) should do
+	case F_GETFL:
+		err = filp->f_flags | (filp->f_xxx ? FASYNC : 0)
+And what if some strange driver doesn't use the "standard" fasync_helper/
+kill_fasync helpers?
+Offtopic, but while we are here...
+	pipe_rdwr_fasync:
+		retval = fasync_helper(fd, filp, on, &pipe->fasync_readers);
+		if (retval >= 0)
+			retval = fasync_helper(fd, filp, on, &pipe->fasync_writers);
+Suppose that on == 1 and the first fasync_helper(fasync_readers) succeeds,
+but the second fasync_helper(fasync_writers) fails. We return the error and
+this file doesn't get FASYNC, but still it is placed on ->fasync_readers.
+This looks just wrong, we return the error to the user-space, but the file
+owner can receive the notifications from ->fasync_readers.
+And. Don't we leak fasync_struct in this case? With the recent changes,
+pipe_rdwr_release() does not call pipe_rdwr_fasync(on => 0) unconditionally.
+Instead, __fput() does this, but depending on ->f_flags & FASYNC.
+IOW, perhaps we need something like the patch below?
+--- a/fs/pipe.c
++++ b/fs/pipe.c
+@@ -702,9 +702,11 @@ pipe_rdwr_fasync(int fd, struct file *fi
+ 
+ 	retval = fasync_helper(fd, filp, on, &pipe->fasync_readers);
+ 
+-	if (retval >= 0)
++	if (retval >= 0) {
+ 		retval = fasync_helper(fd, filp, on, &pipe->fasync_writers);
+-
++		if (retval < 0) /* can only happen if on == true */
++			fasync_helper(-1, filp, 0, &pipe->fasync_readers);
++	}
+ 	mutex_unlock(&inode->i_mutex);
+ 
+ 	if (retval < 0)
+And why pipe_xxx_fasync() take ->i_mutex around fasync_helper() ?
+Afaics, nothing bad can happen if pipe_xxx_fasync() races with, say,
+pipe_read().
+Oleg.

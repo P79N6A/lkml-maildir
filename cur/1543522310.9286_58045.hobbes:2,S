@@ -1,0 +1,152 @@
+Date: Sun, 16 Jan 2000 21:45:17 -0500 (EST)
+From: Ingo Molnar <>
+Subject: [patch] Integrated Buffer-Cache, ext2fs speedups, new RAID for 2.3.40
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/1/17/30
+
+here is the first alpha version of the '2.4 RAID merge' patch against
+pre4-2.3.40:
+	
+http://www.redhat.com/~mingo/ibc-ext2-raid-2.3.40-N1
+which implements three more or less independent (but related) features:
+	- Integrated Buffer-Cache
+	- improved new-style RAID merged into 2.3
+          (i will describe these RAID changes later in a separate email)
+	- ext2fs latency speedups
+        - (plus i've assembled a few benchmark results)
+(i do not expect most of these changes to be accepted into 2.3 because
+they are both intrusive and potentially controversial, so i'll maintain
+them separately and will aim for merging them into early 2.5. Comments
+welcome nevertheless. If any part of the patch should get into 2.3 then i
+can extract it.)
+WARNING: this is an experimental patch changing key filesystem and block
+caching code, and while i tried to make it as safe and secure as possible,
+and have tested it extensively, it might still eat your filesystem,
+destroy your disks and cause worldwide destruction. You have been warned.
+Integrated Buffer-Cache:
+------------------------
+The current 2.3.40 buffer-cache is 'loosely coupled' to the page-cache,
+one portion of the buffer-cache is 'owned' by the page-cache, other parts
+of it are owned by filesystems. This means that entries in it might or
+might not be hashed, filesystems and the pagecache assumes sole ownership
+over buffers, and thus the IO layer is strictly forbidden to access
+buffers from the buffer-cache side. This loosely coupled nature has
+advantages as well (keeps the buffer hash table small), but also brings up
+problems in memory management: if buffers and page-cache pages are aliased
+to the same physical page then it might take some time (and memory
+pressure) for the VM to notice that a given page is free.
+The 'new style' RAID subsystem is moving in the direction of more
+intelligent IO, and as such it would like to snoop cached data, possibly
+add cached data to the buffer-cache, and perform atomic IO operations
+through the buffer-cache - and it wants to be nice to the pagecache as
+well. The RAID layer in some cases also wants to 'pull' further
+buffer-heads from the buffer-cache to do more effective IO. It has simply
+more internal knowledge about request ordering and possible speedups.
+to make memory freeing more agressive and to enable such 'intelligent IO'
+i extended the current buffer-cache and page-cache to do more strict
+cache-control: the pagecache and filesystems are now the 'primary cache
+manager' to the buffer-cache, but it's possible for 'external'
+cache-managers to do (limited) operations on the buffer-cache as well. The
+page-cache is indexing all 'logical blocks'. The buffer-cache is indexing
+'physical blocks'. All buffers which are associated to a block (mapped)
+are now hashed. Whenever a primary cache manager adds a new buffer, it
+performs a hash lookup and kicks out any existing buffers. Such buffers
+are typically hangover buffers from previously truncated inodes, or are
+buffers added by a secondary cache-manager such as the RAID
+resynchronization / reconstruction system threads.
+(it might now also be useful to define the exact interface between
+journaled filesystems and the buffer-cache, and to teach the RAID code
+about transactions. The new-style RAID code now does reconstruction
+completely protected by the buffer-lock, it's basically an atomic IO
+operation to all external observers.)
+the buffer-cache now also removes pages from the page-cache (see
+__unlink_drop_bh()). Freeing of unused buffers/pages got more effective
+this way, because it can now happen much later as well. I've also changed
+set_blocksize() and invalidate_buffers() to properly free unused buffers.
+I've added 'bdrop', which is similar to 'bforget', but does not destroy
+dirty content. 'bdrop' means: 'free the buffer if unused and not dirty'.
+The RAID resync threads use this when they are doing a linear pass over
+disks - 99% of the buffers are not needed afterwards.
+an example for 'pull'-style IO is the RAID5 code which snoops the
+buffer-cache to find further dirty blocks which it might attach to a
+stripe. Such type of optimizations cannot be achieved from the buffer or
+pagecache side.
+ext2fs latency speedups
+-----------------------
+i've noticed that during normal filesystem use, even if all files are
+properly cached it often happens that a file operation 'hangs' for a
+second or two, and slows down things. I've identified all such places i
+have seen, and there were several problem categories:
+	bh = getblk(dev, block, size);
+	if (condition)
+		ll_rw_blk(READ, &bh, 1);
+        ....
+	wait_on_buffer(bh);
+if a buffer is already cached, then the unconditional wait_on_buffer()
+causes unnecessery stalls if there is a write happening (started by
+bdflush) to this buffer. The solution is to:
+	if (!buffer_uptodate(bh))
+		wait_on_buffer(bh);
+there were also some completely broken places which did:
+	result = getblk(,,);
+	if (!buffer_uptodate(result))
+		wait_on_buffer(result);
+	memset(result->b_data, 0, blocksize);
+	mark_buffer_uptodate(result, 1);
+if we are freshly creating a new metadata block then it's completely
+pointless to wait for the block - it might just be accidentally locked
+after a previous truncate. The integrated buffer-cache now prevents 'IO
+clashes' between different bhs doing IO to the same on-disk block, so the
+waiting for the bh lock at truncate time can be removed as well.
+the next one is a bit more subtle and only happens during heavy load:
+	ll_rw_blk(READ, &bh, 1);
+	wait_on_buffer(bh);
+now the READ might block due to IO pressure and contention on the IO
+request lock. Another process might be more lukcy and take the same buffer
+and complete the READ and do a writeback - in which case we do a bogus
+wait for the WRITE. The solution is to:
+	ll_rw_blk(READ, &bh, 1);
+	if (!buffer_uptodate(bh))
+		wait_on_buffer(bh);
+Actually, it might be useful to add a wait_on_buffer_uptodate() function,
+because the above still has a (very small and very unlikely) window for
+the race to happen.
+The last latency category was block_flushpage() and unmap_buffer()
+blocking on the buffer-lock - this now is all moved to the 'cache-add'
+point.
+WARNING: while everything appears to be fine on my box, even during heavy
+testing, it's possible that these patches break ext2fs, so be very careful
+when testing. Do not use this on any production system.
+Benchmark results:
+------------------
+the first test was a script which untars the 2.3.22 Linux kernel and
+patches it up to 2.3.40.
+                    vanilla-2.3.40         ibc-ext2-raid-2.3.40
+untar+patch:           29-30 sec                  23-24 sec
+did 10 runs. The speedup is partly due to the latency fixes in ext2fs, and
+partly due to the removed unmap_buffer() synchronization in flushpage().
+another test is 'make dep':
+                   vanilla-2.3.40           ibc-ext2-raid-2.3.40
+makedep:               3.18 sec                   3.05 sec
+(done for the same directory, the numbers are stable and reproducable.)
+there is a slight improvement in 'dbench' numbers as well:
+                   vanilla-2.3.40           ibc-ext2-raid-2.3.40
+dbench -16:           265 MB/sec                  280 MB/sec
+(I expect fsync() performance to suffer though, but i have not found any
+test that sufficiently measures this.)
+(the buffer-cache changes are a bit more paranoid than they'd need to be,
+some extraneous locking and bget/bput will be removed in future versions
+of the patch.)
+(the RAID code changed alot, i'll write a separate email detailing these
+and the lowlevel block IO changes.)
+anyway, have fun checking out this patch, comments, reports, suggestions
+welcome.
+-- mingo
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

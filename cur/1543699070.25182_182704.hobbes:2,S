@@ -1,0 +1,188 @@
+Date: Mon, 08 Dec 2003 14:56:07 -0500
+From: Trond Myklebust <>
+Subject: Re: [NFS client] NFS locks not released on abnormal process termination
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2003/12/8/190
+
+På må , 08/12/2003 klokka 12:32, skreiv Philippe Troin:
+> Trond, do you think I should push the patch to Marcelo, or should I
+> wait for a better fix?
+No. If I wanted a partial fix, I could just as well have pushed it to
+Marcelo myself. When I said "feel free" I was referring to pursuing the
+remaining signalling bugs.
+I have a feeling the second race case of your test is that you are
+interrupting the fcntl(F_SETLK) call while it is on the wire. If you do
+that, then the server may record the lock as taken, but the client will
+never receive the reply, and so will not know that it must clean up
+locks...
+Hmm... For that case, we probably want to have the locking code record
+the call as having succeeded in order to ensure that we do indeed clear
+out the lock on process exit. See if the appended patch helps...
+Cheers,
+  Trond
+--- linux-2.4.23-rc1/fs/nfs/file.c.orig	2003-11-16 19:28:52.000000000 -0500
++++ linux-2.4.23-rc1/fs/nfs/file.c	2003-12-08 14:53:12.000000000 -0500
+@@ -241,6 +241,92 @@
+ 	goto out;
+ }
+ 
++static int
++do_getlk(struct inode *inode, int cmd, struct file_lock *fl)
++{
++	int status;
++
++	lock_kernel();
++	status = nlmclnt_proc(inode, cmd, fl);
++	unlock_kernel();
++	return status;
++}
++
++static int
++do_unlk(struct inode *inode, int cmd, struct file_lock *fl)
++{
++	sigset_t oldset;
++	int status;
++
++	rpc_clnt_sigmask(NFS_CLIENT(inode), &oldset);
++	/*
++	 * Flush all pending writes before doing anything
++	 * with locks..
++	 */
++	filemap_fdatasync(inode->i_mapping);
++	down(&inode->i_sem);
++	nfs_wb_all(inode);
++	up(&inode->i_sem);
++	filemap_fdatawait(inode->i_mapping);
++
++	/* NOTE: special case
++	 *	If we're signalled while cleaning up locks on process exit, we
++	 *	still need to complete the unlock.
++	 */
++	lock_kernel();
++	status = nlmclnt_proc(inode, cmd, fl);
++	unlock_kernel();
++	rpc_clnt_sigunmask(NFS_CLIENT(inode), &oldset);
++	return status;
++}
++
++static int
++do_setlk(struct inode *inode, int cmd, struct file_lock *fl)
++{
++	int status;
++
++	/*
++	 * Flush all pending writes before doing anything
++	 * with locks..
++	 */
++	status = filemap_fdatasync(inode->i_mapping);
++	if (status == 0) {
++		down(&inode->i_sem);
++		status = nfs_wb_all(inode);
++		up(&inode->i_sem);
++		if (status == 0)
++			status = filemap_fdatawait(inode->i_mapping);
++	}
++	if (status < 0)
++		return status;
++
++	lock_kernel();
++	status = nlmclnt_proc(inode, cmd, fl);
++	/* If we were signalled we still need to ensure that
++	 * we clean up any state on the server. We therefore
++	 * record the lock call as having succeeded in order to
++	 * ensure that locks_remove_posix() cleans it out when
++	 * the process exits.
++	 */
++	if (status == -EINTR || status == -ERESTARTSYS)
++		posix_lock_file(filp, fl, 0);
++	unlock_kernel();
++	if (status < 0)
++		return status;
++
++	/*
++	 * Make sure we clear the cache whenever we try to get the lock.
++	 * This makes locking act as a cache coherency point.
++	 */
++	filemap_fdatasync(inode->i_mapping);
++	down(&inode->i_sem);
++	nfs_wb_all(inode);      /* we may have slept */
++	up(&inode->i_sem);
++	filemap_fdatawait(inode->i_mapping);
++	nfs_zap_caches(inode);
++	return 0;
++}
++
+ /*
+  * Lock a (portion of) a file
+  */
+@@ -248,8 +334,6 @@
+ nfs_lock(struct file *filp, int cmd, struct file_lock *fl)
+ {
+ 	struct inode * inode = filp->f_dentry->d_inode;
+-	int	status = 0;
+-	int	status2;
+ 
+ 	dprintk("NFS: nfs_lock(f=%4x/%ld, t=%x, fl=%x, r=%Ld:%Ld)\n",
+ 			inode->i_dev, inode->i_ino,
+@@ -266,8 +350,8 @@
+ 	/* Fake OK code if mounted without NLM support */
+ 	if (NFS_SERVER(inode)->flags & NFS_MOUNT_NONLM) {
+ 		if (IS_GETLK(cmd))
+-			status = LOCK_USE_CLNT;
+-		goto out_ok;
++			return LOCK_USE_CLNT;
++		return 0;
+ 	}
+ 
+ 	/*
+@@ -280,42 +364,9 @@
+ 	if (!fl->fl_owner || (fl->fl_flags & (FL_POSIX|FL_BROKEN)) != FL_POSIX)
+ 		return -ENOLCK;
+ 
+-	/*
+-	 * Flush all pending writes before doing anything
+-	 * with locks..
+-	 */
+-	status = filemap_fdatasync(inode->i_mapping);
+-	down(&inode->i_sem);
+-	status2 = nfs_wb_all(inode);
+-	if (status2 && !status)
+-		status = status2;
+-	up(&inode->i_sem);
+-	status2 = filemap_fdatawait(inode->i_mapping);
+-	if (status2 && !status)
+-		status = status2;
+-	if (status < 0)
+-		return status;
+-
+-	lock_kernel();
+-	status = nlmclnt_proc(inode, cmd, fl);
+-	unlock_kernel();
+-	if (status < 0)
+-		return status;
+-	
+-	status = 0;
+-
+-	/*
+-	 * Make sure we clear the cache whenever we try to get the lock.
+-	 * This makes locking act as a cache coherency point.
+-	 */
+- out_ok:
+-	if ((IS_SETLK(cmd) || IS_SETLKW(cmd)) && fl->fl_type != F_UNLCK) {
+-		filemap_fdatasync(inode->i_mapping);
+-		down(&inode->i_sem);
+-		nfs_wb_all(inode);      /* we may have slept */
+-		up(&inode->i_sem);
+-		filemap_fdatawait(inode->i_mapping);
+-		nfs_zap_caches(inode);
+-	}
+-	return status;
++	if (IS_GETLK(cmd))
++		return do_getlk(inode, cmd, fl);
++	if (fl->fl_type == F_UNLCK)
++		return do_unlk(inode, cmd, fl);
++	return do_setlk(inode, cmd, fl);
+ }

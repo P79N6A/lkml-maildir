@@ -1,0 +1,876 @@
+Date: Mon, 11 Sep 2000 17:24:35 +0200
+From: Jeroen Vreeken <>
+Subject: [PATCH] vloopback 0.7
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/9/11/74
+
+Hello,
+Attached to this message is a patch against 2.4.0-test8 with my
+video4linux loopback driver.
+I makes two video devices for each pipe created, one for input using
+write and one for output using read or mmap.
+Jeroendiff -ruN linux/CREDITS linux-2.4.0-test8/CREDITS
+--- linux/CREDITS	Fri Sep  8 21:38:00 2000
++++ linux-2.4.0-test8/CREDITS	Mon Sep 11 17:10:51 2000
+@@ -2734,6 +2734,14 @@
+ S: 1098 VA Amsterdam 
+ S: The Netherlands
+ 
++N: Jeroen Vreeken
++E: pe1rxq@amsat.org
++W: 
+http://www.chello.nl/~j.vreeken/
++D: Video4linux loopback driver
++S: Maastrichterweg 63
++S: 5554 GG Valkenswaard
++S: The Netherlands
++
+ N: Peter Shaobo Wang
+ E: pwang@mmdcorp.com
+ W: 
+http://www.mmdcorp.com/pw/linux
+diff -ruN linux/drivers/media/video/Config.in linux-2.4.0-test8/drivers/media/video/Config.in
+--- linux/drivers/media/video/Config.in	Wed Aug 23 23:59:55 2000
++++ linux-2.4.0-test8/drivers/media/video/Config.in	Mon Sep 11 17:10:51 2000
+@@ -38,6 +38,7 @@
+    fi
+    dep_tristate '  Stradis 4:2:2 MPEG-2 video driver  (EXPERIMENTAL)' CONFIG_VIDEO_STRADIS $CONFIG_VIDEO_DEV $CONFIG_PCI
+ fi
++dep_tristate '  Video For Linux loopback' CONFIG_VIDEO_VLOOPBACK $CONFIG_VIDEO_DEV
+ dep_tristate '  Zoran ZR36057/36060 Video For Linux' CONFIG_VIDEO_ZORAN $CONFIG_VIDEO_DEV $CONFIG_PCI $CONFIG_I2C
+ dep_tristate '    Include support for Iomega Buz' CONFIG_VIDEO_BUZ $CONFIG_VIDEO_ZORAN
+ dep_tristate '  Zoran ZR36120/36125 Video For Linux' CONFIG_VIDEO_ZR36120 $CONFIG_VIDEO_DEV $CONFIG_PCI $CONFIG_I2C
+diff -ruN linux/drivers/media/video/Makefile linux-2.4.0-test8/drivers/media/video/Makefile
+--- linux/drivers/media/video/Makefile	Tue Aug 22 20:29:02 2000
++++ linux-2.4.0-test8/drivers/media/video/Makefile	Mon Sep 11 17:10:51 2000
+@@ -57,6 +57,7 @@
+ obj-$(CONFIG_VIDEO_CPIA) += cpia.o
+ obj-$(CONFIG_VIDEO_CPIA_PP) += cpia_pp.o
+ obj-$(CONFIG_VIDEO_CPIA_USB) += cpia_usb.o
++obj-$(CONFIG_VIDEO_VLOOPBACK) += vloopback.o
+ obj-$(CONFIG_TUNER_3036) += tuner-3036.o
+ 
+ # Extract lists of the multi-part drivers.
+diff -ruN linux/drivers/media/video/vloopback.c linux-2.4.0-test8/drivers/media/video/vloopback.c
+--- linux/drivers/media/video/vloopback.c	Thu Jan  1 01:00:00 1970
++++ linux-2.4.0-test8/drivers/media/video/vloopback.c	Mon Sep 11 17:11:12 2000
+@@ -0,0 +1,816 @@
++/*
++ *	vloopback.c
++ *
++ *	Copyright Jeroen Vreeken (pe1rxq@amsat.org), 2000
++ *
++ *	Published under the GNU Public License.
++ *
++ *
++ *	UPDATED:	Jeroen Vreeken.
++ *			Added locks for smp machines. UNTESTED!
++ *			Made the driver much more cpu friendly by using
++ *			a wait queue.
++ *			Went from vmalloc to rvmalloc (yes, I stole the code
++ *			like everybody else) and implemented mmap.
++ *			Implemented VIDIOCGUNIT and removed size/palette checks
++ *			in VIDIOCSYNC.
++ *			Cleaned up a lot of code.
++ *			Changed locks to semaphores.
++ *			Disabled changing size while somebody is using mmap
++ *			Changed mapped check to open check, also don't allow
++ *			a open for write while somebody is reading.
++ *			Added /proc support
++ */
++#define VLNAME "vloopback: "
++#define VLVER "0.7"
++
++#include <linux/config.h>
++#include <linux/kernel.h>
++#include <linux/malloc.h>
++#include <linux/vmalloc.h>
++#include <linux/wrapper.h>
++#include <linux/module.h>
++#include <linux/errno.h>
++#include <linux/videodev.h>
++#include <linux/spinlock.h>
++#include <linux/init.h>
++#include <linux/proc_fs.h>
++
++struct vloopback_device {
++	struct video_device viddev;
++	int pipenr;
++	int in;
++};
++
++struct vloopback_pipe {
++	struct vloopback_device *vloopin;
++ 	struct vloopback_device *vloopout;
++	char *buffer;
++	unsigned long buflength;
++	unsigned int width, height;
++	unsigned int palette;
++	unsigned long frameswrite;
++	unsigned long framesread;
++	unsigned long framesdumped;
++	unsigned int wopen;
++	unsigned int ropen;
++	struct proc_dir_entry *proc_entry;
++	struct semaphore lock;
++	wait_queue_head_t wait;
++};
++
++#define MAX_PIPES 16
++static struct vloopback_pipe *loops[MAX_PIPES];
++static int nr_o_pipes=0;
++static int pipes=-1;
++
++
++/**********************************************************************
++ *
++ * Memory management
++ *
++ * This is a shameless copy from the USB-cpia driver (linux kernel
++ * version 2.3.29 or so, I have no idea what this code actually does ;).
++ * Actually it seems to be a copy of a shameless copy of the bttv-driver.
++ * Or that is a copy of a shameless copy of ... (To the powers: is there
++ * no generic kernel-function to do this sort of stuff?)
++ *
++ * Yes, it was a shameless copy from the bttv-driver. IIRC, Alan says
++ * there will be one, but apparentely not yet -jerdfelt
++ *
++ * So I copied it again for the OV511 driver -claudio
++ *
++ * And it gets copied and copied and copied..... -Jeroen
++ *
++ **********************************************************************/
++
++/* Given PGD from the address space's page table, return the kernel
++ * virtual mapping of the physical memory mapped at ADR.
++ */
++static inline unsigned long uvirt_to_kva(pgd_t *pgd, unsigned long adr)
++{
++        unsigned long ret = 0UL;
++        pmd_t *pmd;
++        pte_t *ptep, pte;
++
++        if (!pgd_none(*pgd)) {
++                pmd = pmd_offset(pgd, adr);
++                if (!pmd_none(*pmd)) {
++                        ptep = pte_offset(pmd, adr);
++                        pte = *ptep;
++                        if (pte_present(pte)) {
++                                ret = (unsigned long) page_address(pte_page(pte));
++                                ret |= (adr & (PAGE_SIZE - 1));
++                        }
++                }
++        }
++
++        return ret;
++}
++
++/* Here we want the physical address of the memory.
++ * This is used when initializing the contents of the
++ * area and marking the pages as reserved.
++ */
++static inline unsigned long kvirt_to_pa(unsigned long adr)
++{
++        unsigned long va, kva, ret;
++
++        va = VMALLOC_VMADDR(adr);
++        kva = uvirt_to_kva(pgd_offset_k(va), va);
++        ret = __pa(kva);
++        return ret;
++}
++
++static void *rvmalloc(unsigned long size)
++{
++        void *mem;
++        unsigned long adr, page;
++
++        /* Round it off to PAGE_SIZE */
++        size += (PAGE_SIZE - 1);
++        size &= ~(PAGE_SIZE - 1);
++
++        mem = vmalloc_32(size);
++        if (!mem)
++                return NULL;
++
++        memset(mem, 0, size); /* Clear the ram out, no junk to the user */
++        adr = (unsigned long) mem;
++        while (size > 0) {
++                page = kvirt_to_pa(adr);
++                mem_map_reserve(virt_to_page(__va(page)));
++                adr += PAGE_SIZE;
++                if (size > PAGE_SIZE)
++                        size -= PAGE_SIZE;
++                else
++                        size = 0;
++        }
++
++        return mem;
++}
++
++static void rvfree(void *mem, unsigned long size)
++{
++        unsigned long adr, page;
++
++        if (!mem)
++                return;
++
++        size += (PAGE_SIZE - 1);
++        size &= ~(PAGE_SIZE - 1);
++
++        adr=(unsigned long) mem;
++        while (size > 0) {
++                page = kvirt_to_pa(adr);
++                mem_map_unreserve(virt_to_page(__va(page)));
++                adr += PAGE_SIZE;
++                if (size > PAGE_SIZE)
++                        size -= PAGE_SIZE;
++                else
++                        size = 0;
++        }
++        vfree(mem);
++}
++
++/**********************************************************************
++ *
++ * End of memory stuff, the rest is mine :)
++ *
++ **********************************************************************/
++
++
++static int vloopback_open(struct video_device *dev, int flags)
++{
++	struct vloopback_device *loopdev=(struct vloopback_device *)dev;
++	int nr=loopdev->pipenr;
++
++	/* Only allow a output to be opened if there is someone feeding
++	 * the pipe.
++	 */
++	if (!loopdev->in) {
++		if (loops[nr]->buffer==NULL) {
++			return -EINVAL;
++		}
++		loops[nr]->framesread=0;
++		loops[nr]->ropen=1;
++	} else {
++		if (loops[nr]->ropen)
++			return -EBUSY;
++		loops[nr]->frameswrite=0;
++		loops[nr]->wopen=1;
++	}
++
++	MOD_INC_USE_COUNT;
++	return 0;
++}
++
++static void vloopback_close(struct video_device *dev)
++{
++	struct vloopback_device *loopdev=(struct vloopback_device *)dev;
++	int nr=loopdev->pipenr;
++	
++	if (loopdev->in) {
++		down(&loops[nr]->lock);
++		if (loops[nr]->buffer) {
++			rvfree(loops[nr]->buffer,
++			    loops[nr]->buflength);
++			loops[nr]->buffer=NULL;
++		}
++		up(&loops[nr]->lock);
++		if (waitqueue_active(&loops[nr]->wait))
++			wake_up(&loops[nr]->wait);
++
++		loops[nr]->width=0;
++		loops[nr]->height=0;
++		loops[nr]->palette=0;
++		printk (VLNAME "frames written: %ld, frames dumped: %ld\n",
++		    loops[nr]->frameswrite,
++		    loops[nr]->framesdumped);
++		loops[nr]->wopen=0;
++	} else {
++		loops[nr]->ropen=0;
++		printk (VLNAME "frames read: %ld\n",
++		    loops[nr]->framesread);
++	}
++
++	MOD_DEC_USE_COUNT;
++}
++
++static int vloopback_init_done(struct video_device *dev)
++{
++	return 0;
++}
++
++static long vloopback_write(struct video_device *v, const char *buf, unsigned long count, int noblock)
++{
++	struct vloopback_device *loopdev=(struct vloopback_device *)v;
++	int nr=loopdev->pipenr;
++	unsigned long realcount=count;
++	
++	if (!loopdev->in) return -EINVAL;
++	
++	if (loops[nr]->buffer==NULL) {
++		return -EINVAL;
++	}
++
++	/* Anybody want some pictures??? */
++	if (!waitqueue_active(&loops[nr]->wait)) {
++		loops[nr]->framesdumped++;
++		return realcount;
++	}
++	
++	down(&loops[nr]->lock);
++	if (!loops[nr]->buffer) {
++		up(&loops[nr]->lock);
++		return -EINVAL;
++	}
++	if (realcount > loops[nr]->buflength) {
++		realcount = loops[nr]->buflength;
++		printk( VLNAME "To much data! Only %ld bytes used.\n", realcount);
++	}
++	
++	copy_from_user(loops[nr]->buffer, buf, realcount);	
++	up(&loops[nr]->lock);
++
++	wake_up(&loops[nr]->wait);
++	loops[nr]->frameswrite++;
++
++	return realcount;
++}
++
++static long vloopback_read(struct video_device *v, char *buf, unsigned long count, int noblock)
++{
++	struct vloopback_device *loopdev=(struct vloopback_device *)v;
++	int nr=loopdev->pipenr;
++	unsigned long realcount=count;
++
++	if (loopdev->in) return -EINVAL;
++
++	if (realcount > loops[nr]->buflength) {
++		realcount = loops[nr]->buflength;
++		printk( VLNAME "Not so much data in buffer!\n");
++	}
++
++	interruptible_sleep_on(&loops[nr]->wait);
++
++	down(&loops[nr]->lock);
++	if (!loops[nr]->buffer) {
++		up(&loops[nr]->lock);
++		return 0;
++	}
++	copy_to_user(buf, loops[nr]->buffer, realcount);	
++	up(&loops[nr]->lock);
++
++	loops[nr]->framesread++;
++	return realcount;
++}
++
++static int vloopback_mmap(struct video_device *dev, const char *adr, unsigned long size)
++{
++	struct vloopback_device *loopdev=(struct vloopback_device *)dev;
++	int nr=loopdev->pipenr;
++        unsigned long start = (unsigned long)adr;
++        unsigned long page, pos;
++
++	down(&loops[nr]->lock);
++        if (loops[nr]->buffer == NULL) {
++		up(&loops[nr]->lock);
++                return -EINVAL;
++	}
++
++        printk(VLNAME "mmap: %ld (%lX) bytes\n", size, size);
++
++        if (size > (((2 * loops[nr]->buflength) + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1))) {
++		up(&loops[nr]->lock);
++                return -EINVAL;
++	}
++
++        pos = (unsigned long)loops[nr]->buffer;
++        while (size > 0) {
++                page = kvirt_to_pa(pos);
++                if (remap_page_range(start, page, PAGE_SIZE, PAGE_SHARED)) {
++			up(&loops[nr]->lock);
++                        return -EAGAIN;
++		}
++                start += PAGE_SIZE;
++                pos += PAGE_SIZE;
++                if (size > PAGE_SIZE)
++                        size -= PAGE_SIZE;
++                else
++                        size = 0;
++        }
++	up(&loops[nr]->lock);
++
++	return 0;
++}
++
++static int vloopback_ioctl(struct video_device *dev, unsigned int cmd, void *arg)
++{
++	struct vloopback_device *loopdev=(struct vloopback_device *)dev;
++	int nr=loopdev->pipenr;
++	
++	switch(cmd)
++	{
++		case VIDIOCGCAP:
++		{
++			struct video_capability b;
++			if (loopdev->in) {
++				sprintf(b.name, "Video loopback %d input",
++				    loopdev->pipenr);
++				b.type = 0;
++			} else {
++				sprintf(b.name, "Video loopback %d output",
++				    loopdev->pipenr);
++				b.type = VID_TYPE_CAPTURE;
++			}
++			b.channels=1;
++			b.audios=0;
++			b.maxwidth=loops[nr]->width;
++			b.maxheight=loops[nr]->height;
++			b.minwidth=loops[nr]->width;
++			b.minheight=loops[nr]->height;
++			if(copy_to_user(arg, &b, sizeof(b)))
++				return -EFAULT;
++			return 0;
++		}
++		case VIDIOCGCHAN:
++		{
++			struct video_channel v;
++			if(copy_from_user(&v, arg, sizeof(v)))
++				return -EFAULT;
++			if(v.channel!=0)
++				return -EINVAL;
++			v.flags=0;
++			v.tuners=0;
++			v.type = VIDEO_TYPE_CAMERA;
++			strcpy(v.name, "Loopback");
++			if(copy_to_user(arg, &v, sizeof(v)))
++				return -EFAULT;
++			return 0;
++		}
++		case VIDIOCSCHAN:
++		{
++			int v;
++			if(copy_from_user(&v, arg, sizeof(v)))
++				return -EFAULT;
++			if(v!=0)
++				return -EINVAL;
++			return 0;
++		}
++		case VIDIOCGTUNER:
++		{
++			struct video_tuner v;
++			if(copy_from_user(&v, arg, sizeof(v))!=0)
++				return -EFAULT;
++			if(v.tuner)
++				return -EINVAL;
++			strcpy(v.name, "Format");
++			v.rangelow=0;
++			v.rangehigh=0;
++			v.flags=0;
++			v.mode=VIDEO_MODE_AUTO;
++			if(copy_to_user(arg,&v, sizeof(v))!=0)
++				return -EFAULT;
++			return 0;
++		}
++		case VIDIOCGPICT:
++		{
++			struct video_picture p;
++			p.colour=0x8000;
++			p.hue=0x8000;
++			p.brightness=0x8000;
++			p.contrast=0x8000;
++			p.whiteness=0x8000;
++			p.depth=0x8000;
++			p.palette=loops[nr]->palette;
++			if(copy_to_user(arg, &p, sizeof(p)))
++				return -EFAULT;
++			return 0;
++
++		}
++		case VIDIOCSPICT:
++		{
++			struct video_picture p;
++			if(copy_from_user(&p, arg, sizeof(p)))
++				return -EFAULT;
++			if (!loopdev->in) {
++				if (p.palette!=loops[nr]->palette)
++					return -EINVAL;
++			} else
++				loops[nr]->palette=p.palette;
++			return 0;
++		}
++		case VIDIOCSWIN:
++		{
++			struct video_window vw;
++			
++			if(copy_from_user(&vw, arg, sizeof(vw)))
++				return -EFAULT;
++			if(vw.flags)
++				return -EINVAL;
++			if(vw.clipcount)
++				return -EINVAL;
++			if (loops[nr]->height==vw.height &&
++			    loops[nr]->width==vw.width)
++				return 0;
++			if(!loopdev->in) {
++				return -EINVAL;
++			} else {
++				loops[nr]->height=vw.height;
++				loops[nr]->width=vw.width;
++				/* Make sure nobody is using the buffer while we
++				   fool around with it.
++				   We are also not allowing changes while
++				   somebody using mmap has the output open.
++				 */
++				down(&loops[nr]->lock);
++				if (loops[nr]->ropen) {
++					printk(VLNAME "Can't change size while opened for read\n");
++					up(&loops[nr]->lock);
++					return -EINVAL;
++				}
++				if (loops[nr]->buffer)
++					rvfree(loops[nr]->buffer, loops[nr]->buflength);
++				loops[nr]->buflength=vw.width*vw.height*4;
++				loops[nr]->buffer=rvmalloc(loops[nr]->buflength);
++				up(&loops[nr]->lock);
++			}
++			return 0;
++		}
++		case VIDIOCGWIN:
++		{
++			struct video_window vw;
++			vw.x=0;
++			vw.y=0;
++			vw.width=loops[nr]->width;
++			vw.height=loops[nr]->height;
++			vw.chromakey=0;
++			vw.flags=0;
++			vw.clipcount=0;
++			if(copy_to_user(arg, &vw, sizeof(vw)))
++				return -EFAULT;
++			return 0;
++		}
++		case VIDIOCGMBUF:
++		{
++			struct video_mbuf vm;
++			
++			if (loopdev->in)
++				return -EINVAL;
++			vm.size=loops[nr]->buflength;
++			vm.frames=1;
++			vm.offsets[0]=0;
++			if(copy_to_user(arg, &vm, sizeof(vm)))
++				return -EFAULT;
++			return 0;
++		}
++		case VIDIOCMCAPTURE:
++		{
++			struct video_mmap vm;
++			
++			if (loopdev->in)
++				return -EINVAL;
++			if (!loops[nr]->buffer)
++				return -EINVAL;
++			if (copy_from_user(&vm, arg, sizeof(vm)))
++				return -EFAULT;
++			if (vm.height!=loops[nr]->height ||
++			    vm.width!=loops[nr]->width ||
++			    vm.format!=loops[nr]->palette) {
++				printk (VLNAME "heigth: %d ioctl: %d\n"
++					VLNAME "width:  %d ioctl: %d\n"
++					VLNAME "palette:%d ioctl: %d\n",
++					loops[nr]->height, vm.height,
++					loops[nr]->width, vm.width,
++					loops[nr]->palette, vm.format);
++					
++				return -EINVAL;
++			}
++			return 0;
++		}
++		case VIDIOCSYNC:
++		{
++			if (loopdev->in)
++				return -EINVAL;
++			if (!loops[nr]->buffer)
++				return -EINVAL;
++			/* Ok, everything should be alright since the program
++			   should have called VIDIOMCAPTURE and we are ready to
++			   do the 'capturing' */
++			interruptible_sleep_on(&loops[nr]->wait);
++			loops[nr]->framesread++;
++
++			return 0;
++		}
++		case VIDIOCGUNIT:
++		{
++			struct video_unit vu;
++			
++			if (loopdev->in)
++				vu.video=loops[nr]->vloopout->viddev.minor;
++			else
++				vu.video=loops[nr]->vloopin->viddev.minor;
++			vu.vbi=VIDEO_NO_UNIT;
++			vu.radio=VIDEO_NO_UNIT;
++			vu.audio=VIDEO_NO_UNIT;
++			vu.teletext=VIDEO_NO_UNIT;
++			if (copy_to_user(arg, &vu, sizeof(vu)))
++				return -EFAULT;
++			return 0;
++		}
++		case VIDIOCCAPTURE:
++		case VIDIOCGFBUF:
++		case VIDIOCGFREQ:
++		case VIDIOCSFREQ:
++		case VIDIOCGAUDIO:
++		case VIDIOCSAUDIO:
++			return -EINVAL;
++		case VIDIOCKEY:
++			return 0;
++		default:
++			return -ENOIOCTLCMD;
++	}
++	return 0;
++}
++
++static struct video_device vloopback_template=
++{
++	"Video Loopback",
++	VID_TYPE_CAPTURE,
++	0,
++	vloopback_open,
++	vloopback_close,
++	vloopback_read,
++	vloopback_write,
++	NULL,
++	vloopback_ioctl,
++	vloopback_mmap,
++	vloopback_init_done,
++	NULL,
++	0,
++	0
++};
++
++/****************************************************************************
++ *	/proc interface
++ *	Based on the ov511 driver
++ ****************************************************************************/
++
++#if defined(CONFIG_PROC_FS) && defined(CONFIG_VIDEO_PROC_FS)
++
++static struct proc_dir_entry *vloopback_proc_entry = NULL;
++extern struct proc_dir_entry *video_proc_entry;
++
++#define YES_NO(x) ((x) ? "yes" : "no")
++
++static int vloopback_read_proc(char *page, char **start, off_t off,
++			      int count, int *eof, void *data)
++{
++	char *out=page;
++	int len;
++	struct vloopback_pipe *pipe=data;
++
++	out += sprintf (out, "driver  : "VLVER"\n");
++	out += sprintf (out, "input   : video%d\n", pipe->vloopin->viddev.minor);
++	out += sprintf (out, "output  : video%d\n", pipe->vloopout->viddev.minor);
++	out += sprintf (out, "writing : %s\n", YES_NO (pipe->wopen));
++	if (pipe->wopen) {
++		out += sprintf (out, "written : %ld\n", pipe->frameswrite);
++		out += sprintf (out, "dumped  : %ld\n", pipe->framesdumped);
++		out += sprintf (out, "reading : %s\n", YES_NO (pipe->ropen));
++		if (pipe->ropen)
++			out += sprintf (out, "read    : %ld\n", pipe->framesread);
++	}
++
++	len = out - page;
++	len -= off;
++	if (len < count) {
++		*eof=1;
++		if (len <= 0) return 0;
++	} else
++		len = count;
++	
++	*start = page + off;
++	
++	return len;
++}
++
++static int vloopback_write_proc(struct file *file, const char *buffer,
++			      unsigned long count, void *data)
++{
++	return -EINVAL;
++}
++
++static void create_proc_vloopback (int nr)
++{
++	char name[16];
++	struct proc_dir_entry *ent;
++	
++	if (!vloopback_proc_entry)
++		return;
++
++	sprintf(name, "vloopback%d", nr);
++	
++	ent=create_proc_entry(name, S_IFREG | S_IRUGO | S_IWUSR, vloopback_proc_entry);
++	
++	if (!ent) {
++		loops[nr]->proc_entry=NULL;
++		return;
++	}
++
++	ent->data = loops[nr];
++	ent->read_proc = vloopback_read_proc;
++	ent->write_proc = vloopback_write_proc;
++	loops[nr]->proc_entry = ent;
++}
++
++static void destroy_proc_vloopback (int nr)
++{
++	char name[16];
++	
++	if (!loops[nr]->proc_entry)
++		return;
++
++	sprintf(name, "vloopback%d", nr);
++	remove_proc_entry(name, vloopback_proc_entry);
++	loops[nr]->proc_entry=NULL;
++}
++
++static void proc_vloopback_create(void)
++{
++	if (video_proc_entry == NULL) {
++		printk(VLNAME "Unable to initialise /proc/video/vloopback");
++		return;
++	}
++	
++	vloopback_proc_entry=create_proc_entry("vloopback", S_IFDIR, video_proc_entry);
++
++	if (vloopback_proc_entry)
++		vloopback_proc_entry->owner = THIS_MODULE;
++	else
++		printk(VLNAME "Unable to initialise /proc/video/vloopback");
++}
++
++static void proc_vloopback_destroy(void)
++{
++	if (vloopback_proc_entry == NULL)
++		return;
++		
++	remove_proc_entry("vloopback", video_proc_entry);
++}
++#endif /* CONFIG_PROC_FS && CONFIG_VIDEO_PROC_FS */
++
++
++/****************************************************************************
++ *	init stuff
++ ****************************************************************************/
++
++static int create_pipe(int nr)
++{
++	loops[nr]= kmalloc(sizeof(struct vloopback_pipe), GFP_KERNEL);
++	loops[nr]->vloopin= kmalloc(sizeof(struct vloopback_device), GFP_KERNEL);
++	loops[nr]->vloopout= kmalloc(sizeof(struct vloopback_device), GFP_KERNEL);
++	loops[nr]->vloopin->pipenr=nr;
++	loops[nr]->vloopout->pipenr=nr;
++	loops[nr]->buffer=NULL;
++	loops[nr]->width=0;
++	loops[nr]->height=0;
++	loops[nr]->palette=0;
++	loops[nr]->frameswrite=0;
++	loops[nr]->framesread=0;
++	loops[nr]->framesdumped=0;
++	loops[nr]->wopen=0;
++	loops[nr]->ropen=0;
++	memcpy(loops[nr]->vloopin, &vloopback_template, sizeof(vloopback_template));
++	memcpy(loops[nr]->vloopout, &vloopback_template, sizeof(vloopback_template));
++	loops[nr]->vloopin->in=1;
++	loops[nr]->vloopout->in=0;
++	((struct video_device *)loops[nr]->vloopin)->type=0;
++	sprintf(((struct video_device *)loops[nr]->vloopin)->name, "Video loopback %d input", nr);
++	((struct video_device *)loops[nr]->vloopout)->type=VID_TYPE_CAPTURE;
++	sprintf(((struct video_device *)loops[nr]->vloopout)->name, "Video loopback %d output", nr);
++	init_waitqueue_head(&loops[nr]->wait);
++	init_MUTEX(&loops[nr]->lock);
++	if (video_register_device(&loops[nr]->vloopin->viddev, VFL_TYPE_GRABBER)==-1) {
++		kfree(loops[nr]->vloopin);
++		kfree(loops[nr]->vloopout);
++		kfree(loops[nr]);
++		loops[nr]=NULL;
++		printk(VLNAME "error registering device\n");
++		return -ENODEV;
++	}
++	if (video_register_device(&loops[nr]->vloopout->viddev, VFL_TYPE_GRABBER)==-1) {
++		video_unregister_device(&loops[nr]->vloopin->viddev);
++		kfree(loops[nr]->vloopin);
++		kfree(loops[nr]->vloopout);
++		kfree(loops[nr]);
++		loops[nr]=NULL;
++		printk(VLNAME "error registering device\n");
++		return -ENODEV;
++	}
++#if defined(CONFIG_PROC_FS) && defined (CONFIG_VIDEO_PROC_FS)
++	create_proc_vloopback(nr);
++#endif
++	return 0;
++}
++
++MODULE_AUTHOR("J.B. Vreeken (pe1rxq@amsat.org)");
++MODULE_DESCRIPTION("Video4linux loopback device.");
++MODULE_PARM(pipes, "i");
++MODULE_PARM_DESC(pipes, "Nr of pipes to create (each pipe uses two video devices)");
++
++EXPORT_NO_SYMBOLS;
++
++static int __init vloopback_init(void)
++{
++	int i;
++
++	printk(VLNAME "Video4linux loopback driver v"VLVER"\n");
++	printk(VLNAME "Written by Jeroen Vreeken, 2000 (pe1rxq@amsat.org)\n");
++
++	if (pipes==-1) pipes=1;
++	if (pipes > MAX_PIPES) {
++		pipes=MAX_PIPES;
++		printk(VLNAME "Nr of pipes is limited to: %d\n", MAX_PIPES);
++	}
++	
++#if defined(CONFIG_PROC_FS) && defined(CONFIG_VIDEO_PROC_FS)
++	proc_vloopback_create();
++#endif
++
++	printk(VLNAME "Registering devices\n");
++	for (i=0; i<pipes; i++) {
++		if (!create_pipe(i)) {
++			printk(VLNAME "Loopback %d registered, input: video%d, output: video%d\n",
++			    i, loops[i]->vloopin->viddev.minor, loops[i]->vloopout->viddev.minor);
++			nr_o_pipes=i+1;
++		}
++	}
++	return 0;
++}
++
++static void __exit cleanup_vloopback_module(void)
++{
++	int i;
++
++	printk(VLNAME "Unregistering video4linux loopback devices\n");
++	for (i=0; i<nr_o_pipes; i++) if (loops[i]) {
++#if defined(CONFIG_PROC_FS) && defined(CONFIG_VIDEO_PROC_FS)
++		destroy_proc_vloopback(i);
++#endif
++		video_unregister_device(&loops[i]->vloopin->viddev);
++		kfree(loops[i]->vloopin);
++		video_unregister_device(&loops[i]->vloopout->viddev);
++		kfree(loops[i]->vloopout);
++		if (loops[i]->buffer) rvfree(loops[i]->buffer, loops[i]->buflength);
++		kfree(loops[i]);
++	}
++#if defined(CONFIG_PROC_FS) && defined(CONFIG_VIDEO_PROC_FS)
++	proc_vloopback_destroy();
++#endif
++	printk(VLNAME "devices unregistered\n");
++}
++
++module_init(vloopback_init);
++module_exit(cleanup_vloopback_module);

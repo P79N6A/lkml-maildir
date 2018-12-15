@@ -1,0 +1,415 @@
+Date: Thu, 10 Aug 2000 21:11:44 +1000
+From: Rusty Russell <>
+Subject: Re: ip_conntrack modules still somewhat buggy
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/8/10/39
+
+In message <3991D10F.5E8B4F8C@baldauf.org> you write:
+> while true; do insmod ip_tables; insmod ip_conntrack; insmod iptable_nat;
+> insmod ipt_MASQUERADE; rmmod ipt_MASQUERADE; rmmod iptable_nat; rmmod
+> ip_conntrack; rmmod ip_tables; done
+[snip]
+> Using /lib/modules/2.4.0-test5/ipv4/ipt_MASQUERADE.o
+> Using /lib/modules/2.4.0-test5/ipv4/ip_tables.o
+> insmod: module : QM_INFO: Invalid argument
+> Using /lib/modules/2.4.0-test5/ipv4/ip_conntrack.o
+> insmod: module : QM_INFO: Invalid argument
+> Using /lib/modules/2.4.0-test5/ipv4/iptable_nat.o
+> insmod: module : QM_INFO: Invalid argument
+> Using /lib/modules/2.4.0-test5/ipv4/ipt_MASQUERADE.o
+> insmod: module : QM_INFO: Invalid argument
+> rmmod: module : QM_INFO: Invalid argument
+> rmmod: module ipt_MASQUERADE is not loaded
+> rmmod: module : QM_INFO: Invalid argument
+> rmmod: module : QM_INFO: Invalid argument
+> rmmod: module iptable_nat is not loaded
+> 
+> ... the complete module subsystem seems to be destroyed ...
+Surprise surprise, there's a race in the module subsystem.  Given how
+disgusting the code is[*], that's not hugely surprising.
+Philipp Rumpf wrote a patch for the module subsystem a month or so
+back; it included the `freeze all CPUs to unload' patch though, which
+Alan disliked.  But it's attached below, for testing.  If this works,
+I'll lobby for its inclusion (well, a variant with a timeout and
+explicit bind-to-processor).
+Rusty.
+[*] Partially, that's because the whole `module' idea is pretty
+disgusting...
+diff -urN linux/arch/i386/mm/extable.c linux-prumpf/arch/i386/mm/extable.c
+--- linux/arch/i386/mm/extable.c	Wed Nov 10 08:31:37 1999
++++ linux-prumpf/arch/i386/mm/extable.c	Wed Jun 28 13:43:10 2000
+@@ -30,26 +30,30 @@
+         return 0;
+ }
+ 
++extern struct rw_semaphore module_mutex;
++
+ unsigned long
+ search_exception_table(unsigned long addr)
+ {
+-	unsigned long ret;
++	unsigned long ret = 0;
+ 
+ #ifndef CONFIG_MODULES
+ 	/* There is only the kernel to search.  */
+ 	ret = search_one_table(__start___ex_table, __stop___ex_table-1, addr);
+-	if (ret) return ret;
+ #else
+ 	/* The kernel is the last "module" -- no need to treat it special.  */
+ 	struct module *mp;
++
++	down_read(&module_mutex);
+ 	for (mp = module_list; mp != NULL; mp = mp->next) {
+ 		if (mp->ex_table_start == NULL)
+ 			continue;
+ 		ret = search_one_table(mp->ex_table_start,
+ 				       mp->ex_table_end - 1, addr);
+-		if (ret) return ret;
++		if (ret) break;
+ 	}
++	up_read(&module_mutex);
+ #endif
+ 
+-	return 0;
++	return ret;
+ }
+diff -urN linux/include/linux/smp.h linux-prumpf/include/linux/smp.h
+--- linux/include/linux/smp.h	Tue Jun 27 17:43:55 2000
++++ linux-prumpf/include/linux/smp.h	Wed Jun 28 13:54:40 2000
+@@ -76,6 +76,9 @@
+ #define MSG_RESCHEDULE		0x0003	/* Reschedule request from master CPU*/
+ #define MSG_CALL_FUNCTION       0x0004  /* Call function on all other CPUs */
+ 
++extern int freeze_other_cpus(void);
++extern void melt_other_cpus(void);
++
+ #else
+ 
+ /*
+@@ -91,6 +94,8 @@
+ #define cpu_number_map(cpu)			0
+ #define smp_call_function(func,info,retry,wait)	({ 0; })
+ #define cpu_online_map				1
++#define freeze_other_cpus()			0
++#define melt_other_cpus()			do { } while(0)
+ 
+ #endif
+ #endif
+diff -urN linux/kernel/module.c linux-prumpf/kernel/module.c
+--- linux/kernel/module.c	Fri Jun 23 20:17:18 2000
++++ linux-prumpf/kernel/module.c	Wed Jun 28 13:45:28 2000
+@@ -46,6 +46,11 @@
+ 	/* Rest are NULL */
+ };
+ 
++/* module_mutex protects module_list - if you can down_read() it, modules
++ * won't be added/removed, but their usecount, flags aso still might change.
++ */
++
++DECLARE_RWSEM(module_mutex);
+ struct module *module_list = &kernel_module;
+ 
+ static long get_mod_name(const char *user_name, char **buf);
+@@ -114,7 +119,6 @@
+ 
+ 	if (!capable(CAP_SYS_MODULE))
+ 		return -EPERM;
+-	lock_kernel();
+ 	if ((namelen = get_mod_name(name_user, &name)) < 0) {
+ 		error = namelen;
+ 		goto err0;
+@@ -123,32 +127,40 @@
+ 		error = -EINVAL;
+ 		goto err1;
+ 	}
++	lock_kernel();
++	down_write(&module_mutex);
+ 	if (find_module(name) != NULL) {
+ 		error = -EEXIST;
+-		goto err1;
++		goto err2;
+ 	}
+ 	if ((mod = (struct module *)module_map(size)) == NULL) {
+ 		error = -ENOMEM;
+-		goto err1;
++		goto err2;
+ 	}
+ 
+ 	memset(mod, 0, sizeof(*mod));
+ 	mod->size_of_struct = sizeof(*mod);
+-	mod->next = module_list;
+ 	mod->name = (char *)(mod + 1);
+ 	mod->size = size;
+ 	memcpy((char*)(mod+1), name, namelen+1);
+ 
+ 	put_mod_name(name);
+ 
++	mod->next = module_list;
+ 	module_list = mod;	/* link it in */
+ 
+ 	error = (long) mod;
++
++	up_write(&module_mutex);
++	unlock_kernel();
++
+ 	goto err0;
++err2:
++	up_write(&module_mutex);
++	unlock_kernel();
+ err1:
+ 	put_mod_name(name);
+ err0:
+-	unlock_kernel();
+ 	return error;
+ }
+ 
+@@ -168,6 +180,7 @@
+ 	if (!capable(CAP_SYS_MODULE))
+ 		return -EPERM;
+ 	lock_kernel();
++	down_read(&module_mutex);
+ 	if ((namelen = get_mod_name(name_user, &name)) < 0) {
+ 		error = namelen;
+ 		goto err0;
+@@ -346,6 +359,7 @@
+ err1:
+ 	put_mod_name(name);
+ err0:
++	up_read(&module_mutex);
+ 	unlock_kernel();
+ 	return error;
+ }
+@@ -353,16 +367,10 @@
+ static spinlock_t unload_lock = SPIN_LOCK_UNLOCKED;
+ int try_inc_mod_count(struct module *mod)
+ {
+-	int res = 1;
+-	if (mod) {
+-		spin_lock(&unload_lock);
+-		if (mod->flags & MOD_DELETED)
+-			res = 0;
+-		else
+-			__MOD_INC_USE_COUNT(mod);
+-		spin_unlock(&unload_lock);
+-	}
+-	return res;
++	if (mod)
++		__MOD_INC_USE_COUNT(mod);
++	
++	return 1;
+ }
+ 
+ asmlinkage long
+@@ -376,10 +384,12 @@
+ 	if (!capable(CAP_SYS_MODULE))
+ 		return -EPERM;
+ 
++	if ((error = get_mod_name(name_user, &name)) < 0)
++		return error;
++
+ 	lock_kernel();
++	down_write(&module_mutex);
+ 	if (name_user) {
+-		if ((error = get_mod_name(name_user, &name)) < 0)
+-			goto out;
+ 		if (error == 0) {
+ 			error = -EINVAL;
+ 			put_mod_name(name);
+@@ -399,7 +409,11 @@
+  		if (!__MOD_IN_USE(mod)) {
+ 			mod->flags |= MOD_DELETED;
+ 			spin_unlock(&unload_lock);
+-			free_module(mod, 0);
++			error = freeze_other_cpus();
++			if(error == 0) {
++				free_module(mod, 0);
++				melt_other_cpus();
++			}
+ 			error = 0;
+ 		} else {
+ 			spin_unlock(&unload_lock);
+@@ -426,7 +440,10 @@
+ 			} else {
+ 				mod->flags |= MOD_DELETED;
+ 				spin_unlock(&unload_lock);
+-				free_module(mod, 1);
++				if(freeze_other_cpus() == 0) {
++					free_module(mod, 1);
++					melt_other_cpus();
++				}
+ 				something_changed = 1;
+ 			}
+ 		} else {
+@@ -439,6 +456,7 @@
+ 		mod->flags &= ~MOD_JUST_FREED;
+ 	error = 0;
+ out:
++	up_write(&module_mutex);
+ 	unlock_kernel();
+ 	return error;
+ }
+@@ -661,6 +679,7 @@
+ 	int err;
+ 
+ 	lock_kernel();
++	down_read(&module_mutex);
+ 	if (name_user == NULL)
+ 		mod = &kernel_module;
+ 	else {
+@@ -706,6 +725,7 @@
+ 		break;
+ 	}
+ out:
++	up_read(&module_mutex);
+ 	unlock_kernel();
+ 	return err;
+ }
+@@ -726,6 +746,7 @@
+ 	struct kernel_sym ksym;
+ 
+ 	lock_kernel();
++	down_read(&module_mutex);
+ 	for (mod = module_list, i = 0; mod; mod = mod->next) {
+ 		/* include the count for the module name! */
+ 		i += mod->nsyms + 1;
+@@ -768,6 +789,7 @@
+ 		}
+ 	}
+ out:
++	up_read(&module_mutex);
+ 	unlock_kernel();
+ 	return i;
+ }
+@@ -848,6 +870,8 @@
+ 	char tmpstr[64];
+ 	struct module_ref *ref;
+ 
++	down_read(&module_mutex);
++
+ 	for (mod = module_list; mod != &kernel_module; mod = mod->next) {
+ 		long len;
+ 		const char *q;
+@@ -914,8 +938,9 @@
+ #undef safe_copy_str
+ #undef safe_copy_cstr
+ 	}
+-
+ fini:
++	up_read(&module_mutex);
++
+ 	return PAGE_SIZE - left;
+ }
+ 
+@@ -932,6 +957,7 @@
+ 	off_t pos   = 0;
+ 	off_t begin = 0;
+ 
++	down_read(&module_mutex);
+ 	for (mod = module_list; mod; mod = mod->next) {
+ 		unsigned i;
+ 		struct module_symbol *sym;
+@@ -966,6 +992,7 @@
+ 	len -= (offset - begin);
+ 	if (len > length)
+ 		len = length;
++	up_read(&module_mutex);
+ 	return len;
+ }
+ 
+@@ -1010,7 +1037,9 @@
+ void put_module_symbol(unsigned long addr)
+ {
+ 	struct module *mp;
+-
++	
++	/* XXX: safe to sleep here ? */
++	down_read(&module_mutex);
+ 	for (mp = module_list; mp; mp = mp->next) {
+ 		if (MOD_CAN_QUERY(mp) &&
+ 		    addr >= (unsigned long)mp &&
+@@ -1019,6 +1048,7 @@
+ 			return;
+ 		}
+ 	}
++	up_read(&module_mutex);
+ }
+ 
+ #else		/* CONFIG_MODULES */
+diff -urN linux/lib/Makefile linux-prumpf/lib/Makefile
+--- linux/lib/Makefile	Fri Jun 23 20:17:18 2000
++++ linux-prumpf/lib/Makefile	Wed Jun 28 01:46:34 2000
+@@ -10,4 +10,8 @@
+ L_OBJS   := errno.o ctype.o string.o vsprintf.o brlock.o
+ LX_OBJS  := cmdline.o
+ 
++ifeq ($(CONFIG_SMP),y)
++L_OBJS += freeze.o
++endif
++
+ include $(TOPDIR)/Rules.make
+diff -urN linux/lib/freeze.c linux-prumpf/lib/freeze.c
+--- linux/lib/freeze.c	Wed Dec 31 16:00:00 1969
++++ linux-prumpf/lib/freeze.c	Wed Jun 28 17:15:42 2000
+@@ -0,0 +1,52 @@
++/* Currently, those functions are only used for module unloading.  I put them
++ * here as they might be useful for other people and would introduce
++ * unnecessary noise in module.c */
++#include <asm/atomic.h>
++#include <asm/errno.h>
++#include <asm/processor.h>
++#include <linux/spinlock.h>
++#include <linux/smp.h>
++
++static atomic_t freeze_count = ATOMIC_INIT(0);
++static volatile int ice_block;
++static spinlock_t freeze_lock = SPIN_LOCK_UNLOCKED;
++
++static int
++antarctica(void *unused)
++{
++	atomic_inc(&freeze_count);
++	while (ice_block)
++		;
++	atomic_dec(&freeze_count);
++	return 0;
++}
++
++int freeze_other_cpus(void)
++{
++	int cpu, retval;
++
++	/* If you reenter this code, you're seriously fucked */
++	if (!spin_trylock(&freeze_lock))
++		return -EAGAIN;
++
++	ice_block = 1;
++	for (cpu = 0; cpu < smp_num_cpus - 1; cpu++) {
++		retval = kernel_thread(antarctica, (void *)0, 0);
++		if (retval < 0)
++			goto out_melt;
++	}
++
++	while(atomic_read(&freeze_count) != smp_num_cpus - 1);
++	return 0;
++out_melt:
++	ice_block = 0;
++	spin_unlock(&freeze_lock);
++	return retval;
++}
++
++void melt_other_cpus(void)
++{
++	ice_block = 0;
++	while(atomic_read(&freeze_count) != 0); /* this is paranoia */
++	spin_unlock(&freeze_lock);
++}
+--
+Hacking time.
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

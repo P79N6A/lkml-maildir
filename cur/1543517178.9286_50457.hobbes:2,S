@@ -1,0 +1,393 @@
+Date: Fri, 26 Nov 1999 17:40:43 -0800
+From: Richard Henderson <>
+Subject: drm changes for non-x86
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/11/26/158
+
+The biggest part of the change is a generic interface to cmpxchg.
+The definition I chose for it -- requiring the user to compare the
+return value with the expected `old' value -- is largely influenced
+by the Sparc64 cas instruction, as that's what it requires.  And
+given that gcc doesn't give you access to condition codes, it's not
+a loss elsewhere either.
+I've tested this insofar as it now compiles on alpha. 
+I don't actually have any interesting 3d hardware.
+r~
+PS: Thoughts on moving xchg and cmpxchg to atomic.h?  They seem
+fairly out of place where they are...
+diff -rup 2.3.30-2-dist/drivers/char/drm/drmP.h 2.3.30-2/drivers/char/drm/drmP.h
+--- 2.3.30-2-dist/drivers/char/drm/drmP.h	Fri Nov 26 14:17:57 1999
++++ 2.3.30-2/drivers/char/drm/drmP.h	Fri Nov 26 13:31:11 1999
+@@ -96,21 +96,6 @@ typedef struct wait_queue *wait_queue_he
+ #define init_waitqueue_head(q) *q = NULL;
+ #endif
+ 
+-#define __drm_dummy_lock(lock) (*(__volatile__ unsigned int *)lock)
+-#define _DRM_CAS(lock,old,new,__ret)				       \
+-	do {							       \
+-		int __dummy;	/* Can't mark eax as clobbered */      \
+-		__asm__ __volatile__(				       \
+-			"lock ; cmpxchg %4,%1\n\t"		       \
+-			"setnz %0"				       \
+-			: "=d" (__ret),				       \
+-			  "=m" (__drm_dummy_lock(lock)),	       \
+-			  "=a" (__dummy)			       \
+-			: "2" (old),				       \
+-			  "r" (new));				       \
+-	} while (0)
+-
+-
+ 
+ 				/* Macros to make printk easier */
+ #define DRM_ERROR(fmt, arg...) \
+diff -rup 2.3.30-2-dist/drivers/char/drm/lists.c 2.3.30-2/drivers/char/drm/lists.c
+--- 2.3.30-2-dist/drivers/char/drm/lists.c	Tue Sep  7 14:51:28 1999
++++ 2.3.30-2/drivers/char/drm/lists.c	Fri Nov 26 13:31:11 1999
+@@ -130,9 +130,7 @@ int drm_freelist_destroy(drm_freelist_t 
+ 
+ int drm_freelist_put(drm_device_t *dev, drm_freelist_t *bl, drm_buf_t *buf)
+ {
+-	unsigned int	 old;
+-	unsigned int	 new;
+-	char		 failed;
++	drm_buf_t	 *old, *prev;
+ 	int		 count = 0;
+ 	drm_device_dma_t *dma = dev->dma;
+ 
+@@ -155,15 +153,14 @@ int drm_freelist_put(drm_device_t *dev, 
+ #endif
+ 	buf->list	= DRM_LIST_FREE;
+ 	do {
+-		old	  = (unsigned long)bl->next;
+-		buf->next = (void *)old;
+-		new	  = (unsigned long)buf;
+-		_DRM_CAS(&bl->next, old, new, failed);
++		old	  = bl->next;
++		buf->next = old;
++		prev	  = cmpxchg(&bl->next, old, buf);
+ 		if (++count > DRM_LOOPING_LIMIT) {
+ 			DRM_ERROR("Looping\n");
+ 			return 1;
+ 		}
+-	} while (failed);
++	} while (prev != old);
+ 	atomic_inc(&bl->count);
+ 	if (atomic_read(&bl->count) > dma->buf_count) {
+ 		DRM_ERROR("%d of %d buffers free after addition of %d\n",
+@@ -180,9 +177,7 @@ int drm_freelist_put(drm_device_t *dev, 
+ 
+ static drm_buf_t *drm_freelist_try(drm_freelist_t *bl)
+ {
+-	unsigned int	  old;
+-	unsigned int	  new;
+-	char		  failed;
++	drm_buf_t	  *old, *new, *prev;
+ 	drm_buf_t	  *buf;
+ 	int		  count = 0;
+ 
+@@ -190,20 +185,20 @@ static drm_buf_t *drm_freelist_try(drm_f
+ 	
+ 				/* Get buffer */
+ 	do {
+-		old = (unsigned int)bl->next;
++		old = bl->next;
+ 		if (!old) {
+ 			return NULL;
+ 		}
+-		new = (unsigned long)bl->next->next;
+-		_DRM_CAS(&bl->next, old, new, failed);
++		new = bl->next->next;
++		prev = cmpxchg(&bl->next, old, new);
+ 		if (++count > DRM_LOOPING_LIMIT) {
+ 			DRM_ERROR("Looping\n");
+ 			return NULL;
+ 		}
+-	} while (failed);
++	} while (prev != old);
+ 	atomic_dec(&bl->count);
+ 	
+-	buf	  = (drm_buf_t *)old;
++	buf	  = old;
+ 	buf->next = NULL;
+ 	buf->list = DRM_LIST_NONE;
+ 	DRM_DEBUG("%d, count = %d, wfh = %d, w%d, p%d\n",
+diff -rup 2.3.30-2-dist/drivers/char/drm/lock.c 2.3.30-2/drivers/char/drm/lock.c
+--- 2.3.30-2-dist/drivers/char/drm/lock.c	Tue Sep  7 14:51:28 1999
++++ 2.3.30-2/drivers/char/drm/lock.c	Fri Nov 26 13:31:11 1999
+@@ -50,15 +50,15 @@ int drm_lock_take(__volatile__ unsigned 
+ {
+ 	unsigned int old;
+ 	unsigned int new;
+-	char	     failed;
++	unsigned int prev;
+ 
+ 	DRM_DEBUG("%d attempts\n", context);
+ 	do {
+ 		old = *lock;
+ 		if (old & _DRM_LOCK_HELD) new = old | _DRM_LOCK_CONT;
+ 		else			  new = context | _DRM_LOCK_HELD;
+-		_DRM_CAS(lock, old, new, failed);
+-	} while (failed);
++		prev = cmpxchg(lock, old, new);
++	} while (prev != old);
+ 	if (_DRM_LOCKING_CONTEXT(old) == context) {
+ 		if (old & _DRM_LOCK_HELD) {
+ 			if (context != DRM_KERNEL_CONTEXT) {
+@@ -84,13 +84,13 @@ int drm_lock_transfer(__volatile__ unsig
+ {
+ 	unsigned int old;
+ 	unsigned int new;
+-	char	     failed;
++	unsigned int prev;
+ 
+ 	do {
+ 		old = *lock;
+ 		new = context | _DRM_LOCK_HELD;
+-		_DRM_CAS(lock, old, new, failed);
+-	} while (failed);
++		prev = cmpxchg(lock, old, new);
++	} while (prev != old);
+ 	DRM_DEBUG("%d => %d\n", _DRM_LOCKING_CONTEXT(old), context);
+ 	return 1;
+ }
+@@ -100,14 +100,14 @@ int drm_lock_free(drm_device_t *dev,
+ {
+ 	unsigned int old;
+ 	unsigned int new;
+-	char	     failed;
++	unsigned int prev;
+ 
+ 	DRM_DEBUG("%d\n", context);
+ 	do {
+ 		old = *lock;
+ 		new = 0;
+-		_DRM_CAS(lock, old, new, failed);
+-	} while (failed);
++		prev = cmpxchg(lock, old, new);
++	} while (prev != old);
+ 	if (_DRM_LOCK_IS_HELD(old) && _DRM_LOCKING_CONTEXT(old) != context) {
+ 		DRM_ERROR("%d freed heavyweight lock held by %d\n",
+ 			  context,
+diff -rup 2.3.30-2-dist/drivers/char/drm/vm.c 2.3.30-2/drivers/char/drm/vm.c
+--- 2.3.30-2-dist/drivers/char/drm/vm.c	Fri Nov 26 14:17:52 1999
++++ 2.3.30-2/drivers/char/drm/vm.c	Fri Nov 26 14:13:44 1999
+@@ -253,7 +253,9 @@ int drm_mmap(struct file *filp, struct v
+ 	}
+ 	vma->vm_flags |= VM_LOCKED | VM_SHM; /* Don't swap */
+ 	if (map->flags & _DRM_READ_ONLY) {
+-		pgprot_val(vma->vm_page_prot) &= ~_PAGE_RW;
++		/* Ye gads this is ugly.  With more thought we could move
++		   this up higher and use `protection_map' instead.  */
++		vma->vm_page_prot = __pgprot(pte_val(pte_wrprotect(__pte(pgprot_val(vma->vm_page_prot)))));
+ 	}
+ 
+ 	
+diff -rup 2.3.30-2-dist/include/asm-alpha/system.h 2.3.30-2/include/asm-alpha/system.h
+--- 2.3.30-2-dist/include/asm-alpha/system.h	Fri Nov 26 14:18:15 1999
++++ 2.3.30-2/include/asm-alpha/system.h	Fri Nov 26 13:31:53 1999
+@@ -317,12 +317,11 @@ extern void __global_restore_flags(unsig
+ #define tbia()		__tbi(-2, /* no second argument */)
+ 
+ /*
+- * Give prototypes to shut up gcc.
++ * Atomic exchange.
+  */
+-extern __inline__ unsigned long xchg_u32(volatile int *m, unsigned long val);
+-extern __inline__ unsigned long xchg_u64(volatile long *m, unsigned long val);
+ 
+-extern __inline__ unsigned long xchg_u32(volatile int *m, unsigned long val)
++extern __inline__ unsigned long
++__xchg_u32(volatile int *m, unsigned long val)
+ {
+ 	unsigned long dummy;
+ 
+@@ -341,7 +340,8 @@ extern __inline__ unsigned long xchg_u32
+ 	return val;
+ }
+ 
+-extern __inline__ unsigned long xchg_u64(volatile long * m, unsigned long val)
++extern __inline__ unsigned long
++__xchg_u64(volatile long *m, unsigned long val)
+ {
+ 	unsigned long dummy;
+ 
+@@ -360,32 +360,108 @@ extern __inline__ unsigned long xchg_u64
+ 	return val;
+ }
+ 
+-/*
+- * This function doesn't exist, so you'll get a linker error
+- * if something tries to do an invalid xchg().
+- *
+- * This only works if the compiler isn't horribly bad at optimizing.
+- * gcc-2.5.8 reportedly can't handle this, but as that doesn't work
+- * too well on the alpha anyway..
+- */
++/* This function doesn't exist, so you'll get a linker error
++   if something tries to do an invalid xchg().  */
+ extern void __xchg_called_with_bad_pointer(void);
+ 
+ static __inline__ unsigned long
+-__xchg(unsigned long x, volatile void * ptr, int size)
++__xchg(volatile void *ptr, unsigned long x, int size)
+ {
+ 	switch (size) {
+ 		case 4:
+-			return xchg_u32(ptr, x);
++			return __xchg_u32(ptr, x);
+ 		case 8:
+-			return xchg_u64(ptr, x);
++			return __xchg_u64(ptr, x);
+ 	}
+ 	__xchg_called_with_bad_pointer();
+ 	return x;
+ }
+ 
+-#define xchg(ptr,x) \
+-  ((__typeof__(*(ptr)))__xchg((unsigned long)(x),(ptr),sizeof(*(ptr))))
++#define xchg(ptr,x)							     \
++  ({									     \
++     __typeof__(*(ptr)) _x_ = (x);					     \
++     (__typeof__(*(ptr))) __xchg((ptr), (unsigned long)_x_, sizeof(*(ptr))); \
++  })
++
+ #define tas(ptr) (xchg((ptr),1))
++
++
++/* 
++ * Atomic compare and exchange.  Compare OLD with MEM, if identical,
++ * store NEW in MEM.  Return the initial value in MEM.  Success is
++ * indicated by comparing RETURN with OLD.
++ */
++
++#define __HAVE_ARCH_CMPXCHG 1
++
++extern __inline__ unsigned long
++__cmpxchg_u32(volatile int *m, int old, int new)
++{
++	unsigned long prev, cmp;
++
++	__asm__ __volatile__(
++	"1:	ldl_l %0,%2\n"
++	"	cmpeq %0,%3,%1\n"
++	"	beq %1,2f\n"
++	"	mov %4,%1\n"
++	"	stl_c %1,%2\n"
++	"	beq %1,3f\n"
++	"2:	mb\n"
++	".section .text2,\"ax\"\n"
++	"3:	br 1b\n"
++	".previous"
++	: "=&r"(prev), "=&r"(cmp), "=m"(*m)
++	: "r"((long) old), "r"(new), "m"(*m));
++
++	return prev;
++}
++
++extern __inline__ unsigned long
++__cmpxchg_u64(volatile long *m, unsigned long old, unsigned long new)
++{
++	unsigned long prev, cmp;
++
++	__asm__ __volatile__(
++	"1:	ldq_l %0,%2\n"
++	"	cmpeq %0,%3,%1\n"
++	"	beq %1,2f\n"
++	"	mov %4,%1\n"
++	"	stq_c %1,%2\n"
++	"	beq %1,3f\n"
++	"2:	mb\n"
++	".section .text2,\"ax\"\n"
++	"3:	br 1b\n"
++	".previous"
++	: "=&r"(prev), "=&r"(cmp), "=m"(*m)
++	: "r"((long) old), "r"(new), "m"(*m));
++
++	return prev;
++}
++
++/* This function doesn't exist, so you'll get a linker error
++   if something tries to do an invalid cmpxchg().  */
++extern void __cmpxchg_called_with_bad_pointer(void);
++
++static __inline__ unsigned long
++__cmpxchg(volatile void *ptr, unsigned long old, unsigned long new, int size)
++{
++	switch (size) {
++		case 4:
++			return __cmpxchg_u32(ptr, old, new);
++		case 8:
++			return __cmpxchg_u64(ptr, old, new);
++	}
++	__cmpxchg_called_with_bad_pointer();
++	return old;
++}
++
++#define cmpxchg(ptr,o,n)						 \
++  ({									 \
++     __typeof__(*(ptr)) _o_ = (o);					 \
++     __typeof__(*(ptr)) _n_ = (n);					 \
++     (__typeof__(*(ptr))) __cmpxchg((ptr), (unsigned long)_o_,		 \
++				    (unsigned long)_n_, sizeof(*(ptr))); \
++  })
+ 
+ #endif /* __ASSEMBLY__ */
+ 
+diff -rup 2.3.30-2-dist/include/asm-i386/system.h 2.3.30-2/include/asm-i386/system.h
+--- 2.3.30-2-dist/include/asm-i386/system.h	Fri Oct 22 12:46:19 1999
++++ 2.3.30-2/include/asm-i386/system.h	Fri Nov 26 13:31:11 1999
+@@ -158,6 +158,51 @@ static inline unsigned long __xchg(unsig
+ 	return x;
+ }
+ 
++/* 
++ * Atomic compare and exchange.  Compare OLD with MEM, if identical,
++ * store NEW in MEM.  Return the initial value in MEM.  Success is
++ * indicated by comparing RETURN with OLD.
++ */
++
++#if CPU != 386
++#define __HAVE_ARCH_CMPXCHG 1
++
++static inline unsigned long __cmpxchg(volatile void *ptr, unsigned long old,
++				       unsigned long new, int size)
++{
++	unsigned long prev;
++	switch (size) {
++		case 1:
++			__asm__ __volatile__(LOCK_PREFIX "cmpxchgb %b1,%2"
++				: "=a"(prev)
++				: "q"(new), "m"(*__xg(ptr)), "0"(old)
++				: "memory");
++			return prev;
++		case 2:
++			__asm__ __volatile__(LOCK_PREFIX "cmpxchgw %w1,%2"
++				: "=a"(prev)
++				: "q"(new), "m"(*__xg(ptr)), "0"(old)
++				: "memory");
++			return prev;
++		case 4:
++			__asm__ __volatile__(LOCK_PREFIX "cmpxchgl %1,%2"
++				: "=a"(prev)
++				: "q"(new), "m"(*__xg(ptr)), "0"(old)
++				: "memory");
++			return prev;
++	}
++	return old;
++}
++
++#define cmpxchg(ptr,o,n)						\
++  ((__typeof__(*(ptr)))__cmpxchg((ptr),(unsigned long)(old),		\
++				 (unsigned long)(new),sizeof(*(ptr))))
++
++#else
++/* Compiling for a 386 proper.  Is it worth implementing via cli/sti?  */
++#endif
++
++
+ /*
+  * Force strict CPU ordering.
+  * And yes, this is required on UP too when we're talking

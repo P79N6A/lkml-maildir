@@ -1,0 +1,1377 @@
+Date: Thu, 8 Mar 2001 10:24:52 -0500
+From: Mathieu Dube <>
+Subject: /dev/poll patch for 2.4
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2001/3/8/97
+
+Hi,
+	Somebody asked me for that patch it might need some tweaking, adding
+#include <linux/poll.h> somewhere
+-- 
+Mathieu Dube	
+Mondo-Live			
+www.flipr.com
+diff -urP linux-2.4.0/drivers/char/Config.in linux-2.4.0-devpoll/drivers/char/Config.in
+--- linux-2.4.0/drivers/char/Config.in	Fri Dec 29 14:07:21 2000
++++ linux-2.4.0-devpoll/drivers/char/Config.in	Mon Jan 29 16:24:42 2001
+@@ -156,6 +156,7 @@
+ 
+ dep_tristate 'Intel i8x0 Random Number Generator support' CONFIG_INTEL_RNG $CONFIG_PCI
+ tristate '/dev/nvram support' CONFIG_NVRAM
++tristate '/dev/poll support' CONFIG_DEVPOLL
+ tristate 'Enhanced Real Time Clock Support' CONFIG_RTC
+ if [ "$CONFIG_IA64" = "y" ]; then
+    bool 'EFI Real Time Clock Services' CONFIG_EFI_RTC
+diff -urP linux-2.4.0/drivers/char/Makefile linux-2.4.0-devpoll/drivers/char/Makefile
+--- linux-2.4.0/drivers/char/Makefile	Thu Jan  4 13:00:55 2001
++++ linux-2.4.0-devpoll/drivers/char/Makefile	Mon Jan 29 16:24:42 2001
+@@ -181,6 +181,7 @@
+ obj-$(CONFIG_60XX_WDT) += sbc60xxwdt.o
+ obj-$(CONFIG_WDT) += wdt.o
+ obj-$(CONFIG_WDTPCI) += wdt_pci.o
++obj-$(CONFIG_DEVPOLL) += devpoll.o
+ obj-$(CONFIG_21285_WATCHDOG) += wdt285.o
+ obj-$(CONFIG_977_WATCHDOG) += wdt977.o
+ obj-$(CONFIG_I810_TCO) += i810-tco.o
+diff -urP linux-2.4.0/drivers/char/devpoll.c linux-2.4.0-devpoll/drivers/char/devpoll.c
+--- linux-2.4.0/drivers/char/devpoll.c	Wed Dec 31 16:00:00 1969
++++ linux-2.4.0-devpoll/drivers/char/devpoll.c	Tue Jan 30 05:40:19 2001
+@@ -0,0 +1,754 @@
++/*
++ * /dev/poll
++ * by Niels Provos <provos@citi.umich.edu>
++ *
++ * provides poll() support via /dev/poll as in Solaris.
++ *
++ * Linux 2.3/2.4 port by Michal Ostrowski
++ *
++ */
++
++#include <linux/module.h>
++#include <linux/init.h>
++#include <linux/kernel.h>
++#include <linux/sched.h>
++#include <linux/file.h>
++#include <linux/signal.h>
++#include <linux/errno.h>
++#include <linux/mm.h>
++#include <linux/malloc.h>
++#include <linux/vmalloc.h>
++#include <linux/poll.h>
++#include <linux/miscdevice.h>
++#include <linux/random.h>
++#include <linux/smp_lock.h>
++#include <linux/wrapper.h>
++
++#include <linux/devpoll.h>
++
++#include <asm/uaccess.h>
++#include <asm/system.h>
++#include <asm/io.h>
++
++/*#define DEBUG 1 */
++#ifdef DEBUG
++#define DPRINTK(x)	printk x
++#define DNPRINTK(n,x)	if (n <= DEBUG) printk x
++#else
++#define DPRINTK(x)
++#define DNPRINTK(n,x)
++#endif
++
++/* Various utility functions */
++
++#define DEFAULT_POLLMASK (POLLIN | POLLOUT | POLLRDNORM | POLLWRNORM)
++
++/* Do dynamic hashing */
++
++#define INITIAL_BUCKET_BITS 6
++#define MAX_BUCKET_BITS 16
++#define RESIZE_LENGTH	2
++
++
++static void free_pg_vec(struct devpoll *dp);
++
++
++/* Initalize the hash table */
++
++int
++dp_init(struct devpoll *dp)
++{
++	int i;
++	int num_buckets;
++	DNPRINTK(3,(KERN_INFO "/dev/poll: dp_init\n"));
++
++	dp->dp_lock = RW_LOCK_UNLOCKED;
++	dp->dp_entries = 0;
++	dp->dp_max = 0;
++	dp->dp_avg = dp->dp_count = 0;
++	dp->dp_cached = dp->dp_calls = 0;
++	dp->dp_bucket_bits = INITIAL_BUCKET_BITS;
++	dp->dp_bucket_mask = (1 << INITIAL_BUCKET_BITS) - 1;
++
++	num_buckets = (dp->dp_bucket_mask + 1);
++	dp->dp_tab = kmalloc(num_buckets * sizeof(struct list_head),
++			     GFP_KERNEL);
++
++	if (!dp->dp_tab)
++		return -ENOMEM;
++
++	for (i = 0; i < num_buckets ; i++) {
++		INIT_LIST_HEAD(&dp->dp_tab[i]);
++	}
++
++	return (0);
++}
++
++int
++dp_resize(struct devpoll *dp)
++{
++	u_int16_t new_mask, old_mask;
++	int i;
++	struct list_head *new_tab, *old_tab;
++	struct dp_fd *dpfd;
++	unsigned long flags;
++	int num_buckets;
++
++	old_mask = dp->dp_bucket_mask;
++	new_mask = (old_mask + 1) * 2 - 1;
++	num_buckets = new_mask + 1;
++
++	DPRINTK((KERN_INFO "/dev/poll: resize %d -> %d\n",
++		 old_mask, new_mask));
++
++	new_tab = kmalloc( num_buckets * sizeof(struct list_head), GFP_KERNEL);
++	if (!new_tab)
++		return -ENOMEM;
++
++	for (i = 0; i < num_buckets; i++) {
++		INIT_LIST_HEAD(&new_tab[i]);
++	}
++
++	old_tab = dp->dp_tab;
++
++	/* Rehash all entries */
++	write_lock_irqsave(&dp->dp_lock, flags);
++	for (i = 0; i <= old_mask; i++) {
++		while(!list_empty(&old_tab[i])){
++			dpfd = list_entry(old_tab[i].next,struct dp_fd,next);
++			list_del(&dpfd->next);
++			INIT_LIST_HEAD(&dpfd->next);
++			list_add(&dpfd->next,&new_tab[dpfd->pfd.fd & new_mask]);
++		}
++	}
++
++	dp->dp_tab = new_tab;
++	dp->dp_bucket_bits++;
++	dp->dp_bucket_mask = new_mask;
++	write_unlock_irqrestore(&dp->dp_lock, flags);
++
++	kfree (old_tab);
++
++	return (0);
++}
++
++int
++dp_insert(struct devpoll *dp, struct pollfd *pfd)
++{
++	struct dp_fd *dpfd;
++	u_int16_t bucket = pfd->fd & dp->dp_bucket_mask;
++	unsigned long flags;
++	struct file *file;
++
++	dpfd = kmalloc(sizeof(struct dp_fd), GFP_KERNEL);
++	if (!dpfd)
++		return -ENOMEM;
++
++	dpfd->flags = 0;
++	set_bit(DPH_DIRTY, &dpfd->flags);
++	dpfd->pfd = *pfd;
++	dpfd->pfd.revents = 0;
++	INIT_LIST_HEAD(&dpfd->next);
++
++	write_lock_irqsave(&dp->dp_lock, flags);
++
++	list_add(&dpfd->next,&dp->dp_tab[bucket]);
++
++	file = fcheck(pfd->fd);
++	if (file != NULL) {
++		write_lock(&(file)->f_dplock);
++		poll_backmap(pfd->fd, dpfd, &(file)->f_backmap);
++		write_unlock(&(file)->f_dplock);
++		set_bit(DPH_BACKMAP, &(dpfd)->flags);
++	}
++	write_unlock_irqrestore(&dp->dp_lock, flags);
++
++	dp->dp_entries++;
++	/* Check if we need to resize the hash table */
++	if ((dp->dp_entries >> dp->dp_bucket_bits) > RESIZE_LENGTH &&
++	    dp->dp_bucket_bits < MAX_BUCKET_BITS)
++		dp_resize(dp);
++
++	return (0);
++}
++
++struct dp_fd *
++dp_find(struct devpoll *dp, int fd)
++{
++	struct dp_fd *dpfd=NULL;
++	struct list_head *lh;
++	u_int16_t bucket = fd & dp->dp_bucket_mask;
++
++	read_lock(&dp->dp_lock);
++	list_for_each(lh,&dp->dp_tab[bucket]){
++		dpfd = list_entry(lh,struct dp_fd,next);
++		if(dpfd->pfd.fd == fd ) break;
++		dpfd = NULL;
++	}
++
++
++	read_unlock(&dp->dp_lock);
++	DNPRINTK(2, (KERN_INFO "dp_find: %d -> %p\n", fd, dpfd));
++
++	return dpfd;
++}
++
++void
++dp_delete(struct devpoll *dp, struct dp_fd *dpfd)
++{
++	unsigned long flags;
++	int fd;
++	struct file *filp;
++
++	write_lock_irqsave(&dp->dp_lock, flags);
++	list_del(&dpfd->next);
++
++	INIT_LIST_HEAD(&dpfd->next);
++
++	/* Remove backmaps if necessary */
++	if (current->files) {
++		fd = dpfd->pfd.fd;
++		filp = fcheck(fd);
++
++		if (test_bit(DPH_BACKMAP, &dpfd->flags) &&
++		    filp && filp->f_backmap){
++			write_lock(&filp->f_dplock);
++			poll_remove_backmap(&filp->f_backmap, fd,
++					    current->files);
++			write_unlock(&filp->f_dplock);
++		}
++	}
++	write_unlock_irqrestore(&dp->dp_lock, flags);
++
++	kfree (dpfd);
++
++	dp->dp_entries--;
++}
++
++void
++dp_free(struct devpoll *dp)
++{
++	int i;
++	struct dp_fd *dpfd = NULL;
++
++	lock_kernel();
++	for (i = 0; i <= dp->dp_bucket_mask; i++) {
++		while(!list_empty(&dp->dp_tab[i])){
++			dpfd = list_entry(dp->dp_tab[i].next,struct dp_fd,next);
++			dp_delete(dp, dpfd);
++		}
++	}
++	unlock_kernel();
++
++	kfree (dp->dp_tab);
++}
++
++
++/*
++ * poll the fds that we keep in our state, return after we reached
++ * max changed fds or are done.
++ * XXX - I do not like how the wait table stuff is done.
++ */
++
++int
++dp_poll(struct devpoll *dp, int max, poll_table *wait,
++	long timeout, struct pollfd *rfds, int usemmap)
++{
++	int count = 0;
++	lock_kernel();
++	read_lock(&dp->dp_lock);
++	for (;;) {
++		unsigned int j=0;
++		struct dp_fd *dpfd = NULL;
++		struct pollfd *fdpnt, pfd;
++		struct file *file;
++		
++		set_current_state(TASK_INTERRUPTIBLE);
++		for (j = 0; (j <= dp->dp_bucket_mask) && count < max; j++) {
++			struct list_head *lh;
++			list_for_each(lh, &dp->dp_tab[j]){
++
++				int fd;
++				unsigned int mask = 0;
++				unsigned int rm =0;
++				dpfd = list_entry(lh,struct dp_fd,next);
++
++				if(count>=max){
++					break;
++				}
++
++				fdpnt = &dpfd->pfd;
++				fd = fdpnt->fd;
++
++				/* poll_wait increments f_count if needed */
++				file = fcheck(fd);
++				if (file == NULL) {
++					/* Got to move backward first;
++					 * dp_delete will remove lh from
++					 * the list otherwise
++					 */
++					lh = lh->prev;
++					dp_delete(dp, dpfd);
++					dpfd = NULL;
++					continue;
++				}
++
++				mask = fdpnt->revents;
++				if (test_and_clear_bit(DPH_DIRTY,
++						       &dpfd->flags) ||
++				    wait != NULL ||
++				    (mask & fdpnt->events))  {
++
++					mask = DEFAULT_POLLMASK;
++					if (file->f_op && file->f_op->poll)
++						mask = file->f_op->poll(file, wait);
++					/* if POLLHINT not supported by file
++					 * then set bit to dirty ---
++					 * must poll this file every time,
++					 * otherwise bit will be set by
++					 * calls to dp_add_hint
++					 */
++					if (!(mask & POLLHINT))
++						set_bit(DPH_DIRTY, &dpfd->flags);
++					fdpnt->revents = mask;
++				}else
++					dp->dp_cached++;
++
++
++				dp->dp_calls++;
++
++				mask &= fdpnt->events | POLLERR | POLLHUP;
++				if (mask) {
++					wait = NULL;
++					count++;
++
++					if (usemmap) {
++						*rfds = *fdpnt;
++						rfds->revents = mask;
++					} else {
++						pfd = *fdpnt;
++						pfd.revents = mask;
++						__copy_to_user(rfds, &pfd,
++							       sizeof(struct pollfd));
++					}
++
++					rfds++;
++				}
++			}
++		}
++
++		wait = NULL;
++		if (count || !timeout || signal_pending(current))
++			break;
++		read_unlock(&dp->dp_lock);
++		timeout = schedule_timeout(timeout);
++		read_lock(&dp->dp_lock);
++	}
++	set_current_state(TASK_RUNNING);
++	read_unlock(&dp->dp_lock);
++	unlock_kernel();
++
++	if( !count && signal_pending(current) )
++		return -EINTR;
++
++	return count;
++}
++
++/*
++ * close a /dev/poll
++ */
++
++static int
++close_devpoll(struct inode * inode, struct file * file)
++{
++	struct devpoll *dp = file->private_data;
++
++	DNPRINTK(1, (KERN_INFO "close /dev/poll, max: %d, avg: %d(%d/%d) %d/%d\n",
++		     dp->dp_max, dp->dp_avg/dp->dp_count,
++		     dp->dp_avg, dp->dp_count,
++		     dp->dp_cached, dp->dp_calls));
++
++	/* free allocated memory */
++	if (dp->dp_memvec)
++		free_pg_vec(dp);
++
++	/* Free the hash table */
++	dp_free(dp);
++
++	kfree(dp);
++
++	MOD_DEC_USE_COUNT;
++	return 0;
++}
++
++/*
++ * open a /dev/poll
++ */
++
++static int
++open_devpoll(struct inode * inode, struct file * file)
++{
++	struct devpoll *dp;
++	int r;
++
++	/* allocated state */
++	dp = kmalloc(sizeof(struct devpoll), GFP_KERNEL);
++	if (dp == NULL)
++		return -ENOMEM;
++
++	memset( dp, 0, sizeof(struct devpoll));
++	if ((r = dp_init(dp))) {
++		kfree (dp);
++		return r;
++	}
++
++	file->private_data = dp;
++
++	MOD_INC_USE_COUNT;
++
++	DNPRINTK(3, (KERN_INFO "open /dev/poll\n"));
++
++	return 0;
++}
++
++/*
++ * write to /dev/poll:
++ * a user writes struct pollfds and we add them to our list, or remove
++ * them if (events & POLLREMOVE) is true
++ */
++
++static int
++write_devpoll(struct file *file, const char *buffer, size_t count,
++	      loff_t *ppos)
++{
++	int r,rcount;
++	struct devpoll *dp = file->private_data;
++	struct pollfd pfd;
++	struct dp_fd *dpfd;
++#ifdef DEBUG
++	int add = 0, delete = 0, change = 0;
++#endif
++
++	DNPRINTK(3, (KERN_INFO "write /dev/poll %i\n",count));
++
++	if (count % sizeof(struct pollfd))
++		return -EINVAL;
++
++	if ((r = verify_area(VERIFY_READ, buffer, count)))
++		return r;
++
++	rcount = count;
++
++	lock_kernel();
++
++	while (count > 0) {
++		__copy_from_user(&pfd, buffer, sizeof(pfd)); /* no check */
++
++		dpfd = dp_find(dp, pfd.fd);
++
++		if (pfd.fd >= current->files->max_fds ||
++		    current->files->fd[pfd.fd] == NULL) {
++			/* Be tolerant, maybe the close happened already */
++			pfd.events = POLLREMOVE;
++		}
++		/* See if we need to remove the file descriptor.  If it
++		 * already exists OR the event fields, otherwise insert
++		 */
++		if (pfd.events & POLLREMOVE) {
++			if (dpfd)
++				dp_delete(dp, dpfd);
++#ifdef DEBUG
++			delete++;
++#endif
++		} else if (dpfd) {
++		  /* XXX dpfd->pfd.events |= pfd.events; */
++			dpfd->pfd.events = pfd.events;
++#ifdef DEBUG
++			change++;
++#endif
++		} else {
++			dp_insert(dp, &pfd);
++#ifdef DEBUG
++			add++;
++#endif
++		}
++
++		buffer += sizeof(pfd);
++		count -= sizeof(pfd);
++	}
++
++	unlock_kernel();
++
++	if (dp->dp_max < dp->dp_entries) {
++		dp->dp_max = dp->dp_entries;
++		DNPRINTK(2, (KERN_INFO "/dev/poll: new max %d\n", dp->dp_max));
++	}
++
++	DNPRINTK(3, (KERN_INFO "write /dev/poll: %d entries (%d/%d/%d)\n",
++		 dp->dp_entries, add, delete, change));
++
++	return (rcount);
++}
++
++static int
++ioctl_devpoll(struct inode *inode, struct file *file,
++	      unsigned int cmd, unsigned long arg)
++{
++	struct devpoll *dp = file->private_data;
++	unsigned mapsize=0;
++	unsigned num_pages=0;
++	int i=0;
++	switch (cmd) {
++	case DP_ALLOC:
++		if (arg > current->rlim[RLIMIT_NOFILE].rlim_cur)
++			return -EINVAL;
++		if (dp->dp_mmap)
++			return -EPERM;
++
++		mapsize = DP_MMAP_SIZE(arg);
++
++		num_pages = ( PAGE_ALIGN(mapsize) >> PAGE_SHIFT);
++
++		dp->dp_memvec = kmalloc( num_pages * sizeof(unsigned long*),
++				 GFP_KERNEL);
++		
++		if( dp->dp_memvec == NULL )
++			return -EINVAL;
++
++		memset(dp->dp_memvec, 0, num_pages * sizeof(unsigned long*));
++
++		for( i = 0 ; i < num_pages ; ++i){
++			unsigned long map, mapend;
++			dp->dp_memvec[i] = (u_char*)__get_free_pages(GFP_KERNEL,0);
++			if(!dp->dp_memvec[i]){
++				free_pg_vec(dp);
++				return -ENOMEM;
++			}
++
++			mapend = virt_to_page(dp->dp_memvec[i] + PAGE_SIZE - 1);
++			for (map = virt_to_page(dp->dp_memvec[i]);
++			     map <= mapend;
++			     map++)
++				set_bit(PG_reserved, &mem_map[map].flags);
++
++			++dp->dp_numvec;
++		}
++
++		dp->dp_nfds = arg;
++
++		DPRINTK((KERN_INFO "allocated %d pollfds\n", dp->dp_nfds));
++
++		return 0;
++	case DP_FREE:
++		if( atomic_read(&dp->dp_mmapped) )
++			return -EBUSY;
++
++		if(dp->dp_memvec[i]){
++			free_pg_vec( dp );
++		}
++
++
++		DPRINTK((KERN_INFO "freed %d pollfds\n", dp->dp_nfds));
++		dp->dp_nfds = 0;
++
++		return 0;
++	case DP_ISPOLLED: {
++		struct pollfd pfd;
++		struct dp_fd *dpfd;
++
++		if (copy_from_user(&pfd, (void *)arg, sizeof(pfd)))
++			return -EFAULT;
++		dpfd = dp_find(dp, pfd.fd);
++		if (dpfd == NULL)
++			return (0);
++
++		/* We poll this fd, return the evens we poll on */
++		pfd.events = dpfd->pfd.events;
++		pfd.revents = 0;
++
++		if (copy_to_user((void *)arg, &pfd, sizeof(pfd)))
++			return -EFAULT;
++		return (1);
++	}
++	case DP_POLL: {
++		struct dvpoll dopoll;
++		int nfds, usemmap = 0;
++		unsigned long timeout;
++		poll_table wait;
++		struct pollfd *rpfds = NULL;
++
++		if (copy_from_user(&dopoll, (void *)arg, sizeof(dopoll)))
++			return -EFAULT;
++
++		/* We do not need to check this value, its user space */
++		nfds = dopoll.dp_nfds;
++		if (nfds <= 0)
++			return -EINVAL;
++
++		if (dopoll.dp_fds == NULL) {
++			if (dp->dp_mmap == NULL )
++				return -EINVAL;
++			rpfds = (struct pollfd*)dp->dp_mmap;
++			usemmap = 1;
++		} else {
++			rpfds = dopoll.dp_fds;
++			if (verify_area(VERIFY_WRITE, rpfds,
++					nfds * sizeof(struct pollfd)))
++				return -EFAULT;
++			usemmap = 0;
++		}
++
++		timeout = dopoll.dp_timeout;
++		if (timeout) {
++			/* Careful about overflow in the intermediate values */
++			if ((unsigned long)timeout < MAX_SCHEDULE_TIMEOUT / HZ)
++				timeout = (timeout*HZ+999)/1000+1;
++			else /* Negative or overflow */
++				timeout = MAX_SCHEDULE_TIMEOUT;
++		}
++
++		/* Initalize wait table */
++		poll_initwait(&wait);
++
++
++
++		nfds = dp_poll(dp, nfds, &wait, timeout, rpfds, usemmap);
++
++		DNPRINTK(2, (KERN_INFO "poll time %ld -> %d\n", timeout, nfds));
++
++
++		poll_freewait(&wait);
++
++		dp->dp_avg += dp->dp_entries;
++		dp->dp_count++;
++
++		return nfds;
++	}
++	default:
++		DPRINTK((KERN_INFO "ioctl(%x) /dev/poll\n", cmd));
++		break;
++	}
++
++	return -EINVAL;
++}
++
++
++static void free_pg_vec(struct devpoll *dp)
++{
++	int i;
++
++	for (i=0; i< dp->dp_numvec; i++) {
++		if (dp->dp_memvec[i]) {
++			unsigned long map, mapend;
++
++			mapend = virt_to_page(dp->dp_memvec[i] + PAGE_SIZE - 1);
++			for (map = virt_to_page(dp->dp_memvec[i]);
++			     map <= mapend; 
++			     map++)
++				clear_bit(PG_reserved, &mem_map[map].flags);
++			free_pages( (unsigned)dp->dp_memvec[i], 0);
++		}
++	}
++	kfree(dp->dp_memvec);
++	dp->dp_numvec = 0 ;
++}
++
++
++static void devpoll_mm_open( struct vm_area_struct * vma){
++	struct file *file = vma->vm_file;
++	struct devpoll *dp = file->private_data;
++	if(dp)
++		atomic_inc(&dp->dp_mmapped);
++}
++
++static void devpoll_mm_close( struct vm_area_struct * vma){
++	struct file *file = vma->vm_file;
++	struct devpoll *dp = file->private_data;
++	if(dp)
++		atomic_dec(&dp->dp_mmapped);
++}
++
++static struct vm_operations_struct devpoll_mmap_ops = {
++	open:	devpoll_mm_open,
++	close:	devpoll_mm_close,
++};
++
++/*
++ * mmap shared memory.  the first half is an array  of struct pollfd,
++ * followed by an array of ints to indicate which file descriptors
++ * changed status.
++ */
++
++static int
++mmap_devpoll(struct file *file, struct vm_area_struct *vma)
++{
++	struct devpoll *dp = file->private_data;
++	unsigned long start; /* Evil type to remap_page_range */
++	int  i=0;
++	int num_pages = 0;
++	size_t size, mapsize;
++
++	DPRINTK((KERN_INFO "mmap /dev/poll: %lx %lx\n",
++		 vma->vm_start, vma->vm_pgoff<<PAGE_SHIFT));
++
++	if ( (vma->vm_pgoff<<PAGE_SHIFT) != 0)
++		return -EINVAL;
++
++	/* Calculate how much memory we can map */
++	size = PAGE_ALIGN(DP_MMAP_SIZE(dp->dp_nfds));
++	mapsize = PAGE_ALIGN(vma->vm_end - vma->vm_start);
++	num_pages = mapsize >> PAGE_SHIFT;
++
++	/* Check if the requested size is within our size */
++	if (mapsize > dp->dp_numvec<<PAGE_SHIFT)
++		return -EINVAL;
++
++
++	start = vma->vm_start;
++	atomic_set(&dp->dp_mmapped,1);
++	for( i = 0 ; i < num_pages ; ++i){
++		if( remap_page_range(start, __pa(dp->dp_memvec[i]),
++				     PAGE_SIZE,
++				     vma->vm_page_prot) )
++			return -EINVAL;
++		start += PAGE_SIZE;
++	}
++	dp->dp_mmap = (u_char*)vma->vm_start;
++	vma->vm_ops = &devpoll_mmap_ops;
++
++	DPRINTK((KERN_INFO "mmap /dev/poll: %lx %x\n", page, mapsize));
++	return 0;
++}
++
++
++
++struct file_operations devpoll_fops = {
++	write:write_devpoll,
++	ioctl: ioctl_devpoll,
++	mmap: mmap_devpoll,
++	open: open_devpoll,
++	release:close_devpoll
++};
++
++static struct miscdevice devpoll = {
++	DEVPOLL_MINOR, "devpoll", &devpoll_fops
++};
++
++int __init devpoll_init(void)
++{
++  printk(KERN_INFO "/dev/poll driver installed.\n");
++  misc_register(&devpoll);
++
++
++  return 0;
++}
++
++module_init(devpoll_init);
++#ifdef MODULE
++
++void cleanup_module(void)
++{
++	misc_deregister(&devpoll);
++}
++#endif
++
+diff -urP linux-2.4.0/fs/file_table.c linux-2.4.0-devpoll/fs/file_table.c
+--- linux-2.4.0/fs/file_table.c	Tue Dec  5 10:27:31 2000
++++ linux-2.4.0-devpoll/fs/file_table.c	Mon Jan 29 16:24:42 2001
+@@ -11,6 +11,7 @@
+ #include <linux/init.h>
+ #include <linux/module.h>
+ #include <linux/smp_lock.h>
++#include <linux/spinlock.h>
+ 
+ /* sysctl tunables... */
+ struct files_stat_struct files_stat = {0, 0, NR_FILE};
+@@ -45,6 +46,7 @@
+ 		f->f_version = ++event;
+ 		f->f_uid = current->fsuid;
+ 		f->f_gid = current->fsgid;
++		rwlock_init(&f->f_dplock);
+ 		list_add(&f->f_list, &anon_list);
+ 		file_list_unlock();
+ 		return f;
+diff -urP linux-2.4.0/fs/open.c linux-2.4.0-devpoll/fs/open.c
+--- linux-2.4.0/fs/open.c	Thu Oct 26 08:11:21 2000
++++ linux-2.4.0-devpoll/fs/open.c	Mon Jan 29 16:24:42 2001
+@@ -13,6 +13,8 @@
+ #include <linux/dnotify.h>
+ #include <linux/module.h>
+ #include <linux/slab.h>
++#include <linux/poll.h>
++#include <linux/devpoll.h>
+ 
+ #include <asm/uaccess.h>
+ 
+@@ -802,6 +804,14 @@
+ 		unlock_kernel();
+ 	}
+ 	fcntl_dirnotify(0, filp, 0);
++	
++	if (filp->f_backmap) {
++		unsigned long flags;
++		write_lock_irqsave(&filp->f_dplock, flags);
++		poll_clean_backmap(&filp->f_backmap);
++		write_unlock_irqrestore(&filp->f_dplock, flags);
++	}
++
+ 	locks_remove_posix(filp, id);
+ 	fput(filp);
+ 	return retval;
+@@ -827,6 +837,14 @@
+ 	FD_CLR(fd, files->close_on_exec);
+ 	__put_unused_fd(files, fd);
+ 	write_unlock(&files->file_lock);
++
++	if (filp->f_backmap) {
++		unsigned long flags;
++		write_lock_irqsave(&filp->f_dplock, flags);
++		poll_remove_backmap(&filp->f_backmap, fd, files);
++		write_unlock_irqrestore(&filp->f_dplock, flags);
++	}
++
+ 	return filp_close(filp, files);
+ 
+ out_unlock:
+diff -urP linux-2.4.0/include/asm-i386/devpoll.h linux-2.4.0-devpoll/include/asm-i386/devpoll.h
+--- linux-2.4.0/include/asm-i386/devpoll.h	Wed Dec 31 16:00:00 1969
++++ linux-2.4.0-devpoll/include/asm-i386/devpoll.h	Mon Jan 29 16:24:42 2001
+@@ -0,0 +1,86 @@
++/*
++ *
++ * /dev/poll
++ * by Niels Provos <provos@citi.umich.edu>
++ *
++ * Linux 2.3/2.4 port by Michal Ostrowski
++ */
++
++#ifndef _LINUX_DEVPOLL_H
++#define _LINUX_DEVPOLL_H
++
++#include <asm/bitops.h>
++#include <linux/list.h>
++#include <asm/atomic.h>
++
++#define DPH_DIRTY	0	/* entry is dirty - bit */
++#define DPH_BACKMAP	1	/* file has an fd back map - bit*/
++#ifdef __KERNEL__
++struct dp_fd {
++	struct list_head next;
++	struct pollfd pfd;
++	int flags;		/* for hinting */
++};
++
++
++struct devpoll {
++	struct list_head *dp_tab;
++	int dp_entries;		/* Entries in hash table */
++	int dp_max;		/* statistics */
++	int dp_avg;		/* more */
++	int dp_count;
++	int dp_cached;
++	int dp_calls;
++	int dp_bucket_bits;
++	int dp_bucket_mask;
++	int dp_nfds;		/* Number of poll fds */
++	u_char*  dp_mmap;	/* vaddr of mapped region */
++	atomic_t dp_mmapped;		/* Are we mmapped */
++	rwlock_t dp_lock;
++	u_char** dp_memvec;	/* Pointer to pages allocated for mmap */
++	int dp_numvec;		/* Size of above array */
++};
++#endif
++/* Match solaris */
++
++struct dvpoll {
++	struct pollfd * dp_fds;	/* Leave this ZERO for mmap */
++	int dp_nfds;
++	int dp_timeout;
++};
++
++
++#define DEVPOLL_MINOR       125   /* Minor device # for /dev/poll */
++
++
++#define DP_MMAP_SIZE(x)	((x) * sizeof(struct pollfd))
++
++#define DP_ALLOC	_IOR('P', 1, int)
++#define DP_POLL		_IOWR('P', 2, struct dvpoll)
++#define DP_FREE		_IO('P', 3)
++#define DP_ISPOLLED	_IOWR('P', 4, struct pollfd)
++
++#ifdef __KERNEL__
++extern rwlock_t devpoll_lock;
++/* Function Prototypes */
++
++extern inline void
++dp_add_hint(struct poll_backmap ** map, rwlock_t *lock)
++{
++	struct poll_backmap *entry;
++	struct dp_fd *dpfd;
++	if (!map)
++		return;
++
++	read_lock(lock);
++	entry = *map;
++	while (entry) {
++		dpfd = entry->arg;
++		set_bit(DPH_DIRTY, &dpfd->flags);	/* atomic */
++		entry = entry->next;
++	}
++	read_unlock(lock);
++}
++#endif /* __KERNEL__ */
++
++#endif
+diff -urP linux-2.4.0/include/asm-i386/poll.h linux-2.4.0-devpoll/include/asm-i386/poll.h
+--- linux-2.4.0/include/asm-i386/poll.h	Thu Jan 23 11:01:28 1997
++++ linux-2.4.0-devpoll/include/asm-i386/poll.h	Mon Jan 29 16:24:42 2001
+@@ -15,6 +15,8 @@
+ #define POLLWRNORM	0x0100
+ #define POLLWRBAND	0x0200
+ #define POLLMSG		0x0400
++#define POLLREMOVE	0x1000
++#define POLLHINT	0x2000
+ 
+ struct pollfd {
+ 	int fd;
+diff -urP linux-2.4.0/include/linux/dcache.h linux-2.4.0-devpoll/include/linux/dcache.h
+--- linux-2.4.0/include/linux/dcache.h	Thu Jan  4 14:50:46 2001
++++ linux-2.4.0-devpoll/include/linux/dcache.h	Mon Jan 29 16:24:42 2001
+@@ -6,6 +6,8 @@
+ #include <asm/atomic.h>
+ #include <linux/mount.h>
+ 
++#include <asm/system.h>
++
+ /*
+  * linux/include/linux/dcache.h
+  *
+diff -urP linux-2.4.0/include/linux/devpoll.h linux-2.4.0-devpoll/include/linux/devpoll.h
+--- linux-2.4.0/include/linux/devpoll.h	Wed Dec 31 16:00:00 1969
++++ linux-2.4.0-devpoll/include/linux/devpoll.h	Mon Jan 29 16:24:42 2001
+@@ -0,0 +1,86 @@
++/*
++ *
++ * /dev/poll
++ * by Niels Provos <provos@citi.umich.edu>
++ *
++ * Linux 2.3/2.4 port by Michal Ostrowski
++ */
++
++#ifndef _LINUX_DEVPOLL_H
++#define _LINUX_DEVPOLL_H
++
++#include <asm/bitops.h>
++#include <linux/list.h>
++#include <asm/atomic.h>
++
++#define DPH_DIRTY	0	/* entry is dirty - bit */
++#define DPH_BACKMAP	1	/* file has an fd back map - bit*/
++#ifdef __KERNEL__
++struct dp_fd {
++	struct list_head next;
++	struct pollfd pfd;
++	int flags;		/* for hinting */
++};
++
++
++struct devpoll {
++	struct list_head *dp_tab;
++	int dp_entries;		/* Entries in hash table */
++	int dp_max;		/* statistics */
++	int dp_avg;		/* more */
++	int dp_count;
++	int dp_cached;
++	int dp_calls;
++	int dp_bucket_bits;
++	int dp_bucket_mask;
++	int dp_nfds;		/* Number of poll fds */
++	u_char*  dp_mmap;	/* vaddr of mapped region */
++	atomic_t dp_mmapped;		/* Are we mmapped */
++	rwlock_t dp_lock;
++	u_char** dp_memvec;	/* Pointer to pages allocated for mmap */
++	int dp_numvec;		/* Size of above array */
++};
++#endif
++/* Match solaris */
++
++struct dvpoll {
++	struct pollfd * dp_fds;	/* Leave this ZERO for mmap */
++	int dp_nfds;
++	int dp_timeout;
++};
++
++
++#define DEVPOLL_MINOR       125   /* Minor device # for /dev/poll */
++
++
++#define DP_MMAP_SIZE(x)	((x) * sizeof(struct pollfd))
++
++#define DP_ALLOC	_IOR('P', 1, int)
++#define DP_POLL		_IOWR('P', 2, struct dvpoll)
++#define DP_FREE		_IO('P', 3)
++#define DP_ISPOLLED	_IOWR('P', 4, struct pollfd)
++
++#ifdef __KERNEL__
++extern rwlock_t devpoll_lock;
++/* Function Prototypes */
++
++extern inline void
++dp_add_hint(struct poll_backmap ** map, rwlock_t *lock)
++{
++	struct poll_backmap *entry;
++	struct dp_fd *dpfd;
++	if (!map)
++		return;
++
++	read_lock(lock);
++	entry = *map;
++	while (entry) {
++		dpfd = entry->arg;
++		set_bit(DPH_DIRTY, &dpfd->flags);	/* atomic */
++		entry = entry->next;
++	}
++	read_unlock(lock);
++}
++#endif /* __KERNEL__ */
++
++#endif
+diff -urP linux-2.4.0/include/linux/fs.h linux-2.4.0-devpoll/include/linux/fs.h
+--- linux-2.4.0/include/linux/fs.h	Thu Jan  4 14:50:47 2001
++++ linux-2.4.0-devpoll/include/linux/fs.h	Mon Jan 29 16:24:42 2001
+@@ -511,6 +511,11 @@
+ 
+ 	unsigned long		f_version;
+ 
++
++	/* used by /dev/poll hinting */
++	struct poll_backmap	*f_backmap;
++	rwlock_t		f_dplock;
++
+ 	/* needed for tty driver, and maybe others */
+ 	void			*private_data;
+ };
+diff -urP linux-2.4.0/include/linux/poll.h linux-2.4.0-devpoll/include/linux/poll.h
+--- linux-2.4.0/include/linux/poll.h	Thu Jan  4 14:51:10 2001
++++ linux-2.4.0-devpoll/include/linux/poll.h	Mon Jan 29 18:31:12 2001
+@@ -8,10 +8,18 @@
+ #include <linux/wait.h>
+ #include <linux/string.h>
+ #include <linux/mm.h>
++#include <linux/malloc.h>
+ #include <asm/uaccess.h>
+ 
+ struct poll_table_page;
+ 
++struct poll_backmap {
++	struct poll_backmap *next;
++	void *arg;			/* pointer to devpoll */
++	struct files_struct *files;	/* files which has this file as */
++	int fd;				/* file descriptor number fd */
++};
++
+ typedef struct poll_table_struct {
+ 	int error;
+ 	struct poll_table_page * table;
+@@ -83,7 +91,89 @@
+ 	memset(fdset, 0, FDS_BYTES(nr));
+ }
+ 
++extern inline void
++poll_backmap(int fd, void *arg, struct poll_backmap ** entry)
++{
++	struct poll_backmap *tmp;
++
++	if (!entry)
++		return;
++
++	/*
++	 * See if we have an entry in the backmap already, in general
++	 * we expect this linked list to be very short.
++	 */
++	tmp = *entry;
++	while (tmp != NULL) {
++		if (tmp->files == current->files && tmp->fd == fd &&
++		    arg==tmp->arg)
++			return;
++		tmp = tmp->next;
++	}
++
++	tmp = (struct poll_backmap *) kmalloc(sizeof(*entry), GFP_KERNEL);
++	if (tmp == NULL)
++		return;
++
++	tmp->arg = arg;
++	tmp->files = current->files;
++	tmp->fd = fd;
++	tmp->next = *entry;
++
++	*entry = tmp;
++}
++
++extern inline void poll_remove_backmap(struct poll_backmap **map, int fd,
++				       struct files_struct *files)
++{
++	struct poll_backmap *tmp = *map, *old = NULL;
++	
++	while (tmp != NULL) {
++		if (tmp->files == files && tmp->fd == fd){
++			struct poll_backmap *next = tmp->next;
++			if( old==NULL )
++				*map = next;
++			else
++				old->next = next;
++			kfree(tmp);
++			tmp = next;
++		}else{
++			old = tmp;
++			tmp = tmp->next;
++		}
++	}
++	
++	if (!tmp)
++		return;
++
++	if (old == NULL)
++		*map = tmp->next;
++	else
++		old->next = tmp->next;
++
++	kfree (tmp);
++}
++
++extern inline void poll_clean_backmap(struct poll_backmap **map)
++{
++	struct poll_backmap *tmp = *map, *old;
++
++	printk("poll_clean_backmap: map %p\n", map);
++	printk("poll_clean_backmap: *map %p\n", *map);
++
++	while (tmp) {
++	  printk("poll_clean_backmap: tmp %p\n", tmp);
++		old = tmp;
++		tmp = tmp->next;
++		kfree (old);
++	}
++
++	*map = NULL;
++}
++
+ extern int do_select(int n, fd_set_bits *fds, long *timeout);
++
++extern void poll_freewait(poll_table *p);
+ 
+ #endif /* KERNEL */
+ 
+diff -urP linux-2.4.0/include/net/sock.h linux-2.4.0-devpoll/include/net/sock.h
+--- linux-2.4.0/include/net/sock.h	Thu Jan  4 14:51:21 2001
++++ linux-2.4.0-devpoll/include/net/sock.h	Mon Jan 29 18:31:12 2001
+@@ -655,6 +655,10 @@
+ 	/* Identd and reporting IO signals */
+ 	struct socket		*socket;
+ 
++	/* For Poll hinting */
++	void 			*backmap;
++	void			*dplock;
++
+ 	/* RPC layer private data */
+ 	void			*user_data;
+   
+diff -urP linux-2.4.0/lib/dec_and_lock.c linux-2.4.0-devpoll/lib/dec_and_lock.c
+--- linux-2.4.0/lib/dec_and_lock.c	Fri Jul  7 16:22:48 2000
++++ linux-2.4.0-devpoll/lib/dec_and_lock.c	Mon Jan 29 16:24:42 2001
+@@ -1,5 +1,6 @@
+ #include <linux/spinlock.h>
+ #include <asm/atomic.h>
++#include <asm/system.h>
+ 
+ /*
+  * This is an architecture-neutral, but slow,
+diff -urP linux-2.4.0/net/atm/common.c linux-2.4.0-devpoll/net/atm/common.c
+--- linux-2.4.0/net/atm/common.c	Mon Jan  1 09:54:07 2001
++++ linux-2.4.0-devpoll/net/atm/common.c	Mon Jan 29 16:24:42 2001
+@@ -481,7 +481,10 @@
+ 
+ 	vcc = ATM_SD(sock);
+ 	poll_wait(file,&vcc->sleep,wait);
+-	mask = 0;
++	sk->backmap = &file->f_backmap;
++	sk->dplock  = &file->f_dplock;
++	mask = POLLHINT;
++
+ 	if (skb_peek(&vcc->recvq) || skb_peek(&vcc->listenq))
+ 		mask |= POLLIN | POLLRDNORM;
+ 	if (test_bit(ATM_VF_RELEASED,&vcc->flags) ||
+diff -urP linux-2.4.0/net/core/sock.c linux-2.4.0-devpoll/net/core/sock.c
+--- linux-2.4.0/net/core/sock.c	Fri Dec 29 14:07:24 2000
++++ linux-2.4.0-devpoll/net/core/sock.c	Mon Jan 29 16:24:42 2001
+@@ -1128,6 +1128,8 @@
+ 	sk->state 	= 	TCP_CLOSE;
+ 	sk->zapped	=	1;
+ 	sk->socket	=	sock;
++	sk->backmap	=	NULL;
++	sk->dplock	=	NULL;
+ 
+ 	if(sock)
+ 	{
+diff -urP linux-2.4.0/net/ipv4/af_inet.c linux-2.4.0-devpoll/net/ipv4/af_inet.c
+--- linux-2.4.0/net/ipv4/af_inet.c	Fri Dec 29 14:07:24 2000
++++ linux-2.4.0-devpoll/net/ipv4/af_inet.c	Mon Jan 29 16:24:42 2001
+@@ -442,6 +442,7 @@
+ 		if (sk->linger && !(current->flags & PF_EXITING))
+ 			timeout = sk->lingertime;
+ 		sock->sk = NULL;
++		sk->backmap = NULL;
+ 		sk->prot->close(sk, timeout);
+ 	}
+ 	return(0);
+diff -urP linux-2.4.0/net/ipv4/tcp.c linux-2.4.0-devpoll/net/ipv4/tcp.c
+--- linux-2.4.0/net/ipv4/tcp.c	Tue Nov 28 21:53:45 2000
++++ linux-2.4.0-devpoll/net/ipv4/tcp.c	Mon Jan 29 16:24:42 2001
+@@ -418,6 +418,7 @@
+ #include <linux/types.h>
+ #include <linux/fcntl.h>
+ #include <linux/poll.h>
++#include <linux/devpoll.h>
+ #include <linux/init.h>
+ #include <linux/smp_lock.h>
+ 
+@@ -548,15 +549,17 @@
+ 	struct tcp_opt *tp = &(sk->tp_pinfo.af_tcp);
+ 
+ 	poll_wait(file, sk->sleep, wait);
++	sk->backmap = &file->f_backmap;
++	sk->dplock  = &file->f_dplock;
+ 	if (sk->state == TCP_LISTEN)
+-		return tcp_listen_poll(sk, wait);
++		return tcp_listen_poll(sk, wait) | POLLHINT;
+ 
+ 	/* Socket is not locked. We are protected from async events
+ 	   by poll logic and correct handling of state changes
+ 	   made by another threads is impossible in any case.
+ 	 */
+ 
+-	mask = 0;
++	mask = POLLHINT;
+ 	if (sk->err)
+ 		mask = POLLERR;
+ 
+@@ -622,7 +625,7 @@
+ 		if (tp->urg_data & TCP_URG_VALID)
+ 			mask |= POLLPRI;
+ 	}
+-	return mask;
++	return mask | POLLHINT;
+ }
+ 
+ /*
+diff -urP linux-2.4.0/net/ipv4/tcp_input.c linux-2.4.0-devpoll/net/ipv4/tcp_input.c
+--- linux-2.4.0/net/ipv4/tcp_input.c	Fri Dec 29 14:07:24 2000
++++ linux-2.4.0-devpoll/net/ipv4/tcp_input.c	Mon Jan 29 18:36:12 2001
+@@ -68,6 +68,7 @@
+ #include <net/tcp.h>
+ #include <net/inet_common.h>
+ #include <linux/ipsec.h>
++#include <linux/devpoll.h>
+ 
+ 
+ /* These are on by default so the code paths get tested.
+@@ -2912,8 +2913,10 @@
+ 
+ 		clear_bit(SOCK_NOSPACE, &sock->flags);
+ 
+-		if (sk->sleep && waitqueue_active(sk->sleep))
++		if (sk->sleep && waitqueue_active(sk->sleep)) {
++			dp_add_hint(sk->backmap, sk->dplock);
+ 			wake_up_interruptible(sk->sleep);
++		}
+ 
+ 		if (sock->fasync_list && !(sk->shutdown&SEND_SHUTDOWN))
+ 			sock_wake_async(sock, 2, POLL_OUT);
+diff -urP linux-2.4.0/net/ipx/af_spx.c linux-2.4.0-devpoll/net/ipx/af_spx.c
+--- linux-2.4.0/net/ipx/af_spx.c	Sun Aug  6 22:20:09 2000
++++ linux-2.4.0-devpoll/net/ipx/af_spx.c	Mon Jan 29 16:24:42 2001
+@@ -66,7 +66,10 @@
+ 	unsigned int mask;
+ 
+ 	poll_wait(file, sk->sleep, wait);
+-	mask = 0;
++	sk->backmap = &file->f_backmap;
++        sk->dplock  = &file->f_dplock;
++
++	mask = POLLHINT;
+ 
+ 	/* exceptional events? */
+ 	if (sk->err || !skb_queue_empty(&sk->error_queue))
+diff -urP linux-2.4.0/net/irda/af_irda.c linux-2.4.0-devpoll/net/irda/af_irda.c
+--- linux-2.4.0/net/irda/af_irda.c	Sat Nov 11 18:11:23 2000
++++ linux-2.4.0-devpoll/net/irda/af_irda.c	Mon Jan 29 16:24:42 2001
+@@ -1637,7 +1637,9 @@
+ 	IRDA_DEBUG(4, __FUNCTION__ "()\n");
+ 
+ 	poll_wait(file, sk->sleep, wait);
+-	mask = 0;
++	sk->backmap = &file->f_backmap;
++	sk->dplock  = &file->f_dplock;
++	mask = POLLHINT;
+ 
+ 	/* exceptional events? */
+ 	if (sk->err)
+diff -urP linux-2.4.0/net/unix/af_unix.c linux-2.4.0-devpoll/net/unix/af_unix.c
+--- linux-2.4.0/net/unix/af_unix.c	Sat Nov 11 19:02:41 2000
++++ linux-2.4.0-devpoll/net/unix/af_unix.c	Mon Jan 29 16:24:42 2001
+@@ -107,6 +107,7 @@
+ #include <net/scm.h>
+ #include <linux/init.h>
+ #include <linux/poll.h>
++#include <linux/devpoll.h>
+ #include <linux/smp_lock.h>
+ 
+ #include <asm/checksum.h>
+@@ -300,8 +301,10 @@
+ {
+ 	read_lock(&sk->callback_lock);
+ 	if (unix_writable(sk)) {
+-		if (sk->sleep && waitqueue_active(sk->sleep))
++		if (sk->sleep && waitqueue_active(sk->sleep)) {
++			dp_add_hint(sk->backmap, sk->dplock);
+ 			wake_up_interruptible(sk->sleep);
++		}
+ 		sk_wake_async(sk, 2, POLL_OUT);
+ 	}
+ 	read_unlock(&sk->callback_lock);
+@@ -1708,7 +1711,10 @@
+ 	unsigned int mask;
+ 
+ 	poll_wait(file, sk->sleep, wait);
+-	mask = 0;
++	
++	sk->backmap = &file->f_backmap;
++	sk->dplock = &file->f_dplock;
++	mask = POLLHINT;
+ 
+ 	/* exceptional events? */
+ 	if (sk->err)

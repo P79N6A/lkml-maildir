@@ -1,0 +1,209 @@
+Date: Sat, 26 May 2001 21:33:59 +0200 (CEST)
+From: Ingo Molnar <>
+Subject: [patch] softirq-2.4.5-A1
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2001/5/26/55
+
+i've attached the next round of softirq-handling fixes.
+correctness fixes:
+ - check for softirqs in the signal return path(s)
+ - make sure all the entry.S return paths check for softirqs with
+   interrupts disabled, otherwise we can end up getting another softirq
+   right after the test. (and this causes a missed softirq.)
+ - add softirq handling to the ACPI and APM code (untested)
+performance tweaks:
+ - remove __cli() from idle-poll, it's not needed.
+ - separate exception handling and irq-ret path to avoid double-checking
+   for softirqs
+with this -A1 patch applied, softirqs should be executed by the kernel at
+the first possible place, and there should be no unlimited softirq
+latencies anymore.
+patch is against vanilla 2.4.5 (patch includes the previous fixes as
+well). The patch compiles, boots and works just fine on x86 SMP.
+	Ingo
+--- linux/drivers/acpi/cpu.c.orig	Sat May 26 21:12:01 2001
++++ linux/drivers/acpi/cpu.c	Sat May 26 21:14:39 2001
+@@ -231,10 +231,14 @@
+ 	sleep_level = 1;
+ 	acpi_sleep_on_busmaster();
+ 	for (;;) {
++		int this_cpu = smp_processor_id();
+ 		unsigned long time;
+ 		unsigned long diff;
+ 
+ 		__cli();
++		if (softirq_active(this_cpu) & softirq_mask(this_cpu))
++			do_softirq();
++
+ 		if (current->need_resched)
+ 			goto out;
+ 		time = acpi_read_pm_timer();
+--- linux/arch/i386/kernel/entry.S.orig	Thu Nov  9 02:09:50 2000
++++ linux/arch/i386/kernel/entry.S	Sat May 26 21:21:39 2001
+@@ -133,6 +133,17 @@
+ 	movl $-8192, reg; \
+ 	andl %esp, reg
+ 
++#ifdef CONFIG_SMP
++# define CHECK_SOFTIRQ \
++	movl processor(%ebx),%eax; \
++	shll $CONFIG_X86_L1_CACHE_SHIFT,%eax; \
++	movl SYMBOL_NAME(irq_stat)(,%eax),%ecx; \
++	testl SYMBOL_NAME(irq_stat)+4(,%eax),%ecx
++#else
++# define CHECK_SOFTIRQ \
++	movl SYMBOL_NAME(irq_stat),%ecx; \
++	testl SYMBOL_NAME(irq_stat)+4,%ecx
++#endif
+ ENTRY(lcall7)
+ 	pushfl			# We get a different stack layout with call gates,
+ 	pushl %eax		# which has to be cleaned up later..
+@@ -203,18 +214,10 @@
+ 	call *SYMBOL_NAME(sys_call_table)(,%eax,4)
+ 	movl %eax,EAX(%esp)		# save the return value
+ ENTRY(ret_from_sys_call)
+-#ifdef CONFIG_SMP
+-	movl processor(%ebx),%eax
+-	shll $CONFIG_X86_L1_CACHE_SHIFT,%eax
+-	movl SYMBOL_NAME(irq_stat)(,%eax),%ecx		# softirq_active
+-	testl SYMBOL_NAME(irq_stat)+4(,%eax),%ecx	# softirq_mask
+-#else
+-	movl SYMBOL_NAME(irq_stat),%ecx		# softirq_active
+-	testl SYMBOL_NAME(irq_stat)+4,%ecx	# softirq_mask
+-#endif
+-	jne   handle_softirq
++	cli
++	CHECK_SOFTIRQ
++	jne handle_softirq
+ 	
+-ret_with_reschedule:
+ 	cmpl $0,need_resched(%ebx)
+ 	jne reschedule
+ 	cmpl $0,sigpending(%ebx)
+@@ -230,6 +233,13 @@
+ 	jne v86_signal_return
+ 	xorl %edx,%edx
+ 	call SYMBOL_NAME(do_signal)
++#ifdef CONFIG_SMP
++	GET_CURRENT(%ebx)
++#endif
++	cli
++	CHECK_SOFTIRQ
++	je restore_all
++	call SYMBOL_NAME(do_softirq)
+ 	jmp restore_all
+ 
+ 	ALIGN
+@@ -238,6 +248,13 @@
+ 	movl %eax,%esp
+ 	xorl %edx,%edx
+ 	call SYMBOL_NAME(do_signal)
++#ifdef CONFIG_SMP
++	GET_CURRENT(%ebx)
++#endif
++	cli
++	CHECK_SOFTIRQ
++	je restore_all
++	call SYMBOL_NAME(do_softirq)
+ 	jmp restore_all
+ 
+ 	ALIGN
+@@ -260,22 +277,22 @@
+ ret_from_exception:
+ #ifdef CONFIG_SMP
+ 	GET_CURRENT(%ebx)
+-	movl processor(%ebx),%eax
+-	shll $CONFIG_X86_L1_CACHE_SHIFT,%eax
+-	movl SYMBOL_NAME(irq_stat)(,%eax),%ecx		# softirq_active
+-	testl SYMBOL_NAME(irq_stat)+4(,%eax),%ecx	# softirq_mask
+-#else
+-	movl SYMBOL_NAME(irq_stat),%ecx		# softirq_active
+-	testl SYMBOL_NAME(irq_stat)+4,%ecx	# softirq_mask
+ #endif
++	cli
++	CHECK_SOFTIRQ
+ 	jne   handle_softirq
++	cmpl $0,need_resched(%ebx)
++	jne reschedule
++	cmpl $0,sigpending(%ebx)
++	jne signal_return
++	jmp restore_all
+ 
+ ENTRY(ret_from_intr)
+ 	GET_CURRENT(%ebx)
+ 	movl EFLAGS(%esp),%eax		# mix EFLAGS and CS
+ 	movb CS(%esp),%al
+ 	testl $(VM_MASK | 3),%eax	# return to VM86 mode or non-supervisor?
+-	jne ret_with_reschedule
++	jne ret_from_sys_call
+ 	jmp restore_all
+ 
+ 	ALIGN
+--- linux/arch/i386/kernel/process.c.orig	Sat May 26 20:54:30 2001
++++ linux/arch/i386/kernel/process.c	Sat May 26 21:17:05 2001
+@@ -79,8 +79,12 @@
+  */
+ static void default_idle(void)
+ {
++	int this_cpu = smp_processor_id();
++
+ 	if (current_cpu_data.hlt_works_ok && !hlt_counter) {
+ 		__cli();
++		if (softirq_active(this_cpu) & softirq_mask(this_cpu))
++			do_softirq();
+ 		if (!current->need_resched)
+ 			safe_halt();
+ 		else
+@@ -95,6 +99,7 @@
+  */
+ static void poll_idle (void)
+ {
++	int this_cpu = smp_processor_id();
+ 	int oldval;
+ 
+ 	__sti();
+@@ -104,14 +109,16 @@
+ 	 * run here:
+ 	 */
+ 	oldval = xchg(&current->need_resched, -1);
++	if (oldval)
++		return;
+ 
+-	if (!oldval)
+-		asm volatile(
+-			"2:"
+-			"cmpl $-1, %0;"
+-			"rep; nop;"
+-			"je 2b;"
+-				: :"m" (current->need_resched));
++	while (current->need_resched == -1) {
++		if (softirq_active(this_cpu) & softirq_mask(this_cpu)) {
++			do_softirq();
++			__sti();
++		}
++		asm volatile( "rep; nop;" );
++	}
+ }
+ 
+ /*
+--- linux/arch/i386/kernel/apm.c.orig	Sat May 26 21:15:12 2001
++++ linux/arch/i386/kernel/apm.c	Sat May 26 21:15:58 2001
+@@ -605,11 +605,15 @@
+ 	while (1) {
+ 		if (!current->need_resched) {
+ 			if (jiffies - start_idle < HARD_IDLE_TIMEOUT) {
++				int this_cpu = smp_processor_id();
++
+ 				if (!current_cpu_data.hlt_works_ok)
+ 					continue;
+ 				if (hlt_counter)
+ 					continue;
+ 				__cli();
++				if (softirq_active(this_cpu) & softirq_mask(this_cpu))
++					do_softirq();
+ 				if (!current->need_resched)
+ 					safe_halt();
+ 				else

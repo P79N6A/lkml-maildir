@@ -1,0 +1,197 @@
+Date: Thu, 27 May 1999 16:58:27 -0400 (EDT)
+From: Chuck Lever <>
+Subject: Re: pre-2.3.4..
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/5/29/47
+
+On Tue, 25 May 1999, Linus Torvalds wrote:
+> There's a pre-2.3.4-1 out there in "testing" on ftp.kernel.org, which has
+> the new scalable network code (well, the first cut of it, anyway). It also
+> updates ISDN and PPC to newer versions. Please test it out and give
+> feedback..
+linus-
+attached is a patch that removes the global kernel lock from brk() and
+when doing anonymous mmap().  it also reorganizes the locking logic in
+handle_pte_fault() to reduce the amount of time spent with the lock held
+needlessly.  the handle_pte_fault() change may be more dangerous than the
+brk() and mmap() changes.  it may also be unnecessary with the upcoming
+parallelized page cache.
+i've tested under heavy load on UP, dual, and quad SMP.  i didn't see
+significant scalability improvements with my workload, but it doesn't
+appear to be memory-allocation intensive.  interactive feel is more
+responsive on SMP hardware, however.
+you may want to include something like this in a pre-2.3.4 kernel for
+wider testing.
+thanks,
+	- Chuck Lever
+--
+corporate:	<chuckl@netscape.com>
+personal:	<chucklever@netscape.net> or <cel@monkey.org>
+The Linux Scalability project:
+	
+http://www.citi.umich.edu/projects/linux-scalability/
+diff -ruN linux-2.2.7-ikd/arch/i386/kernel/sys_i386.c linux/arch/i386/kernel/sys_i386.c
+--- linux-2.2.7-ikd/arch/i386/kernel/sys_i386.c	Thu Dec 17 19:27:35 1998
++++ linux/arch/i386/kernel/sys_i386.c	Wed May 26 14:12:39 1999
+@@ -67,20 +67,22 @@
+ 		return -EFAULT;
+ 
+ 	down(&current->mm->mmap_sem);
+-	lock_kernel();
++
++	a.flags &= ~(MAP_EXECUTABLE | MAP_DENYWRITE);
+ 	if (!(a.flags & MAP_ANONYMOUS)) {
+ 		error = -EBADF;
++		lock_kernel();
+ 		file = fget(a.fd);
+-		if (!file)
+-			goto out;
+-	}
+-	a.flags &= ~(MAP_EXECUTABLE | MAP_DENYWRITE);
++		if (file) {
++			error = do_mmap(file, a.addr, a.len, a.prot,
++						a.flags, a.offset);
++			fput(file);
++		}
++		unlock_kernel();
++	} else
++		error = do_mmap(NULL, a.addr, a.len, a.prot,
++					a.flags, a.offset);
+ 
+-	error = do_mmap(file, a.addr, a.len, a.prot, a.flags, a.offset);
+-	if (file)
+-		fput(file);
+-out:
+-	unlock_kernel();
+ 	up(&current->mm->mmap_sem);
+ 	return error;
+ }
+diff -ruN linux-2.2.7-ikd/mm/memory.c linux/mm/memory.c
+--- linux-2.2.7-ikd/mm/memory.c	Wed May 26 16:07:49 1999
++++ linux/mm/memory.c	Wed May 26 16:22:28 1999
+@@ -620,6 +620,7 @@
+ 	unsigned long old_page, new_page;
+ 	struct page * page_map;
+ 	
++	lock_kernel();
+ 	pte = *page_table;
+ 	new_page = __get_free_page(GFP_USER);
+ 	/* Did someone else copy this page for us while we slept? */
+@@ -782,10 +783,19 @@
+ 	pte_t * page_table, pte_t entry, int write_access)
+ {
+ 	if (!vma->vm_ops || !vma->vm_ops->swapin) {
++
++		lock_kernel();
+ 		swap_in(tsk, vma, page_table, pte_val(entry), write_access);
++		unlock_kernel();
++
+ 		flush_page_to_ram(pte_page(*page_table));
+ 	} else {
+-		pte_t page = vma->vm_ops->swapin(vma, address - vma->vm_start + vma->vm_offset, pte_val(entry));
++		pte_t page;
++
++		lock_kernel();
++		page = vma->vm_ops->swapin(vma, address - vma->vm_start + vma->vm_offset, pte_val(entry));
++		unlock_kernel();
++
+ 		if (pte_val(*page_table) != pte_val(entry)) {
+ 			free_page(pte_page(page));
+ 		} else {
+@@ -798,7 +808,6 @@
+ 			set_pte(page_table, page);
+ 		}
+ 	}
+-	unlock_kernel();
+ 	return 1;
+ }
+ 
+@@ -841,7 +850,6 @@
+ 	pte_t entry;
+ 
+ 	if (!vma->vm_ops || !vma->vm_ops->nopage) {
+-		unlock_kernel();
+ 		return do_anonymous_page(tsk, vma, page_table, write_access);
+ 	}
+ 
+@@ -850,6 +858,7 @@
+ 	 * to copy, not share the page even if sharing is possible.  It's
+ 	 * essentially an early COW detection.
+ 	 */
++	lock_kernel();
+ 	page = vma->vm_ops->nopage(vma, address & PAGE_MASK,
+ 		(vma->vm_flags & VM_SHARED)?0:write_access);
+ 
+@@ -896,7 +905,6 @@
+ {
+ 	pte_t entry;
+ 
+-	lock_kernel();
+ 	entry = *pte;
+ 
+ 	if (!pte_present(entry)) {
+@@ -916,7 +924,6 @@
+ 		set_pte(pte, entry);
+ 		flush_tlb_page(vma, address);
+ 	}
+-	unlock_kernel();
+ 	return 1;
+ }
+ 
+diff -ruN linux-2.2.7-ikd/mm/mmap.c linux/mm/mmap.c
+--- linux-2.2.7-ikd/mm/mmap.c	Wed May 26 16:07:49 1999
++++ linux/mm/mmap.c	Wed May 26 16:31:58 1999
+@@ -92,20 +92,6 @@
+ 
+ 	down(&mm->mmap_sem);
+ 
+-	/*
+-	 * This lock-kernel is one of the main contention points for
+-	 * certain normal loads.  And it really should not be here: almost
+-	 * everything in brk()/mmap()/munmap() is protected sufficiently by
+-	 * the mmap semaphore that we got above.
+-	 *
+-	 * We should move this into the few things that really want the
+-	 * lock, namely anything that actually touches a file descriptor
+-	 * etc.  We can do all the normal anonymous mapping cases without
+-	 * ever getting the lock at all - the actual memory management
+-	 * code is already completely thread-safe.
+-	 */
+-	lock_kernel();
+-
+ 	if (brk < mm->end_code)
+ 		goto out;
+ 	newbrk = PAGE_ALIGN(brk);
+@@ -142,7 +128,6 @@
+ 	mm->brk = brk;
+ out:
+ 	retval = mm->brk;
+-	unlock_kernel();
+ 	up(&mm->mmap_sem);
+ 	return retval;
+ }
+@@ -169,6 +154,10 @@
+ #undef _trans
+ }
+ 
++/*
++ *  As long as "file == NULL", do_mmap() doesn't need the
++ *  global kernel lock
++ */
+ unsigned long do_mmap(struct file * file, unsigned long addr, unsigned long len,
+ 	unsigned long prot, unsigned long flags, unsigned long off)
+ {
+@@ -598,6 +587,10 @@
+  * what needs doing, and the areas themselves, which do the
+  * work.  This now handles partial unmappings.
+  * Jeremy Fitzhardine <jeremy@sw.oz.au>
++ *
++ * NB:  do_munmap doesn't need to be invoked while holding
++ *      the global kernel lock iff the unmapped area has
++ *      no vm_ops
+  */
+ int do_munmap(unsigned long addr, size_t len)
+ {

@@ -1,0 +1,261 @@
+Date: Wed, 16 Jun 1999 15:22:57 +0200 (MEST)
+From: Jaroslav Kysela <>
+Subject: DMA page allocation
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/6/16/58
+
+Hello,
+	I'm really tired with the chronic problem of the linux kernel:
+DMA page allocation when the system memory size is far beyond 16MB.
+ALSA users (and OSS/Lite too) complain many times that the DMA buffer
+for a sound chip can't be allocated or it is too small, because the low
+16MB memory is used with another things.
+	I tried a little bit to dig to this problem and I found useable
+(I hope) solution: to create two memory pools for pages - one standard and
+second for DMA pages (limited size).
+	I prepared a "test" patch (against 2.2.10) which works very well
+for me. In this patch is 2MB of the system memory used for the DMA page
+pool. This limit value could be overriden in the final version of the code
+with an user. The code also needs improvements in some places (to handle
+systems up to 16MB memory, other architectures, allocate only a continuous
+DMA page region etc..).
+	I want to discuss this problem and solution with all kernel gurus.
+I really hope, if my solution would be rejected that someone will come
+with another.
+							Jaroslav
+--- linux.ok1/mm/page_alloc.c	Thu May  6 23:32:06 1999
++++ linux/mm/page_alloc.c	Wed Jun 16 14:17:28 1999
+@@ -3,6 +3,7 @@
+  *
+  *  Copyright (C) 1991, 1992, 1993, 1994  Linus Torvalds
+  *  Swap reorganised 29.12.95, Stephen Tweedie
++ *  DMA page pool added 16.6.1999, Jaroslav Kysela <perex@suse.cz>
+  */
+ 
+ #include <linux/config.h>
+@@ -18,8 +19,11 @@
+ #include <asm/uaccess.h> /* for copy_to/from_user */
+ #include <asm/pgtable.h>
+ 
++#define NR_DMA_PAGES	((2048*1024)/PAGE_SIZE)
++
+ int nr_swap_pages = 0;
+ int nr_free_pages = 0;
++int nr_free_dma_pages = 0;
+ 
+ /*
+  * Free area management
+@@ -46,6 +50,7 @@
+ #define memory_head(x) ((struct page *)(x))
+ 
+ static struct free_area_struct free_area[NR_MEM_LISTS];
++static struct free_area_struct free_area_dma[NR_MEM_LISTS];
+ 
+ static inline void init_mem_queue(struct free_area_struct * head)
+ {
+@@ -92,17 +97,29 @@
+ 
+ static inline void free_pages_ok(unsigned long map_nr, unsigned long order)
+ {
+-	struct free_area_struct *area = free_area + order;
++	struct free_area_struct *area;
++	mem_map_t * map = mem_map + map_nr;
+ 	unsigned long index = map_nr >> (1 + order);
+ 	unsigned long mask = (~0UL) << order;
+ 	unsigned long flags;
+ 
++	area = !PageDMA(map) ? free_area : free_area_dma;
++	area += order;
+ 	spin_lock_irqsave(&page_alloc_lock, flags);
+ 
+ #define list(x) (mem_map+(x))
+ 
+ 	map_nr &= mask;
+-	nr_free_pages -= mask;
++	if (!PageDMA(map)) {
++		nr_free_pages -= mask;
++	} else {
++		if (nr_free_dma_pages >= NR_DMA_PAGES) {
++			map->flags &= ~(1 << PG_DMA);
++			area = free_area + order;
++		} else {
++			nr_free_dma_pages -= mask;
++		}
++	}
+ 	while (mask + (1 << (NR_MEM_LISTS-1))) {
+ 		if (!test_and_change_bit(index, area->map))
+ 			break;
+@@ -155,8 +172,8 @@
+ 	change_bit((index) >> (1+(order)), (area)->map)
+ #define CAN_DMA(x) (PageDMA(x))
+ #define ADDRESS(x) (PAGE_OFFSET + ((x) << PAGE_SHIFT))
+-#define RMQUEUE(order, gfp_mask) \
+-do { struct free_area_struct * area = free_area+order; \
++#define RMQUEUE(pool, order, gfp_mask) \
++do { struct free_area_struct * area = (pool)+order; \
+      unsigned long new_order = order; \
+ 	do { struct page *prev = memory_head(area), *ret = prev->next; \
+ 		while (memory_head(area) != ret) { \
+@@ -165,7 +182,8 @@
+ 				(prev->next = ret->next)->prev = prev; \
+ 				map_nr = ret - mem_map; \
+ 				MARK_USED(map_nr, new_order, area); \
+-				nr_free_pages -= 1 << order; \
++				if (!PageDMA(ret)) nr_free_pages -= 1 << order; \
++				  else nr_free_dma_pages -= 1 << order; \
+ 				EXPAND(ret, map_nr, order, new_order, area); \
+ 				spin_unlock_irqrestore(&page_alloc_lock, flags); \
+ 				return ADDRESS(map_nr); \
+@@ -214,7 +232,7 @@
+ 	 * do our best to just allocate things without
+ 	 * further thought.
+ 	 */
+-	if (!(current->flags & PF_MEMALLOC)) {
++	if (!(current->flags & PF_MEMALLOC) && !(gfp_mask & GFP_DMA)) {
+ 		int freed;
+ 
+ 		if (nr_free_pages > freepages.min) {
+@@ -236,7 +254,7 @@
+ 	}
+ ok_to_allocate:
+ 	spin_lock_irqsave(&page_alloc_lock, flags);
+-	RMQUEUE(order, gfp_mask);
++	RMQUEUE(!(gfp_mask & __GFP_DMA) ? free_area : free_area_dma, order, gfp_mask);
+ 	spin_unlock_irqrestore(&page_alloc_lock, flags);
+ 
+ 	/*
+@@ -258,29 +276,43 @@
+  * We also calculate the percentage fragmentation. We do this by counting the
+  * memory on each free list with the exception of the first item on the list.
+  */
+-void show_free_areas(void)
++static void show_free_areas_pool(struct free_area_struct *pool)
+ {
+- 	unsigned long order, flags;
++ 	unsigned long order;
+  	unsigned long total = 0;
+ 
+-	printk("Free pages:      %6dkB\n ( ",nr_free_pages<<(PAGE_SHIFT-10));
+-	printk("Free: %d (%d %d %d)\n",
+-		nr_free_pages,
+-		freepages.min,
+-		freepages.low,
+-		freepages.high);
+-	spin_lock_irqsave(&page_alloc_lock, flags);
++	printk("    ");
+  	for (order=0 ; order < NR_MEM_LISTS; order++) {
+ 		struct page * tmp;
+ 		unsigned long nr = 0;
+-		for (tmp = free_area[order].next ; tmp != memory_head(free_area+order) ; tmp = tmp->next) {
++		for (tmp = pool[order].next ; tmp != memory_head(pool+order) ; tmp = tmp->next) {
+ 			nr ++;
+ 		}
+ 		total += nr * ((PAGE_SIZE>>10) << order);
+ 		printk("%lu*%lukB ", nr, (unsigned long)((PAGE_SIZE>>10) << order));
+ 	}
++	printk("= %lukB\n", total);
++}
++
++void show_free_areas(void)
++{
++ 	unsigned long flags;
++
++	printk("Free pages:      %6dkB [%d (%d %d %d)]\n",
++				nr_free_pages<<(PAGE_SHIFT-10),
++				nr_free_pages,
++				freepages.min,
++				freepages.low,
++				freepages.high);
++	spin_lock_irqsave(&page_alloc_lock, flags);
++	show_free_areas_pool(free_area);
++	spin_unlock_irqrestore(&page_alloc_lock, flags);
++	printk("Free DMA pages:  %6dkB [%d]\n",
++				nr_free_dma_pages<<(PAGE_SHIFT-10),
++				nr_free_dma_pages);
++	spin_lock_irqsave(&page_alloc_lock, flags);
++	show_free_areas_pool(free_area_dma);
+ 	spin_unlock_irqrestore(&page_alloc_lock, flags);
+-	printk("= %lukB)\n", total);
+ #ifdef SWAP_CACHE_INFO
+ 	show_swap_cache_info();
+ #endif	
+@@ -288,6 +320,28 @@
+ 
+ #define LONG_ALIGN(x) (((x)+(sizeof(long))-1)&~((sizeof(long))-1))
+ 
++static unsigned long __init free_area_pool_init(struct free_area_struct *pool,
++					        unsigned long start_mem,
++					        unsigned long end_mem)
++{
++	unsigned long mask = PAGE_MASK;
++	unsigned long i;
++
++	for (i = 0 ; i < NR_MEM_LISTS ; i++) {
++		unsigned long bitmap_size;
++		init_mem_queue(pool+i);
++		mask += mask;
++		end_mem = (end_mem + ~mask) & mask;
++		bitmap_size = (end_mem - PAGE_OFFSET) >> (PAGE_SHIFT + i);
++		bitmap_size = (bitmap_size + 7) >> 3;
++		bitmap_size = LONG_ALIGN(bitmap_size);
++		pool[i].map = (unsigned int *) start_mem;
++		memset((void *) start_mem, 0, bitmap_size);
++		start_mem += bitmap_size;
++	}
++	return start_mem;
++}
++
+ /*
+  * set up the free-area data structures:
+  *   - mark all pages reserved
+@@ -297,7 +351,6 @@
+ unsigned long __init free_area_init(unsigned long start_mem, unsigned long end_mem)
+ {
+ 	mem_map_t * p;
+-	unsigned long mask = PAGE_MASK;
+ 	unsigned long i;
+ 
+ 	/*
+@@ -323,20 +376,15 @@
+ 		--p;
+ 		atomic_set(&p->count, 0);
+ 		p->flags = (1 << PG_DMA) | (1 << PG_reserved);
++#if 0
++		init_waitqueue_head(&p->wait);
++#endif
+ 	} while (p > mem_map);
+ 
+-	for (i = 0 ; i < NR_MEM_LISTS ; i++) {
+-		unsigned long bitmap_size;
+-		init_mem_queue(free_area+i);
+-		mask += mask;
+-		end_mem = (end_mem + ~mask) & mask;
+-		bitmap_size = (end_mem - PAGE_OFFSET) >> (PAGE_SHIFT + i);
+-		bitmap_size = (bitmap_size + 7) >> 3;
+-		bitmap_size = LONG_ALIGN(bitmap_size);
+-		free_area[i].map = (unsigned int *) start_mem;
+-		memset((void *) start_mem, 0, bitmap_size);
+-		start_mem += bitmap_size;
+-	}
++	start_mem = free_area_pool_init(free_area, start_mem, end_mem);
++	/* We should limit the end of DMAble memory here to avoid
++	   the allocating of the memory which would be never used... */
++	start_mem = free_area_pool_init(free_area_dma, start_mem, end_mem);
+ 	return start_mem;
+ }
+ 
+===== CUT HERE =====
+-----
+Jaroslav Kysela <perex@suse.cz>
+SuSE Linux    
+http://www.suse.com
+ALSA project  
+http://www.alsa-project.org
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

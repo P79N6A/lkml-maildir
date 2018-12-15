@@ -1,0 +1,172 @@
+Date: Mon, 08 Feb 1999 01:09:52 +1100
+From: Nigel Rowe <>
+Subject: NON blocking writes to a FIFO can block (un-interuptable)
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/2/7/34
+
+In 2.0.36, a non-blocking write to a FIFO will block un-interuptably (ie ps
+shows "D" in the stat field) in do_down if another process blocks in 
+pipe_write on that fifo.
+Scenario:
+	NBLOCK proc -->	F
+			I  -----> READER proc
+	BLOCKING proc > F
+			O
+If READER stops reading, both writing procs will fill the fifo, and 'BLOCKING'
+will block in pipe_write when there is insufficient room for it's write.
+However, at this time it has also done a down(&inode->i_sem) (in sys_write()),
+which causes 'NBLOCK' to block in an uninteruptable state waiting for i_sem
+(also in sys_write()).
+In 2.2.0 the situation is a litle better, pipe_write() does an up(&inode->i_sem)
+then a down_interuptable(&inode->i_atomic_write), which still results in 
+'NBLOCK' blocking (before it checks for O_NBLOCK), but at least this time it's
+an interuptable wait on i_atomic_write.
+I can't think of a solution that doesn't require a non-blocking varient of
+down(), so the attached patch (for 2.0.36) includes a 'down_try()' in which,
+if the down fails (ie the semaphore goes -ve), it immediatly does an up and
+returns -1.
+Unfortunately my x86 asm skills are minimal, (and my sparc, mips, alpha etc asm
+totally non-existant) so someone will need to vet down_try() and translate.
+I don't understand the code for down() and down_interuptable() in 2.2.0, so 
+again someone will need to vet and translate.
+-- 
+	Nigel Rowe <nigel@mailcall.com.au>
+	Systems admin, Mail Call Couriers
+--- linux-2.0.36/fs/pipe.c.orig	Mon Nov 16 05:33:14 1998
++++ linux-2.0.36/fs/pipe.c	Tue Feb  2 09:00:26 1999
+@@ -78,28 +78,48 @@
+ 	
+ static int pipe_write(struct inode * inode, struct file * filp, const char * buf, int count)
+ {
+-	int chars = 0, free = 0, written = 0;
++	int chars = 0, free = 0, written = 0, err = 0;
+ 	char *pipebuf;
+ 
+ 	if (!PIPE_READERS(*inode)) { /* no readers */
+ 		send_sig(SIGPIPE,current,0);
+ 		return -EPIPE;
+ 	}
+-/* if count <= PIPE_BUF, we have to make it atomic */
++        /* if count <= PIPE_BUF, we have to make it atomic */
+ 	if (count <= PIPE_BUF)
+ 		free = count;
+ 	else
+ 		free = 1; /* can't do it atomically, wait for any free space */
++
++	if (filp->f_flags & O_NONBLOCK) {
++	    /* try for i_atomic_write before releasing i_sem */
++	    if (down_try(&inode->i_atomic_write)) {
++		return -EAGAIN;	/* don't block in down */
++	    }
++	    up(&inode->i_sem);
++	} else {
++	    /* release i_sem before (posibly) blocking for i_atomic_write */
++	    up(&inode->i_sem);
++	    if (down_interruptible(&inode->i_atomic_write)) {
++		down(&inode->i_sem);
++		return -ERESTARTSYS;
++	    }
++        }
+ 	while (count>0) {
+ 		while ((PIPE_FREE(*inode) < free) || PIPE_LOCK(*inode)) {
+ 			if (!PIPE_READERS(*inode)) { /* no readers */
+ 				send_sig(SIGPIPE,current,0);
+-				return written? :-EPIPE;
++				err = -EPIPE;
++				goto errout;
++			}
++			if (current->signal & ~current->blocked) {
++				err = -ERESTARTSYS;
++				goto errout;
++			}
++			if (filp->f_flags & O_NONBLOCK) {
++				err = -EAGAIN;
++				goto errout;
+ 			}
+-			if (current->signal & ~current->blocked)
+-				return written? :-ERESTARTSYS;
+-			if (filp->f_flags & O_NONBLOCK)
+-				return written? :-EAGAIN;
+ 			interruptible_sleep_on(&PIPE_WAIT(*inode));
+ 		}
+ 		PIPE_LOCK(*inode)++;
+@@ -121,7 +141,10 @@
+ 		free = 1;
+ 	}
+ 	inode->i_ctime = inode->i_mtime = CURRENT_TIME;
+-	return written;
++errout:
++        up(&inode->i_atomic_write);
++        down(&inode->i_sem);
++        return written ? written : err;
+ }
+ 
+ static int pipe_lseek(struct inode * inode, struct file * file, off_t offset, int orig)
+--- linux-2.0.36/fs/inode.c.orig	Thu Nov 13 15:36:41 1997
++++ linux-2.0.36/fs/inode.c	Mon Feb  1 11:23:28 1999
+@@ -561,6 +561,7 @@
+ 	best->i_nlink = 1;
+ 	best->i_version = ++event;
+ 	best->i_sem.count = 1;
++	best->i_atomic_write.count = 1;
+ 	best->i_ino = ++ino;
+ 	best->i_dev = 0;
+ 	nr_free_inodes--;
+--- linux-2.0.36/include/linux/fs.h.orig	Fri Jan 15 10:29:11 1999
++++ linux-2.0.36/include/linux/fs.h	Mon Feb  1 16:51:23 1999
+@@ -303,6 +303,7 @@
+ 	unsigned long	i_version;
+ 	unsigned long	i_nrpages;
+ 	struct semaphore i_sem;
++	struct semaphore i_atomic_write;
+ 	struct inode_operations *i_op;
+ 	struct super_block *i_sb;
+ 	struct wait_queue *i_wait;
+--- linux-2.0.36/include/asm-i386/semaphore.h.orig	Wed Dec 16 12:08:00 1998
++++ linux-2.0.36/include/asm-i386/semaphore.h	Tue Feb  2 11:30:10 1999
+@@ -102,6 +102,37 @@
+ 	return(ret) ;
+ }
+ 
++/* 
++ * A 'non-blocking' version of down. Does a down, if it would block,
++ * immediatly does an up and returns -1, otherwise returns 0 if the
++ * down succeded.
++ *
++ * Unfortunately I have no idea if the ifdef SMP stuff is correct, and
++ * no way to test it.  
++ */
++extern inline int down_try(struct semaphore * sem)
++{
++	int ret;
++	__asm__ __volatile__ (
++	        "xorl %%eax,%%eax\n\t"	/* assume 0 return */
++#ifdef __SMP__
++		"lock ; "
++#endif 
++		"decl 0(%1)\n\t"
++		"jns 1f\n\t"
++#ifdef __SMP__
++		"lock ; "
++#endif 
++		"incl 0(%1)\n\t"	/* down failed, do up */
++	        "dec %%eax\n"		/* return -1 */
++		"1:\n"
++		:"=a" (ret) 
++		:"c" (sem) 
++	 	:"ax", "dx", "memory");
++    
++    	return(ret);
++}
++
+ /*
+  * Note! This is subtle. We jump to wake people up only if
+  * the semaphore was negative (== somebody was waiting on it).
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

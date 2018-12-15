@@ -1,0 +1,1669 @@
+Date: Wed, 11 Jan 2006 18:25:36 +0100 (MET)
+From: Esben Nielsen <>
+Subject: RT Mutex patch and tester [PREEMPT_RT]
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2006/1/11/231
+
+I have done 2 things which might be of interrest:
+I) A rt_mutex unittest suite. It might also be usefull against the generic
+mutexes.
+II) I changed the priority inheritance mechanism in rt.c,
+optaining the following goals:
+1) rt_mutex deadlocks doesn't become raw_spinlock deadlocks. And more
+importantly: futex_deadlocks doesn't become raw_spinlock deadlocks.
+2) Time-Predictable code. No matter how deep you nest your locks
+(kernel or futex) the time spend in irqs or preemption off should be
+limited.
+3) Simpler code. rt.c was kind of messy. Maybe it still is....:-)
+I have lost:
+1) Some speed in the slow slow path. I _might_ have gained some in the
+normal slow path, though, without meassuring it.
+Idea:
+When a task blocks on a lock it adds itself to the wait list and calls
+schedule(). When it is unblocked it has the lock. Or rather due to
+grab-locking it has to check again. Therefore the schedule() call is
+wrapped in a loop.
+Now when a task is PI boosted, it is at the same time checked if it is
+blocked on a rt_mutex. If it is, it is unblocked ( wake_up_process_mutex()
+). It will now go around in the above loop mentioned above. Within this loop
+it will now boost the owner of the lock it is blocked on, maybe unblocking the
+owner, which in turn can boost and unblock the next in the lock chain...
+At all points there is at least one task boosted to the highest priority
+required unblocked and working on boosting the next in the lock chain and
+there is therefore no priority inversion.
+The boosting of a long list of blocked tasks will clearly take longer than
+the previous version as there will be task switches. But remember, it is
+in the slow slow path! And it only occurs when PI boosting is happening on
+_nested_ locks.
+What is gained is that the amount of time where irq and preemption is off
+is limited: One task does it's work with preemption disabled, wakes up the
+next and enable preemption and schedules. The amount of time spend with
+preemption disabled is has a clear upper limit, untouched by how
+complicated and deep the lock structure is.
+So how many locks do we have to worry about? Two.
+One for locking the lock. One for locking various PI related data on the
+task structure, as the pi_waiters list, blocked_on, pending_owner - and
+also prio.
+Therefore only lock->wait_lock and sometask->pi_lock will be locked at the
+same time. And in that order. There is therefore no spinlock deadlocks.
+And the code is simpler.
+Because of the simplere code I was able to implement an optimization:
+Only the first waiter on each lock is member of the owner->pi_waiters.
+Therefore it is not needed to do any list traversels on neither
+owner->pi_waiters, not lock->wait_list. Every operation requires touching
+only removing and/or adding one element to these lists.
+As for robust futexes: They ought to work out of the box now, blocking in
+deadlock situations. I have added an entry to /proc/<pid>/status
+"BlckOn: <pid>". This can be used to do "post mortem" deadlock detection
+from userspace.
+What am I missing:
+Testing on SMP. I have no SMP machine. The unittest can mimic the SMP
+somewhat
+but no unittest can catch _all_ errors.
+Testing with futexes.
+ALL_PI_TASKS are always switched on now. This is for making the code
+simpler.
+My machine fails to run with CONFIG_DEBUG_DEADLOCKS and CONFIG_DEBUG_PREEMPT
+on at the same time. I need a serial cabel and on consol over serial to
+debug it. My screen is too small to see enough there.
+Figure out more tests to run in my unittester.
+So why aren't I doing those things before sending the patch? 1) Well my
+girlfriend comes back tomorrow with our child. I know I will have no time to code anything substential
+then. 2) I want to make sure Ingo sees this approach before he starts
+merging preempt_rt and rt_mutex with his now mainstream mutex.
+Esben
+[unhandled content-type:application/x-gzip]diff -upr linux-2.6.15-rt3.orig/fs/proc/array.c linux-2.6.15-rt3-pipatch/fs/proc/array.c
+--- linux-2.6.15-rt3.orig/fs/proc/array.c	2006-01-11 01:45:18.000000000 +0100
++++ linux-2.6.15-rt3-pipatch/fs/proc/array.c	2006-01-11 03:02:12.000000000 +0100
+@@ -295,6 +295,14 @@ static inline char *task_cap(struct task
+ 			    cap_t(p->cap_effective));
+ }
+ 
++
++static char *show_blocked_on(task_t *task, char *buffer)
++{
++  pid_t pid = get_blocked_on(task);
++  return buffer + sprintf(buffer,"BlckOn: %d\n",pid);
++}
++
++
+ int proc_pid_status(struct task_struct *task, char * buffer)
+ {
+ 	char * orig = buffer;
+@@ -313,6 +321,7 @@ int proc_pid_status(struct task_struct *
+ #if defined(CONFIG_ARCH_S390)
+ 	buffer = task_show_regs(task, buffer);
+ #endif
++	buffer = show_blocked_on(task,buffer);
+ 	return buffer - orig;
+ }
+ 
+diff -upr linux-2.6.15-rt3.orig/include/linux/sched.h linux-2.6.15-rt3-pipatch/include/linux/sched.h
+--- linux-2.6.15-rt3.orig/include/linux/sched.h	2006-01-11 01:45:18.000000000 +0100
++++ linux-2.6.15-rt3-pipatch/include/linux/sched.h	2006-01-11 03:02:12.000000000 +0100
+@@ -1652,6 +1652,8 @@ extern void recalc_sigpending(void);
+ 
+ extern void signal_wake_up(struct task_struct *t, int resume_stopped);
+ 
++extern pid_t get_blocked_on(task_t *task);
++
+ /*
+  * Wrappers for p->thread_info->cpu access. No-op on UP.
+  */
+diff -upr linux-2.6.15-rt3.orig/kernel/hrtimer.c linux-2.6.15-rt3-pipatch/kernel/hrtimer.c
+--- linux-2.6.15-rt3.orig/kernel/hrtimer.c	2006-01-11 01:45:18.000000000 +0100
++++ linux-2.6.15-rt3-pipatch/kernel/hrtimer.c	2006-01-11 03:02:12.000000000 +0100
+@@ -404,7 +404,7 @@ kick_off_hrtimer(struct hrtimer *timer, 
+ # define hrtimer_hres_active		0
+ # define hres_enqueue_expired(t,b,n)	0
+ # define hrtimer_check_clocks()		do { } while (0)
+-# define kick_off_hrtimer		do { } while (0)
++# define kick_off_hrtimer(timer,base)	do { } while (0)
+ 
+ #endif /* !CONFIG_HIGH_RES_TIMERS */
+ 
+diff -upr linux-2.6.15-rt3.orig/kernel/rt.c linux-2.6.15-rt3-pipatch/kernel/rt.c
+--- linux-2.6.15-rt3.orig/kernel/rt.c	2006-01-11 01:45:18.000000000 +0100
++++ linux-2.6.15-rt3-pipatch/kernel/rt.c	2006-01-11 09:08:00.000000000 +0100
+@@ -36,7 +36,10 @@
+  *   (also by Steven Rostedt)
+  *    - Converted single pi_lock to individual task locks.
+  *
++ * By Esben Nielsen:
++ *    Doing priority inheritance with help of the scheduler.
+  */
++
+ #include <linux/config.h>
+ #include <linux/rt_lock.h>
+ #include <linux/sched.h>
+@@ -58,18 +61,26 @@
+  *  To keep from having a single lock for PI, each task and lock
+  *  has their own locking. The order is as follows:
+  *
++ *     lock->wait_lock   -> sometask->pi_lock
++ * You should only hold one wait_lock and one pi_lock
+  * blocked task->pi_lock -> lock->wait_lock -> owner task->pi_lock.
+  *
+- * This is safe since a owner task should never block on a lock that
+- * is owned by a blocking task.  Otherwise you would have a deadlock
+- * in the normal system.
+- * The same goes for the locks. A lock held by one task, should not be
+- * taken by task that holds a lock that is blocking this lock's owner.
++ * lock->wait_lock protects everything inside the lock and all the waiters
++ * on lock->wait_list.
++ * sometask->pi_lock protects everything on task-> related to the rt_mutex.
++ *
++ * Invariants  - must be true when unlock lock->wait_lock:
++ *   If lock->wait_list is non-empty 
++ *     1) lock_owner(lock) points to a valid thread.
++ *     2) The first and only the first waiter on the list must be on
++ *        lock_owner(lock)->task->pi_waiters.
++ * 
++ *  A waiter struct is on the lock->wait_list iff waiter->ti!=NULL.
+  *
+- * A task that is about to grab a lock is first considered to be a
+- * blocking task, even if the task successfully acquires the lock.
+- * This is because the taking of the locks happen before the
+- * task becomes the owner.
++ *  Strategy for boosting lock chain:
++ *   task A blocked on lock 1 owned by task B blocked on lock 2 etc..
++ *  A sets B's prio up and wakes B. B try to get lock 2 again and fails.
++ *  B therefore boost C.
+  */
+ 
+ /*
+@@ -117,8 +128,11 @@
+  * This flag is good for debugging the PI code - it makes all tasks
+  * in the system fall under PI handling. Normally only SCHED_FIFO/RR
+  * tasks are PI-handled:
++ *
++ * It must stay on for now as the invariant that the first waiter is always
++ * on the pi_waiters list is keeped only this way (for now).
+  */
+-#define ALL_TASKS_PI 0
++#define ALL_TASKS_PI 1
+ 
+ #ifdef CONFIG_DEBUG_DEADLOCKS
+ # define __EIP_DECL__ , unsigned long eip
+@@ -311,7 +325,7 @@ void check_preempt_wakeup(struct task_st
+ 		}
+ }
+ 
+-static inline void
++static void
+ account_mutex_owner_down(struct task_struct *task, struct rt_mutex *lock)
+ {
+ 	if (task->lock_count >= MAX_LOCK_STACK) {
+@@ -325,7 +339,7 @@ account_mutex_owner_down(struct task_str
+ 	task->lock_count++;
+ }
+ 
+-static inline void
++static void
+ account_mutex_owner_up(struct task_struct *task)
+ {
+ 	if (!task->lock_count) {
+@@ -729,25 +743,6 @@ restart:
+ #if ALL_TASKS_PI && defined(CONFIG_DEBUG_DEADLOCKS)
+ 
+ static void
+-check_pi_list_present(struct rt_mutex *lock, struct rt_mutex_waiter *waiter,
+-		      struct thread_info *old_owner)
+-{
+-	struct rt_mutex_waiter *w;
+-
+-	_raw_spin_lock(&old_owner->task->pi_lock);
+-	TRACE_WARN_ON_LOCKED(plist_node_empty(&waiter->pi_list));
+-
+-	plist_for_each_entry(w, &old_owner->task->pi_waiters, pi_list) {
+-		if (w == waiter)
+-			goto ok;
+-	}
+-	TRACE_WARN_ON_LOCKED(1);
+-ok:
+-	_raw_spin_unlock(&old_owner->task->pi_lock);
+-	return;
+-}
+-
+-static void
+ check_pi_list_empty(struct rt_mutex *lock, struct thread_info *old_owner)
+ {
+ 	struct rt_mutex_waiter *w;
+@@ -781,274 +776,116 @@ check_pi_list_empty(struct rt_mutex *loc
+ 
+ #endif
+ 
+-/*
+- * Move PI waiters of this lock to the new owner:
+- */
+-static void
+-change_owner(struct rt_mutex *lock, struct thread_info *old_owner,
+-	     struct thread_info *new_owner)
+-{
+-	struct rt_mutex_waiter *w, *tmp;
+-	int requeued = 0, sum = 0;
+-
+-	if (old_owner == new_owner)
+-		return;
+-
+-	SMP_TRACE_BUG_ON_LOCKED(!spin_is_locked(&old_owner->task->pi_lock));
+-	SMP_TRACE_BUG_ON_LOCKED(!spin_is_locked(&new_owner->task->pi_lock));
+-	plist_for_each_entry_safe(w, tmp, &old_owner->task->pi_waiters, pi_list) {
+-		if (w->lock == lock) {
+-			trace_special_pid(w->ti->task->pid, w->ti->task->prio, w->ti->task->normal_prio);
+-			plist_del(&w->pi_list);
+-			w->pi_list.prio = w->ti->task->prio;
+-			plist_add(&w->pi_list, &new_owner->task->pi_waiters);
+-			requeued++;
+-		}
+-		sum++;
+-	}
+-	trace_special(sum, requeued, 0);
+-}
+ 
+-int pi_walk, pi_null, pi_prio, pi_initialized;
+ 
+-/*
+- * The lock->wait_lock and p->pi_lock must be held.
+- */
+-static void pi_setprio(struct rt_mutex *lock, struct task_struct *task, int prio)
++static int calc_pi_prio(task_t *task)
+ {
+-	struct rt_mutex *l = lock;
+-	struct task_struct *p = task;
+-	/*
+-	 * We don't want to release the parameters locks.
+-	 */
++	int prio = task->normal_prio;
++	if(!plist_head_empty(&task->pi_waiters)) {
++		struct  rt_mutex_waiter *waiter = 
++			plist_first_entry(&task->pi_waiters, struct rt_mutex_waiter, pi_list);
++		prio = min(waiter->pi_list.prio,prio);
+ 
+-	if (unlikely(!p->pid)) {
+-		pi_null++;
+-		return;
+ 	}
++	return prio;
+ 
+-	SMP_TRACE_BUG_ON_LOCKED(!spin_is_locked(&lock->wait_lock));
+-	SMP_TRACE_BUG_ON_LOCKED(!spin_is_locked(&p->pi_lock));
+-#ifdef CONFIG_DEBUG_DEADLOCKS
+-	pi_prio++;
+-	if (p->policy != SCHED_NORMAL && prio > normal_prio(p)) {
+-		TRACE_OFF();
+-
+-		printk("huh? (%d->%d??)\n", p->prio, prio);
+-		printk("owner:\n");
+-		printk_task(p);
+-		printk("\ncurrent:\n");
+-		printk_task(current);
+-		printk("\nlock:\n");
+-		printk_lock(lock, 1);
+-		dump_stack();
+-		trace_local_irq_disable(ti);
+ 	}
+-#endif
+-	/*
+-	 * If the task is blocked on some other task then boost that
+-	 * other task (or tasks) too:
+-	 */
+-	for (;;) {
+-		struct rt_mutex_waiter *w = p->blocked_on;
+-#ifdef CONFIG_DEBUG_DEADLOCKS
+-		int was_rt = rt_task(p);
+-#endif
+-
+-		mutex_setprio(p, prio);
+ 
+-		/*
+-		 * The BKL can really be a pain. It can happen where the
+-		 * BKL is being held by one task that is just about to
+-		 * block on another task that is waiting for the BKL.
+-		 * This isn't a deadlock, since the BKL is released
+-		 * when the task goes to sleep.  This also means that
+-		 * all holders of the BKL are not blocked, or are just
+-		 * about to be blocked.
+-		 *
+-		 * Another side-effect of this is that there's a small
+-		 * window where the spinlocks are not held, and the blocked
+-		 * process hasn't released the BKL.  So if we are going
+-		 * to boost the owner of the BKL, stop after that,
+-		 * since that owner is either running, or about to sleep
+-		 * but don't go any further or we are in a loop.
+-		 */
+-		if (!w || unlikely(p->lock_depth >= 0))
+-			break;
+-		/*
+-		 * If the task is blocked on a lock, and we just made
+-		 * it RT, then register the task in the PI list and
+-		 * requeue it to the wait list:
+-		 */
+-
+-		/*
+-		 * Don't unlock the original lock->wait_lock
+-		 */
+-		if (l != lock)
+-			_raw_spin_unlock(&l->wait_lock);
+-		l = w->lock;
+-		TRACE_BUG_ON_LOCKED(!lock);
+-
+-#ifdef CONFIG_PREEMPT_RT
+-		/*
+-		 * The current task that is blocking can also the one
+-		 * holding the BKL, and blocking on a task that wants
+-		 * it.  So if it were to get this far, we would deadlock.
+-		 */
+-		if (unlikely(l == &kernel_sem.lock) && lock_owner(l) == current_thread_info()) {
+-			/*
+-			 * No locks are held for locks, so fool the unlocking code
+-			 * by thinking the last lock was the original.
+-			 */
+-			l = lock;
+-			break;
++static void fix_prio(task_t *task)
++{
++	int prio = calc_pi_prio(task);
++	if(task->prio > prio) {
++		/* Boost him */
++		mutex_setprio(task,prio);
++		if(task->blocked_on) {
++			/* Let it run to boost it's lock */
++			wake_up_process_mutex(task);
+ 		}
+-#endif
+-
+-		if (l != lock)
+-			_raw_spin_lock(&l->wait_lock);
+-
+-		TRACE_BUG_ON_LOCKED(!lock_owner(l));
+-
+-		if (!plist_node_empty(&w->pi_list)) {
+-			TRACE_BUG_ON_LOCKED(!was_rt && !ALL_TASKS_PI && !rt_task(p));
+-			/*
+-			 * If the task is blocked on a lock, and we just restored
+-			 * it from RT to non-RT then unregister the task from
+-			 * the PI list and requeue it to the wait list.
+-			 *
+-			 * (TODO: this can be unfair to SCHED_NORMAL tasks if they
+-			 *        get PI handled.)
+-			 */
+-			plist_del(&w->pi_list);
+-		} else
+-			TRACE_BUG_ON_LOCKED((ALL_TASKS_PI || rt_task(p)) && was_rt);
+-
+-		if (ALL_TASKS_PI || rt_task(p)) {
+-			w->pi_list.prio = prio;
+-			plist_add(&w->pi_list, &lock_owner(l)->task->pi_waiters);
+-		}
+-
+-		plist_del(&w->list);
+-		w->list.prio = prio;
+-		plist_add(&w->list, &l->wait_list);
+-
+-		pi_walk++;
+-
+-		if (p != task)
+-			_raw_spin_unlock(&p->pi_lock);
+-
+-		p = lock_owner(l)->task;
+-		TRACE_BUG_ON_LOCKED(!p);
+-		_raw_spin_lock(&p->pi_lock);
+-		/*
+-		 * If the dependee is already higher-prio then
+-		 * no need to boost it, and all further tasks down
+-		 * the dependency chain are already boosted:
+-		 */
+-		if (p->prio <= prio)
+-			break;
+ 	}
+-	if (l != lock)
+-		_raw_spin_unlock(&l->wait_lock);
+-	if (p != task)
+-		_raw_spin_unlock(&p->pi_lock);
+-}
+-
+-/*
+- * Change priority of a task pi aware
+- *
+- * There are several aspects to consider:
+- * - task is priority boosted
+- * - task is blocked on a mutex
+- *
+- */
+-void pi_changeprio(struct task_struct *p, int prio)
+-{
+-	unsigned long flags;
+-	int oldprio;
+-
+-	spin_lock_irqsave(&p->pi_lock,flags);
+-	if (p->blocked_on)
+-		spin_lock(&p->blocked_on->lock->wait_lock);
+-
+-	oldprio = p->normal_prio;
+-	if (oldprio == prio)
+-		goto out;
+-
+-	/* Set normal prio in any case */
+-	p->normal_prio = prio;
+-
+-	/* Check, if we can safely lower the priority */
+-	if (prio > p->prio && !plist_head_empty(&p->pi_waiters)) {
+-		struct rt_mutex_waiter *w;
+-		w = plist_first_entry(&p->pi_waiters,
+-				      struct rt_mutex_waiter, pi_list);
+-		if (w->ti->task->prio < prio)
+-			prio = w->ti->task->prio;
++	else if(task->prio < prio) {
++		/* Priority too high */
++		if(task->blocked_on) {
++			/* Let it run to unboost it's lock */
++			wake_up_process_mutex(task);
++		}
++		else {
++			mutex_setprio(task,prio);
++		}
+ 	}
+-
+-	if (prio == p->prio)
+-		goto out;
+-
+-	/* Is task blocked on a mutex ? */
+-	if (p->blocked_on)
+-		pi_setprio(p->blocked_on->lock, p, prio);
+-	else
+-		mutex_setprio(p, prio);
+- out:
+-	if (p->blocked_on)
+-		spin_unlock(&p->blocked_on->lock->wait_lock);
+-
+-	spin_unlock_irqrestore(&p->pi_lock, flags);
+-
+ }
+ 
++int pi_walk, pi_null, pi_prio, pi_initialized;
++
+ /*
+  * This is called with both the waiter->task->pi_lock and
+  * lock->wait_lock held.
+  */
+ static void
+ task_blocks_on_lock(struct rt_mutex_waiter *waiter, struct thread_info *ti,
+-		    struct rt_mutex *lock __EIP_DECL__)
++                    struct rt_mutex *lock, int state __EIP_DECL__)
+ {
++	struct rt_mutex_waiter *old_first;
+ 	struct task_struct *task = ti->task;
+ #ifdef CONFIG_DEBUG_DEADLOCKS
+ 	check_deadlock(lock, 0, ti, eip);
+ 	/* mark the current thread as blocked on the lock */
+ 	waiter->eip = eip;
+ #endif
++	SMP_TRACE_BUG_ON_LOCKED(!spin_is_locked(&lock->wait_lock));
++	SMP_TRACE_BUG_ON_LOCKED(spin_is_locked(&task->pi_lock));
++
++	if(plist_head_empty(&lock->wait_list)) {
++		old_first = NULL;
++	}
++	else {
++		old_first = plist_first_entry(&lock->wait_list, struct rt_mutex_waiter, list);
++	}
++
++
++	_raw_spin_lock(&task->pi_lock);
+ 	task->blocked_on = waiter;
+ 	waiter->lock = lock;
+ 	waiter->ti = ti;
+-	plist_node_init(&waiter->pi_list, task->prio);
++        
++	{
++		/* Fixup the prio of the (current) task here while we have the
++		   pi_lock */
++		int prio = calc_pi_prio(task);
++		if(prio!=task->prio) {
++			mutex_setprio(task,prio);
++		}
++	}
++
++	plist_node_init(&waiter->list, task->prio);
++	plist_add(&waiter->list, &lock->wait_list);
++	set_task_state(task, state);
++	_raw_spin_unlock(&task->pi_lock);
++
++	set_lock_owner_pending(lock);   
++#if !ALL_TASKS_PI
+ 	/*
+ 	 * Add SCHED_NORMAL tasks to the end of the waitqueue (FIFO):
+ 	 */
+-	SMP_TRACE_BUG_ON_LOCKED(!spin_is_locked(&task->pi_lock));
+-	SMP_TRACE_BUG_ON_LOCKED(!spin_is_locked(&lock->wait_lock));
+-#if !ALL_TASKS_PI
+ 	if ((!rt_task(task) &&
+ 		!(lock->mutex_attr & FUTEX_ATTR_PRIORITY_INHERITANCE))) {
+-		plist_add(&waiter->list, &lock->wait_list);
+-		set_lock_owner_pending(lock);
+ 		return;
+ 	}
+ #endif
+-	_raw_spin_lock(&lock_owner(lock)->task->pi_lock);
+-	plist_add(&waiter->pi_list, &lock_owner(lock)->task->pi_waiters);
+-	/*
+-	 * Add RT tasks to the head:
+-	 */
+-	plist_add(&waiter->list, &lock->wait_list);
+-	set_lock_owner_pending(lock);
+-	/*
+-	 * If the waiter has higher priority than the owner
+-	 * then temporarily boost the owner:
+-	 */
+-	if (task->prio < lock_owner(lock)->task->prio)
+-		pi_setprio(lock, lock_owner(lock)->task, task->prio);
+-	_raw_spin_unlock(&lock_owner(lock)->task->pi_lock);
++	if(waiter ==
++	   plist_first_entry(&lock->wait_list, struct rt_mutex_waiter, list)) {
++		task_t *owner = lock_owner(lock)->task;
++
++		plist_node_init(&waiter->pi_list, task->prio);
++
++		_raw_spin_lock(&owner->pi_lock);
++		if(old_first) {
++			plist_del(&old_first->pi_list);
++		}
++		plist_add(&waiter->pi_list, &owner->pi_waiters);
++		fix_prio(owner);
++
++		_raw_spin_unlock(&owner->pi_lock);
++	}
+ }
+ 
+ /*
+@@ -1085,20 +922,45 @@ EXPORT_SYMBOL(__init_rwsem);
+ #endif
+ 
+ /*
+- * This must be called with both the old_owner and new_owner pi_locks held.
+- * As well as the lock->wait_lock.
++ * This must be called with the lock->wait_lock held.
++ * Must: new_owner!=NULL
++ * Likely: old_owner==NULL
+  */
+-static inline
++static 
+ void set_new_owner(struct rt_mutex *lock, struct thread_info *old_owner,
+ 			struct thread_info *new_owner __EIP_DECL__)
+ {
++	SMP_TRACE_BUG_ON_LOCKED(spin_is_locked(&old_owner->task->pi_lock));
++	SMP_TRACE_BUG_ON_LOCKED(spin_is_locked(&new_owner->task->pi_lock));
++	SMP_TRACE_BUG_ON_LOCKED(!spin_is_locked(&lock->wait_lock));
++
+ 	if (new_owner)
+ 		trace_special_pid(new_owner->task->pid, new_owner->task->prio, 0);
+-	if (unlikely(old_owner))
+-		change_owner(lock, old_owner, new_owner);
++	if(old_owner) {
++		account_mutex_owner_up(old_owner->task);
++	}
++#ifdef CONFIG_DEBUG_DEADLOCKS
++	if (trace_on && unlikely(old_owner)) {
++		TRACE_WARN_ON_LOCKED(list_empty(&lock->held_list));
++		list_del_init(&lock->held_list);
++	}
++#endif
+ 	lock->owner = new_owner;
+-	if (!plist_head_empty(&lock->wait_list))
++	if (!plist_head_empty(&lock->wait_list)) {
++		struct rt_mutex_waiter *next =
++			plist_first_entry(&lock->wait_list, 
++					  struct rt_mutex_waiter, list);
++		if(old_owner) {
++			_raw_spin_lock(&old_owner->task->pi_lock);
++			plist_del(&next->pi_list);
++			_raw_spin_unlock(&old_owner->task->pi_lock);
++		}
++		_raw_spin_lock(&new_owner->task->pi_lock);
++		plist_add(&next->pi_list, &new_owner->task->pi_waiters);
+ 		set_lock_owner_pending(lock);
++		_raw_spin_unlock(&new_owner->task->pi_lock);
++	}
++        
+ #ifdef CONFIG_DEBUG_DEADLOCKS
+ 	if (trace_on) {
+ 		TRACE_WARN_ON_LOCKED(!list_empty(&lock->held_list));
+@@ -1109,6 +971,32 @@ void set_new_owner(struct rt_mutex *lock
+ 	account_mutex_owner_down(new_owner->task, lock);
+ }
+ 
++
++static inline void remove_waiter(struct rt_mutex *lock, 
++                                 struct rt_mutex_waiter *waiter, 
++                                 int fixprio)
++{
++	task_t *owner = lock_owner(lock) ? lock_owner(lock)->task : NULL;
++	int first = (waiter==plist_first_entry(&lock->wait_list, 
++					       struct rt_mutex_waiter, list));
++        
++	plist_del(&waiter->list);
++	if(first && owner) {
++		_raw_spin_lock(&owner->pi_lock);
++		plist_del(&waiter->pi_list);
++		if(!plist_head_empty(&lock->wait_list)) {
++			struct rt_mutex_waiter *next =
++				plist_first_entry(&lock->wait_list, 
++						  struct rt_mutex_waiter, list);
++			plist_add(&next->pi_list, &owner->pi_waiters);                  
++		}
++		if(fixprio) {
++			fix_prio(owner);
++		}
++		_raw_spin_unlock(&owner->pi_lock);
++	}
++}
++
+ /*
+  * handle the lock release when processes blocked on it that can now run
+  * - the spinlock must be held by the caller
+@@ -1123,70 +1011,34 @@ pick_new_owner(struct rt_mutex *lock, st
+ 	struct thread_info *new_owner;
+ 
+ 	SMP_TRACE_BUG_ON_LOCKED(!spin_is_locked(&lock->wait_lock));
++	SMP_TRACE_BUG_ON_LOCKED(spin_is_locked(&old_owner->task->pi_lock));
++
+ 	/*
+ 	 * Get the highest prio one:
+ 	 *
+ 	 * (same-prio RT tasks go FIFO)
+ 	 */
+ 	waiter = plist_first_entry(&lock->wait_list, struct rt_mutex_waiter, list);
+-
+-#ifdef CONFIG_SMP
+- try_again:
+-#endif
++	remove_waiter(lock,waiter,0);
+ 	trace_special_pid(waiter->ti->task->pid, waiter->ti->task->prio, 0);
+ 
+-#if ALL_TASKS_PI
+-	check_pi_list_present(lock, waiter, old_owner);
+-#endif
+ 	new_owner = waiter->ti;
+-	/*
+-	 * The new owner is still blocked on this lock, so we
+-	 * must release the lock->wait_lock before grabing
+-	 * the new_owner lock.
+-	 */
+-	_raw_spin_unlock(&lock->wait_lock);
+-	_raw_spin_lock(&new_owner->task->pi_lock);
+-	_raw_spin_lock(&lock->wait_lock);
+-	/*
+-	 * In this split second of releasing the lock, a high priority
+-	 * process could have come along and blocked as well.
+-	 */
+-#ifdef CONFIG_SMP
+-	waiter = plist_first_entry(&lock->wait_list, struct rt_mutex_waiter, list);
+-	if (unlikely(waiter->ti != new_owner)) {
+-		_raw_spin_unlock(&new_owner->task->pi_lock);
+-		goto try_again;
+-	}
+-#ifdef CONFIG_PREEMPT_RT
+-	/*
+-	 * Once again the BKL comes to play.  Since the BKL can be grabbed and released
+-	 * out of the normal P1->L1->P2 order, there's a chance that someone has the
+-	 * BKL owner's lock and is waiting on the new owner lock.
+-	 */
+-	if (unlikely(lock == &kernel_sem.lock)) {
+-		if (!_raw_spin_trylock(&old_owner->task->pi_lock)) {
+-			_raw_spin_unlock(&new_owner->task->pi_lock);
+-			goto try_again;
+-		}
+-	} else
+-#endif
+-#endif
+-		_raw_spin_lock(&old_owner->task->pi_lock);
+-
+-	plist_del(&waiter->list);
+-	plist_del(&waiter->pi_list);
+-	waiter->pi_list.prio = waiter->ti->task->prio;
+ 
+ 	set_new_owner(lock, old_owner, new_owner __W_EIP__(waiter));
++
++	_raw_spin_lock(&new_owner->task->pi_lock);
+ 	/* Don't touch waiter after ->task has been NULLed */
+ 	mb();
+ 	waiter->ti = NULL;
+ 	new_owner->task->blocked_on = NULL;
+-	TRACE_WARN_ON(save_state != lock->save_state);
+-
+-	_raw_spin_unlock(&old_owner->task->pi_lock);
++#ifdef CAPTURE_LOCK
++	new_owner->task->rt_flags |= RT_PENDOWNER;
++	new_owner->task->pending_owner = lock;
++#endif
+ 	_raw_spin_unlock(&new_owner->task->pi_lock);
+ 
++	TRACE_WARN_ON(save_state != lock->save_state);
++
+ 	return new_owner;
+ }
+ 
+@@ -1222,6 +1074,34 @@ static inline void init_lists(struct rt_
+ #endif
+ }
+ 
++
++static void remove_pending_owner_nolock(task_t *owner)
++{
++	owner->rt_flags &= ~RT_PENDOWNER;
++	owner->pending_owner = NULL;
++}
++
++static void remove_pending_owner(task_t *owner)
++{
++	_raw_spin_lock(&owner->pi_lock);
++	remove_pending_owner_nolock(owner);
++	_raw_spin_unlock(&owner->pi_lock);
++}
++
++int task_is_pending_owner_nolock(struct thread_info  *owner, 
++                                 struct rt_mutex *lock)
++{
++	return (lock_owner(lock) == owner) &&
++		(owner->task->pending_owner == lock);
++}
++int task_is_pending_owner(struct thread_info  *owner, struct rt_mutex *lock)
++{
++	int res;
++	_raw_spin_lock(&owner->task->pi_lock);
++	res = task_is_pending_owner_nolock(owner,lock);
++	_raw_spin_unlock(&owner->task->pi_lock);
++	return res;
++}
+ /*
+  * Try to grab a lock, and if it is owned but the owner
+  * hasn't woken up yet, see if we can steal it.
+@@ -1233,6 +1113,8 @@ static int __grab_lock(struct rt_mutex *
+ {
+ #ifndef CAPTURE_LOCK
+ 	return 0;
++#else
++	int res = 0;
+ #endif
+ 	/*
+ 	 * The lock is owned, but now test to see if the owner
+@@ -1241,111 +1123,36 @@ static int __grab_lock(struct rt_mutex *
+ 
+ 	TRACE_BUG_ON_LOCKED(!owner);
+ 
++	_raw_spin_lock(&owner->pi_lock);
++
+ 	/* The owner is pending on a lock, but is it this lock? */
+ 	if (owner->pending_owner != lock)
+-		return 0;
++		goto out_unlock;
+ 
+ 	/*
+ 	 * There's an owner, but it hasn't woken up to take the lock yet.
+ 	 * See if we should steal it from him.
+ 	 */
+ 	if (task->prio > owner->prio)
+-		return 0;
++		goto out_unlock;
+ #ifdef CONFIG_PREEMPT_RT
+ 	/*
+ 	 * The BKL is a PITA. Don't ever steal it
+ 	 */
+ 	if (lock == &kernel_sem.lock)
+-		return 0;
++		goto out_unlock;
+ #endif
+ 	/*
+ 	 * This task is of higher priority than the current pending
+ 	 * owner, so we may steal it.
+ 	 */
+-	owner->rt_flags &= ~RT_PENDOWNER;
+-	owner->pending_owner = NULL;
++	remove_pending_owner_nolock(owner);
+ 
+-#ifdef CONFIG_DEBUG_DEADLOCKS
+-	/*
+-	 * This task will be taking the ownership away, and
+-	 * when it does, the lock can't be on the held list.
+-	 */
+-	if (trace_on) {
+-		TRACE_WARN_ON_LOCKED(list_empty(&lock->held_list));
+-		list_del_init(&lock->held_list);
+-	}
+-#endif
+-	account_mutex_owner_up(owner);
++	res = 1;
+ 
+-	return 1;
+-}
+-
+-/*
+- * Bring a task from pending ownership to owning a lock.
+- *
+- * Return 0 if we secured it, otherwise non-zero if it was
+- * stolen.
+- */
+-static int
+-capture_lock(struct rt_mutex_waiter *waiter, struct thread_info *ti,
+-	     struct task_struct *task)
+-{
+-	struct rt_mutex *lock = waiter->lock;
+-	struct thread_info *old_owner;
+-	unsigned long flags;
+-	int ret = 0;
+-
+-#ifndef CAPTURE_LOCK
+-	return 0;
+-#endif
+-#ifdef CONFIG_PREEMPT_RT
+-	/*
+-	 * The BKL is special, we always get it.
+-	 */
+-	if (lock == &kernel_sem.lock)
+-		return 0;
+-#endif
+-
+-	trace_lock_irqsave(&trace_lock, flags, ti);
+-	/*
+-	 * We are no longer blocked on the lock, so we are considered a
+-	 * owner. So we must grab the lock->wait_lock first.
+-	 */
+-	_raw_spin_lock(&lock->wait_lock);
+-	_raw_spin_lock(&task->pi_lock);
+-
+-	if (!(task->rt_flags & RT_PENDOWNER)) {
+-		/*
+-		 * Someone else stole it.
+-		 */
+-		old_owner = lock_owner(lock);
+-		TRACE_BUG_ON_LOCKED(old_owner == ti);
+-		if (likely(!old_owner) || __grab_lock(lock, task, old_owner->task)) {
+-			/* we got it back! */
+-			if (old_owner) {
+-				_raw_spin_lock(&old_owner->task->pi_lock);
+-				set_new_owner(lock, old_owner, ti __W_EIP__(waiter));
+-				_raw_spin_unlock(&old_owner->task->pi_lock);
+-			} else
+-				set_new_owner(lock, old_owner, ti __W_EIP__(waiter));
+-			ret = 0;
+-		} else {
+-			/* Add ourselves back to the list */
+-			TRACE_BUG_ON_LOCKED(!plist_node_empty(&waiter->list));
+-			plist_node_init(&waiter->list, task->prio);
+-			task_blocks_on_lock(waiter, ti, lock __W_EIP__(waiter));
+-			ret = 1;
+-		}
+-	} else {
+-		task->rt_flags &= ~RT_PENDOWNER;
+-		task->pending_owner = NULL;
+-	}
+-
+-	_raw_spin_unlock(&lock->wait_lock);
+-	_raw_spin_unlock(&task->pi_lock);
+-	trace_unlock_irqrestore(&trace_lock, flags, ti);
+-
+-	return ret;
++ out_unlock:
++	_raw_spin_unlock(&owner->pi_lock);
++	return res;
+ }
+ 
+ static inline void INIT_WAITER(struct rt_mutex_waiter *waiter)
+@@ -1366,10 +1173,24 @@ static inline void FREE_WAITER(struct rt
+ #endif
+ }
+ 
++static int allowed_to_take_lock(struct thread_info *ti,
++                                task_t *task,
++                                struct thread_info *old_owner,
++                                struct rt_mutex *lock)
++{
++	SMP_TRACE_BUG_ON_LOCKED(!spin_is_locked(&lock->wait_lock));
++	SMP_TRACE_BUG_ON_LOCKED(spin_is_locked(&old_owner->task->pi_lock));
++	SMP_TRACE_BUG_ON_LOCKED(spin_is_locked(&task->pi_lock));
++
++	return !old_owner || 
++		task_is_pending_owner(ti,lock) || 
++		__grab_lock(lock, task, old_owner->task);
++}
++
+ /*
+  * lock it semaphore-style: no worries about missed wakeups.
+  */
+-static inline void
++static void
+ ____down(struct rt_mutex *lock __EIP_DECL__)
+ {
+ 	struct thread_info *ti = current_thread_info(), *old_owner;
+@@ -1379,65 +1200,56 @@ ____down(struct rt_mutex *lock __EIP_DEC
+ 
+ 	trace_lock_irqsave(&trace_lock, flags, ti);
+ 	TRACE_BUG_ON_LOCKED(!raw_irqs_disabled());
+-	_raw_spin_lock(&task->pi_lock);
+ 	_raw_spin_lock(&lock->wait_lock);
+ 	INIT_WAITER(&waiter);
+ 
+-	old_owner = lock_owner(lock);
+ 	init_lists(lock);
+ 
+-	if (likely(!old_owner) || __grab_lock(lock, task, old_owner->task)) {
++	/* wait to be given the lock */
++	for (;;) {
++		old_owner = lock_owner(lock);
++
++		if(allowed_to_take_lock(ti, task, old_owner,lock)) {
+ 		/* granted */
+-		TRACE_WARN_ON_LOCKED(!plist_head_empty(&lock->wait_list) && !old_owner);
+-		if (old_owner) {
+-			_raw_spin_lock(&old_owner->task->pi_lock);
++			TRACE_WARN_ON_LOCKED(!plist_head_empty(&lock->wait_list) && !old_owner);
+ 			set_new_owner(lock, old_owner, ti __EIP__);
+-			_raw_spin_unlock(&old_owner->task->pi_lock);
+-		} else
+-			set_new_owner(lock, old_owner, ti __EIP__);
+-		_raw_spin_unlock(&lock->wait_lock);
+-		_raw_spin_unlock(&task->pi_lock);
+-		trace_unlock_irqrestore(&trace_lock, flags, ti);
+-
+-		FREE_WAITER(&waiter);
+-		return;
+-	}
+-
+-	set_task_state(task, TASK_UNINTERRUPTIBLE);
+-
+-	plist_node_init(&waiter.list, task->prio);
+-	task_blocks_on_lock(&waiter, ti, lock __EIP__);
++			remove_pending_owner(task);
++			_raw_spin_unlock(&lock->wait_lock);
++			trace_unlock_irqrestore(&trace_lock, flags, ti);
+ 
+-	TRACE_BUG_ON_LOCKED(!raw_irqs_disabled());
+-	/* we don't need to touch the lock struct anymore */
+-	_raw_spin_unlock(&lock->wait_lock);
+-	_raw_spin_unlock(&task->pi_lock);
+-	trace_unlock_irqrestore(&trace_lock, flags, ti);
++			FREE_WAITER(&waiter);
++			return;
++		}
++		
++		task_blocks_on_lock(&waiter, ti, lock, TASK_UNINTERRUPTIBLE __EIP__);
+ 
+-	might_sleep();
++		TRACE_BUG_ON_LOCKED(!raw_irqs_disabled());
++		/* we don't need to touch the lock struct anymore */
++		_raw_spin_unlock(&lock->wait_lock);
++		trace_unlock_irqrestore(&trace_lock, flags, ti);
++		
++		might_sleep();
++		
++		nosched_flag = current->flags & PF_NOSCHED;
++		current->flags &= ~PF_NOSCHED;
+ 
+-	nosched_flag = current->flags & PF_NOSCHED;
+-	current->flags &= ~PF_NOSCHED;
++		if (waiter.ti)
++		{
++			schedule();
++		}
++		
++		current->flags |= nosched_flag;
++		task->state = TASK_RUNNING;
+ 
+-wait_again:
+-	/* wait to be given the lock */
+-	for (;;) {
+-		if (!waiter.ti)
+-			break;
+-		schedule();
+-		set_task_state(task, TASK_UNINTERRUPTIBLE);
+-	}
+-	/*
+-	 * Check to see if we didn't have ownership stolen.
+-	 */
+-	if (capture_lock(&waiter, ti, task)) {
+-		set_task_state(task, TASK_UNINTERRUPTIBLE);
+-		goto wait_again;
++		trace_lock_irqsave(&trace_lock, flags, ti);
++		_raw_spin_lock(&lock->wait_lock);
++		if(waiter.ti) {
++			remove_waiter(lock,&waiter,1);
++		}
+ 	}
+ 
+-	current->flags |= nosched_flag;
+-	task->state = TASK_RUNNING;
+-	FREE_WAITER(&waiter);
++	/* Should not get here! */
++	BUG_ON(1);
+ }
+ 
+ /*
+@@ -1450,122 +1262,105 @@ wait_again:
+  * enables the seemless use of arbitrary (blocking) spinlocks within
+  * sleep/wakeup event loops.
+  */
+-static inline void
++static void
+ ____down_mutex(struct rt_mutex *lock __EIP_DECL__)
+ {
+ 	struct thread_info *ti = current_thread_info(), *old_owner;
+-	unsigned long state, saved_state, nosched_flag;
++	unsigned long state, saved_state;
+ 	struct task_struct *task = ti->task;
+ 	struct rt_mutex_waiter waiter;
+ 	unsigned long flags;
+-	int got_wakeup = 0, saved_lock_depth;
++	int got_wakeup = 0;
++	
++	        
+ 
+ 	trace_lock_irqsave(&trace_lock, flags, ti);
+ 	TRACE_BUG_ON_LOCKED(!raw_irqs_disabled());
+-	_raw_spin_lock(&task->pi_lock);
+ 	_raw_spin_lock(&lock->wait_lock);
+-	INIT_WAITER(&waiter);
+-
+-	old_owner = lock_owner(lock);
+-	init_lists(lock);
+-
+-	if (likely(!old_owner) || __grab_lock(lock, task, old_owner->task)) {
+-		/* granted */
+-		TRACE_WARN_ON_LOCKED(!plist_head_empty(&lock->wait_list) && !old_owner);
+-		if (old_owner) {
+-			_raw_spin_lock(&old_owner->task->pi_lock);
+-			set_new_owner(lock, old_owner, ti __EIP__);
+-			_raw_spin_unlock(&old_owner->task->pi_lock);
+-		} else
+-			set_new_owner(lock, old_owner, ti __EIP__);
+-		_raw_spin_unlock(&lock->wait_lock);
+-		_raw_spin_unlock(&task->pi_lock);
+-		trace_unlock_irqrestore(&trace_lock, flags, ti);
+-
+-		FREE_WAITER(&waiter);
+-		return;
+-	}
+-
+-	plist_node_init(&waiter.list, task->prio);
+-	task_blocks_on_lock(&waiter, ti, lock __EIP__);
+-
+-	TRACE_BUG_ON_LOCKED(!raw_irqs_disabled());
+-	/*
++/*
+ 	 * Here we save whatever state the task was in originally,
+ 	 * we'll restore it at the end of the function and we'll
+ 	 * take any intermediate wakeup into account as well,
+ 	 * independently of the mutex sleep/wakeup mechanism:
+ 	 */
+ 	saved_state = xchg(&task->state, TASK_UNINTERRUPTIBLE);
++        
++	INIT_WAITER(&waiter);
+ 
+-	/* we don't need to touch the lock struct anymore */
+-	_raw_spin_unlock(&lock->wait_lock);
+-	_raw_spin_unlock(&task->pi_lock);
+-	trace_unlock(&trace_lock, ti);
+-
+-	/*
+-	 * TODO: check 'flags' for the IRQ bit here - it is illegal to
+-	 * call down() from an IRQs-off section that results in
+-	 * an actual reschedule.
+-	 */
+-
+-	nosched_flag = current->flags & PF_NOSCHED;
+-	current->flags &= ~PF_NOSCHED;
+-
+-	/*
+-	 * BKL users expect the BKL to be held across spinlock/rwlock-acquire.
+-	 * Save and clear it, this will cause the scheduler to not drop the
+-	 * BKL semaphore if we end up scheduling:
+-	 */
+-	saved_lock_depth = task->lock_depth;
+-	task->lock_depth = -1;
++	init_lists(lock);
+ 
+-wait_again:
+ 	/* wait to be given the lock */
+ 	for (;;) {
+-		unsigned long saved_flags = current->flags & PF_NOSCHED;
+-
+-		if (!waiter.ti)
+-			break;
+-		trace_local_irq_enable(ti);
+-		// no need to check for preemption here, we schedule().
+-		current->flags &= ~PF_NOSCHED;
++		old_owner = lock_owner(lock);
++        
++		if (allowed_to_take_lock(ti,task,old_owner,lock)) {
++		/* granted */
++			TRACE_WARN_ON_LOCKED(!plist_head_empty(&lock->wait_list) && !old_owner);
++			set_new_owner(lock, old_owner, ti __EIP__);
++			remove_pending_owner(task);
++			_raw_spin_unlock(&lock->wait_lock);
++                        
++			/*
++			 * Only set the task's state to TASK_RUNNING if it got
++			 * a non-mutex wakeup. We keep the original state otherwise.
++			 * A mutex wakeup changes the task's state to TASK_RUNNING_MUTEX,
++			 * not TASK_RUNNING - hence we can differenciate betwee5~n the two
++			 * cases:
++			 */
++			state = xchg(&task->state, saved_state);
++			if (state == TASK_RUNNING)
++				got_wakeup = 1;
++			if (got_wakeup)
++				task->state = TASK_RUNNING;
++			trace_unlock_irqrestore(&trace_lock, flags, ti);
++			preempt_check_resched();
+ 
+-		schedule();
++			FREE_WAITER(&waiter);
++			return;
++		}
++		
++		task_blocks_on_lock(&waiter, ti, lock,
++				    TASK_UNINTERRUPTIBLE __EIP__);
+ 
+-		current->flags |= saved_flags;
+-		trace_local_irq_disable(ti);
+-		state = xchg(&task->state, TASK_UNINTERRUPTIBLE);
+-		if (state == TASK_RUNNING)
+-			got_wakeup = 1;
+-	}
+-	/*
+-	 * Check to see if we didn't have ownership stolen.
+-	 */
+-	if (capture_lock(&waiter, ti, task)) {
+-		state = xchg(&task->state, TASK_UNINTERRUPTIBLE);
+-		if (state == TASK_RUNNING)
+-			got_wakeup = 1;
+-		goto wait_again;
+-	}
+-	/*
+-	 * Only set the task's state to TASK_RUNNING if it got
+-	 * a non-mutex wakeup. We keep the original state otherwise.
+-	 * A mutex wakeup changes the task's state to TASK_RUNNING_MUTEX,
+-	 * not TASK_RUNNING - hence we can differenciate between the two
+-	 * cases:
+-	 */
+-	state = xchg(&task->state, saved_state);
+-	if (state == TASK_RUNNING)
+-		got_wakeup = 1;
+-	if (got_wakeup)
+-		task->state = TASK_RUNNING;
+-	trace_local_irq_enable(ti);
+-	preempt_check_resched();
++		TRACE_BUG_ON_LOCKED(!raw_irqs_disabled());
++		/* we don't need to touch the lock struct anymore */
++		_raw_spin_unlock(&lock->wait_lock);
++		trace_unlock(&trace_lock, ti);
++                
++		if (waiter.ti) {
++			unsigned long saved_flags = 
++				current->flags & PF_NOSCHED;
++			/*
++			 * BKL users expect the BKL to be held across spinlock/rwlock-acquire.
++			 * Save and clear it, this will cause the scheduler to not drop the
++			 * BKL semaphore if we end up scheduling:
++			 */
+ 
+-	task->lock_depth = saved_lock_depth;
+-	current->flags |= nosched_flag;
+-	FREE_WAITER(&waiter);
++			int saved_lock_depth = task->lock_depth;
++			task->lock_depth = -1;
++			
++
++			trace_local_irq_enable(ti);
++			// no need to check for preemption here, we schedule().
++                        
++			current->flags &= ~PF_NOSCHED;
++			
++			schedule();
++			
++			trace_local_irq_disable(ti);
++			task->flags |= saved_flags;
++			task->lock_depth = saved_lock_depth;
++			state = xchg(&task->state, TASK_RUNNING_MUTEX);
++			if (state == TASK_RUNNING)
++				got_wakeup = 1;
++		}
++		
++		trace_lock_irq(&trace_lock, ti);
++		_raw_spin_lock(&lock->wait_lock);
++		if(waiter.ti) {
++			remove_waiter(lock,&waiter,1);
++		}
++	}
+ }
+ 
+ static void __up_mutex_waiter_savestate(struct rt_mutex *lock __EIP_DECL__);
+@@ -1574,7 +1369,7 @@ static void __up_mutex_waiter_nosavestat
+ /*
+  * release the lock:
+  */
+-static inline void
++static void
+ ____up_mutex(struct rt_mutex *lock, int save_state __EIP_DECL__)
+ {
+ 	struct thread_info *ti = current_thread_info();
+@@ -1587,13 +1382,6 @@ ____up_mutex(struct rt_mutex *lock, int 
+ 	_raw_spin_lock(&lock->wait_lock);
+ 	TRACE_BUG_ON_LOCKED(!lock->wait_list.prio_list.prev && !lock->wait_list.prio_list.next);
+ 
+-#ifdef CONFIG_DEBUG_DEADLOCKS
+-	if (trace_on) {
+-		TRACE_WARN_ON_LOCKED(lock_owner(lock) != ti);
+-		TRACE_WARN_ON_LOCKED(list_empty(&lock->held_list));
+-		list_del_init(&lock->held_list);
+-	}
+-#endif
+ 
+ #if ALL_TASKS_PI
+ 	if (plist_head_empty(&lock->wait_list))
+@@ -1604,11 +1392,19 @@ ____up_mutex(struct rt_mutex *lock, int 
+ 			__up_mutex_waiter_savestate(lock __EIP__);
+ 		else
+ 			__up_mutex_waiter_nosavestate(lock __EIP__);
+-	} else
++	} else {
++#ifdef CONFIG_DEBUG_DEADLOCKS
++		if (trace_on) {
++			TRACE_WARN_ON_LOCKED(lock_owner(lock) != ti);
++			TRACE_WARN_ON_LOCKED(list_empty(&lock->held_list));
++			list_del_init(&lock->held_list);
++		}
++#endif
+ 		lock->owner = NULL;
++		account_mutex_owner_up(ti->task);
++	}
+ 	_raw_spin_unlock(&lock->wait_lock);
+ #if defined(CONFIG_DEBUG_PREEMPT) && defined(CONFIG_PREEMPT_RT)
+-	account_mutex_owner_up(current);
+ 	if (!current->lock_count && !rt_prio(current->normal_prio) &&
+ 					rt_prio(current->prio)) {
+ 		static int once = 1;
+@@ -1841,125 +1637,99 @@ static int __sched __down_interruptible(
+ 	struct rt_mutex_waiter waiter;
+ 	struct timer_list timer;
+ 	unsigned long expire = 0;
++	int timer_installed = 0;
+ 	int ret;
+ 
+ 	trace_lock_irqsave(&trace_lock, flags, ti);
+ 	TRACE_BUG_ON_LOCKED(!raw_irqs_disabled());
+-	_raw_spin_lock(&task->pi_lock);
+ 	_raw_spin_lock(&lock->wait_lock);
+ 	INIT_WAITER(&waiter);
+ 
+-	old_owner = lock_owner(lock);
+ 	init_lists(lock);
+ 
+-	if (likely(!old_owner) || __grab_lock(lock, task, old_owner->task)) {
++	ret = 0;
++	/* wait to be given the lock */
++	for (;;) {
++		old_owner = lock_owner(lock);
++                
++		if (allowed_to_take_lock(ti,task,old_owner,lock)) {
+ 		/* granted */
+-		TRACE_WARN_ON_LOCKED(!plist_head_empty(&lock->wait_list) && !old_owner);
+-		if (old_owner) {
+-			_raw_spin_lock(&old_owner->task->pi_lock);
++			TRACE_WARN_ON_LOCKED(!plist_head_empty(&lock->wait_list) && !old_owner);
+ 			set_new_owner(lock, old_owner, ti __EIP__);
+-			_raw_spin_unlock(&old_owner->task->pi_lock);
+-		} else
+-			set_new_owner(lock, old_owner, ti __EIP__);
+-		_raw_spin_unlock(&lock->wait_lock);
+-		_raw_spin_unlock(&task->pi_lock);
+-		trace_unlock_irqrestore(&trace_lock, flags, ti);
+-
+-		FREE_WAITER(&waiter);
+-		return 0;
+-	}
++			_raw_spin_unlock(&lock->wait_lock);
++			trace_unlock_irqrestore(&trace_lock, flags, ti);
+ 
+-	set_task_state(task, TASK_INTERRUPTIBLE);
++			goto out_free_timer;
++		}
+ 
+-	plist_node_init(&waiter.list, task->prio);
+-	task_blocks_on_lock(&waiter, ti, lock __EIP__);
++		task_blocks_on_lock(&waiter, ti, lock, TASK_INTERRUPTIBLE __EIP__);
+ 
+-	TRACE_BUG_ON_LOCKED(!raw_irqs_disabled());
+-	/* we don't need to touch the lock struct anymore */
+-	_raw_spin_unlock(&lock->wait_lock);
+-	_raw_spin_unlock(&task->pi_lock);
+-	trace_unlock_irqrestore(&trace_lock, flags, ti);
+-
+-	might_sleep();
++		TRACE_BUG_ON_LOCKED(!raw_irqs_disabled());
++		/* we don't need to touch the lock struct anymore */
++		_raw_spin_unlock(&lock->wait_lock);
++		trace_unlock_irqrestore(&trace_lock, flags, ti);
++		
++		might_sleep();
++		
++		nosched_flag = current->flags & PF_NOSCHED;
++		current->flags &= ~PF_NOSCHED;
++		if (time && !timer_installed) {
++			expire = time + jiffies;
++			init_timer(&timer);
++			timer.expires = expire;
++			timer.data = (unsigned long)current;
++			timer.function = process_timeout;
++			add_timer(&timer);
++			timer_installed = 1;
++		}
+ 
+-	nosched_flag = current->flags & PF_NOSCHED;
+-	current->flags &= ~PF_NOSCHED;
+-	if (time) {
+-		expire = time + jiffies;
+-		init_timer(&timer);
+-		timer.expires = expire;
+-		timer.data = (unsigned long)current;
+-		timer.function = process_timeout;
+-		add_timer(&timer);
+-	}
++                        
++		if (waiter.ti) {
++			schedule();
++		}
++		
++		current->flags |= nosched_flag;
++		task->state = TASK_RUNNING;
+ 
+-	ret = 0;
+-wait_again:
+-	/* wait to be given the lock */
+-	for (;;) {
+-		if (signal_pending(current) || (time && !timer_pending(&timer))) {
+-			/*
+-			 * Remove ourselves from the wait list if we
+-			 * didnt get the lock - else return success:
+-			 */
+-			trace_lock_irq(&trace_lock, ti);
+-			_raw_spin_lock(&task->pi_lock);
+-			_raw_spin_lock(&lock->wait_lock);
+-			if (waiter.ti || time) {
+-				plist_del(&waiter.list);
+-				/*
+-				 * If we were the last waiter then clear
+-				 * the pending bit:
+-				 */
+-				if (plist_head_empty(&lock->wait_list))
+-					lock->owner = lock_owner(lock);
+-				/*
+-				 * Just remove ourselves from the PI list.
+-				 * (No big problem if our PI effect lingers
+-				 *  a bit - owner will restore prio.)
+-				 */
+-				TRACE_WARN_ON_LOCKED(waiter.ti != ti);
+-				TRACE_WARN_ON_LOCKED(current->blocked_on != &waiter);
+-				plist_del(&waiter.pi_list);
+-				waiter.pi_list.prio = task->prio;
+-				waiter.ti = NULL;
+-				current->blocked_on = NULL;
+-				if (time) {
+-					ret = (int)(expire - jiffies);
+-					if (!timer_pending(&timer)) {
+-						del_singleshot_timer_sync(&timer);
+-						ret = -ETIMEDOUT;
+-					}
+-				} else
+-					ret = -EINTR;
++		trace_lock_irqsave(&trace_lock, flags, ti);
++		_raw_spin_lock(&lock->wait_lock);
++		if(waiter.ti) {
++			remove_waiter(lock,&waiter,1);
++		}
++		if(signal_pending(current)) {
++			if (time) {
++				ret = (int)(expire - jiffies);
++				if (!timer_pending(&timer)) {
++					ret = -ETIMEDOUT;
++				}
+ 			}
+-			_raw_spin_unlock(&lock->wait_lock);
+-			_raw_spin_unlock(&task->pi_lock);
+-			trace_unlock_irq(&trace_lock, ti);
+-			break;
++			else
++				ret = -EINTR;
++			
++			goto out_unlock;
+ 		}
+-		if (!waiter.ti)
+-			break;
+-		schedule();
+-		set_task_state(task, TASK_INTERRUPTIBLE);
+-	}
+-
+-	/*
+-	 * Check to see if we didn't have ownership stolen.
+-	 */
+-	if (!ret) {
+-		if (capture_lock(&waiter, ti, task)) {
+-			set_task_state(task, TASK_INTERRUPTIBLE);
+-			goto wait_again;
++		else if(timer_installed &&
++			!timer_pending(&timer)) {
++			ret = -ETIMEDOUT;
++			goto out_unlock;
+ 		}
+ 	}
+ 
+-	task->state = TASK_RUNNING;
+-	current->flags |= nosched_flag;
+ 
++ out_unlock:
++	_raw_spin_unlock(&lock->wait_lock);
++	trace_unlock_irqrestore(&trace_lock, flags, ti);
++
++ out_free_timer:
++	if (time && timer_installed) {
++		if (!timer_pending(&timer)) {
++			del_singleshot_timer_sync(&timer);
++		}
++	}
+ 	FREE_WAITER(&waiter);
+ 	return ret;
+ }
++
+ /*
+  * trylock for writing -- returns 1 if successful, 0 if contention
+  */
+@@ -1972,7 +1742,6 @@ static int __down_trylock(struct rt_mute
+ 
+ 	trace_lock_irqsave(&trace_lock, flags, ti);
+ 	TRACE_BUG_ON_LOCKED(!raw_irqs_disabled());
+-	_raw_spin_lock(&task->pi_lock);
+ 	/*
+ 	 * It is OK for the owner of the lock to do a trylock on
+ 	 * a lock it owns, so to prevent deadlocking, we must
+@@ -1989,17 +1758,11 @@ static int __down_trylock(struct rt_mute
+ 	if (likely(!old_owner) || __grab_lock(lock, task, old_owner->task)) {
+ 		/* granted */
+ 		TRACE_WARN_ON_LOCKED(!plist_head_empty(&lock->wait_list) && !old_owner);
+-		if (old_owner) {
+-			_raw_spin_lock(&old_owner->task->pi_lock);
+-			set_new_owner(lock, old_owner, ti __EIP__);
+-			_raw_spin_unlock(&old_owner->task->pi_lock);
+-		} else
+-			set_new_owner(lock, old_owner, ti __EIP__);
++		set_new_owner(lock, old_owner, ti __EIP__);
+ 		ret = 1;
+ 	}
+ 	_raw_spin_unlock(&lock->wait_lock);
+ failed:
+-	_raw_spin_unlock(&task->pi_lock);
+ 	trace_unlock_irqrestore(&trace_lock, flags, ti);
+ 
+ 	return ret;
+@@ -2050,7 +1813,6 @@ static void __up_mutex_waiter_nosavestat
+ {
+ 	struct thread_info *old_owner_ti, *new_owner_ti;
+ 	struct task_struct *old_owner, *new_owner;
+-	struct rt_mutex_waiter *w;
+ 	int prio;
+ 
+ 	old_owner_ti = lock_owner(lock);
+@@ -2064,25 +1826,11 @@ static void __up_mutex_waiter_nosavestat
+ 	 * waiter's priority):
+ 	 */
+ 	_raw_spin_lock(&old_owner->pi_lock);
+-	prio = old_owner->normal_prio;
+-	if (unlikely(!plist_head_empty(&old_owner->pi_waiters))) {
+-		w = plist_first_entry(&old_owner->pi_waiters, struct rt_mutex_waiter, pi_list);
+-		if (w->ti->task->prio < prio)
+-			prio = w->ti->task->prio;
+-	}
++	prio = calc_pi_prio(old_owner);
++
+ 	if (unlikely(prio != old_owner->prio))
+-		pi_setprio(lock, old_owner, prio);
++		mutex_setprio(old_owner, prio);
+ 	_raw_spin_unlock(&old_owner->pi_lock);
+-#ifdef CAPTURE_LOCK
+-#ifdef CONFIG_PREEMPT_RT
+-	if (lock != &kernel_sem.lock) {
+-#endif
+-		new_owner->rt_flags |= RT_PENDOWNER;
+-		new_owner->pending_owner = lock;
+-#ifdef CONFIG_PREEMPT_RT
+-	}
+-#endif
+-#endif
+ 	wake_up_process(new_owner);
+ }
+ 
+@@ -2090,7 +1838,6 @@ static void __up_mutex_waiter_savestate(
+ {
+ 	struct thread_info *old_owner_ti, *new_owner_ti;
+ 	struct task_struct *old_owner, *new_owner;
+-	struct rt_mutex_waiter *w;
+ 	int prio;
+ 
+ 	old_owner_ti = lock_owner(lock);
+@@ -2104,25 +1851,11 @@ static void __up_mutex_waiter_savestate(
+ 	 * waiter's priority):
+ 	 */
+ 	_raw_spin_lock(&old_owner->pi_lock);
+-	prio = old_owner->normal_prio;
+-	if (unlikely(!plist_head_empty(&old_owner->pi_waiters))) {
+-		w = plist_first_entry(&old_owner->pi_waiters, struct rt_mutex_waiter, pi_list);
+-		if (w->ti->task->prio < prio)
+-			prio = w->ti->task->prio;
+-	}
++	prio = calc_pi_prio(old_owner);
++
+ 	if (unlikely(prio != old_owner->prio))
+-		pi_setprio(lock, old_owner, prio);
++		mutex_setprio(old_owner, prio);
+ 	_raw_spin_unlock(&old_owner->pi_lock);
+-#ifdef CAPTURE_LOCK
+-#ifdef CONFIG_PREEMPT_RT
+-	if (lock != &kernel_sem.lock) {
+-#endif
+-		new_owner->rt_flags |= RT_PENDOWNER;
+-		new_owner->pending_owner = lock;
+-#ifdef CONFIG_PREEMPT_RT
+-	}
+-#endif
+-#endif
+ 	wake_up_process_mutex(new_owner);
+ }
+ 
+@@ -2578,7 +2311,7 @@ int __lockfunc _read_trylock(rwlock_t *r
+ {
+ #ifdef CONFIG_DEBUG_RT_LOCKING_MODE
+ 	if (!preempt_locks)
+-	return _raw_read_trylock(&rwlock->lock.lock.debug_rwlock);
++		return _raw_read_trylock(&rwlock->lock.lock.debug_rwlock);
+ 	else
+ #endif
+ 		return down_read_trylock_mutex(&rwlock->lock);
+@@ -2905,17 +2638,6 @@ notrace int irqs_disabled(void)
+ EXPORT_SYMBOL(irqs_disabled);
+ #endif
+ 
+-/*
+- * This routine changes the owner of a mutex. It's only
+- * caller is the futex code which locks a futex on behalf
+- * of another thread.
+- */
+-void fastcall rt_mutex_set_owner(struct rt_mutex *lock, struct thread_info *t)
+-{
+-	account_mutex_owner_up(current);
+-	account_mutex_owner_down(t->task, lock);
+-	lock->owner = t;
+-}
+ 
+ struct thread_info * fastcall rt_mutex_owner(struct rt_mutex *lock)
+ {
+@@ -2950,7 +2672,6 @@ down_try_futex(struct rt_mutex *lock, st
+ 
+ 	trace_lock_irqsave(&trace_lock, flags, proxy_owner);
+ 	TRACE_BUG_ON_LOCKED(!raw_irqs_disabled());
+-	_raw_spin_lock(&task->pi_lock);
+ 	_raw_spin_lock(&lock->wait_lock);
+ 
+ 	old_owner = lock_owner(lock);
+@@ -2959,16 +2680,10 @@ down_try_futex(struct rt_mutex *lock, st
+ 	if (likely(!old_owner) || __grab_lock(lock, task, old_owner->task)) {
+ 		/* granted */
+ 		TRACE_WARN_ON_LOCKED(!plist_head_empty(&lock->wait_list) && !old_owner);
+-		if (old_owner) {
+-			_raw_spin_lock(&old_owner->task->pi_lock);
+-			set_new_owner(lock, old_owner, proxy_owner __EIP__);
+-			_raw_spin_unlock(&old_owner->task->pi_lock);
+-		} else
+ 			set_new_owner(lock, old_owner, proxy_owner __EIP__);
+ 		ret = 1;
+ 	}
+ 	_raw_spin_unlock(&lock->wait_lock);
+-	_raw_spin_unlock(&task->pi_lock);
+ 	trace_unlock_irqrestore(&trace_lock, flags, proxy_owner);
+ 
+ 	return ret;
+@@ -3064,3 +2779,33 @@ void fastcall init_rt_mutex(struct rt_mu
+ 	__init_rt_mutex(lock, save_state, name, file, line);
+ }
+ EXPORT_SYMBOL(init_rt_mutex);
++
++
++pid_t get_blocked_on(task_t *task)
++{
++	pid_t res = 0;
++	struct rt_mutex *lock;
++	struct thread_info *owner;
++ try_again:
++	_raw_spin_lock(&task->pi_lock);
++	if(!task->blocked_on) {
++		_raw_spin_unlock(&task->pi_lock);
++		goto out;
++	}
++	lock = task->blocked_on->lock;
++	if(!_raw_spin_trylock(&lock->wait_lock)) {
++		_raw_spin_unlock(&task->pi_lock);
++		goto try_again;
++	}       
++	owner = lock_owner(lock);
++	if(owner)
++		res = owner->task->pid;
++
++	_raw_spin_unlock(&task->pi_lock);
++	_raw_spin_unlock(&lock->wait_lock);
++        
++ out:
++	return res;
++                
++}
++EXPORT_SYMBOL(get_blocked_on);

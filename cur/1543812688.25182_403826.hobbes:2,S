@@ -1,0 +1,177 @@
+Date: Mon, 06 Mar 2006 17:06:54 -0500
+From: Andres Salomon <>
+Subject: pdflush and high load
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2006/3/6/132
+
+Hi,
+(2nd attempt at posting this; the first one appears to have
+disappeared?)
+I have a dual processor opteron system w/ a 3ware controller.  When
+testing out i/o by doing a simple 'dd if=/dev/zero of=/mnt/foo bs=1M
+count=1024', the load ends up hitting about 12 before the dd finishes.
+This happens because 8 pdflush processes are spawned, and they all sit
+in D state for most of the time.
+While the load itself isn't a problem, I was tracking down other bugs
+that it was potentially creating, and wondering why the load even needed
+to be that high.  During the i/o, the pdflush processes look like this:
+Mar  5 18:29:28 localhost kernel: pdflush       D C112D5E0     0  5698
+11              5697 (L-TLB)
+Mar  5 18:29:28 localhost kernel: d2e8de84 d2e8de88 c124d200 c112d5e0
+00000004 f7d21550 c1922c00 c1924758
+Mar  5 18:29:28 localhost kernel:        00000286 00000000 00000000
+c180f440 00000001 00000000 9db0b4c0 000f44b6 
+Mar  5 18:29:28 localhost kernel:        f7d21550 f7e2d550 f7e2d678
+c180fe80 d2e8de94 d2e8de94 0029545f d2e8df04
+Mar  5 18:29:28 localhost kernel: Call Trace:
+Mar  5 18:29:28 localhost kernel:  [schedule_timeout+111/142]
+schedule_timeout+0x6f/0x8e
+Mar  5 18:29:28 localhost kernel:  [process_timeout+0/9] process_timeout
+0x0/0x9
+Mar  5 18:29:28 localhost kernel:  [io_schedule_timeout+41/51]
+io_schedule_timeout+0x29/0x33
+Mar  5 18:29:28 localhost kernel:  [blk_congestion_wait+101/122]
+blk_congestion_wait+0x65/0x7a
+Mar  5 18:29:28 localhost kernel:  [autoremove_wake_function+0/58]
+autoremove_wake_function+0x0/0x3a
+Mar  5 18:29:28 localhost kernel:  [sync_sb_inodes+217/628]
+sync_sb_inodes+0xd9/0x274
+Mar  5 18:29:28 localhost kernel:  [autoremove_wake_function+0/58]
+autoremove_wake_function+0x0/0x3a
+Mar  5 18:29:28 localhost kernel:  [pdflush+0/50] pdflush+0x0/0x32
+Mar  5 18:29:28 localhost kernel:  [writeback_inodes+121/204]
+writeback_inodes+0x79/0xcc
+Mar  5 18:29:28 localhost kernel:  [pdflush+0/50] pdflush+0x0/0x32
+Mar  5 18:29:28 localhost kernel:  [background_writeout+133/148]
+background_writeout+0x85/0x94
+Mar  5 18:29:28 localhost kernel:  [__pdflush+231/379] __pdflush
++0xe7/0x17b
+Mar  5 18:29:28 localhost kernel:  [pdflush+45/50] pdflush+0x2d/0x32
+Mar  5 18:29:28 localhost kernel:  [background_writeout+0/148]
+background_writeout+0x0/0x94
+Mar  5 18:29:28 localhost kernel:  [kthread+124/166] kthread+0x7c/0xa6
+Mar  5 18:29:28 localhost kernel:  [kthread+0/166] kthread+0x0/0xa6
+Mar  5 18:29:28 localhost kernel:  [kernel_thread_helper+5/11]
+kernel_thread_helper+0x5/0xb
+Basically, what ends up happening on my system is, each pdflush process
+is handling background_writeout(), encountering congestion, and calling
+blk_congestion_wait(WRITE, HZ/10) after every loop.
+Blk_congestion_wait() does an uninterruptible sleep, and other things
+get scheduled (typically of the 8 pdflush processes, 4 will be just
+waiting at schedule(), 2 will actually be writing out pages in
+generic_writepages(), and 2 will be off doing other random stuff like
+handling softirqs or updating the wall time inside the timer irq
+handler).
+Is there a reason why this sleep needs to happen w/
+TASK_UNINTERRUPTIBLE?  I tried setting it to TASK_INTERRUPTIBLE, and
+encountered a minor performance hit (it took a few extra seconds to
+write the 1GB of data); however, the pdflush processes spent most of
+their time in S state, so the load on the system was much more
+reasonable.
+Aside from the TASK_UNINTERRUPTIBLE sleep, I think the real problem is
+that the pdflush spawning metric has no way to determine whether a
+pdflush process is doing actual useful work or not.  Currently, it
+checks whether there's more work that needs to be done, and keeps
+spawning pdflush threads (up to 8) without checking whether that would
+actually help or not.  Throwing a printk inside the
+background_writeout() loop showed the following work being done:
+Mar  6 02:57:34 localhost kernel: background_writeout(130):
+nr_dirty=102743, nr_unstable=0, bg_thresh=26212, written=0,
+min_pages=-2681, pages_skipped=0, nr_to_write=1024(/1024),
+encountered_congestion=1
+Mar  6 02:57:34 localhost kernel: background_writeout(5717):
+nr_dirty=102740, nr_unstable=0, bg_thresh=26212, written=5,
+min_pages=-2476, pages_skipped=0, nr_to_write=1019(/1024),
+encountered_congestion=1
+Mar  6 02:57:34 localhost kernel: background_writeout(131):
+nr_dirty=102755, nr_unstable=0, bg_thresh=26212, written=11,
+min_pages=-2318, pages_skipped=0, nr_to_write=1013(/1024),
+encountered_congestion=1
+Mar  6 02:57:34 localhost kernel: background_writeout(131):
+nr_dirty=102742, nr_unstable=0, bg_thresh=26212, written=0,
+min_pages=-2329, pages_skipped=0, nr_to_write=1024(/1024),
+encountered_congestion=1
+Mar  6 02:57:34 localhost kernel: background_writeout(5717):
+nr_dirty=102744, nr_unstable=0, bg_thresh=26212, written=3,
+min_pages=-2481, pages_skipped=0, nr_to_write=1021(/1024),
+encountered_congestion=1
+Mar  6 02:57:34 localhost kernel: background_writeout(131):
+nr_dirty=102741, nr_unstable=0, bg_thresh=26212, written=1,
+min_pages=-2329, pages_skipped=0, nr_to_write=1023(/1024),
+encountered_congestion=1
+Mar  6 02:57:34 localhost kernel: background_writeout(130):
+nr_dirty=102742, nr_unstable=0, bg_thresh=26212, written=0,
+min_pages=-2681, pages_skipped=0, nr_to_write=1024(/1024),
+encountered_congestion=1
+Mar  6 02:57:34 localhost kernel: background_writeout(5716):
+nr_dirty=102743, nr_unstable=0, bg_thresh=26212, written=0,
+min_pages=-1962, pages_skipped=0, nr_to_write=1024(/1024),
+encountered_congestion=1
+Mar  6 02:57:34 localhost kernel: background_writeout(131):
+nr_dirty=102744, nr_unstable=0, bg_thresh=26212, written=2,
+min_pages=-2330, pages_skipped=0, nr_to_write=1022(/1024),
+encountered_congestion=1
+Mar  6 02:57:34 localhost kernel: background_writeout(5716):
+nr_dirty=102744, nr_unstable=0, bg_thresh=26212, written=0,
+min_pages=-1962, pages_skipped=0, nr_to_write=1024(/1024),
+encountered_congestion=1
+Mar  6 02:57:34 localhost kernel: background_writeout(130):
+nr_dirty=102744, nr_unstable=0, bg_thresh=26212, written=0,
+min_pages=-2681, pages_skipped=0, nr_to_write=1024(/1024),
+encountered_congestion=1
+As you can see, they constantly encounter congestion, and constantly
+have things to write out, so the background_writeout loop happens
+endlessly; however, only two of the processes are actually able to get
+anything useful done.  Pid #130 and #5716 cannot write anything out due
+to locks, so they just keep trying and trying; pids #131 and #5717 are
+actually doing useful work.  This is typically what it looks like w/ all
+pdflush processes.
+My solution to the problem is to keep the blk_congestion_wait() sleep as
+uninterruptible, but add a check to the background_writeout() loop to
+check whether the current pdflush thread is actually doing anything
+useful; if it's not, just give up.  My threshold for "useful" is having
+written any pages in the past 2 loop iterations.  This means that
+pdflush processes that are actually working should continue working;
+ones that are not will exit sooner; and ones that are temporarily not
+working due to other activity on the system should exit (and new pdflush
+threads should be spawned later on that will attempt to do work again).
+I've attached the patch I'm using; my completely unscientific tests
+shows it improving i/o speed on the 1GB file write.  Feedback on it
+would be excellent.
+Signed-off-by: Andres Salomon <dilinger@debian.org>
+diff --git a/mm/page-writeback.c b/mm/page-writeback.c
+index 945559f..99c2561 100644
+--- a/mm/page-writeback.c
++++ b/mm/page-writeback.c
+@@ -319,6 +319,7 @@ void throttle_vm_writeout(void)
+ static void background_writeout(unsigned long _min_pages)
+ {
+ 	long min_pages = _min_pages;
++	long last_wrote = -1;
+ 	struct writeback_control wbc = {
+ 		.bdi		= NULL,
+ 		.sync_mode	= WB_SYNC_NONE,
+@@ -331,6 +332,7 @@ static void background_writeout(unsigned
+ 		struct writeback_state wbs;
+ 		long background_thresh;
+ 		long dirty_thresh;
++		long wrote;
+ 
+ 		get_dirty_limits(&wbs, &background_thresh, &dirty_thresh, NULL);
+ 		if (wbs.nr_dirty + wbs.nr_unstable < background_thresh
+@@ -340,7 +342,11 @@ static void background_writeout(unsigned
+ 		wbc.nr_to_write = MAX_WRITEBACK_PAGES;
+ 		wbc.pages_skipped = 0;
+ 		writeback_inodes(&wbc);
+-		min_pages -= MAX_WRITEBACK_PAGES - wbc.nr_to_write;
++		wrote = MAX_WRITEBACK_PAGES - wbc.nr_to_write;
++		if (!last_wrote && !wrote)
++			break;
++		last_wrote = wrote;
++		min_pages -= wrote;
+ 		if (wbc.nr_to_write > 0 || wbc.pages_skipped > 0) {
+ 			/* Wrote less than expected */
+ 			blk_congestion_wait(WRITE, HZ/10);[unhandled content-type:application/pgp-signature]

@@ -1,0 +1,122 @@
+Date: Fri, 2 Feb 2007 12:58:09 -0800 (PST)
+From: Davide Libenzi <>
+Subject: Re: [PATCH 2 of 4] Introduce i386 fibril scheduling
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2007/2/2/206
+
+On Fri, 2 Feb 2007, Linus Torvalds wrote:
+> > You get some other funny things from co-routines which are very powerful,
+> > very dangerous, or plain insane
+> 
+> You forgot "very hard to think about". 
+> 
+> We DO NOT want coroutines in general. It's clever, but it's
+>  (a) impossible to do without language support that C doesn't have, or 
+>      some really really horrid macro constructs that really only work for 
+>      very specific and simple cases.
+>  (b) very non-intuitive unless you've worked with coroutines a lot (and 
+>      almost nobody has)
+Actually, coroutines are not too bad to program once you have a 
+total-coverage async scheduler to run them. The attached (very sketchy) 
+example uses libpcl ( 
+http://www.xmailserver.org/libpcl.html
+ ) and epoll 
+as scheduler (but here you can really use anything). You can implement 
+coroutines in many way, from C preprocessor macros up to anything, but in 
+the libpcl case they are simply switched stacks. Like fibrils are supposed 
+to be. The problem is that in order to make a real-life example of 
+coroutine-based application work, you need everything that can put you at 
+sleep (syscalls or any external library call you have no control on) 
+implemented in an async way. And what I ended up doing is exactly what Zab 
+did inside the kernel. In my case a dynamic pool of (userspace) threads 
+servicing any non-native potentially pre-emptive call, and signaling the 
+result to a pollable fd (pipe in my case) that is integrated in the epoll 
+(poll/select whatever) scheduler.
+I personally find Zab idea a really good one, since it allows for generic 
+kernel async implementation, w/out the burden of dirtying kernel code 
+paths with AIO knowledge. Being it fibrils or real kthreads, it is IMO 
+definitely worth a very close look.
+- Davide
+struct eph_conn {
+	int sfd;
+	unsigned int events, revents;
+	coroutine_t co;
+};
+int eph_new_conn(int sfd, void *func) {
+	struct eph_conn *conn;
+	struct epoll_event ev;
+	conn = (struct eph_conn *) malloc(sizeof(struct eph_conn));
+	conn->sfd = sfd;
+	conn->co = co_create(func, conn, NULL, STACKSIZE);
+	ev.events = 0;
+	ev.data.ptr = conn;
+	epoll_ctl(kdpfd, EPOLL_CTL_ADD, sfd, &ev);
+	co_call(conn->co);
+	return 0;
+}
+void eph_exit_conn(struct eph_conn *conn) {
+	struct epoll_event ev;
+	epoll_ctl(kdpfd, EPOLL_CTL_DEL, conn->sfd, &ev);
+	co_exit();
+}
+int eph_connect(struct eph_conn *conn, const struct sockaddr *serv_addr, socklen_t addrlen) {
+	if (connect(conn->sfd, serv_addr, addrlen) == -1) {
+		if (errno != EWOULDBLOCK && errno != EINPROGRESS)
+			return -1;
+		co_resume();
+		if (conn->revents & (EPOLLERR | EPOLLHUP))
+			return -1;
+	}
+	return 0;
+}
+int eph_read(struct eph_conn *conn, void *buf, int nbyte) {
+	int n;
+	while ((n = read(conn->sfd, buf, nbyte)) < 0) {
+		if (errno == EINTR)
+			continue;
+		if (errno != EAGAIN && errno != EWOULDBLOCK)
+			return -1;
+		co_resume();
+	}
+	return n;
+}
+int eph_write(struct eph_conn *conn, void const *buf, int nbyte) {
+	int n;
+	while ((n = write(conn->sfd, buf, nbyte)) < 0) {
+		if (errno == EINTR)
+			continue;
+		if (errno != EAGAIN && errno != EWOULDBLOCK)
+			return -1;
+		co_resume();
+	}
+	return n;
+}
+int eph_accept(struct eph_conn *conn, struct sockaddr *addr, int *addrlen) {
+	int sfd;
+	while ((sfd = accept(conn->sfd, addr, (socklen_t *) addrlen)) < 0) {
+		if (errno == EINTR)
+			continue;
+		if (errno != EAGAIN && errno != EWOULDBLOCK)
+			return -1;
+		co_resume();
+	}
+	return sfd;
+}
+int eph_scheduler(int loop, long timeout) {
+	int i, nfds;
+	struct eph_conn *conn;
+	struct epoll_event *cevents;
+	do {
+		nfds = epoll_wait(kdpfd, events, maxfds, timeout);
+		for (i = 0, cevents = events; i < nfds; i++, cevents++) {
+			conn = cevents->data.ptr;
+			conn->revents = cevents->events;
+			if (conn->revents & conn->events)
+				co_call(conn->co);
+		}
+	} while (loop);
+	return 0;
+}

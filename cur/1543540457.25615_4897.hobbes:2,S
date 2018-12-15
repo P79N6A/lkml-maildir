@@ -1,0 +1,404 @@
+Date: Tue, 1 Aug 2000 13:38:16 +0100 (BST)
+From: Mark Hemment <>
+Subject: Re: [PATCH] Decrease hash table memory overhead
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/8/1/47
+
+Andi,
+> Smaller cache footprint is always a win. E.g. when your user program and
+> the kernel manage to run both in L2 for a working set you save a lot of time.
+> The key to that is small overall memory/cache footprint of the kernel 
+> (2.0 was much better in that than 2.4) 
+  I've attached a patch (against 2.4.0-test5) for the page cache, which
+demonstrates a technique to reduce the length of re-searching of a chain
+after its guarding lock has been temporarily dropped (say, for a blocking
+operation), and the re-search is expected to fail.
+  While the patch is only for the page cache, something similar could be
+done for the inode, dcache, and buffer cache.
+Description:
+  A common operation is to search a chain, looking for a certain matching
+object.  If the object isn't found, the chain's guard is dropped, a new
+object allocated, then the chain is re-lock and re-searched for the object
+before inserting the newly allocated one (to catch races in inserting the
+same object).  Nothing special here.
+  For most chains, objects are _always_ inserted at the chain's
+head.  This means, after the initial search, a new object can only appear
+between the chain's head and what was the first object in the chain.  As
+the chain maybe empty, or the first object may disappear, the continued 
+existence of the first object cannot be relied upon after the guard is
+dropped.
+  By inserting a marker (cookie) as the first object (after the original
+search and while the guarding lock is still held) gives a well known 
+point at which to terminate a subsequent search (assuming it doesn't match
+before reaching the marker).
+  By taking the memory for the cookie off the kernel stack, it doesn't
+require an allocation.  The cookie only needs to contain the linkage
+pointers and the members checked during a search, so it doesn't need to be
+the full size of the objects held in the chain; setting the members in
+the cookie so that it cannot match any valid searches.  Of course, avoid
+taking a large amount of memory from the k-stack.
+  As the cookie comes from k-stack, its virtual address uniquely  
+identifies it from other cookies which may be in use on the same chain
+(assuming no clever mapping tricks are being used on the k-stack - eg. for
+each CPU, the stack of the running task is always mapped to the same virt
+address, with other (non-running) tasks having their stacks unmapped).
+  Of course, a cookie could be allocated from kmalloc() (and friends) when
+the code assumes it will need it in the near furture.
+  For the page-cache, I'm using a cookie when re-searching a chain and do
+not expect to find the page.  That is, after a failed search, I insert a
+page-cookie into the chain's head.  After allocating a new page, I can
+limit the re-search upto the cookie - no rocket science here.
+  Obviously, there is no point in limiting a search which is expected to
+succeed, so I haven't used a cookie for every re-search of the page-cache.
+  I haven't benchmarked the patch; perhaps the overhead in adding/removing
+the cookie is more than is saved - needs a proper investigation.
+  In the page-cache, I'm using a full page structure as a cookie.  This
+could be cutdown, but would then require keeping the full page struct and
+the cookie page struct in sync.
+  As well as limiting re-searches, cookies can be used as markers during
+walks - basically, restart points in a chain after dropping, and then
+retaking, the chain's guard.
+  I can't believe no one has thought of doing this before (I've seen it in
+other OSes I've worked on).  Is the cost of the cookies too high to make
+it worthwhile?  Or are they simply too ugly?
+Mark
+diff -ur -X ignore --new-file linux-2.4.0-test5/include/linux/pagemap.h markhe-2.4.0-test5/include/linux/pagemap.h
+--- linux-2.4.0-test5/include/linux/pagemap.h	Mon Jul 31 11:58:40 2000
++++ markhe-2.4.0-test5/include/linux/pagemap.h	Tue Aug  1 12:24:07 2000
+@@ -73,10 +73,11 @@
+ #define find_get_page(mapping, index) \
+ 		__find_get_page(mapping, index, page_hash(mapping, index))
+ extern struct page * __find_lock_page (struct address_space * mapping,
+-				unsigned long index, struct page **hash);
++				unsigned long index, struct page **hash,
++				struct page *cookie);
+ extern void lock_page(struct page *page);
+ #define find_lock_page(mapping, index) \
+-		__find_lock_page(mapping, index, page_hash(mapping, index))
++		__find_lock_page(mapping, index, page_hash(mapping, index), NULL)
+ 
+ extern void __add_page_to_hash_queue(struct page * page, struct page **p);
+ 
+diff -ur -X ignore --new-file linux-2.4.0-test5/mm/filemap.c markhe-2.4.0-test5/mm/filemap.c
+--- linux-2.4.0-test5/mm/filemap.c	Thu Jul 20 17:55:04 2000
++++ markhe-2.4.0-test5/mm/filemap.c	Tue Aug  1 13:17:48 2000
+@@ -393,6 +393,27 @@
+ 	return page;
+ }
+ 
++static inline struct page *
++__find_page_nolock_cookie(struct address_space *mapping, unsigned long offset,
++			  struct page *page, struct page *cookie)
++{
++	goto inside;
++
++	for (;;) {
++		page = page->next_hash;
++inside:
++		if (page == cookie)
++			goto not_found;
++		if (page->mapping != mapping)
++			continue;
++		if (page->index == offset)
++			break;
++	}
++	SetPageReferenced(page);
++not_found:
++	return page;
++}
++
+ /*
+  * By the time this is called, the page is locked and
+  * we don't have to worry about any races any more.
+@@ -507,7 +528,9 @@
+ 	struct address_space *mapping, unsigned long offset,
+ 	struct page **hash)
+ {
++#if	0
+ 	struct page *alias;
++#endif
+ 	unsigned long flags;
+ 
+ 	if (PageLocked(page))
+@@ -520,9 +543,30 @@
+ 	add_page_to_inode_queue(mapping, page);
+ 	__add_page_to_hash_queue(page, hash);
+ 	lru_cache_add(page);
++#if	0
+ 	alias = __find_page_nolock(mapping, offset, *hash);
+ 	if (alias != page)
+ 		BUG();
++#endif
++}
++
++static inline void __add_cookie_to_page_cache(struct page *cookie,
++	struct page **hash)
++{
++	cookie->index = (unsigned long)(-1);
++	cookie->mapping = NULL;
++
++	if ((cookie->next_hash = *hash) != NULL)
++		(*hash)->pprev_hash = &cookie->next_hash;
++	*hash = cookie;
++	cookie->pprev_hash = hash;
++}
++
++static inline void __remove_cookie_from_page_cache(struct page *cookie)
++{
++	if(cookie->next_hash)
++		cookie->next_hash->pprev_hash = cookie->pprev_hash;
++	*cookie->pprev_hash = cookie->next_hash;
+ }
+ 
+ void add_to_page_cache(struct page * page, struct address_space * mapping, unsigned long offset)
+@@ -534,20 +578,23 @@
+ 
+ static int add_to_page_cache_unique(struct page * page,
+ 	struct address_space *mapping, unsigned long offset,
+-	struct page **hash)
++	struct page **hash, struct page *cookie)
+ {
+ 	int err;
+ 	struct page *alias;
+ 
+ 	spin_lock(&pagecache_lock);
+-	alias = __find_page_nolock(mapping, offset, *hash);
++	alias = __find_page_nolock_cookie(mapping, offset, *hash, cookie);
+ 
+ 	err = 1;
+-	if (!alias) {
++	if (alias == cookie) {
+ 		__add_to_page_cache(page,mapping,offset,hash);
+ 		err = 0;
+ 	}
+ 
++	/* always remove cookie */
++	__remove_cookie_from_page_cache(cookie);
++
+ 	spin_unlock(&pagecache_lock);
+ 	return err;
+ }
+@@ -562,18 +609,23 @@
+ 	struct address_space *mapping = inode->i_mapping;
+ 	struct page **hash = page_hash(mapping, offset);
+ 	struct page *page; 
++	struct page	cookie;
+ 
+ 	spin_lock(&pagecache_lock);
+ 	page = __find_page_nolock(mapping, offset, *hash); 
+-	spin_unlock(&pagecache_lock);
+-	if (page)
++	if (page) {
++		spin_unlock(&pagecache_lock);
+ 		return 0;
++	}
++	__add_cookie_to_page_cache(&cookie, hash);
++	spin_unlock(&pagecache_lock);
+ 
+ 	page = page_cache_alloc();
+ 	if (!page)
+-		return -ENOMEM;
++		goto oom;
+ 
+-	if (!add_to_page_cache_unique(page, mapping, offset, hash)) {
++	/* add_to_page_cache_unique() always removes cookie */
++	if (!add_to_page_cache_unique(page, mapping, offset, hash, &cookie)) {
+ 		int error = mapping->a_ops->readpage(file, page);
+ 		page_cache_release(page);
+ 		return error;
+@@ -584,6 +636,13 @@
+ 	 */
+ 	page_cache_free(page);
+ 	return 0;
++
++oom:
++	spin_lock(&pagecache_lock);
++	__remove_cookie_from_page_cache(&cookie);
++	spin_unlock(&pagecache_lock);
++
++	return -ENOMEM;
+ }
+ 
+ /*
+@@ -692,10 +751,71 @@
+ }
+ 
+ /*
++ * a rather lightweight function, finding and getting a reference to a
++ * hashed page atomically, waiting for it if it's locked.
++ * If the page isn't found, the given cookie is linked at the head of
++ * the list.
++ */
++struct page * __find_get_page_cookie(struct address_space *mapping,
++				unsigned long offset, struct page **hash,
++				struct page *cookie)
++{
++	struct page *page;
++
++	/*
++	 * We scan the hash list read-only. Addition to and removal from
++	 * the hash-list needs a held write-lock.
++	 */
++repeat:
++	spin_lock(&pagecache_lock);
++	page = __find_page_nolock(mapping, offset, *hash);
++
++	if (page == NULL) {
++		__add_cookie_to_page_cache(cookie, hash);
++		spin_unlock(&pagecache_lock);
++		return NULL;
++	}
++
++	page_cache_get(page);
++	spin_unlock(&pagecache_lock);
++
++	/* Found the page, sleep if locked. */
++	if (PageLocked(page)) {
++		struct task_struct *tsk = current;
++		DECLARE_WAITQUEUE(wait, tsk);
++
++		sync_page(page);
++
++		__set_task_state(tsk, TASK_UNINTERRUPTIBLE);
++		add_wait_queue(&page->wait, &wait);
++
++		if (PageLocked(page))
++			schedule();
++		__set_task_state(tsk, TASK_RUNNING);
++		remove_wait_queue(&page->wait, &wait);
++
++		/*
++		 * The page might have been unhashed meanwhile. It's
++		 * not freed though because we hold a reference to it.
++		 * If this is the case then it will be freed _here_,
++		 * and we recheck the hash anyway.
++		 */
++		page_cache_release(page);
++		goto repeat;
++	}
++	/*
++	 * It's not locked so we can return the page and we hold
++	 * a reference to it.
++	 */
++	return page;
++}
++
++/*
+  * Get the lock to a page atomically.
+  */
+ struct page * __find_lock_page (struct address_space *mapping,
+-				unsigned long offset, struct page **hash)
++				unsigned long offset, struct page **hash,
++				struct page *cookie)
+ {
+ 	struct page *page;
+ 
+@@ -706,12 +826,17 @@
+ repeat:
+ 	spin_lock(&pagecache_lock);
+ 	page = __find_page_nolock(mapping, offset, *hash);
+-	if (page)
+-		page_cache_get(page);
++	if (page == NULL) {
++		if (cookie)
++			__add_cookie_to_page_cache(cookie, hash);
++		spin_unlock(&pagecache_lock);
++		return NULL;
++	}
++	page_cache_get(page);
+ 	spin_unlock(&pagecache_lock);
+ 
+ 	/* Found the page, sleep if locked. */
+-	if (page && TryLockPage(page)) {
++	if (TryLockPage(page)) {
+ 		struct task_struct *tsk = current;
+ 		DECLARE_WAITQUEUE(wait, tsk);
+ 
+@@ -1136,21 +1261,33 @@
+ 		 * We get here with the page cache lock held.
+ 		 */
+ 		if (!cached_page) {
++			struct page	cookie;
++
++			__add_cookie_to_page_cache(&cookie, hash);
+ 			spin_unlock(&pagecache_lock);
++
+ 			cached_page = page_cache_alloc();
+-			if (!cached_page) {
+-				desc->error = -ENOMEM;
+-				break;
+-			}
+ 
+ 			/*
+ 			 * Somebody may have added the page while we
+ 			 * dropped the page cache lock. Check for that.
+ 			 */
+ 			spin_lock(&pagecache_lock);
+-			page = __find_page_nolock(mapping, index, *hash);
+-			if (page)
++			page = __find_page_nolock_cookie(mapping, index, *hash,
++						      &cookie);
++			__remove_cookie_from_page_cache(&cookie);
++			if (page != &cookie)
+ 				goto found_page;
++
++			/*
++			 * Handle allocation failure after the re-checking of
++			 * the page cache.
++			 */
++			if (!cached_page) {
++				spin_unlock(&pagecache_lock);
++				desc->error = -ENOMEM;
++				break;
++			}
+ 		}
+ 
+ 		/*
+@@ -2312,9 +2449,11 @@
+ {
+ 	struct page **hash = page_hash(mapping, index);
+ 	struct page *page, *cached_page = NULL;
++	struct page cookie;
+ 	int err;
+ repeat:
+-	page = __find_get_page(mapping, index, hash);
++	/* adds "cookie" if page isn't found */
++	page = __find_get_page_cookie(mapping, index, hash, &cookie);
+ 	if (!page) {
+ 		if (!cached_page) {
+ 			cached_page = page_cache_alloc();
+@@ -2322,7 +2461,9 @@
+ 				return ERR_PTR(-ENOMEM);
+ 		}
+ 		page = cached_page;
+-		if (add_to_page_cache_unique(page, mapping, index, hash))
++		/* always removes "cookie" from chain */
++		if (add_to_page_cache_unique(page, mapping, index, hash,
++					     &cookie))
+ 			goto repeat;
+ 		cached_page = NULL;
+ 		err = filler(data, page);
+@@ -2369,8 +2510,9 @@
+ 				unsigned long index, struct page **cached_page)
+ {
+ 	struct page *page, **hash = page_hash(mapping, index);
++	struct page	cookie;
+ repeat:
+-	page = __find_lock_page(mapping, index, hash);
++	page = __find_lock_page(mapping, index, hash, &cookie);
+ 	if (!page) {
+ 		if (!*cached_page) {
+ 			*cached_page = page_cache_alloc();
+@@ -2378,7 +2520,8 @@
+ 				return NULL;
+ 		}
+ 		page = *cached_page;
+-		if (add_to_page_cache_unique(page, mapping, index, hash))
++		if (add_to_page_cache_unique(page, mapping, index, hash,
++		    &cookie))
+ 			goto repeat;
+ 		*cached_page = NULL;
+ 	}

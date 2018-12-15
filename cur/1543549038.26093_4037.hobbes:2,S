@@ -1,0 +1,347 @@
+Date: Tue, 19 Sep 2000 00:20:18 +1100
+From: Andrew Morton <>
+Subject: Re: [patch] Card services & yenta driver
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/9/18/4
+
+Linus Torvalds wrote:
+> 
+> ...
+> 
+> I don't like Andrew's patch: I see why he does what he does, but it feels
+> like papering over the real problem which is that the interfaces are just
+> too opaque for the cs.c code to easily tell the controller what to do, and
+> vice versa. They both have state, and neither of them can look at the
+> others state, even though they are really talking about the same thing.
+So the design objective is to keep the device driver as a thin,
+stateless layer which simply converts generic messages and
+indications into device-specific ones.
+Shouldn't the per-socket threads then operate at the Card
+Services layer, rather than at the driver layer?  Sigh.  I'm
+not sure we really need the threads at all.
+> I don't like this "pass hints around" approach. Why not say outright what
+> you want done, instead of having magic flags that in combination with
+> other magic flags imply what is going on?
+OK, well I suggest that it is still logical for the Card Services layer
+to send a message to the driver saying "the debounce period has
+ended. Please flush any buffered insertion events".  (Perhaps
+it would be more logical to buffer the events at the CS layer...)
+The previous implementation was a bit putrid, so this patch adds a
+new method to pccard_operations and to pci_socket_ops called
+"command".  It's a generic "do something" interface which can
+be expanded.  I'm not sure if this is what you're after, but...
+It also converts all the delay units to microseconds.
+Linus, if you choose to not apply this (and who would blame
+you after all this futzin'), please do apply the one in the
+next email.
+--- linux-2.4.0-test9-pre2/include/pcmcia/ss.h	Mon Sep 18 20:31:50 2000
++++ linux-akpm/include/pcmcia/ss.h	Mon Sep 18 22:54:17 2000
+@@ -65,6 +65,9 @@
+ #define SS_CAP_PCCARD		0x4000
+ #define SS_CAP_CARDBUS		0x8000
+ 
++/* Commands to pci_socket_ops.command() */
++#define SC_DEBOUNCE_END	1
++
+ /* for GetSocket, SetSocket */
+ typedef struct socket_state_t {
+     u_int	flags;
+@@ -82,7 +85,6 @@
+ #define SS_DMA_MODE	0x0080
+ #define SS_SPKR_ENA	0x0100
+ #define SS_OUTPUT_ENA	0x0200
+-#define SS_DEBOUNCED	0x0400	/* Tell driver that the debounce delay has ended */
+ 
+ /* Flags for I/O port and memory windows */
+ #define MAP_ACTIVE	0x01
+@@ -134,6 +136,7 @@
+ 	int (*get_mem_map)(unsigned int sock, struct pccard_mem_map *mem);
+ 	int (*set_mem_map)(unsigned int sock, struct pccard_mem_map *mem);
+ 	void (*proc_setup)(unsigned int sock, struct proc_dir_entry *base);
++	int (*command)(unsigned int sock, int cmd, void *arg);
+ };
+ 
+ /*
+--- linux-2.4.0-test9-pre2/drivers/pcmcia/pci_socket.h	Tue Jul 11 22:21:15 2000
++++ linux-akpm/drivers/pcmcia/pci_socket.h	Mon Sep 18 22:59:13 2000
+@@ -40,6 +40,7 @@
+ 	int (*get_mem_map)(struct pci_socket *, struct pccard_mem_map *);
+ 	int (*set_mem_map)(struct pci_socket *, struct pccard_mem_map *);
+ 	void (*proc_setup)(struct pci_socket *, struct proc_dir_entry *base);
++	int (*command)(struct pci_socket *, int cmd, void *arg);
+ };
+ 
+ extern struct pci_socket_ops yenta_operations;
+--- linux-2.4.0-test9-pre2/drivers/pcmcia/ti113x.h	Sat Aug  5 13:37:01 2000
++++ linux-akpm/drivers/pcmcia/ti113x.h	Mon Sep 18 23:56:35 2000
+@@ -189,7 +189,8 @@
+ 	yenta_set_io_map,
+ 	yenta_get_mem_map,
+ 	yenta_set_mem_map,
+-	yenta_proc_setup
++	yenta_proc_setup,
++	yenta_command,
+ };
+ 
+ #define ti_sysctl(socket)	((socket)->private[0])
+@@ -232,7 +233,8 @@
+ 	yenta_set_io_map,
+ 	yenta_get_mem_map,
+ 	yenta_set_mem_map,
+-	yenta_proc_setup
++	yenta_proc_setup,
++	yenta_command,
+ };
+ 
+ #define ti_diag(socket)		((socket)->private[0])
+@@ -269,7 +271,8 @@
+ 	yenta_set_io_map,
+ 	yenta_get_mem_map,
+ 	yenta_set_mem_map,
+-	yenta_proc_setup
++	yenta_proc_setup,
++	yenta_command,
+ };
+ 
+ #endif /* CONFIG_CARDBUS */
+--- linux-2.4.0-test9-pre2/drivers/pcmcia/ricoh.h	Wed Jan 26 06:41:20 2000
++++ linux-akpm/drivers/pcmcia/ricoh.h	Mon Sep 18 23:56:35 2000
+@@ -157,7 +157,8 @@
+ 	yenta_set_io_map,
+ 	yenta_get_mem_map,
+ 	yenta_set_mem_map,
+-	yenta_proc_setup
++	yenta_proc_setup,
++	yenta_command,
+ };
+ 
+ #endif /* CONFIG_CARDBUS */
+--- linux-2.4.0-test9-pre2/drivers/pcmcia/cardbus.c	Mon Sep 18 20:31:49 2000
++++ linux-akpm/drivers/pcmcia/cardbus.c	Mon Sep 18 23:03:47 2000
+@@ -68,10 +68,9 @@
+ #include "cs_internal.h"
+ #include "rsrc_mgr.h"
+ 
+-#ifndef PCMCIA_DEBUG
+-#define PCMCIA_DEBUG 1
+-#endif
++#ifdef PCMCIA_DEBUG
+ static int pc_debug = PCMCIA_DEBUG;
++#endif
+ 
+ /*====================================================================*/
+ 
+@@ -372,9 +371,9 @@
+ void cb_enable(socket_info_t * s)
+ {
+ 	struct pci_dev *dev;
+-	u_char i, bus = s->cap.cb_dev->subordinate->number;
++	u_char i;
+ 
+-	DEBUG(0, "cs: cb_enable(bus %d)\n", bus);
++	DEBUG(0, "cs: cb_enable(bus %d)\n", s->cap.cb_dev->subordinate->number);
+ 
+ 	/* Configure bridge */
+ 	cb_release_cis_mem(s);
+--- linux-2.4.0-test9-pre2/drivers/pcmcia/cs.c	Mon Sep 18 20:31:49 2000
++++ linux-akpm/drivers/pcmcia/cs.c	Mon Sep 18 23:58:12 2000
+@@ -103,13 +103,13 @@
+ 
+ #define INT_MODULE_PARM(n, v) static int n = v; MODULE_PARM(n, "i")
+ 
+-INT_MODULE_PARM(setup_delay,	10);		/* centiseconds */
+-INT_MODULE_PARM(resume_delay,	20);		/* centiseconds */
+-INT_MODULE_PARM(shutdown_delay,	3);		/* centiseconds */
+-INT_MODULE_PARM(vcc_settle,	40);		/* centiseconds */
++INT_MODULE_PARM(setup_delay,	100000);	/* usecs */
++INT_MODULE_PARM(resume_delay,	200000);	/* usecs */
++INT_MODULE_PARM(shutdown_delay,	30000);		/* usecs */
++INT_MODULE_PARM(vcc_settle,	400000);	/* usecs */
+ INT_MODULE_PARM(reset_time,	10);		/* usecs */
+-INT_MODULE_PARM(unreset_delay,	10);		/* centiseconds */
+-INT_MODULE_PARM(unreset_check,	10);		/* centiseconds */
++INT_MODULE_PARM(unreset_delay,	100000);	/* usecs */
++INT_MODULE_PARM(unreset_check,	100000);	/* usecs */
+ INT_MODULE_PARM(unreset_limit,	30);		/* unreset_check's */
+ 
+ /* Access speed for attribute memory windows */
+@@ -279,6 +279,13 @@
+ 	return s->ss_entry->init(s->sock);
+ }
+ 
++static int socket_command(socket_info_t *s, int cmd, void *arg)
++{
++	if (s->ss_entry->command)
++		return s->ss_entry->command(s->sock, cmd, arg);
++	return -EINVAL;
++}
++
+ /*====================================================================*/
+ 
+ #if defined(CONFIG_PROC_FS) && defined(PCMCIA_DEBUG)
+@@ -447,12 +454,12 @@
+ static int send_event(socket_info_t *s, event_t event, int priority);
+ 
+ /*
+- * Sleep for n_cs centiseconds (1 cs = 1/100th of a second)
++ * Sleep for n_us microseconds
+  */
+-static void cs_sleep(unsigned int n_cs)
++static void us_sleep(unsigned int n_us)
+ {
+ 	current->state = TASK_INTERRUPTIBLE;
+-	schedule_timeout( (n_cs * HZ + 99) / 100);
++	schedule_timeout( (n_us * HZ + 999999) / 1000000);
+ }
+ 
+ static void shutdown_socket(socket_info_t *s)
+@@ -507,7 +514,7 @@
+ 		if (!(val & SS_PENDING))
+ 			break;
+ 		if (--setup_timeout) {
+-			cs_sleep(10);
++			us_sleep(100000);
+ 			continue;
+ 		}
+ 		printk(KERN_NOTICE "cs: socket %p voltage interrogation"
+@@ -519,7 +526,6 @@
+ 	if (val & SS_DETECT) {
+ 		DEBUG(1, "cs: setup_socket(%p): applying power\n", s);
+ 		s->state |= SOCKET_PRESENT;
+-		s->socket.flags &= SS_DEBOUNCED;
+ 		if (val & SS_3VCARD)
+ 		    s->socket.Vcc = s->socket.Vpp = 33;
+ 		else if (!(val & SS_XVCARD))
+@@ -536,7 +542,7 @@
+ #endif
+ 		}
+ 		set_socket(s, &s->socket);
+-		cs_sleep(vcc_settle);
++		us_sleep(vcc_settle);
+ 		reset_socket(s);
+ 		ret = 1;
+ 	} else {
+@@ -564,7 +570,7 @@
+     udelay((long)reset_time);
+     s->socket.flags &= ~SS_RESET;
+     set_socket(s, &s->socket);
+-    cs_sleep(unreset_delay/10);
++    us_sleep(unreset_delay);
+     unreset_socket(s);
+ } /* reset_socket */
+ 
+@@ -583,7 +589,7 @@
+ 			break;
+ 		DEBUG(2, "cs: socket %d not ready yet\n", s->sock);
+ 		if (--setup_timeout) {
+-			cs_sleep(unreset_check);
++			us_sleep(unreset_check);
+ 			continue;
+ 		}
+ 		printk(KERN_NOTICE "cs: socket %p timed out during"
+@@ -659,7 +665,7 @@
+ 	DEBUG(0, "cs: flushing pending setup\n");
+ 	s->state &= ~EVENT_MASK;
+     }
+-    cs_sleep(shutdown_delay);
++    us_sleep(shutdown_delay);
+     s->state &= ~SOCKET_PRESENT;
+     shutdown_socket(s);
+ }
+@@ -682,13 +688,12 @@
+ 	    }
+ 	    s->state |= SOCKET_SETUP_PENDING;
+ 	    if (s->state & SOCKET_SUSPEND)
+-		cs_sleep(resume_delay);
++		us_sleep(resume_delay);
+ 	    else
+-		cs_sleep(setup_delay);
+-	    s->socket.flags |= SS_DEBOUNCED;
++		us_sleep(setup_delay);
++	    socket_command(s, SC_DEBOUNCE_END, (void *)0);
+ 	    if (setup_socket(s) == 0)
+ 		s->state &= ~SOCKET_SETUP_PENDING;
+-	    s->socket.flags &= ~SS_DEBOUNCED;
+ 	}
+     }
+     if (events & SS_BATDEAD)
+--- linux-2.4.0-test9-pre2/drivers/pcmcia/pci_socket.c	Sun Jul 30 02:28:13 2000
++++ linux-akpm/drivers/pcmcia/pci_socket.c	Mon Sep 18 22:58:35 2000
+@@ -154,6 +154,15 @@
+ 		socket->op->proc_setup(socket, base);
+ }
+ 
++static int pci_socket_command(unsigned int sock, int cmd, void *arg)
++{
++	pci_socket_t *socket = pci_socket_array + sock;
++
++	if (socket->op && socket->op->command)
++		return socket->op->command(socket, cmd, arg);
++	return -EINVAL;
++}
++
+ static struct pccard_operations pci_socket_operations = {
+ 	pci_init_socket,
+ 	pci_suspend_socket,
+@@ -166,7 +175,8 @@
+ 	pci_set_io_map,
+ 	pci_get_mem_map,
+ 	pci_set_mem_map,
+-	pci_proc_setup
++	pci_proc_setup,
++	pci_socket_command,
+ };
+ 
+ static int __devinit add_pci_socket(int nr, struct pci_dev *dev, struct pci_socket_ops *ops)
+--- linux-2.4.0-test9-pre2/drivers/pcmcia/yenta.c	Mon Sep 18 20:31:49 2000
++++ linux-akpm/drivers/pcmcia/yenta.c	Mon Sep 18 22:57:16 2000
+@@ -233,11 +233,6 @@
+ {
+ 	u16 bridge;
+ 
+-	if (state->flags & SS_DEBOUNCED) {
+-		/* The insertion debounce period has ended.  Clear any pending insertion events */
+-		socket->events &= ~SS_DETECT;
+-		state->flags &= ~SS_DEBOUNCED;		/* SS_DEBOUNCED is oneshot */
+-	}
+ 	yenta_set_power(socket, state);
+ 	socket->io_irq = state->io_irq;
+ 	bridge = config_readw(socket, CB_BRIDGE_CONTROL) & ~(CB_BRIDGE_CRST | CB_BRIDGE_INTR);
+@@ -438,6 +433,20 @@
+ 	/* Not done yet */
+ }
+ 
++static int yenta_command(pci_socket_t *socket, int cmd, void *arg)
++{
++	int ret = 0;
++	switch (cmd) {
++	case SC_DEBOUNCE_END:
++		/* The insertion debounce period has ended.  Clear any pending insertion events */
++		socket->events &= ~SS_DETECT;
++		break;
++	default:
++		BUG();
++	}
++	return ret;
++}
++
+ static unsigned int yenta_events(pci_socket_t *socket)
+ {
+ 	u8 csc;
+@@ -853,6 +862,7 @@
+ 	yenta_set_io_map,
+ 	yenta_get_mem_map,
+ 	yenta_set_mem_map,
+-	yenta_proc_setup
++	yenta_proc_setup,
++	yenta_command,
+ };
+ EXPORT_SYMBOL(yenta_operations);
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+Please read the FAQ at 
+http://www.tux.org/lkml/

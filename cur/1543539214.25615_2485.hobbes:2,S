@@ -1,0 +1,439 @@
+Date: Tue, 18 Jul 2000 20:00:37 +0100 (BST)
+From: Tigran Aivazian <>
+Subject: [patch-2.4.0-test5-pre2] forced umount with a few fixes
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/7/18/70
+
+Hi Manfred
+The patch below has the fixes for the problems you mentioned and also one
+you didn't mention (the munmap case didn't know about the possibility of
+multiple mounted instances per superblock).
+Now I will think about the more serious issues you mentioned:
+a) race with module unload (meaning the corresponding filesystem module's
+unload, not nullfs)
+b) need to synchronize with a thread in between fget/fput (is that what
+you meant by coda_release() example?)
+c) deadlock with concurrent rename (not sure yet if there is a deadlock
+here - need to open my eyes wider :)
+Regards,
+Tigran
+diff -urN -X dontdiff linux/Makefile nullfs/Makefile
+--- linux/Makefile	Tue Jul 18 19:29:08 2000
++++ nullfs/Makefile	Tue Jul 18 19:33:32 2000
+@@ -82,7 +82,7 @@
+ 
+ CPPFLAGS := -D__KERNEL__ -I$(HPATH)
+ 
+-CFLAGS := $(CPPFLAGS) -Wall -Wstrict-prototypes -O2 -fomit-frame-pointer
++CFLAGS := $(CPPFLAGS) -g -Wall -Wstrict-prototypes -O2 -fomit-frame-pointer
+ AFLAGS := -D__ASSEMBLY__ $(CPPFLAGS)
+ 
+ #
+diff -urN -X dontdiff linux/fs/Makefile nullfs/fs/Makefile
+--- linux/fs/Makefile	Tue Jul 11 19:26:50 2000
++++ nullfs/fs/Makefile	Tue Jul 18 19:32:27 2000
+@@ -19,9 +19,9 @@
+ ALL_SUB_DIRS = coda minix ext2 fat msdos vfat proc isofs nfs umsdos ntfs \
+ 		hpfs sysv smbfs ncpfs ufs efs affs romfs autofs hfs lockd \
+ 		nfsd nls devpts devfs adfs partitions qnx4 udf bfs cramfs \
+-		openpromfs autofs4 ramfs jffs
++		openpromfs autofs4 ramfs jffs nullfs
+ 
+-SUB_DIRS :=
++SUB_DIRS := nullfs
+ 
+ ifeq ($(CONFIG_QUOTA),y)
+ O_OBJS += dquot.o
+diff -urN -X dontdiff linux/fs/bad_inode.c nullfs/fs/bad_inode.c
+--- linux/fs/bad_inode.c	Thu Apr 27 09:01:30 2000
++++ nullfs/fs/bad_inode.c	Tue Jul 18 19:32:27 2000
+@@ -29,7 +29,7 @@
+ 
+ #define EIO_ERROR ((void *) (return_EIO))
+ 
+-static struct file_operations bad_file_ops =
++struct file_operations bad_file_ops =
+ {
+ 	llseek:		EIO_ERROR,
+ 	read:		EIO_ERROR,
+diff -urN -X dontdiff linux/fs/nullfs/Makefile nullfs/fs/nullfs/Makefile
+--- linux/fs/nullfs/Makefile	Thu Jan  1 01:00:00 1970
++++ nullfs/fs/nullfs/Makefile	Tue Jul 18 19:32:27 2000
+@@ -0,0 +1,9 @@
++#
++# Makefile for NULLFS filesystem.
++#
++
++O_TARGET := nullfs.o
++O_OBJS   := inode.o
++M_OBJS   := $(O_TARGET)
++
++include $(TOPDIR)/Rules.make
+diff -urN -X dontdiff linux/fs/nullfs/inode.c nullfs/fs/nullfs/inode.c
+--- linux/fs/nullfs/inode.c	Thu Jan  1 01:00:00 1970
++++ nullfs/fs/nullfs/inode.c	Tue Jul 18 19:54:45 2000
+@@ -0,0 +1,309 @@
++/*
++ *  nullfs - the Null Filesystem
++ *
++ *  Author - Tigran Aivazian <tigran@veritas.com>
++ *
++ *  This file is released under the GPL.
++ *
++ *  The nullfs filesystem is used by forced umount ('umount -f' command)
++ *  to move inodes that keep the filesystem being umounted busy to it.
++ */
++
++#include <linux/module.h>
++#include <linux/fs.h>
++#include <linux/mm.h>
++#include <linux/init.h>
++#include <linux/smp_lock.h>
++
++#define NULLFS_MAGIC	0xABCD0001
++
++static struct super_block *nullfs_read_super(struct super_block *,void *,int);
++
++static DECLARE_FSTYPE(nullfs_fs_type, "nullfs", 
++			nullfs_read_super, FS_NOMOUNT|FS_SINGLE);
++
++static struct vfsmount *nullfs_mnt = NULL;
++static struct super_block *nullfs_sb = NULL; /* nullfs_mnt->mnt_sb */
++
++static int __init init_nullfs_fs(void)
++{
++	int err = register_filesystem(&nullfs_fs_type);
++
++	if (!err) {
++		nullfs_mnt = kern_mount(&nullfs_fs_type);
++		if (IS_ERR(nullfs_mnt)) {
++			err = PTR_ERR(nullfs_mnt);
++			unregister_filesystem(&nullfs_fs_type);
++		} else {
++			nullfs_sb = nullfs_mnt->mnt_sb;
++			err = 0;
++		}
++	}
++	return err;
++}
++
++module_init(init_nullfs_fs);
++
++static struct inode *nullfs_get_inode(struct super_block *sb, int mode)
++{
++	struct inode *inode = get_empty_inode();
++
++	if (inode) {
++		make_bad_inode(inode);
++		inode->i_sb = sb;
++		inode->i_dev = sb->s_dev;
++		inode->i_mode = mode;
++		inode->i_nlink = 1;
++		inode->i_size = 0;
++		inode->i_blocks = 0;
++	}
++	return inode;
++}
++
++/* VFS ->statfs() method */
++static int nullfs_statfs(struct super_block *sb, struct statfs *buf)
++{
++	buf->f_type = NULLFS_MAGIC;
++	buf->f_bsize = BLOCK_SIZE;
++	buf->f_namelen = 0;
++	return 0;
++}
++
++/* Note that we don't need ->read_inode() here */
++static struct super_operations nullfs_ops = {
++	statfs:		nullfs_statfs,
++};
++
++/* VFS ->read_super() method */
++static struct super_block *nullfs_read_super(struct super_block * sb, 
++		void * data, int silent)
++{
++	struct inode * root = nullfs_get_inode(sb, S_IFDIR|S_IRUSR|S_IWUSR);
++
++	if (!root)
++		return NULL;
++	sb->s_blocksize = 1024;
++	sb->s_blocksize_bits = 10;
++	sb->s_magic = NULLFS_MAGIC;
++	sb->s_op = &nullfs_ops;
++	sb->s_root = d_alloc(NULL, &(const struct qstr){ "null:", 5, 0});
++	if (!sb->s_root) {
++		iput(root);
++		return NULL;
++	}
++	sb->s_root->d_sb = sb;
++	sb->s_root->d_parent = sb->s_root;
++	d_instantiate(sb->s_root, root);
++	return sb;
++}
++
++/* moves the inode into nullfs and bads it, called on every open file. 
++ * The 'root' argument is passed so that we don't down root->i_sem twice 
++ */
++static void disable_fd(struct task_struct *tsk, int fd, struct dentry *root)
++{
++	struct files_struct *files;
++	struct file *file;
++	struct inode *inode;
++	mode_t saved_mode;
++	struct file_operations *fop;
++
++	files = tsk->files;
++	file = files->fd[fd];
++	inode = file->f_dentry->d_inode;
++	fop = file->f_op;
++
++	/* serialize with operations on this inode */
++	if (inode != root->d_inode) /* root is down'd by the caller */
++		down(&inode->i_sem);
++
++	locks_remove_posix(file, files);
++	locks_remove_flock(file);
++
++	/* flush and release fs-specific resources */
++	if (fop->flush)
++		fop->flush(file);
++	if (fop->release)
++		fop->release(inode, file);
++
++	/* get rid of pages in the cache */
++	vmtruncate(inode, 0);
++
++	/* rehash this inode into nullfs */
++	remove_inode_hash(inode);
++	inode->i_sb = nullfs_sb;
++	insert_inode_hash(inode);
++
++	/* make subsequent io on this inode return EIO */
++	saved_mode = inode->i_mode;
++	make_bad_inode(inode);
++	inode->i_mode = saved_mode;
++	inode->i_dev = nullfs_sb->s_dev;
++	xchg(&file->f_op, &bad_file_ops);
++
++	/* switch file->f_vfsmnt to nullfs mntpoint */
++	mntput(file->f_vfsmnt);
++	file->f_vfsmnt = mntget(nullfs_mnt);
++
++	/* ok, now we can decrement root's d_count */
++	dput(root);
++
++	if (inode != root->d_inode) /* root is down'd by the caller */
++		up(&inode->i_sem);
++
++	printk(KERN_WARNING "VFS: disabled fd=%d for %s/%d (d_count=%d)\n", 
++			fd, tsk->comm, tsk->pid, atomic_read(&root->d_count));
++}
++
++static void disable_pwd(struct task_struct *tsk)
++{
++	struct inode *inode;
++	struct dentry *dentry;
++
++	inode = nullfs_get_inode(nullfs_sb, S_IFDIR|0755);
++	if (!inode) {
++		printk(KERN_ERR "disable_pwd(): can't allocate inode\n");
++		return;
++	}
++	dentry = d_alloc(nullfs_sb->s_root, 
++			&(const struct qstr){"dead_pwd", 8, 0});
++	if (!dentry) {
++		iput(inode);
++		printk(KERN_ERR "disable_pwd(): can't allocate dentry\n");
++		return;
++	}
++	d_instantiate(dentry, inode);
++	dget(dentry); /* pin the dentry in core */
++	set_fs_pwd(tsk->fs, nullfs_mnt, dentry);
++	printk(KERN_ERR "VFS: disabled pwd for %s/%d\n", tsk->comm, tsk->pid);
++}
++
++static void disable_root(struct task_struct *tsk)
++{
++	struct inode *inode;
++	struct dentry *dentry;
++
++	inode = nullfs_get_inode(nullfs_sb, S_IFDIR|0755);
++	if (!inode) {
++		printk(KERN_ERR "disable_root(): can't allocate inode\n");
++		return;
++	}
++	dentry = d_alloc(nullfs_sb->s_root, 
++			&(const struct qstr){"dead_root", 9, 0});
++	if (!dentry) {
++		iput(inode);
++		printk(KERN_ERR "disable_root(): can't allocate dentry\n");
++		return;
++	}
++	d_instantiate(dentry, inode);
++	dget(dentry); /* pin the dentry in core */
++	set_fs_root(tsk->fs, nullfs_mnt, dentry);
++	printk(KERN_INFO "VFS: disabled root for %s/%d\n", 
++			tsk->comm, tsk->pid);
++}
++
++/* should go into asm-XXX/processor.h for each arch */
++#define put_task_struct(tsk)      atomic_dec(&mem_map[MAP_NR(tsk)].count)
++
++/* called from do_umount() if MNT_FORCE is specified */
++void disable_filesystem(struct vfsmount *mnt)
++{
++	struct task_struct *tsk;
++	struct dentry *root;
++	struct file *file;
++	struct inode *inode;
++	struct super_block *sb;
++
++	sb = mnt->mnt_sb;
++	root = sb->s_root;
++	down(&root->d_inode->i_sem);
++repeat:
++	file_list_lock();
++	read_lock(&tasklist_lock);
++	for_each_task(tsk) {
++		int fd, j = 0;
++		struct files_struct *files;
++		struct mm_struct *mm;
++		struct vm_area_struct *vma;
++
++		files = tsk->files;
++		mm = tsk->mm;
++		if (!files || !mm)
++			continue;
++
++		if (tsk->fs->pwdmnt == mnt) {
++			get_task_struct(tsk);
++			read_unlock(&tasklist_lock);
++			file_list_unlock();
++			disable_pwd(tsk); /* may block */
++			put_task_struct(tsk);
++			goto repeat;
++		}
++
++		if (tsk->fs->rootmnt == mnt) {
++			get_task_struct(tsk);
++			read_unlock(&tasklist_lock);
++			file_list_unlock();
++			disable_root(tsk); /* may block */
++			put_task_struct(tsk);
++			goto repeat;
++		}
++
++		/* check if any process has open files here */
++		while (1) {
++			unsigned long set;
++
++			fd = j * __NFDBITS;
++			if (fd >= files->max_fdset || fd >= files->max_fds)
++				break;
++			set = files->open_fds->fds_bits[j++];
++			while (set) {
++				if (set & 1) {
++					file = files->fd[fd];
++					inode = file->f_dentry->d_inode;
++					if (inode && (inode->i_sb == sb) &&
++						!is_bad_inode(inode)) {
++						get_task_struct(tsk);
++						read_unlock(&tasklist_lock);
++						file_list_unlock();
++
++						/* may block */
++						disable_fd(tsk, fd, root);
++						put_task_struct(tsk);
++						goto repeat;
++					}
++				}
++				fd++;
++				set >>= 1;
++			}
++		}
++
++		/* now check for mmap'd files and unmap them */
++		vmlist_modify_lock(mm);
++		for (vma = mm->mmap; vma; vma=vma->vm_next) {
++			file = vma->vm_file;
++			if (!file)
++				continue;
++			inode = file->f_dentry->d_inode;
++			if (!inode || !inode->i_sb)
++				continue;
++			if (file->f_vfsmnt == mnt) {
++				vmlist_modify_unlock(mm);
++				get_task_struct(tsk);
++				read_unlock(&tasklist_lock);
++				file_list_unlock();
++				down(&mm->mmap_sem);
++				do_munmap(mm, vma->vm_start, 
++						vma->vm_end - vma->vm_start);
++				up(&mm->mmap_sem);
++				put_task_struct(tsk);
++				goto repeat;
++			}
++		}
++		vmlist_modify_unlock(mm);
++	}
++
++	read_unlock(&tasklist_lock);
++	file_list_unlock();
++	up(&root->d_inode->i_sem);
++}
+diff -urN -X dontdiff linux/fs/super.c nullfs/fs/super.c
+--- linux/fs/super.c	Tue Jul 11 19:26:50 2000
++++ nullfs/fs/super.c	Tue Jul 18 19:33:17 2000
+@@ -463,10 +463,11 @@
+ 		path = d_path(tmp->mnt_root, tmp, buffer, PAGE_SIZE);
+ 		if (!path)
+ 			continue;
+-		len += sprintf( buf + len, "%s %s %s %s",
++		len += sprintf( buf + len, "%s %s %s %s mnt_count=%d",
+ 			tmp->mnt_devname, path,
+ 			tmp->mnt_sb->s_type->name,
+-			tmp->mnt_sb->s_flags & MS_RDONLY ? "ro" : "rw" );
++			tmp->mnt_sb->s_flags & MS_RDONLY ? "ro" : "rw",
++			atomic_read(&tmp->mnt_count));
+ 		for (fs_infop = fs_info; fs_infop->flag; fs_infop++) {
+ 		  if (tmp->mnt_sb->s_flags & fs_infop->flag) {
+ 		    strcpy(buf + len, fs_infop->str);
+@@ -978,6 +979,9 @@
+ 			retval = do_remount_sb(sb, MS_RDONLY, 0);
+ 		return retval;
+ 	}
++
++	if (flags&MNT_FORCE)
++		disable_filesystem(mnt);
+ 
+ 	spin_lock(&dcache_lock);
+ 	if (atomic_read(&mnt->mnt_count) > 2) {
+diff -urN -X dontdiff linux/include/linux/fs.h nullfs/include/linux/fs.h
+--- linux/include/linux/fs.h	Tue Jul 11 19:26:51 2000
++++ nullfs/include/linux/fs.h	Tue Jul 18 19:34:29 2000
+@@ -913,6 +913,7 @@
+ /* Invalid inode operations -- fs/bad_inode.c */
+ extern void make_bad_inode(struct inode *);
+ extern int is_bad_inode(struct inode *);
++extern struct file_operations bad_file_ops;
+ 
+ extern struct file_operations read_fifo_fops;
+ extern struct file_operations write_fifo_fops;
+@@ -1174,6 +1175,8 @@
+ extern kdev_t ROOT_DEV;
+ extern char root_device_name[];
+ 
++/* fs/nullfs/inode.c - used by forced umount */
++extern void disable_filesystem(struct vfsmount *);
+ 
+ extern void show_buffers(void);
+ extern void mount_root(void);
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

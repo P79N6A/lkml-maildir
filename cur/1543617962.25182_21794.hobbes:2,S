@@ -1,0 +1,177 @@
+Date: Sun, 20 Jan 2002 14:29:04 +0100 (CET)
+From: Ingo Molnar <>
+Subject: [sched] [patch] idle-thread-fixes-2.5.3-pre2-A1
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2002/1/20/16
+
+the attached, bigger patch cleans up a particular aspect of scheduler
+initialization that is the source of two unclean pieces of code within the
+timer interrupt:
+in idle_tick():
+        if ((jiffies % IDLE_REBALANCE_TICK) ||
+                        likely(this_rq()->curr == NULL))
+                return;
+in scheduler_tick():
+        if (p == rq->idle || !rq->idle)
+                return idle_tick();
+both the 'this_rq()->curr == NULL' and '!rq->idle' tests are only there to
+fix a temporary bootup-only situation where the idle threads are not
+initialized yet.
+the source of the problem is that idle thread initialization on SMP is not
+'atomic'. Eg., on x86 the idle threads first do timer calibration, for
+which period of time it's possible for timer interrupts to arrive on that
+(partly initialized) CPU.
+the attached patch solves this problem by splitting up init_idle() into
+two parts: init_idle() and idle_startup_done(). After init_idle() is
+called, it's possible to receive timer interrupts on a CPU. But schedule()
+can only be called after all idle threads have done idle_startup_done().
+	Ingo
+--- linux/init/main.c.orig	Sun Jan 20 11:36:05 2002
++++ linux/init/main.c	Sun Jan 20 11:38:59 2002
+@@ -290,8 +290,6 @@
+ extern void setup_arch(char **);
+ extern void cpu_idle(void);
+ 
+-unsigned long wait_init_idle;
+-
+ #ifndef CONFIG_SMP
+ 
+ #ifdef CONFIG_X86_LOCAL_APIC
+@@ -305,6 +303,16 @@
+ 
+ #else
+ 
++static unsigned long __initdata wait_init_idle;
++
++void __init idle_startup_done(void)
++{
++	clear_bit(smp_processor_id(), &wait_init_idle);
++	while (wait_init_idle) {
++		cpu_relax();
++		barrier();
++	}
++}
+ 
+ /* Called by boot processor to activate the rest. */
+ static void __init smp_init(void)
+@@ -315,6 +323,7 @@
+ 
+ 	smp_threads_ready=1;
+ 	smp_commence();
++	idle_startup_done();
+ }
+ 
+ #endif
+@@ -411,20 +420,13 @@
+ 	check_bugs();
+ 	printk("POSIX conformance testing by UNIFIX\n");
+ 
++	init_idle();
+ 	/* 
+ 	 *	We count on the initial thread going ok 
+ 	 *	Like idlers init is an unlocked kernel thread, which will
+ 	 *	make syscalls (and thus be locked).
+ 	 */
+ 	smp_init();
+-
+-	/*
+-	 * Finally, we wait for all other CPU's, and initialize this
+-	 * thread that will become the idle thread for the boot CPU.
+-	 * After this, the scheduler is fully initialized, and we can
+-	 * start creating and running new threads.
+-	 */
+-	init_idle();
+ 
+ 	/* Do the rest non-__init'ed, we're now alive */
+ 	rest_init();
+--- linux/kernel/sched.c.orig	Sun Jan 20 11:38:38 2002
++++ linux/kernel/sched.c	Sun Jan 20 11:38:59 2002
+@@ -489,8 +489,7 @@
+ 
+ static inline void idle_tick(void)
+ {
+-	if ((jiffies % IDLE_REBALANCE_TICK) ||
+-			likely(this_rq()->curr == NULL))
++	if (jiffies % IDLE_REBALANCE_TICK)
+ 		return;
+ 	spin_lock(&this_rq()->lock);
+ 	load_balance(this_rq(), 1);
+@@ -506,7 +505,7 @@
+ 	unsigned long now = jiffies;
+ 	runqueue_t *rq = this_rq();
+ 
+-	if (p == rq->idle || !rq->idle)
++	if (p == rq->idle)
+ 		return idle_tick();
+ 	/* Task might have expired already, but not scheduled off yet */
+ 	if (p->array != rq->active) {
+@@ -1221,8 +1220,6 @@
+ 	read_unlock(&tasklist_lock);
+ }
+ 
+-extern unsigned long wait_init_idle;
+-
+ static inline void double_rq_lock(runqueue_t *rq1, runqueue_t *rq2)
+ {
+ 	if (rq1 == rq2)
+@@ -1257,16 +1254,11 @@
+ 	this_rq->curr = this_rq->idle = current;
+ 	deactivate_task(current, rq);
+ 	current->array = NULL;
+-	current->prio = MAX_PRIO-1;
++	current->prio = MAX_PRIO;
+ 	current->state = TASK_RUNNING;
+-	clear_bit(smp_processor_id(), &wait_init_idle);
+ 	double_rq_unlock(this_rq, rq);
+-	while (wait_init_idle) {
+-		cpu_relax();
+-		barrier();
+-	}
+ 	current->need_resched = 1;
+-	__sti();
++	__restore_flags(flags);
+ }
+ 
+ extern void init_timervecs(void);
+@@ -1305,7 +1297,7 @@
+ 	 */
+ 	rq = this_rq();
+ 	rq->curr = current;
+-	rq->idle = NULL;
++	rq->idle = current;
+ 	wake_up_process(current);
+ 
+ 	init_timervecs();
+--- linux/include/linux/sched.h.orig	Sun Jan 20 11:36:05 2002
++++ linux/include/linux/sched.h	Sun Jan 20 11:38:59 2002
+@@ -141,6 +141,7 @@
+ 
+ extern void sched_init(void);
+ extern void init_idle(void);
++extern void idle_startup_done(void);
+ extern void show_state(void);
+ extern void cpu_init (void);
+ extern void trap_init(void);
+--- linux/arch/i386/kernel/smpboot.c.orig	Sun Jan 20 11:36:02 2002
++++ linux/arch/i386/kernel/smpboot.c	Sun Jan 20 11:38:59 2002
+@@ -462,6 +462,7 @@
+ 	 * things done here to the most necessary things.
+ 	 */
+ 	cpu_init();
++	init_idle();
+ 	smp_callin();
+ 	while (!atomic_read(&smp_commenced))
+ 		rep_nop();
+@@ -470,8 +471,8 @@
+ 	 * the local TLBs too.
+ 	 */
+ 	local_flush_tlb();
++	idle_startup_done();
+ 
+-	init_idle();
+ 	return cpu_idle();
+ }
+ 

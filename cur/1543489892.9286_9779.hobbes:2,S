@@ -1,0 +1,296 @@
+Date: Sun, 14 Mar 1999 18:12:17 +0100 (CET)
+From: Andrea Arcangeli <>
+Subject: Re: [patch] recover losed timer interrupt using the TSC [Re: [patch] kstat change to see how much Linux SMP really scale well]
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/3/14/40
+
+On Sun, 14 Mar 1999, Andrea Arcangeli wrote:
+>Another thing I noticed is that in some places we are doing something
+>like:
+>
+>	(value + DIVISOR/2) / DIVISOR
+>
+>I can give to it a sense, but I think it's more wrong than right.
+No it was right. I need that too in recover_lost_timer() when converting
+from usec to jiffies the time passed between the last and the current
+timer irq. The point is that the value in usec is a multiple of 10000, but
+for some arithmetic error due conversion between timer-chip-latch to usec,
+it could be 19999 or 20001, and if it will be 19999 recover_lost_timer()
+could not notice that we missed a timer irq.
+So the right thing to do also in recover_lost_timer is not only to divide
+by 1000000/HZ as in my first preliminary patch, but to get a 100%
+relialable value (and fooling the aritmethic errors) we must do:
+	ticks_passed = (delta_usec + 500000/HZ) / (1000000/HZ);
+This way I checked that recover_lost_timer() never risk to not notice
+a losed an irq.
+So here it is a new patch. Maybe it's better to not printk a NOTICE to the
+user... Personally I would like to know when I lose timer irq and I don't
+think it's something it has to happen in regular conditions even if I
+think we need this patch because we _must_ be robust enough to deal with
+lost timer irqs also considering that the code inserted is really minimal.
+And maybe somebody needs really to do something with irq disabled for long
+times.
+I also fixed the CALIBRATE_TIME that was 50001 while it had to be 50000
+(with my patch calibrate_time now is 50000 as my HP-48 agree with). Let me
+know if I missed something.
+So here it is my new timer-2.2.3-B:
+Index: arch/i386/kernel/time.c
+===================================================================
+RCS file: /var/cvs/linux/arch/i386/kernel/time.c,v
+retrieving revision 1.1.2.8
+diff -u -r1.1.2.8 time.c
+--- time.c	1999/03/09 01:37:39	1.1.2.8
++++ linux/arch/i386/kernel/time.c	1999/03/14 17:00:42
+@@ -28,6 +28,11 @@
+  * 1998-12-24 Copyright (C) 1998  Andrea Arcangeli
+  *	Fixed a xtime SMP race (we need the xtime_lock rw spinlock to
+  *	serialize accesses to xtime/lost_ticks).
++ * 1999-03-14    Andrea Arcangeli
++ *	Developed recover_lost_timer(): using the TSC information we won't
++ *	ever miss a timer irq anymore.
++ *	Improved calibrate_tcs() doing replication in time of the algorithm
++ *	to get a safer tsc2usec-quotient value.
+  */
+ 
+ #include <linux/errno.h>
+@@ -76,6 +81,7 @@
+ static unsigned long fast_gettimeoffset_quotient=0;
+ 
+ extern rwlock_t xtime_lock;
++extern volatile unsigned long lost_ticks;
+ 
+ static inline unsigned long do_fast_gettimeoffset(void)
+ {
+@@ -236,7 +242,6 @@
+  */
+ void do_gettimeofday(struct timeval *tv)
+ {
+-	extern volatile unsigned long lost_ticks;
+ 	unsigned long flags;
+ 	unsigned long usec, sec;
+ 
+@@ -412,14 +417,47 @@
+ static int use_tsc = 0;
+ 
+ /*
++ * Using a bit better the TSC information now we are also able to recover
++ * from lost timer interrupts. -arca
++ */
++static inline void recover_lost_timer(unsigned long delta_cycles,
++				      int delay_usec)
++{
++	/*
++	 * The algorithm I invented to know if we losed an irq in the meantime
++	 * works this way:
++	 *
++	 *	- convert delta from cycles to usec
++	 *	- remove from the delta_usec the latency of the irqs
++	 *	- convert from usec to timer ticks
++	 *
++	 *				-arca
++	 */
++
++	register unsigned long delta_usec;
++
++	__asm__("mull %2"
++		:"=a" (delta_cycles), "=d" (delta_usec)
++		:"g" (fast_gettimeoffset_quotient), "0" (delta_cycles));
++	delta_usec -= delay_usec;
++	delta_usec = (delta_usec + 500000/HZ) / (1000000/HZ);
++
++	if ((long) delta_usec <= 1)
++		return;
++
++	delta_usec -= 1;
++	printk(KERN_NOTICE "recover_lost_timer: lost %lu ticks\n", delta_usec);
++	lost_ticks += delta_usec;
++	jiffies += delta_usec;
++}
++
++/*
+  * This is the same as the above, except we _also_ save the current
+  * Time Stamp Counter value at the time of the timer interrupt, so that
+  * we later on can estimate the time of day more exactly.
+  */
+ static void timer_interrupt(int irq, void *dev_id, struct pt_regs *regs)
+ {
+-	int count;
+-
+ 	/*
+ 	 * Here we are in the timer irq handler. We just have irqs locally
+ 	 * disabled but we don't know if the timer_bh is running on the other
+@@ -443,16 +481,23 @@
+ 		 * has the SA_INTERRUPT flag set. -arca
+ 		 */
+ 	
++		unsigned long old_cycles = last_tsc_low;
++		int old_delay, count;
++
+ 		/* read Pentium cycle counter */
+-		__asm__("rdtsc" : "=a" (last_tsc_low) : : "edx");
++		__asm__ __volatile__("rdtsc" : "=a" (last_tsc_low) : : "edx");
+ 
+ 		outb_p(0x00, 0x43);     /* latch the count ASAP */
+ 
+ 		count = inb_p(0x40);    /* read the latched count */
++		old_delay = delay_at_last_interrupt;
+ 		count |= inb(0x40) << 8;
+ 
+ 		count = ((LATCH-1) - count) * TICK_SIZE;
+ 		delay_at_last_interrupt = (count + LATCH/2) / LATCH;
++
++		recover_lost_timer(last_tsc_low - old_cycles,
++				   delay_at_last_interrupt - old_delay);
+ 	}
+  
+ 	do_timer_interrupt(irq, NULL, regs);
+@@ -543,43 +588,58 @@
+  * device.
+  */
+ 
++/*
++ * To get a more safe quotient value (that it will be used forever) we
++ * try many times and we'll stop if we'll get the same value for two times
++ * consecutively. -arca
++ */
++
+ #define CALIBRATE_LATCH	(5 * LATCH)
+-#define CALIBRATE_TIME	(5 * 1000020/HZ)
++/*
++ * The timer chip will decrease the latch for CALIBRATE_LATCH times. The
++ * frequency between every latch change is CLOCK_TICK_RATE.
++ * So the time in usec for decrease CALIBRATE_LATCH we'll be:
++ *
++ *	CALIBRATE_LATCH * 1000000 / CLOCK_TICK_RATE.
++ *
++ * So I used `unsigned long long' to not overflowing. The operation is so
++ * simple that I expect that won't trigger gcc `long long' bugs ;). -arca
++ */
++#define CALIBRATE_TIME							   \
++	((unsigned long long) CALIBRATE_LATCH * 1000000 / CLOCK_TICK_RATE)
+ 
+ __initfunc(static unsigned long calibrate_tsc(void))
+ {
+-       /* Set the Gate high, disable speaker */
+-	outb((inb(0x61) & ~0x02) | 0x01, 0x61);
+-
+-	/*
+-	 * Now let's take care of CTC channel 2
+-	 *
+-	 * Set the Gate high, program CTC channel 2 for mode 0,
+-	 * (interrupt on terminal count mode), binary count,
+-	 * load 5 * LATCH count, (LSB and MSB) to begin countdown.
+-	 */
+-	outb(0xb0, 0x43);			/* binary, mode 0, LSB/MSB, Ch 2 */
+-	outb(CALIBRATE_LATCH & 0xff, 0x42);	/* LSB of count */
+-	outb(CALIBRATE_LATCH >> 8, 0x42);	/* MSB of count */
++	int i;
++	unsigned long last_quotient = -999992 /* be quiet compiler */;
++	unsigned long calibrate_latch = CALIBRATE_LATCH;
++	unsigned long calibrate_time = CALIBRATE_TIME;
+ 
++	for (i=0; i<20; i++)
+ 	{
+ 		unsigned long startlow, starthigh;
+ 		unsigned long endlow, endhigh;
+-		unsigned long count;
+ 
++		/* Set the Gate high, disable speaker */
++		outb((inb(0x61) & ~0x02) | 0x01, 0x61);
++
++		/*
++		 * Now let's take care of CTC channel 2
++		 *
++		 * Set the Gate high, program CTC channel 2 for mode 0,
++		 * (interrupt on terminal count mode), binary count,
++		 * load 5 * LATCH count, (LSB and MSB) to begin countdown.
++		 */
++		outb(0xb0, 0x43);	/* binary, mode 0, LSB/MSB, Ch 2 */
++		outb(calibrate_latch & 0xff, 0x42);	/* LSB of count */
++		outb(calibrate_latch >> 8, 0x42);	/* MSB of count */
++
+ 		__asm__ __volatile__("rdtsc":"=a" (startlow),"=d" (starthigh));
+-		count = 0;
+-		do {
+-			count++;
+-		} while ((inb(0x61) & 0x20) == 0);
++		while ((inb(0x61) & 0x20) == 0);
+ 		__asm__ __volatile__("rdtsc":"=a" (endlow),"=d" (endhigh));
+ 
+ 		last_tsc_low = endlow;
+ 
+-		/* Error: ECTCNEVERSET */
+-		if (count <= 1)
+-			goto bad_ctc;
+-
+ 		/* 64-bit subtract - gcc just messes up with long longs */
+ 		__asm__("subl %2,%0\n\t"
+ 			"sbbl %3,%1"
+@@ -592,15 +652,26 @@
+ 			goto bad_ctc;
+ 
+ 		/* Error: ECPUTOOSLOW */
+-		if (endlow <= CALIBRATE_TIME)
++		if (endlow <= calibrate_time)
+ 			goto bad_ctc;
+ 
+ 		__asm__("divl %2"
+ 			:"=a" (endlow), "=d" (endhigh)
+-			:"r" (endlow), "0" (0), "1" (CALIBRATE_TIME));
++			:"r" (endlow), "0" (0), "1" (calibrate_time));
++
++		if (i && last_quotient == endlow)
++		{
++			printk("calibrate_tsc: consistent quotient %lu "
++			       "found after %d tries\n", endlow, i);
++			return endlow;
++		}
+ 
+-		return endlow;
++		last_quotient = endlow;
+ 	}
++
++	printk("calibrate_tsc: inconsistent quotient using the last %lu!\n",
++	       last_quotient);
++	return last_quotient;
+ 
+ 	/*
+ 	 * The CTC wasn't reliable: we got a hit on the very first read,
+Index: kernel/sched.c
+===================================================================
+RCS file: /var/cvs/linux/kernel/sched.c,v
+retrieving revision 1.1.2.18
+diff -u -r1.1.2.18 sched.c
+--- sched.c	1999/02/25 13:27:24	1.1.2.18
++++ linux/kernel/sched.c	1999/03/14 14:06:06
+@@ -1299,15 +1299,13 @@
+ static void update_wall_time(unsigned long ticks)
+ {
+ 	do {
+-		ticks--;
+ 		update_wall_time_one_tick();
+-	} while (ticks);
+-
+-	if (xtime.tv_usec >= 1000000) {
+-	    xtime.tv_usec -= 1000000;
+-	    xtime.tv_sec++;
+-	    second_overflow();
+-	}
++		while (xtime.tv_usec >= 1000000) {
++			xtime.tv_usec -= 1000000;
++			xtime.tv_sec++;
++			second_overflow();
++		}
++	} while (--ticks);
+ }
+ 
+ static inline void do_process_times(struct task_struct *p,
+Andrea Arcangeli
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

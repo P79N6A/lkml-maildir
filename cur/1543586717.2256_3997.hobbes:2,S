@@ -1,0 +1,1069 @@
+Date: Wed, 4 Apr 2001 13:41:54 -0700 (PDT)
+From: Jonathan Morton <>
+Subject: [PATCH] Revised memory-management stuff (was: OOM killer)
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2001/4/4/151
+
+The attached patch applies to 2.4.3 and should address the most serious
+concerns surrounding OOM and low-memory situations for most people.  A
+summary of the patch contents follows:
+MAJOR: OOM killer now only activates when truly out of memory, ie. when
+buffer and cache memory has already been eaten down to the bone.
+MEDIUM: The allocation mechanism will now only allow processes to reserve
+memory if there is sufficient memory remaining *and* the process is not
+already hogging RAM.  IOW, if the allocating process is already 4x the
+size of the remaining free memory, reservation of more memory (by fork(),
+malloc() or related calls) will fail.
+MEDIUM: The OOM killer algorithm has been reworked to be a little more
+intelligent by default, and also now allows the sysadmin to specify PIDs
+and/or process names which should be left untouched.  Simply echo a
+space-delimited list of PIDs and/or process names into
+/proc/sys/vm/oom-no-kill, and the OOM killer will ignore all processes
+matching any entry in the list until only they and init remain.  Init (as
+PID 1 or as a root process named "init") is now always
+ignored.  TODO: make certain parameters of the OOM killer configurable.
+W-I-P: The memory-accounting code from an old 2.3.99 patch has been
+re-introduced, but is in sore need of debugging.  It can be activated by
+echoing a negative number into /proc/sys/vm/overcommit_memory - but do
+this at your own risk.  Interested kernel hackers should alter the
+"#define VM_DEBUG 0" to 1 in include/linux/mm.h to view lots of debugging
+and warning messages.  I have seen the memory-accounting code attempt to
+"free" blocks of memory exceeding 2GB which had never been allocated,
+while running gcc.  The sanity-check code detects these anomalies and
+attempts to correct for them, but this isn't good...
+SIDE EFFECT: All parts of the kernel which can change the total amount of
+VM (eg. by adding/removing swap) should now call
+vm_invalidate_totalmem() to notify the VM about this.  A new function
+vm_total() now reports the total amount of VM available.  The total VM and
+the amount of reserved memory are now available from /proc/meminfo.
+diff -rBU 5 linux-2.4.3/fs/exec.c linux-oom/fs/exec.c
+--- linux-2.4.3/fs/exec.c	Thu Mar 22 09:26:18 2001
++++ linux-oom/fs/exec.c	Tue Apr  3 09:32:07 2001
+@@ -386,23 +386,31 @@
+ }
+ 
+ static int exec_mmap(void)
+ {
+ 	struct mm_struct * mm, * old_mm;
++	struct task_struct * tsk = current;
++	unsigned long reserved = 0;
+ 
+-	old_mm = current->mm;
++	old_mm = tsk->mm;
+ 	if (old_mm && atomic_read(&old_mm->mm_users) == 1) {
++	        /* Keep old stack reservation */
+ 		mm_release();
+ 		exit_mmap(old_mm);
+ 		return 0;
+ 	}
+ 
++	reserved = vm_enough_memory(tsk->rlim[RLIMIT_STACK].rlim_cur >> 
++				    PAGE_SHIFT);
++	if(!reserved)
++	        return -ENOMEM;
++
+ 	mm = mm_alloc();
+ 	if (mm) {
+-		struct mm_struct *active_mm;
++		struct mm_struct *active_mm = tsk->active_mm;
+ 
+-		if (init_new_context(current, mm)) {
++		if (init_new_context(tsk, mm)) {
+ 			mmdrop(mm);
+ 			return -ENOMEM;
+ 		}
+ 
+ 		/* Add it to the list of mm's */
+@@ -424,10 +432,12 @@
+ 			return 0;
+ 		}
+ 		mmdrop(active_mm);
+ 		return 0;
+ 	}
++
++	vm_release_memory(reserved);
+ 	return -ENOMEM;
+ }
+ 
+ /*
+  * This function makes sure the current process has its own signal table,
+diff -rBU 5 linux-2.4.3/fs/proc/proc_misc.c linux-oom/fs/proc/proc_misc.c
+--- linux-2.4.3/fs/proc/proc_misc.c	Fri Mar 23 11:45:28 2001
++++ linux-oom/fs/proc/proc_misc.c	Tue Apr  3 09:32:27 2001
+@@ -173,11 +173,13 @@
+                 "HighTotal:    %8lu kB\n"
+                 "HighFree:     %8lu kB\n"
+                 "LowTotal:     %8lu kB\n"
+                 "LowFree:      %8lu kB\n"
+                 "SwapTotal:    %8lu kB\n"
+-                "SwapFree:     %8lu kB\n",
++                "SwapFree:  %8lu kB\n"
++                "VMTotal:   %8lu kB\n"
++                "VMReserved:%8lu kB\n",
+                 K(i.totalram),
+                 K(i.freeram),
+                 K(i.sharedram),
+                 K(i.bufferram),
+                 K(atomic_read(&page_cache_size)),
+@@ -188,11 +190,13 @@
+                 K(i.totalhigh),
+                 K(i.freehigh),
+                 K(i.totalram-i.totalhigh),
+                 K(i.freeram-i.freehigh),
+                 K(i.totalswap),
+-                K(i.freeswap));
++                K(i.freeswap),
++                K(vm_total()), 
++                K(vm_reserved));
+ 
+ 	return proc_calc_metrics(page, start, off, count, eof, len);
+ #undef B
+ #undef K
+ }
+diff -rBU 5 linux-2.4.3/include/linux/mm.h linux-oom/include/linux/mm.h
+--- linux-2.4.3/include/linux/mm.h	Mon Mar 26 15:48:13 2001
++++ linux-oom/include/linux/mm.h	Tue Apr  3 19:59:12 2001
+@@ -22,10 +22,19 @@
+ #include <asm/page.h>
+ #include <asm/pgtable.h>
+ #include <asm/atomic.h>
+ 
+ /*
++ * These are used to prevent VM overcommit.
++ */
++
++#define VM_DEBUG 0
++extern long vm_reserved;
++extern spinlock_t vm_lock;
++extern inline long vm_total(void);
++
++/*
+  * Linux kernel virtual memory manager primitives.
+  * The idea being to have a "virtual" mm in the same way
+  * we have a virtual fs - giving a cleaner interface to the
+  * mm details, and allowing different kinds of memory mappings
+  * (from shared memory to executable loading to arbitrary
+@@ -456,10 +465,14 @@
+ extern int do_munmap(struct mm_struct *, unsigned long, size_t);
+ 
+ extern unsigned long do_brk(unsigned long, unsigned long);
+ 
+ struct zone_t;
++
++extern long vm_enough_memory(long pages);
++extern void vm_release_memory(long pages);
++
+ /* filemap.c */
+ extern void remove_inode_page(struct page *);
+ extern unsigned long page_unuse(struct page *);
+ extern void truncate_inode_pages(struct address_space *, loff_t);
+ 
+diff -rBU 5 linux-2.4.3/include/linux/sysctl.h linux-oom/include/linux/sysctl.h
+--- linux-2.4.3/include/linux/sysctl.h	Mon Mar 26 15:48:10 2001
++++ linux-oom/include/linux/sysctl.h	Tue Apr  3 12:57:27 2001
+@@ -130,11 +130,12 @@
+ 	VM_OVERCOMMIT_MEMORY=5,	/* Turn off the virtual memory safety limit */
+ 	VM_BUFFERMEM=6,		/* struct: Set buffer memory thresholds */
+ 	VM_PAGECACHE=7,		/* struct: Set cache memory thresholds */
+ 	VM_PAGERDAEMON=8,	/* struct: Control kswapd behaviour */
+ 	VM_PGT_CACHE=9,		/* struct: Set page table cache parameters */
+-	VM_PAGE_CLUSTER=10	/* int: set number of pages to swap together */
++	VM_PAGE_CLUSTER=10,	/* int: set number of pages to swap together */
++	VM_OOM_NOKILL=11        /* string: List of PIDs to avoid killing on OOM */
+ };
+ 
+ 
+ /* CTL_NET names: */
+ enum
+diff -rBU 5 linux-2.4.3/kernel/exit.c linux-oom/kernel/exit.c
+--- linux-2.4.3/kernel/exit.c	Fri Feb  9 11:29:44 2001
++++ linux-oom/kernel/exit.c	Tue Apr  3 09:32:14 2001
+@@ -304,10 +304,15 @@
+ 	struct mm_struct * mm = tsk->mm;
+ 
+ 	mm_release();
+ 	if (mm) {
+ 		atomic_inc(&mm->mm_count);
++		if (atomic_read(&mm->mm_users) == 1) {
++		/* Only release stack if we're the last one using this mm */
++			vm_release_memory(tsk->rlim[RLIMIT_STACK].rlim_cur >>
++				PAGE_SHIFT);
++		}
+ 		if (mm != tsk->active_mm) BUG();
+ 		/* more a memory barrier than a real lock */
+ 		task_lock(tsk);
+ 		tsk->mm = NULL;
+ 		task_unlock(tsk);
+diff -rBU 5 linux-2.4.3/kernel/fork.c linux-oom/kernel/fork.c
+--- linux-2.4.3/kernel/fork.c	Mon Mar 19 12:35:08 2001
++++ linux-oom/kernel/fork.c	Tue Apr  3 09:32:21 2001
+@@ -123,10 +123,11 @@
+ }
+ 
+ static inline int dup_mmap(struct mm_struct * mm)
+ {
+ 	struct vm_area_struct * mpnt, *tmp, **pprev;
++	unsigned long reserved = 0;
+ 	int retval;
+ 
+ 	flush_cache_mm(current->mm);
+ 	mm->locked_vm = 0;
+ 	mm->mmap = NULL;
+@@ -140,10 +141,19 @@
+ 		struct file *file;
+ 
+ 		retval = -ENOMEM;
+ 		if(mpnt->vm_flags & VM_DONTCOPY)
+ 			continue;
++
++		reserved = 0;
++		if((mpnt->vm_flags & (VM_GROWSDOWN | VM_WRITE | VM_SHARED)) == VM_WRITE) {
++			unsigned long npages = mpnt->vm_end - mpnt->vm_start;
++			reserved = vm_enough_memory(npages >> PAGE_SHIFT);
++			if(!reserved)
++				goto fail_nomem;
++		}
++
+ 		tmp = kmem_cache_alloc(vm_area_cachep, SLAB_KERNEL);
+ 		if (!tmp)
+ 			goto fail_nomem;
+ 		*tmp = *mpnt;
+ 		tmp->vm_flags &= ~VM_LOCKED;
+@@ -278,10 +288,11 @@
+ }
+ 
+ static int copy_mm(unsigned long clone_flags, struct task_struct * tsk)
+ {
+ 	struct mm_struct * mm, *oldmm;
++	unsigned long reserved;
+ 	int retval;
+ 
+ 	tsk->min_flt = tsk->maj_flt = 0;
+ 	tsk->cmin_flt = tsk->cmaj_flt = 0;
+ 	tsk->nswap = tsk->cnswap = 0;
+@@ -303,10 +314,14 @@
+ 		mm = oldmm;
+ 		goto good_mm;
+ 	}
+ 
+ 	retval = -ENOMEM;
++	reserved = vm_enough_memory(tsk->rlim[RLIMIT_STACK].rlim_cur >> PAGE_SHIFT);
++	if(!reserved)
++		goto fail_nomem;
++
+ 	mm = allocate_mm();
+ 	if (!mm)
+ 		goto fail_nomem;
+ 
+ 	/* Copy the current MM stuff.. */
+@@ -347,10 +362,12 @@
+ 	return 0;
+ 
+ free_pt:
+ 	mmput(mm);
+ fail_nomem:
++	if (reserved)
++		vm_release_memory(reserved);
+ 	return retval;
+ }
+ 
+ static inline struct fs_struct *__copy_fs_struct(struct fs_struct *old)
+ {
+diff -rBU 5 linux-2.4.3/kernel/sysctl.c linux-oom/kernel/sysctl.c
+--- linux-2.4.3/kernel/sysctl.c	Fri Feb 16 16:02:37 2001
++++ linux-oom/kernel/sysctl.c	Tue Apr  3 09:32:49 2001
+@@ -42,10 +42,11 @@
+ /* External variables not in a header file. */
+ extern int panic_timeout;
+ extern int C_A_D;
+ extern int bdf_prm[], bdflush_min[], bdflush_max[];
+ extern int sysctl_overcommit_memory;
++extern char vm_nokill[];
+ extern int max_threads;
+ extern int nr_queued_signals, max_queued_signals;
+ extern int sysrq_enabled;
+ 
+ /* this is needed for the proc_dointvec_minmax for [fs_]overflow UID and GID */
+@@ -268,10 +269,12 @@
+ 	 &pager_daemon, sizeof(pager_daemon_t), 0644, NULL, &proc_dointvec},
+ 	{VM_PGT_CACHE, "pagetable_cache", 
+ 	 &pgt_cache_water, 2*sizeof(int), 0644, NULL, &proc_dointvec},
+ 	{VM_PAGE_CLUSTER, "page-cluster", 
+ 	 &page_cluster, sizeof(int), 0644, NULL, &proc_dointvec},
++	{VM_OOM_NOKILL, "oom-no-kill", 
++	 &vm_nokill, 256, 0644, NULL, &proc_dostring, &sysctl_string},
+ 	{0}
+ };
+ 
+ static ctl_table proc_table[] = {
+ 	{0}
+diff -rBU 5 linux-2.4.3/mm/mmap.c linux-oom/mm/mmap.c
+--- linux-2.4.3/mm/mmap.c	Wed Mar 28 12:55:34 2001
++++ linux-oom/mm/mmap.c	Wed Apr  4 00:41:39 2001
+@@ -35,47 +35,163 @@
+ pgprot_t protection_map[16] = {
+ 	__P000, __P001, __P010, __P011, __P100, __P101, __P110, __P111,
+ 	__S000, __S001, __S010, __S011, __S100, __S101, __S110, __S111
+ };
+ 
+-int sysctl_overcommit_memory;
++int sysctl_overcommit_memory = 0;
++
++/* Unfortunately these need to be longs so we need a spinlock. */
++long vm_reserved = 0;
++long totalvm = 0;
++spinlock_t vm_lock = SPIN_LOCK_UNLOCKED;
++
++void vm_invalidate_totalmem(void)
++{
++	int flags;
++
++	spin_lock_irqsave(&vm_lock, flags);
++	totalvm = 0;
++	spin_unlock_irqrestore(&vm_lock, flags);
++}
++
++long vm_total(void) 
++{
++	int flags;
++
++	spin_lock_irqsave(&vm_lock, flags);
++	if(!totalvm) {
++		struct sysinfo i;
++		si_meminfo(&i);
++		si_swapinfo(&i);
++		totalvm = i.totalram + i.totalswap;
++	}
++	spin_unlock_irqrestore(&vm_lock, flags);	
++
++	return totalvm;
++}
+ 
+ /* Check that a process has enough memory to allocate a
+  * new virtual mapping.
+  */
+-int vm_enough_memory(long pages)
++long vm_enough_memory(long pages)
+ {
+ 	/* Stupid algorithm to decide if we have enough memory: while
+ 	 * simple, it hopefully works in most obvious cases.. Easy to
+ 	 * fool it, but this should catch most mistakes.
+ 	 */
+ 	/* 23/11/98 NJC: Somewhat less stupid version of algorithm,
+ 	 * which tries to do "TheRightThing".  Instead of using half of
+ 	 * (buffers+cache), use the minimum values.  Allow an extra 2%
+ 	 * of num_physpages for safety margin.
+ 	 */
++	/* From non-overcommit patch: only allow vm_reserved to exceed
++	 * vm_total if we're root.
++	 */
+ 
+-	long free;
++	int flags;
++	long free = 0;
+ 	
+-        /* Sometimes we want to use more memory than we have. */
+-	if (sysctl_overcommit_memory)
+-	    return 1;
++	spin_lock_irqsave(&vm_lock, flags);
+ 
++	/* JDM: for testing the memory-accounting code, if VM_DEBUG is set
++	 * we calcualte the free memory both ways and check one against
++	 * the other.  Otherwise we just calculate the one we need.
++	 */
++#if (!VM_DEBUG)
++	if(sysctl_overcommit_memory >= 0) {
++#endif
+ 	free = atomic_read(&buffermem_pages);
+ 	free += atomic_read(&page_cache_size);
+ 	free += nr_free_pages();
+ 	free += nr_swap_pages;
+-	/*
+-	 * The code below doesn't account for free space in the inode
+-	 * and dentry slab cache, slab cache fragmentation, inodes and
+-	 * dentries which will become freeable under VM load, etc.
+-	 * Lets just hope all these (complex) factors balance out...
++
++	/* The dentry and inode caches may contain unused entries.  I have no
++	 * idea whether these caches actually shrink under pressure, but...
++	 */
++	free += (dentry_stat.nr_unused * sizeof(struct dentry)) >> PAGE_SHIFT;
++	free += (inodes_stat.nr_unused * sizeof(struct inode)) >> PAGE_SHIFT;
++
++#if VM_DEBUG
++	if(vm_reserved < (vm_total() - free)) {
++		printk(KERN_WARNING "vm_enough_memory: vm_reserved (%ld) was inconsistent "
++				"with allocated memory (%ld) in process %d (%s)\n", 
++		                vm_reserved, vm_total() - free, current->pid, current->comm);
++		/* Make it consistent for now */
++		vm_reserved = vm_total() - free;
++#endif
++	}
++
++	if(sysctl_overcommit_memory < 0)
++		free = vm_total() - vm_reserved;
++	
++	/* Attempt to curtail memory allocations before hard OOM occurs.
++	 * Based on current process size, which is hopefully a good and fast heuristic.
++	 * Also fix bug where the real OOM limit of (free == freepages.min) is not taken into account.
++	 * In fact, we use freepages.high as the threshold to make sure there's still room for buffers+cache.
++	 *
++	 * -- Jonathan "Chromatix" Morton [JDM], 2001-03-24 to 2001-04-03
++	 */
++
++	if(current->mm)
++		free -= (current->mm->total_vm / 4) + freepages.high;
++	else
++		free -= freepages.min;
++
++#if VM_DEBUG
++	printk(KERN_DEBUG "vm_enough_memory(): process %d reserving %ld pages\n",
++			current->pid, pages);
++#endif
++
++	if(pages > free)
++		if( !(sysctl_overcommit_memory == -1 && current->uid == 0)
++				&& sysctl_overcommit_memory != 1)
++			pages = 0;
++
++	vm_reserved += pages;
++	spin_unlock_irqrestore(&vm_lock, flags);
++			
++	return pages;
++}
++
++/* Account for freeing up the memory */
++inline void vm_release_memory(long pages)
++{
++	int flags;
++	long free;
++
++	spin_lock_irqsave(&vm_lock, flags);
++
++	vm_reserved -= pages;
++
++#if VM_DEBUG
++	/* Perform sanity check */  
++	free = atomic_read(&buffermem_pages);
++	free += atomic_read(&page_cache_size);
++	free += nr_free_pages();
++	free += nr_swap_pages;
++  
++	/* The dentry and inode caches may contain unused entries.  I have no
++	 * idea whether these caches actually shrink under pressure, but...
+ 	 */
+ 	free += (dentry_stat.nr_unused * sizeof(struct dentry)) >> PAGE_SHIFT;
+ 	free += (inodes_stat.nr_unused * sizeof(struct inode)) >> PAGE_SHIFT;
+ 
+-	return free > pages;
++	if(vm_reserved < (vm_total() - free)) {
++		printk(KERN_WARNING "vm_enough_memory: vm_reserved (%ld) was inconsistent "
++				"with allocated memory (%ld) in process %d (%s)\n", 
++		                vm_reserved, vm_total() - free, current->pid, current->comm);
++		/* Make it consistent for now */
++		vm_reserved = vm_total() - free;
++	}
++#endif
++
++	spin_unlock_irqrestore(&vm_lock, flags);
++
++#if VM_DEBUG
++	printk(KERN_DEBUG "vm_release_memory(): process %d freeing %ld pages\n",
++			current->pid, pages);
++#endif
+ }
+ 
+ /* Remove one vm structure from the inode's i_mapping address space. */
+ static inline void __remove_shared_vm_struct(struct vm_area_struct *vma)
+ {
+@@ -199,10 +315,11 @@
+ 	unsigned long prot, unsigned long flags, unsigned long pgoff)
+ {
+ 	struct mm_struct * mm = current->mm;
+ 	struct vm_area_struct * vma;
+ 	unsigned int vm_flags;
++	long reserved = 0;
+ 	int correct_wcount = 0;
+ 	int error;
+ 
+ 	if (file && (!file->f_op || !file->f_op->mmap))
+ 		return -ENODEV;
+@@ -377,10 +494,11 @@
+ 	/* Undo any partial mapping done by a device driver. */
+ 	flush_cache_range(mm, vma->vm_start, vma->vm_end);
+ 	zap_page_range(mm, vma->vm_start, vma->vm_end - vma->vm_start);
+ 	flush_tlb_range(mm, vma->vm_start, vma->vm_end);
+ free_vma:
++       vm_release_memory(reserved);
+ 	kmem_cache_free(vm_area_cachep, vma);
+ 	return error;
+ }
+ 
+ /* Get an address range which is currently unmapped.
+@@ -556,10 +674,13 @@
+ 	unsigned long end = addr + len;
+ 
+ 	area->vm_mm->total_vm -= len >> PAGE_SHIFT;
+ 	if (area->vm_flags & VM_LOCKED)
+ 		area->vm_mm->locked_vm -= len >> PAGE_SHIFT;
++       if ((area->vm_flags & (VM_GROWSDOWN | VM_WRITE | VM_SHARED)) 
++               == VM_WRITE)
++               vm_release_memory(len >> PAGE_SHIFT);
+ 
+ 	/* Unmapping the whole area. */
+ 	if (addr == area->vm_start && end == area->vm_end) {
+ 		if (area->vm_ops && area->vm_ops->close)
+ 			area->vm_ops->close(area);
+@@ -791,11 +912,11 @@
+  */
+ unsigned long do_brk(unsigned long addr, unsigned long len)
+ {
+ 	struct mm_struct * mm = current->mm;
+ 	struct vm_area_struct * vma;
+-	unsigned long flags, retval;
++	unsigned long flags, retval, reserved = 0;
+ 
+ 	len = PAGE_ALIGN(len);
+ 	if (!len)
+ 		return addr;
+ 
+@@ -822,11 +943,11 @@
+ 		return -ENOMEM;
+ 
+ 	if (mm->map_count > MAX_MAP_COUNT)
+ 		return -ENOMEM;
+ 
+-	if (!vm_enough_memory(len >> PAGE_SHIFT))
++	if (!(reserved = vm_enough_memory(len >> PAGE_SHIFT)))
+ 		return -ENOMEM;
+ 
+ 	flags = calc_vm_flags(PROT_READ|PROT_WRITE|PROT_EXEC,
+ 				MAP_FIXED|MAP_PRIVATE) | mm->def_flags;
+ 
+@@ -840,16 +962,19 @@
+ 			vma->vm_end = addr + len;
+ 			goto out;
+ 		}
+ 	}	
+ 
++
+ 	/*
+ 	 * create a vma struct for an anonymous mapping
+ 	 */
+ 	vma = kmem_cache_alloc(vm_area_cachep, SLAB_KERNEL);
+-	if (!vma)
++	if (!vma) {
++		vm_release_memory(reserved);
+ 		return -ENOMEM;
++	}
+ 
+ 	vma->vm_mm = mm;
+ 	vma->vm_start = addr;
+ 	vma->vm_end = addr + len;
+ 	vma->vm_flags = flags;
+@@ -908,10 +1033,13 @@
+ 		mm->map_count--;
+ 		remove_shared_vm_struct(mpnt);
+ 		zap_page_range(mm, start, size);
+ 		if (mpnt->vm_file)
+ 			fput(mpnt->vm_file);
++               if ((mpnt->vm_flags & (VM_GROWSDOWN | VM_WRITE | VM_SHARED)) 
++                       == VM_WRITE)
++                       vm_release_memory(size >> PAGE_SHIFT);
+ 		kmem_cache_free(vm_area_cachep, mpnt);
+ 		mpnt = next;
+ 	}
+ 	flush_tlb_mm(mm);
+ 
+diff -rBU 5 linux-2.4.3/mm/mremap.c linux-oom/mm/mremap.c
+--- linux-2.4.3/mm/mremap.c	Mon Mar 19 17:17:43 2001
++++ linux-oom/mm/mremap.c	Tue Apr  3 10:07:33 2001
+@@ -11,12 +11,10 @@
+ #include <linux/swap.h>
+ 
+ #include <asm/uaccess.h>
+ #include <asm/pgalloc.h>
+ 
+-extern int vm_enough_memory(long pages);
+-
+ static inline pte_t *get_one_pte(struct mm_struct *mm, unsigned long addr)
+ {
+ 	pgd_t * pgd;
+ 	pmd_t * pmd;
+ 	pte_t * pte = NULL;
+diff -rBU 5 linux-2.4.3/mm/oom_kill.c linux-oom/mm/oom_kill.c
+--- linux-2.4.3/mm/oom_kill.c	Tue Nov 14 10:56:46 2000
++++ linux-oom/mm/oom_kill.c	Tue Apr  3 09:26:08 2001
+@@ -11,143 +11,295 @@
+  *
+  *  Since we won't call these routines often (on a well-configured
+  *  machine) this file will double as a 'coding guide' and a signpost
+  *  for newbie kernel hackers. It features several pointers to major
+  *  kernel subsystems and hints as to where to find out what things do.
++ *
++ *  Reworked April 2001 by Jonathan "Chromatix" Morton [JDM]
+  */
+ 
+ #include <linux/mm.h>
+ #include <linux/sched.h>
+ #include <linux/swap.h>
+ #include <linux/swapctl.h>
+ #include <linux/timex.h>
+ 
+ /* #define DEBUG */
+ 
++enum {
++	false = 0,
++	true = 1
++};
++
++/* A list of PIDs and/or process names which shouldn't be killed in OOM situations */
++char vm_nokill[256] = {0};
++
+ /**
+  * int_sqrt - oom_kill.c internal function, rough approximation to sqrt
+  * @x: integer of which to calculate the sqrt
+  * 
+  * A very rough approximation to the sqrt() function.
+  */
+-static unsigned int int_sqrt(unsigned int x)
++static unsigned long int_sqrt(unsigned long x)
+ {
+-	unsigned int out = x;
++	unsigned long out = x;
+ 	while (x & ~(unsigned int)1) x >>=2, out >>=1;
+ 	if (x) out -= out >> 2;
+ 	return (out ? out : 1);
+ }	
+ 
+ /**
++ * oom_unkillable - determine whether a process is in the list of "please don't hurt me"
++ * processes.  This allows sysadmins to designate mission-critical processes which will
++ * never be killed unless no alternatives remain.  NB: 'init' need not be explicitly
++ * listed here, since it is already filtered out by other means.
++ */
++int oom_unkillable(struct task_struct *p)
++{
++	/* For each space-delimited entry in the vm_nokill array, check whether it's a number
++	 * or a name.  If a number, match it to the PID of the specified process.  If a name,
++	 * match to the name.  Process names consisting entirely of digits are not supported.
++	 */
++
++	/* A potential race condition exists here when the vm_nokill string is being modified
++	 * at the same time as OOM is reached.  The chances of this should be minimal, and
++	 * some care is taken to minimise the effects.  In particular, running off the end
++	 * of the array is guarded against.
++	 */
++
++	char *wordstart, *wordend, *ptr;
++	int c, pid;
++
++	for(wordstart = wordend = vm_nokill, c = pid = 0;
++			c < 256 && (*wordend) && (*wordstart);
++			c++, wordstart = wordend + 1) {
++
++		/* Find the start of the next word */
++		for( ; (*wordstart == 0 || *wordstart == ' ' || *wordstart == '\t') && c < 256; c++, wordstart++)
++			;
++
++		/* Find the end of this word */
++		for(wordend = wordstart; *wordend != 0 && *wordend != ' ' && *wordend != '\t' && c < 256; c++, wordend++)
++			;
++
++		/* No difference?  Must be end of string */
++		if(wordend == wordstart)
++			break;
++
++		/* Determine whether it's a number or name */
++		for(pid = true, ptr = wordstart; ptr < wordend; ptr++)
++			if(*ptr > '9' || *ptr < '0') {
++				pid = false;
++				break;
++			}
++
++		if(pid) {
++			/* Does the pid match? */
++			pid = simple_strtol(wordstart, 0, 10);
++			if(pid == p->pid)
++				return true;
++		} else {
++			/* Does the name match? */
++			if(!p->comm)
++				continue;
++			if(!strncmp(wordstart, p->comm, wordend - wordstart) && strlen(p->comm) == (wordend - wordstart))
++				return true;
++		}
++
++	}
++
++	/* No match, so nothing special */
++	return false;
++}
++
++/**
+  * oom_badness - calculate a numeric value for how bad this task has been
+  * @p: task struct of which task we should calculate
++ * @pass: weight reduction factor for time-based corrections
+  *
+  * The formula used is relatively simple and documented inline in the
+  * function. The main rationale is that we want to select a good task
+- * to kill when we run out of memory.
++ * to kill when we run out of memory.  This selection should also be
++ * intuitive to the average sysadmin.
++ *
++ * Processes we don't really want to kill include:
++ *   Batch-run processes which have lots of computation done (which would be wasted)
++ *   System daemons or services (eg. mail server or database)
++ *     (usually these run for a long time and are well-behaved)
++ *   Processes started by the superuser (we assume he knows what he's doing)
++ *
++ * Processes we *do* want to kill include:
++ *   Unprivileged-user processes which are gratuitously consuming memory very quickly
++ *     (usually these will have short runtimes, CPU usage and high UIDs)
++ *   System daemons which have suddenly "sprung a leak" (this is a relatively rare event)
++ *
++ * The above rules are only guidelines - for example it makes more sense to kill a
++ * virtually-unused mail or web server rather than an interactive client on a workstation,
++ * whereas the reverse might be true on a busy server.  However, this is partially accounted
++ * for by the simple algorithm embedded here (busy servers consume CPU, right?).
++ *
++ * On the first pass through the list of processes, the OOM killer uses (pass == 0) which should
++ * work well for most situations.  If no "obvious" target shows up, the pass number is
++ * increased on each subsequent run to select a lesser weight on the CPU time and run time values.
+  *
+- * Good in this context means that:
+- * 1) we lose the minimum amount of work done
+- * 2) we recover a large amount of memory
+- * 3) we don't kill anything innocent of eating tons of memory
+- * 4) we want to kill the minimum amount of processes (one)
+- * 5) we try to kill the process the user expects us to kill, this
+- *    algorithm has been meticulously tuned to meet the priniciple
+- *    of least surprise ... (be careful when you change it)
++ * In this way, long-running processes will still get terminated if they spring a leak, when no
++ * other "obviously bad" (ie. shortlived and huge) processes are left in the system.
+  */
+ 
+-static int badness(struct task_struct *p)
++static unsigned long badness(struct task_struct *p, int pass)
+ {
+-	int points, cpu_time, run_time;
++	unsigned long points, cpu_time, run_time, t;
+ 
++	/* If there's no memory associated with this process, killing it will help nothing */
+ 	if (!p->mm)
+ 		return 0;
+-	/*
+-	 * The memory size of the process is the basis for the badness.
++
++	/* Don't *ever* try to kill init!
++	 * If that's the only process left, we'll panic anyway...
+ 	 */
+-	points = p->mm->total_vm;
++	if (p->pid == 1 || (!strcmp("init", p->comm) && p->uid == 0))
++		return 0;
+ 
+ 	/*
+-	 * CPU time is in seconds and run time is in minutes. There is no
+-	 * particular reason for this other than that it turned out to work
+-	 * very well in practice. This is not safe against jiffie wraps
+-	 * but we don't care _that_ much...
++	 * The memory size of the process is the main badness factor.
++	 * Scale it up so it's roughly normalised relative to the total VM in the system.
++	 * On most systems, unsigned long is 32 bits - note that the following code will
++	 * produce bigger numbers on systems where this is not the case.
+ 	 */
+-	cpu_time = (p->times.tms_utime + p->times.tms_stime) >> (SHIFT_HZ + 3);
+-	run_time = (jiffies - p->start_time) >> (SHIFT_HZ + 10);
+-
+-	points /= int_sqrt(cpu_time);
+-	points /= int_sqrt(int_sqrt(run_time));
++	points = p->mm->total_vm;
++	t = vm_total();
++	while(t < (1 << (sizeof(unsigned long) - 1))) {
++		t <<= 1;
++		points <<= 1;
++	}
+ 
+ 	/*
+-	 * Niced processes are most likely less important, so double
+-	 * their badness points.
++	 * Process with plenty of runtime and cpu time under their belt are more likely to be
++	 * well-behaved and/or important, so give them big goodness factors.  These reduce to
++	 * "virtually immune" after about 1 week uptime and 1 day CPU time, or proportionally
++	 * equivalent values.  Short-lived processes (with, say under 10 mins CPU time and 1
++	 * hour runtime or proportionate balances) will get nice big scores depending mostly
++	 * on their size.
++	 *
++	 * CPU time is in seconds and run time is in minutes (well, actually, 64 seconds).
++	 * There is no particular reason for this other than that it turned out to work
++	 * reasonably well in a few common testcases.
+ 	 */
+-	if (p->nice > 0)
+-		points *= 2;
++	cpu_time = (p->times.tms_utime + p->times.tms_stime) >> SHIFT_HZ;
++	run_time = ((unsigned long) jiffies - p->start_time) >> (SHIFT_HZ + 6);
++	
++	/* If this isn't the first pass, give the CPU and run times progressively less weight */
++	while(pass > 0) {
++		pass--;
++		cpu_time = int_sqrt(cpu_time);
++		run_time = int_sqrt(run_time);
++	}
++
++	/* Make sure no divide-by-zero crap happens later, for very new processes */
++	if(!cpu_time)
++		cpu_time = 1;
++	if(!run_time)
++		run_time = 1;
++
++	/* Apply the weights - since these are goodness factors, they reduce the badness factor */
++	points /= cpu_time;
++	points /= run_time;
+ 
+ 	/*
+ 	 * Superuser processes are usually more important, so we make it
+ 	 * less likely that we kill those.
+ 	 */
+ 	if (cap_t(p->cap_effective) & CAP_TO_MASK(CAP_SYS_ADMIN) ||
+ 				p->uid == 0 || p->euid == 0)
+-		points /= 4;
++		points /= 2;
++
++	/* Much the same goes for processes with low UIDs (FIXME: make this configurable) */
++	if(p->uid < 100 || p->euid < 100)
++		points /= 2;
+ 
+ 	/*
+ 	 * We don't want to kill a process with direct hardware access.
+ 	 * Not only could that mess up the hardware, but usually users
+ 	 * tend to only have this flag set on applications they think
+ 	 * of as important.
+ 	 */
+ 	if (cap_t(p->cap_effective) & CAP_TO_MASK(CAP_SYS_RAWIO))
+ 		points /= 4;
+-#ifdef DEBUG
+-	printk(KERN_DEBUG "OOMkill: task %d (%s) got %d points\n",
+-	p->pid, p->comm, points);
++
++	/* Always return at least 1 if there is any memory associated with the process */
++	if(points < 1)
++		points = 1;
++
++#if defined(DEBUG) || VM_DEBUG
++	printk(KERN_DEBUG "OOMkill: task %d (%s) got %lu points on pass %d (with cputime %lu and runtime %lu)\n",
++	p->pid, p->comm, points, pass, cpu_time, run_time);
+ #endif
+ 	return points;
+ }
+ 
+ /*
+  * Simple selection loop. We chose the process with the highest
+  * number of 'points'. We need the locks to make sure that the
+  * list of task structs doesn't change while we look the other way.
+  *
++ * As documented for badness(), we rescan the task list (with different weights) if we don't find a
++ * particularly "bad" process.  We put a cap on how many times we try this, though - a machine full
++ * of many small processes can still go OOM.
++ *
+  * (not docbooked, we don't want this one cluttering up the manual)
+  */
+ static struct task_struct * select_bad_process(void)
+ {
+-	int maxpoints = 0;
++	unsigned long maxpoints = 0;
+ 	struct task_struct *p = NULL;
+ 	struct task_struct *chosen = NULL;
++	int pass = 0;
++	int suppress_unkillable = 0;
+ 
+ 	read_lock(&tasklist_lock);
+-	for_each_task(p) {
+-		if (p->pid) {
+-			int points = badness(p);
+-			if (points > maxpoints) {
+-				chosen = p;
+-				maxpoints = points;
+-			}
++	for( ; suppress_unkillable < 2; suppress_unkillable++) {
++		if(suppress_unkillable)
++			printk(KERN_ERR "OOMkill: unable to find a non-critical process to kill!\n");
++
++		do {
++			for_each_task(p) {
++				if (p->pid && (!oom_unkillable(p) || suppress_unkillable)) {
++					unsigned long points = badness(p, pass);
++					if (points > maxpoints) {
++						chosen = p;
++						maxpoints = points;
+ 		}
++				} else {
++#if defined(DEBUG) || VM_DEBUG
++					printk(KERN_DEBUG "OOMkill: task %d (%s) skipped due to vm_nokill list\n",
++							p->pid, p->comm);
++#endif
++	 			}
++			}
++			pass++;
++		} while(maxpoints < 1024 && pass < 10);
++		if(maxpoints > 1)
++			break;
+ 	}
+ 	read_unlock(&tasklist_lock);
++
++	printk(KERN_INFO "Out of Memory: Selected process with badness %lu on pass %d\n",
++	       maxpoints, pass - 1);
++
+ 	return chosen;
+ }
+ 
+ /**
+- * oom_kill - kill the "best" process when we run out of memory
++ * oom_kill - kill the most appropriate process when we run out of memory
+  *
+  * If we run out of memory, we have the choice between either
+  * killing a random task (bad), letting the system crash (worse)
+  * OR try to be smart about which process to kill. Note that we
+  * don't have to be perfect here, we just have to be good.
+  *
+  * We must be careful though to never send SIGKILL a process with
+- * CAP_SYS_RAW_IO set, send SIGTERM instead (but it's unlikely that
+- * we select a process with CAP_SYS_RAW_IO set).
++ * CAP_SYS_RAW_IO set, send SIGTERM instead.
+  */
+ void oom_kill(void)
+ {
+ 
+ 	struct task_struct *p = select_bad_process();
+@@ -189,22 +341,31 @@
+  * Returns 0 if there is still enough memory left,
+  * 1 when we are out of memory (otherwise).
+  */
+ int out_of_memory(void)
+ {
+-	struct sysinfo swp_info;
++	long free;
+ 
+ 	/* Enough free memory?  Not OOM. */
+-	if (nr_free_pages() > freepages.min)
++	free = nr_free_pages();
++	if (free > freepages.min)
++		return 0;
++
++	if (free + nr_inactive_clean_pages() > freepages.low)
+ 		return 0;
+ 
+-	if (nr_free_pages() + nr_inactive_clean_pages() > freepages.low)
++	/*
++	 * Buffers and caches can be freed up (Jonathan "Chromatix" Morton)
++	 * Fixes bug where systems with tons of "free" RAM were erroneously detecting OOM.
++	 */
++	free += atomic_read(&buffermem_pages);
++	free += atomic_read(&page_cache_size);
++	if (free > freepages.low)
+ 		return 0;
+ 
+ 	/* Enough swap space left?  Not OOM. */
+-	si_swapinfo(&swp_info);
+-	if (swp_info.freeswap > 0)
++	if (nr_swap_pages > 0)
+ 		return 0;
+ 
+ 	/* Else... */
+ 	return 1;
+ }
+diff -rBU 5 linux-2.4.3/mm/shmem.c linux-oom/mm/shmem.c
+--- linux-2.4.3/mm/shmem.c	Fri Mar  2 15:16:59 2001
++++ linux-oom/mm/shmem.c	Tue Apr  3 09:32:35 2001
+@@ -842,11 +842,10 @@
+ 	int error;
+ 	struct file *file;
+ 	struct inode * inode;
+ 	struct dentry *dentry, *root;
+ 	struct qstr this;
+-	int vm_enough_memory(long pages);
+ 
+ 	error = -ENOMEM;
+ 	if (!vm_enough_memory((size) >> PAGE_SHIFT))
+ 		goto out;
+ 
+diff -rBU 5 linux-2.4.3/mm/swapfile.c linux-oom/mm/swapfile.c
+--- linux-2.4.3/mm/swapfile.c	Thu Mar 22 09:22:15 2001
++++ linux-oom/mm/swapfile.c	Tue Apr  3 09:32:40 2001
+@@ -15,10 +15,13 @@
+ #include <linux/pagemap.h>
+ #include <linux/shm.h>
+ 
+ #include <asm/pgtable.h>
+ 
++extern int sysctl_overcommit_memory;
++extern void vm_invalidate_totalmem(void);
++
+ spinlock_t swaplock = SPIN_LOCK_UNLOCKED;
+ unsigned int nr_swapfiles;
+ 
+ struct swap_list_t swap_list = {-1, -1};
+ 
+@@ -405,11 +408,11 @@
+ 
+ asmlinkage long sys_swapoff(const char * specialfile)
+ {
+ 	struct swap_info_struct * p = NULL;
+ 	struct nameidata nd;
+-	int i, type, prev;
++	int i, type, prev, flags;
+ 	int err;
+ 	
+ 	if (!capable(CAP_SYS_ADMIN))
+ 		return -EPERM;
+ 
+@@ -450,11 +453,22 @@
+ 		swap_list.next = swap_list.head;
+ 	}
+ 	nr_swap_pages -= p->pages;
+ 	swap_list_unlock();
+ 	p->flags = SWP_USED;
+-	err = try_to_unuse(type);
++
++       /* Don't allow removal of swap if it will cause overcommit */
++       spin_lock_irqsave(&vm_lock, flags);
++       if ((sysctl_overcommit_memory < 0) && 
++               (vm_reserved > vm_total())) {
++               spin_unlock_irqrestore(&vm_lock, flags);
++               err = -ENOMEM;
++       } else {
++               spin_unlock_irqrestore(&vm_lock, flags);
++               err = try_to_unuse(type);
++       }
++
+ 	if (err) {
+ 		/* re-insert swap space back into swap_list */
+ 		swap_list_lock();
+ 		for (prev = -1, i = swap_list.head; i >= 0; prev = i, i = swap_info[i].next)
+ 			if (p->prio >= swap_info[i].prio)
+@@ -485,10 +499,11 @@
+ 
+ out_dput:
+ 	unlock_kernel();
+ 	path_release(&nd);
+ out:
++	vm_invalidate_totalmem();
+ 	return err;
+ }
+ 
+ int get_swaparea_info(char *buf)
+ {
+@@ -789,10 +804,11 @@
+ 		++least_priority;
+ 	path_release(&nd);
+ out:
+ 	if (swap_header)
+ 		free_page((long) swap_header);
++	vm_invalidate_totalmem();
+ 	unlock_kernel();
+ 	return error;
+ }
+ 
+ void si_swapinfo(struct sysinfo *val)

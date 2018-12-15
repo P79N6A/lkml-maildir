@@ -1,0 +1,300 @@
+Date: Thu, 11 Mar 1999 22:24:07 +0100 (CET)
+From: Andrea Arcangeli <>
+Subject: [patch] kstat change to see how much Linux SMP really scale well
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/3/11/117
+
+If I run something that doesn't scale well in SMP (due the big kernel
+lock) right now the kernel doesn't tell me how much the two CPU are really
+doing _useful_ things.
+While one CPU is blocked spinning on the lock it's not useful but we are
+accounting such time as normal kernel "useful" time. I don't like this too
+much because I want to see in xosview also how much the two CPU are used
+really. I think this would allow us to trivially discover big-kernel-lock
+bottleneck for example.
+So I changed the SMP kernel-time accounting to take care of what the
+kernel is doing. If the kernel was spinning on the lock at profiling time
+the system kernel-time won't be increased.
+This worked fine here. I think people with many CPU can be interested in
+this my new code because they will trivially be able to see how much Linux
+is really SMP-scaling well. But don't take it too much seriously because
+it's a probabilistc value. So I bet that some kind of usage could confuse
+the new statistics and so your CPU could be used _more_ of what's been
+reported (but this is true also for the old _current_ statistcs).
+I like very much this profiling approch because now I can see with my eyes
+what's happening really on the two CPU over the time and in _real_ time.
+Here is my patch against 2.2.3:
+Index: arch/i386/vmlinux.lds
+===================================================================
+RCS file: /var/cvs/linux/arch/i386/vmlinux.lds,v
+retrieving revision 1.1.2.1
+diff -u -r1.1.2.1 vmlinux.lds
+--- vmlinux.lds	1999/01/18 01:36:59	1.1.2.1
++++ linux/arch/i386/vmlinux.lds	1999/03/11 12:33:07
+@@ -13,7 +13,9 @@
+ 	*(.fixup)
+ 	*(.gnu.warning)
+ 	} = 0x9090
++  __lock_start = .;
+   .text.lock : { *(.text.lock) }	/* out-of-line lock text */
++  __lock_end = .;
+   .rodata : { *(.rodata) }
+   .kstrtab : { *(.kstrtab) }
+ 
+Index: arch/i386/kernel/smp.c
+===================================================================
+RCS file: /var/cvs/linux/arch/i386/kernel/smp.c,v
+retrieving revision 1.1.2.9
+diff -u -r1.1.2.9 smp.c
+--- smp.c	1999/02/20 15:57:15	1.1.2.9
++++ linux/arch/i386/kernel/smp.c	1999/03/11 18:31:17
+@@ -38,6 +38,7 @@
+ #include <linux/mc146818rtc.h>
+ #include <linux/smp_lock.h>
+ #include <linux/init.h>
++#include <linux/module.h>
+ #include <asm/mtrr.h>
+ 
+ #include "irq.h"
+@@ -1665,6 +1666,26 @@
+ 	send_IPI_allbutself(MTRR_CHANGE_VECTOR);
+ }
+ 
++static __inline__ int smp_cpu_spinning(struct pt_regs * regs)
++{
++#ifndef	CONFIG_MODULES
++	if (regs->eip < _lock_start || regs->eip >= _lock_end)
++		return 0;
++	return 1;
++#else
++	/* The kernel is the last "module" -- no need to treat it special.  */
++	struct module *mp;
++	for (mp = module_list; mp != NULL; mp = mp->next)
++	{
++		if (!mp->lock_start)
++			continue;
++		if (regs->eip >= mp->lock_start && regs->eip < mp->lock_end)
++			return 1;
++	}
++	return 0;
++#endif
++}
++
+ /*
+  * Local timer interrupt handler. It does both profiling and
+  * process statistics/rescheduling.
+@@ -1702,7 +1723,12 @@
+ 		if (user_mode(regs))
+ 			user=1;
+ 		else
+-			system=1;
++			/*
++			 * Avoid to account as useful the wasted time the CPU
++			 * spend spinning on the SMP locks. -arca
++			 */
++			if (!smp_cpu_spinning(regs))
++				system=1;
+ 
+  		irq_enter(cpu, 0);
+ 		if (p->pid) {
+Index: include/linux/module.h
+===================================================================
+RCS file: /var/cvs/linux/include/linux/module.h,v
+retrieving revision 1.1.2.1
+diff -u -r1.1.2.1 module.h
+--- module.h	1999/01/18 01:33:03	1.1.2.1
++++ linux/include/linux/module.h	1999/03/11 20:32:31
+@@ -22,6 +22,11 @@
+ 
+ #include <asm/atomic.h>
+ 
++/* lock segment addresses */
++extern const char	__lock_start, __lock_end;
++#define _lock_start	((unsigned long) &__lock_start)
++#define _lock_end	((unsigned long) &__lock_end)
++
+ /* Don't need to bring in all of uaccess.h just for this decl.  */
+ struct exception_table_entry;
+ 
+@@ -82,6 +87,8 @@
+ 	const struct module_persist *persist_start;
+ 	const struct module_persist *persist_end;
+ 	int (*can_unload)(void);
++	unsigned long lock_start;
++	unsigned long lock_end;
+ };
+ 
+ struct module_info
+Index: kernel/module.c
+===================================================================
+RCS file: /var/cvs/linux/kernel/module.c,v
+retrieving revision 1.1.2.1
+diff -u -r1.1.2.1 module.c
+--- module.c	1999/01/18 01:32:51	1.1.2.1
++++ linux/kernel/module.c	1999/03/11 20:46:52
+@@ -42,7 +42,14 @@
+ 	NULL,			/* cleanup */
+ 	__start___ex_table,	/* ex_table_start */
+ 	__stop___ex_table,	/* ex_table_end */
+-	/* Rest are NULL */
++#ifdef __alpha__
++	NULL,			/* gp */
++#endif
++	NULL,			/* persist_start */
++	NULL,			/* persist_stop */
++	NULL,			/* can_unload */
++	_lock_start,
++	_lock_end,
+ };
+ 
+ struct module *module_list = &kernel_module;
+@@ -146,6 +153,7 @@
+ 
+ 	put_mod_name(name);
+ 
++	wmb();	/* avoid racing with the SMP irq -arca */
+ 	module_list = mod;	/* link it in */
+ 
+ 	error = (long) mod;
+@@ -217,7 +225,7 @@
+ 
+ 	/* Make sure all interesting pointers are sane.  */
+ 
+-#define bound(p, n, m)  ((unsigned long)(p) >= (unsigned long)(m+1) &&  \
++#define bound(p, n, m)  ((unsigned long)(p) >= (unsigned long)((m)+1) &&  \
+ 	         (unsigned long)((p)+(n)) <= (unsigned long)(m) + (m)->size)
+ 
+ 	if (!bound(mod->name, namelen, mod)) {
+@@ -242,15 +250,21 @@
+ 	}
+ 	if (mod->ex_table_start > mod->ex_table_end
+ 	    || (mod->ex_table_start &&
+-		!((unsigned long)mod->ex_table_start >= (unsigned long)(mod+1)
+-		  && ((unsigned long)mod->ex_table_end
+-		      < (unsigned long)mod + mod->size)))
++		!bound(mod->ex_table_start,
++		       mod->ex_table_end - mod->ex_table_start - 1, mod))
+ 	    || (((unsigned long)mod->ex_table_start
+ 		 - (unsigned long)mod->ex_table_end)
+ 		% sizeof(struct exception_table_entry))) {
+ 		printk(KERN_ERR "init_module: mod->ex_table_* invalid.\n");
+ 		goto err2;
+ 	}
++	if (mod->lock_start > mod->lock_end
++	    || (mod->lock_start &&
++		!bound(mod->lock_start,
++		       mod->lock_end - mod->lock_start - 1, mod))) {
++		printk(KERN_ERR "init_module: mod->lock_* invalid.\n");
++		goto err2;
++	}
+ 	if (mod->flags & ~MOD_AUTOCLEAN) {
+ 		printk(KERN_ERR "init_module: mod->flags invalid.\n");
+ 		goto err2;
+@@ -261,11 +275,6 @@
+ 		goto err2;
+ 	}
+ #endif
+-	if (mod_member_present(mod, can_unload)
+-	    && mod->can_unload && !bound(mod->can_unload, 0, mod)) {
+-		printk(KERN_ERR "init_module: mod->can_unload out of bounds.\n");
+-		goto err2;
+-	}
+ 
+ #undef bound
+ 
+@@ -797,6 +806,8 @@
+ 			dep->dep->flags |= MOD_JUST_FREED;
+ 	}
+ 
++	cli();	/* avoid racing with the SMP irq -arca */
++
+ 	/* And from the main module list.  */
+ 
+ 	if (mod == module_list) {
+@@ -807,6 +818,8 @@
+ 			continue;
+ 		p->next = mod->next;
+ 	}
++
++	sti();
+ 
+ 	/* And free the memory.  */
+ 
+The module patch will be obviously backwards compatible. So you _don't_
+need a new insmod after the patch. But you need a new insmod if you want
+to take advantage of this new feature with the spinlocks compiled in the
+module. If you are lazy just apply the patch and you'll get an almost
+perfect kernel SMP profiling.
+So here my second patch against modutils-2.1.85 (this is the latest I have
+here, and the phone of my home is busy right now so I can't download a new
+one, I hope it will apply also in latest modutils) that will force insmod
+to take care of the new lock_begin/end fields:
+===================================================================
+RCS file: modutils-2.1.85/include/module.h,v
+retrieving revision 1.1
+diff -u -r1.1 modutils-2.1.85/include/module.h
+--- modutils-2.1.85/include/module.h	1999/03/11 20:23:55	1.1
++++ modutils-2.1.85/include/module.h	1999/03/11 20:24:53
+@@ -154,6 +154,8 @@
+   unsigned tgt_long persist_start;
+   unsigned tgt_long persist_end;
+   unsigned tgt_long can_unload;
++  unsigned tgt_long lock_start;
++  unsigned tgt_long lock_end;
+   unsigned tgt_long runsize;
+ };
+ 
+===================================================================
+RCS file: modutils-2.1.85/insmod/insmod.c,v
+retrieving revision 1.1
+diff -u -r1.1 modutils-2.1.85/insmod/insmod.c
+--- modutils-2.1.85/insmod/insmod.c	1999/03/11 18:32:52	1.1
++++ modutils-2.1.85/insmod/insmod.c	1999/03/11 20:25:34
+@@ -1282,6 +1282,12 @@
+       module->ex_table_start = sec->header.sh_addr;
+       module->ex_table_end = sec->header.sh_addr + sec->header.sh_size;
+     }
++  sec = obj_find_section(f, ".text.lock");
++  if (sec)
++    {
++      module->lock_start = sec->header.sh_addr;
++      module->lock_end = sec->header.sh_addr + sec->header.sh_size;
++    }
+ 
+   sec = obj_find_section(f, ".text.init");
+   if (sec)
+Since I just compiled a new working insmod here I'll provide you also a
+new insmod that will make more confortable the upgrade.
+ftp://e-mind.com/pub/linux/kernel-patches/spinning-no-system/insmod.gz
+andrea@laser:/usr/src/linux$ file /sbin/insmod 
+/sbin/insmod: ELF 32-bit LSB executable, Intel 80386, version 1, dynamically linked (uses shared libs), stripped
+I don't have other archs.
+BTW, it looks to me that the persist fields of struct module are been
+obsoleted by kmod. Maybe I could replace the two obsoleted fields with my
+new one? Right now I took a _safe_ approch (also because I don't have an
+updated modutils source tree here to double check the real status of the
+persist fields). I am not too much worried about that though since it's
+really a minor issue ;).
+The only bad thing is that I think other archs will stop compiling until
+somebody will define _lock_start and _lock_end somewhere there too. A
+just compiling approch is to do something like:
+#ifdef __i386__
++/* lock segment addresses */
++extern const char      __lock_start, __lock_end;
++#define _lock_start    ((unsigned long) &__lock_start)
++#define _lock_end      ((unsigned long) &__lock_end)
+#else
+#define _lock_start 0
+#define _lock_end 0
+#endif
+but if you don't define the two values as pointer to the start and end of
+the .text.lock segment you'll probably don't want to apply my patch ;).
+Andrea Arcangeli
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

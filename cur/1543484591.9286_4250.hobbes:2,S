@@ -1,0 +1,217 @@
+Date: Fri, 5 Feb 1999 15:33:50 +0100 (CET)
+From: Andrea Arcangeli <>
+Subject: Re: [patch] inode leakage again
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/2/5/94
+
+On Fri, 5 Feb 1999, Andrea Arcangeli wrote:
+>>and I cannot access any file anymore, I get above message again and again
+>>until I do sync.
+>
+>Bingo. When you do sync you get everything back ok?
+Ok. The reason your proggy:
+#include <stdio.h>
+void main(void)
+{
+        int i;
+        char buf[100];
+        FILE *file;
+        for(i=0;i<10000;i++) {
+                sprintf(buf,"%d",i);
+                file=fopen(buf,"w");
+                if (file == NULL) {
+                        printf("cannot open file\n");
+                        exit(0);
+                }
+                fclose(file);
+        }
+}
+was failing with my last fix is exactly due the dirty inodes that was not
+flushed do disk.
+This my new patch should fix all your inode problems. These fixes are
+needed also in the case we'll move the inode allocation to the slab
+instead of getting raw pages.  The only differences is that if we'll make
+the inode pool shrinkable we will be allowed to go over inode-max without
+harming the system forever (just removing the return NULL if the `if
+(nr_inodes > max_inodes)' fails). 
+I checked that now your proggy fail _only_ if you comment out fclose() and
+that is what has to happen.
+Index: fs/inode.c
+===================================================================
+RCS file: /var/cvs/linux/fs/inode.c,v
+retrieving revision 1.1.1.2
+diff -u -r1.1.1.2 inode.c
+--- inode.c	1999/01/26 18:30:24	1.1.1.2
++++ linux/fs/inode.c	1999/02/05 14:14:17
+@@ -54,7 +54,7 @@
+  * NOTE! You also have to own the lock if you change
+  * the i_state of an inode while it is in use..
+  */
+-spinlock_t inode_lock = SPIN_LOCK_UNLOCKED;
++static spinlock_t inode_lock = SPIN_LOCK_UNLOCKED;
+ 
+ /*
+  * Statistics gathering..
+@@ -62,9 +62,8 @@
+ struct {
+ 	int nr_inodes;
+ 	int nr_free_inodes;
+-	int preshrink;		/* pre-shrink dcache? */
+-	int dummy[4];
+-} inodes_stat = {0, 0, 0,};
++	int dummy[5];
++} inodes_stat = {0, 0, };
+ 
+ int max_inodes;
+ 
+@@ -140,7 +139,7 @@
+ 		inode->i_sb->s_op->write_inode(inode);
+ }
+ 
+-static inline void sync_one(struct inode *inode)
++static void sync_one(struct inode *inode)
+ {
+ 	if (inode->i_state & I_LOCK) {
+ 		spin_unlock(&inode_lock);
+@@ -312,6 +311,34 @@
+ 	return busy;
+ }
+ 
++static int produce_freeable_inodes(void)
++{
++	struct super_block * sb;
++	int nr = 0;
++
++	for (sb = sb_entry(super_blocks.next);
++	     sb != sb_entry(&super_blocks);
++	     sb = sb_entry(sb->s_list.next))
++	{
++		struct list_head * tmp, * head;
++
++		if (!sb->s_dev)
++			continue;
++
++		head = &sb->s_dirty;
++		while ((tmp = head->prev) != head)
++		{
++			struct inode * inode;
++			inode = list_entry(tmp, struct inode, i_list);
++			sync_one(inode);
++			if (!inode->i_count)
++				nr++;
++		}
++	}
++
++	return nr;
++}
++
+ /*
+  * This is called with the inode lock held. It searches
+  * the in-use for the specified number of freeable inodes.
+@@ -331,9 +358,11 @@
+ {
+ 	struct list_head *tmp, *head = &inode_in_use;
+ 	LIST_HEAD(freeable);
+-	int found = 0, depth = goal << 1;
++	LIST_HEAD(busy);
++	int found = 0;
+ 
+-	while ((tmp = head->prev) != head && depth--) {
++ again:
++	while ((tmp = head->prev) != head) {
+ 		struct inode * inode = list_entry(tmp, struct inode, i_list);
+ 		list_del(tmp);
+ 		if (CAN_UNUSE(inode)) {
+@@ -344,12 +373,19 @@
+ 				continue;
+ 			break;
+ 		}
+-		list_add(tmp, head);
++		list_add(tmp, &busy);
+ 	}
++	list_splice(&busy, head);
+ 	if (found) {
+ 		spin_unlock(&inode_lock);
+ 		dispose_list(&freeable);
+ 		spin_lock(&inode_lock);
++	} else {
++		if (produce_freeable_inodes())
++		{
++			INIT_LIST_HEAD(&busy);
++			goto again;
++		}
+ 	}
+ 	return found;
+ }
+@@ -403,7 +439,7 @@
+ 	/*
+ 	 * Check whether to restock the unused list.
+ 	 */
+-	if (inodes_stat.preshrink) {
++	if (inodes_stat.nr_inodes > max_inodes) {
+ 		struct list_head *tmp;
+ 		try_to_free_inodes(8);
+ 		tmp = inode_unused.next;
+@@ -413,6 +449,9 @@
+ 			inode = list_entry(tmp, struct inode, i_list);
+ 			return inode;
+ 		}
++		spin_unlock(&inode_lock);
++		printk(KERN_WARNING "grow_inodes: inode-max limit reached\n");
++		return NULL;
+ 	}
+ 		
+ 	spin_unlock(&inode_lock);
+@@ -436,9 +475,6 @@
+ 		 */
+ 		inodes_stat.nr_inodes += INODES_PER_PAGE;
+ 		inodes_stat.nr_free_inodes += INODES_PER_PAGE - 1;
+-		inodes_stat.preshrink = 0;
+-		if (inodes_stat.nr_inodes > max_inodes)
+-			inodes_stat.preshrink = 1;
+ 		return inode;
+ 	}
+ 
+@@ -447,7 +483,6 @@
+ 	 * the dcache and then try again to free some inodes.
+ 	 */
+ 	prune_dcache(inodes_stat.nr_inodes >> 2);
+-	inodes_stat.preshrink = 1;
+ 
+ 	spin_lock(&inode_lock);
+ 	free_inodes(inodes_stat.nr_inodes >> 2);
+@@ -462,7 +497,7 @@
+ 	}
+ 	spin_unlock(&inode_lock);
+ 
+-	printk("grow_inodes: allocation failed\n");
++	printk(KERN_WARNING "grow_inodes: allocation failed\n");
+ 	return NULL;
+ }
+ 
+Index: include/linux/fs.h
+===================================================================
+RCS file: /var/cvs/linux/include/linux/fs.h,v
+retrieving revision 1.1.1.2
+diff -u -r1.1.1.2 fs.h
+--- fs.h	1999/01/23 16:29:43	1.1.1.2
++++ linux/include/linux/fs.h	1999/02/05 14:14:58
+@@ -399,7 +390,6 @@
+ /* Inode state bits.. */
+ #define I_DIRTY		1
+ #define I_LOCK		2
+-#define I_FREEING	4
+ 
+ extern void __mark_inode_dirty(struct inode *);
+ static inline void mark_inode_dirty(struct inode *inode)
+Linus I hope that I am not harming you sending to you this patch, but I
+think it's good enough to be applyed on the official tree.
+Andrea Arcangeli
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

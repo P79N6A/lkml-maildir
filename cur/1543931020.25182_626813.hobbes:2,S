@@ -1,0 +1,121 @@
+Date: Tue, 11 Dec 2007 18:06:07 -0800
+From: Andrew Morton <>
+Subject: Re: [patch 2/2] 9p util semaphore to mutex
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2007/12/11/373
+
+On Sun, 09 Dec 2007 13:15:11 -0400 Kevin Winchester <kjwinchester@gmail.com> wrote:
+> Convert the semaphore to a mutex in net/9p/util.c
+> 
+> Signed-off-by: Kevin Winchester <kjwinchester@gmail.com>
+> 
+> ---
+>  net/9p/util.c |   12 ++++++------
+>  1 file changed, 6 insertions(+), 6 deletions(-)
+> 
+> Index: v2.6.24-rc4/net/9p/util.c
+> ===================================================================
+> --- v2.6.24-rc4.orig/net/9p/util.c
+> +++ v2.6.24-rc4/net/9p/util.c
+> @@ -33,7 +33,7 @@
+>  #include <net/9p/9p.h>
+> 
+>  struct p9_idpool {
+> -	struct semaphore lock;
+> +	struct mutex lock;
+>  	struct idr pool;
+>  };
+> 
+> @@ -45,7 +45,7 @@ struct p9_idpool *p9_idpool_create(void)
+>  	if (!p)
+>  		return ERR_PTR(-ENOMEM);
+> 
+> -	init_MUTEX(&p->lock);
+> +	mutex_init(&p->lock);
+>  	idr_init(&p->pool);
+> 
+>  	return p;
+> @@ -76,14 +76,14 @@ retry:
+>  	if (idr_pre_get(&p->pool, GFP_KERNEL) == 0)
+>  		return 0;
+> 
+> -	if (down_interruptible(&p->lock) == -EINTR) {
+> +	if (mutex_lock_interruptible(&p->lock) == -EINTR) {
+>  		P9_EPRINTK(KERN_WARNING, "Interrupted while locking\n");
+>  		return -1;
+>  	}
+> 
+>  	/* no need to store exactly p, we just need something non-null */
+>  	error = idr_get_new(&p->pool, p, &i);
+> -	up(&p->lock);
+> +	mutex_unlock(&p->lock);
+> 
+>  	if (error == -EAGAIN)
+>  		goto retry;
+> @@ -104,12 +104,12 @@ EXPORT_SYMBOL(p9_idpool_get);
+> 
+>  void p9_idpool_put(int id, struct p9_idpool *p)
+>  {
+> -	if (down_interruptible(&p->lock) == -EINTR) {
+> +	if (mutex_lock_interruptible(&p->lock) == -EINTR) {
+>  		P9_EPRINTK(KERN_WARNING, "Interrupted while locking\n");
+>  		return;
+>  	}
+>  	idr_remove(&p->pool, id);
+> -	up(&p->lock);
+> +	mutex_unlock(&p->lock);
+>  }
+>  EXPORT_SYMBOL(p9_idpool_put);
+I cannot see how the code which you are modifying could have been correct.
+If the lock is contended and this task has signal_pending() then boom - we
+return from p9_idpool_put() without having removed the item from the IDR
+tree and then we just lose all track of this fact.  It is at a minimum a
+memory leak.
+I'm getting the feeling that we need to go and take a general look at the
+down_interuptible() and mutex_lock_interruptible() callers in the nether
+regions of the kernel...
+Meanwhile I'd propose this instead:
+From: Andrew Morton <akpm@linux-foundation.org>
+Don't use down_interruptible() in situations where we cannot handle the
+consequences.
+Cc: Kevin Winchester <kjwinchester@gmail.com>
+Cc: Eric Van Hensbergen <ericvh@gmail.com>
+Cc: Ron Minnich <rminnich@sandia.gov>
+Cc: Latchesar Ionkov <lucho@ionkov.net>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+ net/9p/util.c |   11 ++---------
+ 1 file changed, 2 insertions(+), 9 deletions(-)
+diff -puN net/9p/util.c~9p-util-fix-semaphore-handling net/9p/util.c
+--- a/net/9p/util.c~9p-util-fix-semaphore-handling
++++ a/net/9p/util.c
+@@ -76,12 +76,8 @@ retry:
+ 	if (idr_pre_get(&p->pool, GFP_KERNEL) == 0)
+ 		return 0;
+ 
+-	if (down_interruptible(&p->lock) == -EINTR) {
+-		P9_EPRINTK(KERN_WARNING, "Interrupted while locking\n");
+-		return -1;
+-	}
+-
+ 	/* no need to store exactly p, we just need something non-null */
++	down(&p->lock);
+ 	error = idr_get_new(&p->pool, p, &i);
+ 	up(&p->lock);
+ 
+@@ -104,10 +100,7 @@ EXPORT_SYMBOL(p9_idpool_get);
+ 
+ void p9_idpool_put(int id, struct p9_idpool *p)
+ {
+-	if (down_interruptible(&p->lock) == -EINTR) {
+-		P9_EPRINTK(KERN_WARNING, "Interrupted while locking\n");
+-		return;
+-	}
++	down(&p->lock);
+ 	idr_remove(&p->pool, id);
+ 	up(&p->lock);
+ }
+_

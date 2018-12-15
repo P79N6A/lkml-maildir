@@ -1,0 +1,173 @@
+Date: Mon, 18 Oct 1999 01:16:40 +0200 (MET DST)
+From:  Andries.Brouwer@cwi ...
+Subject: changing the size of a mounted partition
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/10/17/84
+
+Andreas writes:
+> The issue isn't being able to add and remove other partitions on a disk,
+> but rather to change the size of the underlying partition for a filesystem
+> that is currently mounted.
+Hmm, yes, that isnt currently supported.
+On the other hand, this is very close to what add_partition
+and del_partition currently do, so a resize_partition
+would be easy enough (patch below, entirely untested of course).
+If you want to be able to shrink a mounted partition then that
+seems tricky - we have to collect from the rest of the kernel
+how much is being used as swap, or how large the currently
+mounted filesystem is. On the other hand, if you only want to
+grow a partition, there is no problem.
+Andries
+------------- patch: grow a partition that is in use -----------
+diff -u --recursive --new-file ../linux-2.3.22/linux/drivers/block/blkpg.c ./linux/drivers/block/blkpg.c
+--- ../linux-2.3.22/linux/drivers/block/blkpg.c	Wed May 26 18:30:31 1999
++++ ./linux/drivers/block/blkpg.c	Mon Oct 18 00:50:42 1999
+@@ -18,6 +18,7 @@
+  * Partition stuff:
+  *    add_partition()
+  *    delete_partition()
++ *    resize_partition()
+  *    test_partition_in_use()   (also for test_disk_in_use)
+  *
+  * Geometry stuff:
+@@ -88,7 +89,8 @@
+  *                 or has the same number as an existing one
+  *          0: all OK.
+  */
+-int add_partition(kdev_t dev, struct blkpg_partition *p) {
++static int
++add_partition(kdev_t dev, struct blkpg_partition *p) {
+ 	struct gendisk *g;
+ 	long long ppstart, pplength;
+ 	long pstart, plength;
+@@ -148,7 +150,8 @@
+  *
+  * Note that the dev argument refers to the entire disk, not the partition.
+  */
+-int del_partition(kdev_t dev, struct blkpg_partition *p) {
++static int
++delete_partition(kdev_t dev, struct blkpg_partition *p) {
+ 	struct gendisk *g;
+ 	kdev_t devp;
+ 	int drive, first_minor, minor;
+@@ -187,6 +190,81 @@
+ 	return 0;
+ }
+ 
++/*
++ * Resize a partition given by partition number.
++ *
++ * If a partition is not in use, then delete_partition() followed
++ * by add_partition() will do. On the other hand, if a partition
++ * is in use, then probably we must not change the starting sector
++ * and may only grow, not shrink it. Maybe we can add machinery
++ * later and allow a filesystem to tell us how much of the partition
++ * is in actual use, so that also shrinking is possible.
++ *
++ * returns: EINVAL: bad parameters
++ *          ENXIO: cannot find partition
++ *          EBUSY: partition is busy and we order it to shrink
++ *          0: all OK.
++ *
++ * Note that the dev argument refers to the entire disk, not the partition.
++ */
++static int
++resize_partition(kdev_t dev, struct blkpg_partition *p) {
++	struct gendisk *g;
++	long long ppstart, pplength;
++	long pstart, plength;
++	int i, drive, first_minor, end_minor, minor;
++	kdev_t devp;
++
++	/* convert bytes to sectors, check for fit in a hd_struct */
++	ppstart = (p->start >> 9);
++	pplength = (p->length >> 9);
++	pstart = ppstart;
++	plength = pplength;
++	if (pstart != ppstart || plength != pplength
++	    || pstart < 0 || plength < 0)
++		return -EINVAL;
++
++	/* find the drive major */
++	g = get_gendisk(dev);
++	if (!g)
++		return -ENXIO;
++
++	/* drive and partition number OK? */
++	drive = (MINOR(dev) >> g->minor_shift);
++	first_minor = (drive << g->minor_shift);
++	end_minor   = first_minor + g->max_p;
++	if (first_minor != MINOR(dev) || p->pno <= 0 || p->pno >= g->max_p)
++		return -EINVAL;
++
++	/* existing drive and partition? */
++	minor = first_minor + p->pno;
++	if (drive >= g->nr_real || g->part[minor].nr_sects == 0)
++		return -ENXIO;
++
++	/* partition in use? Incomplete check for now. */
++	devp = MKDEV(MAJOR(dev), minor);
++	if (get_super(devp) ||          /* mounted? */
++	    is_swap_partition(devp)) {
++		/* yes - do not change start, and do not shrink */
++		if (g->part[minor].start_sect != pstart ||
++		    g->part[minor].nr_sects > plength)
++			return -EBUSY;
++	}
++
++	/* overlap? */
++	for (i=first_minor+1; i<end_minor; i++)
++		if (!(pstart+plength <= g->part[i].start_sect ||
++		      pstart >= g->part[i].start_sect + g->part[i].nr_sects))
++			return -EBUSY;
++
++	/* all seems OK */
++	g->part[minor].start_sect = pstart;
++	g->part[minor].nr_sects = plength;
++	if (g->sizes)
++		g->sizes[minor] = (plength >> (BLOCK_SIZE_BITS - 9));
++	return 0;
++}
++
+ int blkpg_ioctl(kdev_t dev, struct blkpg_ioctl_arg *arg)
+ {
+ 	struct blkpg_ioctl_arg a;
+@@ -199,6 +277,7 @@
+ 	switch (a.op) {
+ 		case BLKPG_ADD_PARTITION:
+ 		case BLKPG_DEL_PARTITION:
++		case BLKPG_RESIZE_PARTITION:
+ 			len = a.datalen;
+ 			if (len < sizeof(struct blkpg_partition))
+ 				return -EINVAL;
+@@ -208,8 +287,10 @@
+ 				return -EACCES;
+ 			if (a.op == BLKPG_ADD_PARTITION)
+ 				return add_partition(dev, &p);
++			else if (a.op == BLKPG_DEL_PARTITION)
++				return delete_partition(dev, &p);
+ 			else
+-				return del_partition(dev, &p);
++				return resize_partition(dev, &p);
+ 		default:
+ 			return -EINVAL;
+ 	}
+diff -u --recursive --new-file ../linux-2.3.22/linux/include/linux/blkpg.h ./linux/include/linux/blkpg.h
+--- ../linux-2.3.22/linux/include/linux/blkpg.h	Sat May 22 22:38:37 1999
++++ ./linux/include/linux/blkpg.h	Mon Oct 18 00:52:46 1999
+@@ -39,6 +39,7 @@
+ /* The subfunctions (for the op field) */
+ #define BLKPG_ADD_PARTITION	1
+ #define BLKPG_DEL_PARTITION	2
++#define BLKPG_RESIZE_PARTITION	3
+ 
+ /* Sizes of name fields. Unused at present. */
+ #define BLKPG_DEVNAMELTH	64
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

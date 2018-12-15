@@ -1,0 +1,671 @@
+Date: Sat, 15 May 1999 10:43:48 -0400
+From: Zack Weinberg <>
+Subject: Re: All the problems with 2.2.8/2.3.x and bdflush/update
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/5/16/33
+
+On Fri, 14 May 1999 18:22:13 +0200 (CEST), Andrea Arcangeli wrote:
+>On Fri, 14 May 1999, Zack Weinberg wrote:
+>
+>>You get an additional process slot, which is not to be sneezed at.
+>>More significant, though, you have a guarantee that data is flushed
+>>back within some short period of time, no matter what state the system
+>
+>You don't care to run update always with the same delta-time between
+>different runs. update does "sync some old buffer to disk". If you'll
+>delay the call of sync_old_buffers() then as worse the next time you'll
+>sync to disk some more dirty buffer.
+>
+>The stability of the VM system is enforced by bdflush/kswapd and not
+>from uptime.
+Here's a scenario for you:  I do some operation which generates a lot
+of dirty buffers, but not enough to trigger bdflush due to low
+memory.  The machine then sits completely idle for several hours.  If
+update is not running, will those dirty buffers be written back?
+This is not as farfetched as it might sound; suppose I update several
+pieces of software on my workstation right before going to bed.
+>>is in.  You don't seem to think this is important, but to anyone who
+>>maintains a server with key data on it, it is *critical*.
+>
+>If you need filesystem integrity after a crash (or better after a power
+>fail... ;), then you need a fault toulerant fs and not ext2. update
+>can't save you, it can only alleviate the damage.
+Granted.
+>>block; instead you call flush_dirty_buffers directly.  I'm not sure
+>>that's a good idea; can you justify it?
+>
+>Think if bdflush was writing the last bdflush_param.ndirty buffer. You'll
+>issue a sleep_on() but you'll get a wakeup without waiting that some more
+>buffer is been synced back to disk. And my way will avoid many task switch
+>ping-pong.
+If bdflush is already active, you probably wanted to be woken up at
+that point anyway.  I think.
+I ran some extensive tests last night.  Some basic info:
+- P133 with 32Mb memory, 4Gb disk; TSC enabled; hdparm settings -c1 -u1 -m16
+  (DMA doesn't work for some reason).
+- egcs-2.91.66 Debian GNU/Linux (egcs-1.1.2 release), with strength 
+   reduction turned on and -m486 -malign-blah... replaced by -mpentium.
+Here's the bonnie matrix.  -a is andrea1, -z is my revised
+no-userspace-update patch, -az is both.  I tried to break out just the
+buffer.c changes in andrea1 but it didn't work.  2.3.1 is not quite
+vanilla; your infinite loop fix was added to ext2/truncate.c and the
+run_task_queue call was removed from wakeup_bdflush.
+              -------Sequential Output-------- ---Sequential Input-- --Random--
+              -Per Char- --Block--- -Rewrite-- -Per Char- --Block--- --Seeks---
+Kernel     MB K/sec %CPU K/sec %CPU K/sec %CPU K/sec %CPU K/sec %CPU  /sec %CPU
+2.3.1     100  1310 95.0  4933 38.9  1842 29.4  1330 94.4  4706 26.7  64.9  3.7
+2.3.1-z   100  1336 96.2  4943 38.1  1828 28.8  1339 95.4  4809 28.1  64.0  3.9
+2.3.1-a   100  1282 92.2  5489 46.7  1717 28.4  1278 90.7  4897 28.5  72.1  4.0
+2.3.1-az  100  1286 93.3  5490 46.8  1713 28.6  1278 90.8  4900 27.5  71.0  4.1
+That's a little hard to parse; here are the deltas.
+Kernel       Output       Input   Seek
+          chr blk  rmw  chr blk
+2.3.1       0   0    0    0   0   0.0
+2.3.1-z    26  10 - 14    9 103  -0.9
+2.3.1-a   -28 556 -125  -52 191   7.2
+2.3.1-az  -24 557 -129  -52 194   6.1
+andrea1 improves block I/O rates substantially, but is worse for
+character I/O and `rewrite' (read/mod/write cycle for each 8k of the
+file). My patch offers small improvements on most things, a slight
+lose on read-mod-write, and a biggish improvement on block input.  The
+combination performs about the same as andrea1 by itself.
+I brought a lot of the changes to sync_old_buffers in andrea1 into my
+code, that's probably where the performance improvements in my patch
+come from.
+Patches are appended.  Notebook people: I know how to fix your problem, and
+that will follow in a few hours.
+zw
+Patch versus vanilla 2.3.1:
+--- buffer.c.231	Thu May 13 16:47:39 1999
++++ buffer.c	Sat May 15 09:45:18 1999
+@@ -100,7 +100,7 @@
+ 				each time we call refill */
+ 		int nref_dirt; /* Dirty buffer threshold for activating bdflush
+ 				  when trying to refill buffers. */
+-		int dummy1;    /* unused */
++		int interval;  /* Time (sec) between spontaneous wakeups */
+ 		int age_buffer;  /* Time for normal buffer to age before 
+ 				    we flush it */
+ 		int age_super;  /* Time for superblock to age before we 
+@@ -112,7 +112,7 @@
+ } bdf_prm = {{40, 500, 64, 256, 15, 30*HZ, 5*HZ, 1884, 2}};
+ 
+ /* These are the min and max parameter values that we will allow to be assigned */
+-int bdflush_min[N_PARAM] = {  0,  10,    5,   25,  0,   1*HZ,   1*HZ, 1, 1};
++int bdflush_min[N_PARAM] = {  0,  10,    5,   25,  1,   1*HZ,   1*HZ, 1, 1};
+ int bdflush_max[N_PARAM] = {100,5000, 2000, 2000,100, 600*HZ, 600*HZ, 2047, 5};
+ 
+ void wakeup_bdflush(int);
+@@ -1555,19 +1555,16 @@
+  * response to dirty buffers.  Once this process is activated, we write back
+  * a limited number of buffers to the disks and then go back to sleep again.
+  */
+-static DECLARE_WAIT_QUEUE_HEAD(bdflush_wait);
+ static DECLARE_WAIT_QUEUE_HEAD(bdflush_done);
+ struct task_struct *bdflush_tsk = 0;
+ 
+ void wakeup_bdflush(int wait)
+ {
+-	if (current == bdflush_tsk)
++	if (!bdflush_tsk || current == bdflush_tsk)
+ 		return;
+-	wake_up(&bdflush_wait);
+-	if (wait) {
+-		run_task_queue(&tq_disk);
++	wake_up_process(bdflush_tsk);
++	if (wait)
+ 		sleep_on(&bdflush_done);
+-	}
+ }
+ 
+ 
+@@ -1578,79 +1575,71 @@
+  * get written back.  Ideally, we would have a timestamp on the inodes
+  * and superblocks so that we could write back only the old ones as well
+  */
++#define too_many_dirty_buffers() \
++	(nr_buffers_type[BUF_DIRTY] > nr_buffers * bdf_prm.b_un.nfract / 100)
+ 
+-static int sync_old_buffers(void)
++static void sync_old_buffers(int all)
+ {
+-	int i;
+-	int ndirty, nwritten;
+-	int nlist;
+-	int ncount;
++	int writea = WRITEA;  /* non-blocking write for loop device */
++	int i, flushed = 0;
+ 	struct buffer_head * bh, *next;
+ 
+-	sync_supers(0);
+-	sync_inodes(0);
++ restart:
++	bh = lru_list[BUF_DIRTY];
++	if (!bh)
++		return;
++	i = nr_buffers_type[BUF_DIRTY];
++	for (; i-- > 0; bh = next) {
++		next = bh->b_next_free;
+ 
+-	ncount = 0;
+-#ifdef DEBUG
+-	for(nlist = 0; nlist < NR_LIST; nlist++)
+-#else
+-	for(nlist = BUF_LOCKED; nlist <= BUF_DIRTY; nlist++)
+-#endif
+-	{
+-		ndirty = 0;
+-		nwritten = 0;
+-	repeat:
++		if (!buffer_dirty(bh)) {
++			printk(KERN_ERR "clean buffer on dirty list!\n");
++			continue;
++		}
++		if (buffer_locked(bh))
++			continue;
++		    
++		if (all && time_before(jiffies, bh->b_flushtime))
++			continue;
+ 
+-		bh = lru_list[nlist];
+-		if(bh) 
+-			 for (i = nr_buffers_type[nlist]; i-- > 0; bh = next) {
+-				 /* We may have stalled while waiting for I/O to complete. */
+-				 if(bh->b_list != nlist) goto repeat;
+-				 next = bh->b_next_free;
+-				 if(!lru_list[nlist]) {
+-					 printk("Dirty list empty %d\n", i);
+-					 break;
+-				 }
+-				 
+-				 /* Clean buffer on dirty list?  Refile it */
+-				 if (nlist == BUF_DIRTY && !buffer_dirty(bh) && !buffer_locked(bh)) {
+-					 refile_buffer(bh);
+-					 continue;
+-				 }
+-				  
+-				  /* Unlocked buffer on locked list?  Refile it */
+-				  if (nlist == BUF_LOCKED && !buffer_locked(bh)) {
+-					  refile_buffer(bh);
+-					  continue;
+-				  }
+-				 
+-				 if (buffer_locked(bh) || !buffer_dirty(bh))
+-					  continue;
+-				 ndirty++;
+-				 if(time_before(jiffies, bh->b_flushtime))
+-					continue;
+-				 nwritten++;
+-				 next->b_count++;
+-				 bh->b_count++;
+-				 bh->b_flushtime = 0;
+-#ifdef DEBUG
+-				 if(nlist != BUF_DIRTY) ncount++;
+-#endif
+-				 ll_rw_block(WRITE, 1, &bh);
+-				 bh->b_count--;
+-				 next->b_count--;
+-			 }
++		flushed++;
++		bh->b_flushtime = 0;
++
++		/* Should we write back buffers that are shared or
++		   not?? currently dirty buffers are not shared,
++		   so it does not matter */
++		next->b_count++;
++		if (MAJOR(bh->b_dev) != LOOP_MAJOR)
++			ll_rw_block(WRITE, 1, &bh);
++		else {
++			ll_rw_block(writea, 1, &bh);
++			writea = WRITEA;
++			if (buffer_dirty(bh))
++				flushed--;
++		}
++		next->b_count--;
++
++		if (flushed >= bdf_prm.b_un.ndirty) {
++			if (!all && !too_many_dirty_buffers())
++				return;
++			flushed = 1;
++		}
++
++		/* We may have stalled while waiting for I/O to complete. */
++		if(next->b_list != BUF_DIRTY) goto restart;
++	}
++	/* If we didn't write anything, but there are still
++	 * dirty buffers, then make the next write to a
++	 * loop device be a blocking write.
++	 * This lets us block--which we _must_ do! */
++	if (flushed == 0 && nr_buffers_type[BUF_DIRTY] > 0 && writea != WRITE) {
++		writea = WRITE;
++		goto restart;
+ 	}
+-	run_task_queue(&tq_disk);
+-#ifdef DEBUG
+-	if (ncount) printk("sync_old_buffers: %d dirty buffers not on dirty list\n", ncount);
+-	printk("Wrote %d/%d buffers\n", nwritten, ndirty);
+-#endif
+-	run_task_queue(&tq_disk);
+-	return 0;
+ }
+ 
+ 
++
+ /* This is the interface to bdflush.  As we get more sophisticated, we can
+  * pass tuning parameters to this "process", to adjust how it behaves. 
+  * We would want to verify each parameter, however, to make sure that it 
+@@ -1664,10 +1653,9 @@
+ 	if (!capable(CAP_SYS_ADMIN))
+ 		goto out;
+ 
+-	if (func == 1) {
+-		 error = sync_old_buffers();
+-		 goto out;
+-	}
++	if (func == 1)
++		/* Function 1 is obsolete.  */
++		goto out;
+ 
+ 	/* Basically func 1 means read param 1, 2 means write param 1, etc */
+ 	if (func >= 2) {
+@@ -1710,13 +1698,7 @@
+ */
+ int bdflush(void * unused) 
+ {
+-	int i;
+-	int ndirty;
+-	int nlist;
+-	int ncount;
+-	struct buffer_head * bh, *next;
+-	int major;
+-	int wrta_cmd = WRITEA;	/* non-blocking write for LOOP */
++	long remaining, last_super_flush;
+ 
+ 	/*
+ 	 *	We have a bare-bones task_struct, and really should fill
+@@ -1726,8 +1708,12 @@
+ 
+ 	current->session = 1;
+ 	current->pgrp = 1;
+-	sprintf(current->comm, "kflushd");
++	current->dumpable = 0;
++	strcpy(current->comm, "kflushd");
++	sigfillset(&current->blocked);
+ 	bdflush_tsk = current;
++	remaining = bdf_prm.b_un.interval * HZ;
++	last_super_flush = jiffies;
+ 
+ 	/*
+ 	 *	As a kernel thread we want to tamper with system buffers
+@@ -1737,93 +1723,26 @@
+ 	lock_kernel();
+ 		 
+ 	for (;;) {
+-#ifdef DEBUG
+-		printk("bdflush() activated...");
+-#endif
++		wake_up(&bdflush_done);
++		bdflush_tsk->state = TASK_INTERRUPTIBLE;
++		remaining = schedule_timeout(remaining);
+ 
+-		CHECK_EMERGENCY_SYNC
++		CHECK_EMERGENCY_SYNC;
+ 
+-		ncount = 0;
+-#ifdef DEBUG
+-		for(nlist = 0; nlist < NR_LIST; nlist++)
+-#else
+-		for(nlist = BUF_LOCKED; nlist <= BUF_DIRTY; nlist++)
+-#endif
+-		 {
+-			 ndirty = 0;
+-		 repeat:
+-
+-			 bh = lru_list[nlist];
+-			 if(bh) 
+-				  for (i = nr_buffers_type[nlist]; i-- > 0 && ndirty < bdf_prm.b_un.ndirty; 
+-				       bh = next) {
+-					  /* We may have stalled while waiting for I/O to complete. */
+-					  if(bh->b_list != nlist) goto repeat;
+-					  next = bh->b_next_free;
+-					  if(!lru_list[nlist]) {
+-						  printk("Dirty list empty %d\n", i);
+-						  break;
+-					  }
+-					  
+-					  /* Clean buffer on dirty list?  Refile it */
+-					  if (nlist == BUF_DIRTY && !buffer_dirty(bh)) {
+-						  refile_buffer(bh);
+-						  continue;
+-					  }
+-					  
+-					  /* Unlocked buffer on locked list?  Refile it */
+-					  if (nlist == BUF_LOCKED && !buffer_locked(bh)) {
+-						  refile_buffer(bh);
+-						  continue;
+-					  }
+-					  
+-					  if (buffer_locked(bh) || !buffer_dirty(bh))
+-						   continue;
+-					  major = MAJOR(bh->b_dev);
+-					  /* Should we write back buffers that are shared or not??
+-					     currently dirty buffers are not shared, so it does not matter */
+-					  next->b_count++;
+-					  bh->b_count++;
+-					  ndirty++;
+-					  bh->b_flushtime = 0;
+-					  if (major == LOOP_MAJOR) {
+-						  ll_rw_block(wrta_cmd,1, &bh);
+-						  wrta_cmd = WRITEA;
+-						  if (buffer_dirty(bh))
+-							  --ndirty;
+-					  }
+-					  else
+-					  ll_rw_block(WRITE, 1, &bh);
+-#ifdef DEBUG
+-					  if(nlist != BUF_DIRTY) ncount++;
+-#endif
+-					  bh->b_count--;
+-					  next->b_count--;
+-				  }
+-		 }
+-#ifdef DEBUG
+-		if (ncount) printk("sys_bdflush: %d dirty buffers not on dirty list\n", ncount);
+-		printk("sleeping again.\n");
+-#endif
+-		/* If we didn't write anything, but there are still
+-		 * dirty buffers, then make the next write to a
+-		 * loop device to be a blocking write.
+-		 * This lets us block--which we _must_ do! */
+-		if (ndirty == 0 && nr_buffers_type[BUF_DIRTY] > 0 && wrta_cmd != WRITE) {
+-			wrta_cmd = WRITE;
+-			continue;
+-		}
+-		run_task_queue(&tq_disk);
+-		wake_up(&bdflush_done);
+-		
+-		/* If there are still a lot of dirty buffers around, skip the sleep
+-		   and flush some more */
+-		if(ndirty == 0 || nr_buffers_type[BUF_DIRTY] <= nr_buffers * bdf_prm.b_un.nfract/100) {
+-			spin_lock_irq(&current->sigmask_lock);
+-			flush_signals(current);
+-			spin_unlock_irq(&current->sigmask_lock);
++		if (remaining)
++			sync_old_buffers(0);
++		else {
++			remaining = bdf_prm.b_un.interval * HZ;
++			if (time_before(last_super_flush
++					+ bdf_prm.b_un.age_super, jiffies)) {
++				sync_supers(0);
++				sync_inodes(0);
++				last_super_flush = jiffies;
++			}
+ 
+-			interruptible_sleep_on(&bdflush_wait);
++			sync_old_buffers(1);
+ 		}
++
++		run_task_queue(&tq_disk);
+ 	}
+ }
+Patch versus 2.3.1-andrea1:
+--- buffer.c.231a	Sat May 15 00:31:51 1999
++++ buffer.c	Sat May 15 09:45:42 1999
+@@ -103,7 +103,7 @@
+ 				each time we call refill */
+ 		int nref_dirt; /* Dirty buffer threshold for activating bdflush
+ 				  when trying to refill buffers. */
+-		int dummy1;    /* unused */
++		int interval;  /* Time (sec) between spontaneous wakeups */
+ 		int age_buffer;  /* Time for normal buffer to age before 
+ 				    we flush it */
+ 		int age_super;  /* Time for superblock to age before we 
+@@ -115,11 +115,11 @@
+ } bdf_prm = {{70, (NR_REQUEST * 2) / 3, 64, 256, 15, 60*HZ, 30*HZ, 1884, 2}};
+ 
+ /* These are the min and max parameter values that we will allow to be assigned */
+-int bdflush_min[N_PARAM] = {  0,  10,    5,   25,  0,   1*HZ,   1*HZ, 1, 1};
++int bdflush_min[N_PARAM] = {  0,  10,    5,   25,  1,   1*HZ,   1*HZ, 1, 1};
+ int bdflush_max[N_PARAM] = {100,5000, 2000, 2000,100, 600*HZ, 600*HZ, 2047, 5};
+ 
+ void wakeup_bdflush(void);
+-static void flush_dirty_buffers(void);
++static void flush_dirty_buffers(int);
+ 
+ /*
+  * Rewrote the wait-routines to use the "new" wait-queue functionality,
+@@ -661,7 +661,7 @@
+ static void refill_freelist(int size)
+ {
+ 	if (!grow_buffers(size)) {
+-		flush_dirty_buffers();
++		flush_dirty_buffers(0);
+ 		current->policy |= SCHED_YIELD;
+ 		schedule();
+ 	}
+@@ -763,7 +763,7 @@
+ 			 */
+ 			if (too_many_dirty_buffers())
+ 			{
+-				flush_dirty_buffers();
++				flush_dirty_buffers(0);
+ 				if (too_many_dirty_buffers())
+ 					wakeup_bdflush();
+ 			}
+@@ -775,7 +775,7 @@
+ 			 */
+ 			if (MAJOR(bh->b_dev) == LOOP_MAJOR &&
+ 			    nr_buffers_type[BUF_DIRTY]*2>nr_buffers)
+-				flush_dirty_buffers();
++				flush_dirty_buffers(0);
+ 		}
+ 	}
+ 	set_writetime(bh, flag);
+@@ -1653,16 +1653,16 @@
+  * 3) Quit writing loop blocks if a freelist went low (avoids deadlock
+  *	with running out of free buffers for loop's "real" device).
+ */
+-static void flush_dirty_buffers(void)
++static void flush_dirty_buffers(int all)
+ {
+-	int wrta_cmd = WRITEA;	/* non-blocking write mainly for LOOP */
++	int writea = WRITEA;  /* non-blocking write for loop device */
+ 	int i, flushed = 0;
+ 	struct buffer_head * bh, *next;
+ 
+  restart:
+ 	bh = lru_list[BUF_DIRTY];
+ 	if (!bh)
+-		goto out;
++		return;
+ 	i = nr_buffers_type[BUF_DIRTY];
+ 	for (; i > 0; bh = next, i--)
+ 	{
+@@ -1676,6 +1676,8 @@
+ 		}
+ 		if (buffer_locked(bh))
+ 			continue;
++		if (all && time_before(jiffies, bh->b_flushtime))
++			continue;
+ 
+ 		flushed++;
+ 
+@@ -1687,25 +1689,27 @@
+ 			ll_rw_block(WRITE, 1, &bh);
+ 		else
+ 		{
+-			ll_rw_block(wrta_cmd,1, &bh);
+-			wrta_cmd = WRITEA;
++			ll_rw_block(writea, 1, &bh);
++			writea = WRITEA;
+ 			if (buffer_dirty(bh))
+ 				flushed--;
+ 		}
+ 		next->b_count--;
+ 
+-		if (flushed >= bdf_prm.b_un.ndirty)
+-			return;
++		if (flushed >= bdf_prm.b_un.ndirty) {
++			if (!all && !too_many_dirty_buffers())
++				return;
++			flushed = 1;
++		}
+ 		if (next->b_list != BUF_DIRTY)
+ 			goto restart;
+ 	}
+ 	if (flushed == 0 && nr_buffers_type[BUF_DIRTY] > 0 &&
+-	    wrta_cmd != WRITE)
++	    writea != WRITE)
+ 	{
+-		wrta_cmd = WRITE;
++		writea = WRITE;
+ 		goto restart;
+ 	}
+- out:
+ }
+ 
+ void wakeup_bdflush(void)
+@@ -1714,56 +1718,6 @@
+ 		wake_up_process(bdflush_tsk);
+ }
+ 
+-/* 
+- * Here we attempt to write back old buffers.  We also try to flush inodes 
+- * and supers as well, since this function is essentially "update", and 
+- * otherwise there would be no way of ensuring that these quantities ever 
+- * get written back.  Ideally, we would have a timestamp on the inodes
+- * and superblocks so that we could write back only the old ones as well
+- */
+-
+-static int sync_old_buffers(void)
+-{
+-	int i;
+-	struct buffer_head * bh, *next;
+-	static unsigned long last_super_flush = 0;
+-
+-	if (time_before(last_super_flush + bdf_prm.b_un.age_super, jiffies))
+-	{		
+-		sync_supers(0);
+-		sync_inodes(0);
+-		last_super_flush = jiffies;
+-	}
+-
+- refiled:
+-	bh = lru_list[BUF_DIRTY];
+-	if (!bh)
+-		goto out;
+-	i = nr_buffers_type[BUF_DIRTY];
+-	for (; i > 0; bh = next, i--)
+-	{
+-		next = bh->b_next_free;
+-		if (!buffer_dirty(bh))
+-		{
+-			printk(KERN_ERR
+-			       "old_buffers: buffer clean in BUF_DIRTY!\n");
+-			continue;
+-		}
+-		if (buffer_locked(bh))
+-			continue;
+-		if (time_before(jiffies, bh->b_flushtime))
+-			continue;
+-
+-		next->b_count++;
+-		ll_rw_block(WRITE, 1, &bh);
+-		next->b_count--;
+-		if (next->b_list != BUF_DIRTY)
+-			goto refiled;
+-	}
+- out:
+-	return 0;
+-}
+-
+ /* This is the interface to bdflush.  As we get more sophisticated, we can
+  * pass tuning parameters to this "process", to adjust how it behaves. 
+  * We would want to verify each parameter, however, to make sure that it 
+@@ -1777,10 +1731,9 @@
+ 	if (!capable(CAP_SYS_ADMIN))
+ 		goto out;
+ 
+-	if (func == 1) {
+-		 error = sync_old_buffers();
+-		 goto out;
+-	}
++	if (func == 1)
++		/* Function 1 is obsolete */
++		goto out;
+ 
+ 	/* Basically func 1 means read param 1, 2 means write param 1, etc */
+ 	if (func >= 2) {
+@@ -1815,6 +1768,8 @@
+ 
+ int bdflush(void * unused) 
+ {
++	long remaining, last_super_flush;
++
+ 	/*
+ 	 *	We have a bare-bones task_struct, and really should fill
+ 	 *	in a few more things so "top" and /proc/2/{exe,root,cwd}
+@@ -1823,8 +1778,12 @@
+ 
+ 	current->session = 1;
+ 	current->pgrp = 1;
+-	sprintf(current->comm, "kflushd");
++	current->dumpable = 0;
++	strcpy(current->comm, "kflushd");
++	sigfillset(&current->blocked);
+ 	bdflush_tsk = current;
++	remaining = bdf_prm.b_un.interval * HZ;
++	last_super_flush = jiffies;
+ 
+ 	/*
+ 	 *	As a kernel thread we want to tamper with system buffers
+@@ -1834,24 +1793,25 @@
+ 	lock_kernel();
+ 		 
+ 	for (;;) {
+-#ifdef DEBUG
+-		printk("bdflush() activated...");
+-#endif
+-
+-		CHECK_EMERGENCY_SYNC
+-
+-		flush_dirty_buffers();
++		bdflush_tsk->state = TASK_INTERRUPTIBLE;
++		remaining = schedule_timeout(remaining);
++		
++		CHECK_EMERGENCY_SYNC;
+ 
+-		if (!too_many_dirty_buffers())
+-		{
+-			run_task_queue(&tq_disk);
+-
+-			spin_lock_irq(&current->sigmask_lock);
+-			flush_signals(current);
+-			spin_unlock_irq(&current->sigmask_lock);
++		if(remaining) {
++			flush_dirty_buffers(0);
++		} else {
++			remaining = bdf_prm.b_un.interval * HZ;
++			if (time_before(last_super_flush
++					+ bdf_prm.b_un.age_super, jiffies)) {
++				sync_supers(0);
++				sync_inodes(0);
++				last_super_flush = jiffies;
++			}
+ 
+-			bdflush_tsk->state = TASK_INTERRUPTIBLE;
+-			schedule();
++			flush_dirty_buffers(1);
+ 		}
++
++		run_task_queue(&tq_disk);
+ 	}
+ }
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

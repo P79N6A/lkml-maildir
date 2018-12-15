@@ -1,0 +1,182 @@
+Date: Fri, 20 Oct 2000 18:45:11 +0200
+From: Andrea Arcangeli <>
+Subject: VM_RESERVED [was Re: mapping user space buffer to kernel address space]
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/10/20/21
+
+On Thu, Oct 19, 2000 at 03:45:43PM -0700, Linus Torvalds wrote:
+> 
+> 
+> On Fri, 20 Oct 2000, Andrea Arcangeli wrote:
+> 
+> > On Thu, Oct 19, 2000 at 05:16:14PM -0400, Jeff Garzik wrote:
+> > > solution is really elegant.  Excluding all the debug code and assertions
+> > > I stick in there, the guts of via audio mmap support went from ~50 lines
+> > > to ~10.
+> > 
+> > Was it 50 lines with remap_page_range?
+> 
+> You cannot use remap_page_range() if the pages aren't physically
+> contiguous.
+Yep.
+And about the other question?
+> Face it, Andrea, remap_page_range() is a very limited hack that only works
+> for a very limited subset of the things that real people want to do. It is
+> _not_ a generic solution, while the nopage() approach _is_ generic.
+But without keeping those pages pinned in the ptes, the nopage approch is
+_suboptimal_ and adding a dummy swapout that returns "progress" where no
+progress is been made will also _break_ the VM with relatively large device
+mmapped vmas. It would at least _certainly_ break 2.2.18pre15aa1 (if 2.4.x has
+an oom deadlock in GFP it won't break of course).
+I'm fine to drop remap_page_range and the PG_reserved bit, but to do that I'd
+suggest to add a new per-VMA VM_RESERVED bitflags. This will also avoid to walk
+pagetables where it makes no sense to unmap the pages (it won't only avoid
+senseless page faults) and it will fix the VM callbacks problem that returns
+"success" when no progress is made. (SHM returns a dummy 0 too, but progress is
+been made in that case)
+The only reason it could make sense to do that unmapping is if we would be able
+to also free the _pagetables_, but we do that only via munmap if a whole gdt
+entry gets unmapped (and after munmap the page is been just unmapped anyways).
+So once we'll free pagetables via swap_out (maybe never) some driver with
+houndred of mbytes of virtual mapping may choose to drop the VM_RESERVED
+bitflag from their vmas if pagefaults aren't a performance problem for that
+drivers.
+I just find hard to widespread propose something that ends doing the wrong
+thing (ok I see it's not a big deal but it's still the _wrong_ thing to do and
+the VM_RESERVED way will fix it a _zero_ cost, it will improve performance
+compared to PG_reserved and it will also avoid the uglyness of having all the
+SG drivers out there implementing a dummy swapout callback :).
+This introduces VM_RESERVED against test10-pre4:
+--- 2.4.0-test10-pre4/include/linux/mm.h.~1~	Fri Oct 20 17:56:09 2000
++++ 2.4.0-test10-pre4/include/linux/mm.h	Fri Oct 20 18:23:47 2000
+@@ -95,6 +95,7 @@
+ 
+ #define VM_DONTCOPY	0x00020000      /* Do not copy this vma on fork */
+ #define VM_DONTEXPAND	0x00040000	/* Cannot expand with mremap() */
++#define VM_RESERVED	0x00080000	/* Don't unmap it from swap_out */
+ 
+ #define VM_STACK_FLAGS	0x00000177
+ 
+--- 2.4.0-test10-pre4/include/linux/wrapper.h.~1~	Tue Aug  8 06:01:36 2000
++++ 2.4.0-test10-pre4/include/linux/wrapper.h	Fri Oct 20 18:26:02 2000
+@@ -29,8 +29,17 @@
+ #define vma_get_end(v) v->vm_end
+ #define vma_get_page_prot(v) v->vm_page_prot
+ 
++/*
++ * mem_map_reserve()/unreserve() are going to be obsoleted by
++ * vma_reserve(). (unreserve shouldn't be necessary)
++ *
++ * Instead of marking the pages as reserved, just mark the vma as reserved
++ * this will improve performance (it's zero cost unlike the PG_reserved check)
++ * and it will be trivial for not physically contigous mappings too.
++ */
+ #define mem_map_reserve(p) set_bit(PG_reserved, &p->flags)
+ #define mem_map_unreserve(p) clear_bit(PG_reserved, &p->flags)
+ #define mem_map_inc_count(p) atomic_inc(&(p->count))
+ #define mem_map_dec_count(p) atomic_dec(&(p->count))
++#define vma_reserve(vma)	((vma)->vm_flags |= VM_RESERVED)
+ #endif
+--- 2.4.0-test10-pre4/mm/vmscan.c.~1~	Fri Oct 20 17:56:10 2000
++++ 2.4.0-test10-pre4/mm/vmscan.c	Fri Oct 20 18:11:09 2000
+@@ -318,7 +318,7 @@
+ 	unsigned long end;
+ 
+ 	/* Don't swap out areas which are locked down */
+-	if (vma->vm_flags & VM_LOCKED)
++	if (vma->vm_flags & (VM_LOCKED|VM_RESERVED))
+ 		return 0;
+ 
+ 	pgdir = pgd_offset(mm, address);
+And this shows a pratical (but untested :) demonstration of the VM_RESERVED
+usage:
+--- 2.4.0-test10-pre4/drivers/media/video/bttv-driver.c.~1~	Thu Oct 12 03:04:42 2000
++++ 2.4.0-test10-pre4/drivers/media/video/bttv-driver.c	Fri Oct 20 18:32:43 2000
+@@ -39,7 +39,6 @@
+ #include <linux/sched.h>
+ #include <asm/segment.h>
+ #include <linux/types.h>
+-#include <linux/wrapper.h>
+ #include <linux/interrupt.h>
+ #include <linux/kmod.h>
+ #include <linux/vmalloc.h>
+@@ -181,40 +180,17 @@
+ static void * rvmalloc(signed long size)
+ {
+ 	void * mem;
+-	unsigned long adr, page;
+ 
+ 	mem=vmalloc_32(size);
+ 	if (mem) 
+-	{
+ 		memset(mem, 0, size); /* Clear the ram out, no junk to the user */
+-	        adr=(unsigned long) mem;
+-		while (size > 0) 
+-                {
+-	                page = kvirt_to_pa(adr);
+-			mem_map_reserve(virt_to_page(__va(page)));
+-			adr+=PAGE_SIZE;
+-			size-=PAGE_SIZE;
+-		}
+-	}
+ 	return mem;
+ }
+ 
+ static void rvfree(void * mem, signed long size)
+ {
+-        unsigned long adr, page;
+-        
+ 	if (mem) 
+-	{
+-	        adr=(unsigned long) mem;
+-		while (size > 0) 
+-                {
+-	                page = kvirt_to_pa(adr);
+-			mem_map_unreserve(virt_to_page(__va(page)));
+-			adr+=PAGE_SIZE;
+-			size-=PAGE_SIZE;
+-		}
+ 		vfree(mem);
+-	}
+ }
+ 
+ 
+--- 2.4.0-test10-pre4/drivers/media/video/videodev.c.~1~	Wed Jul 19 07:35:33 2000
++++ 2.4.0-test10-pre4/drivers/media/video/videodev.c	Fri Oct 20 18:32:38 2000
+@@ -27,6 +27,7 @@
+ #include <linux/errno.h>
+ #include <linux/videodev.h>
+ #include <linux/init.h>
++#include <linux/wrapper.h>
+ 
+ #include <asm/uaccess.h>
+ #include <asm/system.h>
+@@ -228,6 +229,7 @@
+ 	int ret = -EINVAL;
+ 	struct video_device *vfl=video_device[MINOR(file->f_dentry->d_inode->i_rdev)];
+ 	if(vfl->mmap) {
++		vma_reserve(vma);
+ 		lock_kernel();
+ 		ret = vfl->mmap(vfl, (char *)vma->vm_start, 
+ 				(unsigned long)(vma->vm_end-vma->vm_start));
+ bttv-driver.c |   24 ------------------------
+ videodev.c    |    2 ++
+ 2 files changed, 2 insertions(+), 24 deletions(-)
+Once VM_RESERVED is in place using nopage instead of remap_page_range looks
+fine to me (we'll have an additional startup page fault but that can
+explained as a mmap latency reduction and after all people can keep
+using remap_page_range to avoid that first page fault as the bttv
+driver would still do with the above patch applied even if it's just
+using the new vma_reserve way).
+(in theory we could use VM_LOCKED for that but as you noticed we would
+end corrupting the number of locked-page stats and I just find cleaner
+to not mix mlock and reserved kernel pages issues)
+Andrea
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+Please read the FAQ at 
+http://www.tux.org/lkml/

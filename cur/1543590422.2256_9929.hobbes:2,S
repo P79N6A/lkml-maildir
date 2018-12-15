@@ -1,0 +1,127 @@
+Date: Wed, 9 May 2001 17:55:52 +0200
+From: Trond Myklebust <>
+Subject: [PATCH] Linux-2.4.4 flush out dirty NFS pages on munmap()
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2001/5/9/88
+
+Hi Alan and Linus,
+ The Suse people have identified a problem with shared mmap() under
+Linux 2.4.
+Basically it boils down to the fact that we want to commit pages to
+the server when we munmap() both in order to ensure that they are
+flushed out with the correct credentials (page launder is too
+unreliable in that respect), and to ensure that file close-to-open
+cache consistency is maintained.
+The following patch by Andrea passes the test that Kurt Garloff put
+out on Linux Kernel, both on my setup and on his. As you can see it
+hooks the vm_ops and installs a vma close method that calls
+filemap_fdatasync() for us, then flushes out those pages and puts them
+on the clean_pages list.
+I also added in similar protection around the locking code. I'm not
+sure if anybody is using locking + shared mmap(), but if they do, then
+we want to try to ensure data cache consistency.
+Please note: there remains a question about what to do when
+page_launder() clears the PG_dirty bit for us, and yet writepage()
+receives an error. I'm nervous about just automatically marking the
+page as dirty again, as that could easily lead to infinite loops. For
+the moment, therefore, I'd prefer to delay making a decision about
+that case...
+Cheers,
+  Trond
+diff -u --recursive --new-file linux-2.4.4/fs/nfs/file.c linux-2.4.4-mmap/fs/nfs/file.c
+--- linux-2.4.4/fs/nfs/file.c	Fri Feb  9 20:29:44 2001
++++ linux-2.4.4-mmap/fs/nfs/file.c	Wed May  9 17:30:26 2001
+@@ -39,6 +39,7 @@
+ static ssize_t nfs_file_write(struct file *, const char *, size_t, loff_t *);
+ static int  nfs_file_flush(struct file *);
+ static int  nfs_fsync(struct file *, struct dentry *dentry, int datasync);
++static void nfs_file_close_vma(struct vm_area_struct *);
+ 
+ struct file_operations nfs_file_operations = {
+ 	read:		nfs_file_read,
+@@ -57,6 +58,11 @@
+ 	setattr:	nfs_notify_change,
+ };
+ 
++static struct vm_operations_struct nfs_file_vm_ops = {
++	nopage:		filemap_nopage,
++	close:		nfs_file_close_vma,
++};
++
+ /* Hack for future NFS swap support */
+ #ifndef IS_SWAPFILE
+ # define IS_SWAPFILE(inode)	(0)
+@@ -104,6 +110,21 @@
+ 	return result;
+ }
+ 
++static void nfs_file_close_vma(struct vm_area_struct * vma)
++{
++	struct inode * inode;
++
++	inode = vma->vm_file->f_dentry->d_inode;
++
++	if (inode->i_state & I_DIRTY_PAGES) {
++		filemap_fdatasync(inode->i_mapping);
++		down(&inode->i_sem);
++		nfs_wb_all(inode);
++		up(&inode->i_sem);
++		filemap_fdatawait(inode->i_mapping);
++	}
++}
++
+ static int
+ nfs_file_mmap(struct file * file, struct vm_area_struct * vma)
+ {
+@@ -115,8 +136,11 @@
+ 		dentry->d_parent->d_name.name, dentry->d_name.name);
+ 
+ 	status = nfs_revalidate_inode(NFS_SERVER(inode), inode);
+-	if (!status)
++	if (!status) {
+ 		status = generic_file_mmap(file, vma);
++		if (!status)
++			vma->vm_ops = &nfs_file_vm_ops;
++	}
+ 	return status;
+ }
+ 
+@@ -283,9 +307,11 @@
+ 	 * Flush all pending writes before doing anything
+ 	 * with locks..
+ 	 */
+-	down(&filp->f_dentry->d_inode->i_sem);
++	filemap_fdatasync(inode->i_mapping);
++	down(&inode->i_sem);
+ 	status = nfs_wb_all(inode);
+-	up(&filp->f_dentry->d_inode->i_sem);
++	up(&inode->i_sem);
++	filemap_fdatawait(inode->i_mapping);
+ 	if (status < 0)
+ 		return status;
+ 
+@@ -300,10 +326,12 @@
+ 	 */
+  out_ok:
+ 	if ((cmd == F_SETLK || cmd == F_SETLKW) && fl->fl_type != F_UNLCK) {
+-		down(&filp->f_dentry->d_inode->i_sem);
++		filemap_fdatasync(inode->i_mapping);
++		down(&inode->i_sem);
+ 		nfs_wb_all(inode);      /* we may have slept */
++		up(&inode->i_sem);
++		filemap_fdatawait(inode->i_mapping);
+ 		nfs_zap_caches(inode);
+-		up(&filp->f_dentry->d_inode->i_sem);
+ 	}
+ 	return status;
+ }
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+More majordomo info at  
+http://vger.kernel.org/majordomo-info.html
+Please read the FAQ at  
+http://www.tux.org/lkml/

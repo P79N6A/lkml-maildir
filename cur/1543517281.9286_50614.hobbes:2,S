@@ -1,0 +1,133 @@
+Date: Mon, 29 Nov 1999 00:21:33 -0800
+From: "Howard Chu" <>
+Subject: EXTPROC, telnetd LINEMODE?
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/11/29/13
+
+I made a first pass at EXTPROC/LINEMODE support in the 2.3.29 kernel, but
+I'm missing something obvious and I don't know what's wrong. Could someone
+please look over these patches and give me some hints?
+I'm amazed that you guys can put up with telnet over dial-up lines in
+character-at-a-time mode, it's driving me batty.
+Also, it looks like /usr/include/{termbits.h,termios.h} disagree with
+/usr/src/linux/include. (A) it seems to me that these files ought to be
+identical and (B) it would be best if there were only a single copy of each
+file, so that it can't go out of sync as it has. The big problem of course
+is NCCS, it's 32 in /usr/include but only 8 or 19 or something in
+/usr/src/linux, so the c_ispeed and c_ospeed fields of the termios struct
+are hopelessly lost.
+In the patches included below, the only thing that seems to work as intended
+is my TIOCSIG addition. My big problem seems to be that the tty driver is
+always in cooked/echo mode, even when I set the EXTPROC bit and attempt to
+bypass that processing. Also, it seems that I never hit the code to send the
+TIOCPKT_IOCTL data, or at least, telnetd never receives any notification
+when an ioctl is issued on the slave pty. It may be that I am either setting
+or checking for EXTPROC on the wrong half of the pty, but I've tried various
+combinations and gotten the same (lack of) results.
+--- include/linux/tty.h       1999/11/28 13:41:00     1.1
++++ tty.h       1999/11/28 14:04:00
+@@ -236,6 +236,7 @@
+ #define L_FLUSHO(tty)  _L_FLAG((tty),FLUSHO)
+ #define L_PENDIN(tty)  _L_FLAG((tty),PENDIN)
+ #define L_IEXTEN(tty)  _L_FLAG((tty),IEXTEN)
++#define L_EXTPROC(tty) _L_FLAG((tty),EXTPROC)
+ /*
+  * Where all of the state associated with a tty is kept while the tty
+--- include/asm-i386/ioctls.h    1999/11/28 12:03:31     1.1
++++ ioctls.h    1999/11/28 14:03:51
+@@ -49,6 +49,7 @@
+ #define TIOCGSID       0x5429  /* Return the session ID of FD */
+ #define TIOCGPTN       _IOR('T',0x30, unsigned int) /* Get Pty Number (of
+pty-m
+ux device) */
+ #define TIOCSPTLCK     _IOW('T',0x31, int)  /* Lock/unlock Pty */
++#define TIOCSIG                _IO('T',0x32)  /* pty: generate signal */
+ #define FIONCLEX       0x5450  /* these numbers need to be adjusted. */
+ #define FIOCLEX                0x5451
+@@ -76,6 +77,7 @@
+ #define TIOCPKT_START           8
+ #define TIOCPKT_NOSTOP         16
+ #define TIOCPKT_DOSTOP         32
++#define TIOCPKT_IOCTL          64
+ #define TIOCSER_TEMT    0x01   /* Transmitter physically empty */
+--- include/asm-i386/termbits.h  1999/11/28 12:12:31     1.1
++++ termbits.h  1999/11/28 12:13:05
+@@ -152,6 +152,7 @@
+ #define FLUSHO 0010000
+ #define PENDIN 0040000
+ #define IEXTEN 0100000
++#define EXTPROC        0200000
+ /* tcflow() and TCXONC use these */
+ #define        TCOOFF          0
+--- drivers/char/n_tty.c     1999/11/28 13:28:50     1.1
++++ n_tty.c     1999/11/28 13:51:51
+@@ -262,6 +262,9 @@
+ static void echo_char(unsigned char c, struct tty_struct *tty)
+ {
++       if (L_EXTPROC(tty))
++               return;
++
+        if (L_ECHOCTL(tty) && iscntrl(c) && c != '\t') {
+                put_char('^', tty);
+                put_char(c ^ 0100, tty);
+@@ -447,7 +450,7 @@
+ static inline void n_tty_receive_char(struct tty_struct *tty, unsigned char
+c)
+ {
+-       if (tty->raw) {
++       if (tty->raw || L_EXTPROC(tty)) {
+                put_tty_queue(c, tty);
+                return;
+        }
+@@ -944,6 +947,9 @@
+                        tty->link->ctrl_status = 0;
+                        put_user(cs, b++);
+                        nr--;
++                       if (cs & TIOCPKT_IOCTL)
++                               nr -= copy_to_user(b, tty->link->termios,
++                                       sizeof(struct termios));
+                        break;
+                }
+                /* This statement must be first before checking for input
+--- drivers/char/pty.c       1999/11/28 13:28:50     1.1
++++ pty.c       1999/11/28 14:01:42
+@@ -250,6 +250,13 @@
+        return 0;
+ }
++static int pty_signal(struct tty_struct *tty, int sig)
++{
++       if (tty->link && tty->link->pgrp > 0)
++               kill_pg(tty->link->pgrp, sig, 1);
++       return 0;
++}
++
+ static int pty_bsd_ioctl(struct tty_struct *tty, struct file *file,
+                        unsigned int cmd, unsigned long arg)
+ {
+@@ -260,6 +267,8 @@
+        switch(cmd) {
+        case TIOCSPTLCK: /* Set PT Lock (disallow slave open) */
+                return pty_set_lock(tty, (int *) arg);
++       case TIOCSIG:   /* send signal to other side of pty */
++               return pty_signal(tty, (int) arg);
+        }
+        return -ENOIOCTLCMD;
+ }
+--- drivers/char/tty_ioctl.c 1999/11/28 13:28:50     1.1
++++ tty_ioctl.c 1999/11/28 13:33:49
+@@ -133,6 +133,8 @@
+                                tty->ctrl_status |= TIOCPKT_NOSTOP;
+                        wake_up_interruptible(&tty->link->read_wait);
+                }
++               if (tty->link->termios->c_lflag & EXTPROC)
++                       tty->ctrl_status |= TIOCPKT_IOCTL;
+        }
+        if (tty->driver.set_termios)
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

@@ -1,0 +1,243 @@
+Date: Thu, 29 Mar 2001 00:07:02 +1000
+From: Keith Owens <>
+Subject: [RFC] Large scale kernel performance recording
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2001/3/28/64
+
+Consider the set of machines that have large numbers of cpus and which
+want large scale kernel performance reporting.  Basically large server
+boxes or number crunchers; this note does not apply to a 486 firewall
+running LRP.  Reading performance data for large machines or large
+numbers of counters via /proc does not scale.  We (Mark Goodwin, Keith
+Owens, SGI) propose an ABI for large scale kernel performance
+monitoring.  Obviously this ABI would be optional, configured at kernel
+compile time, with no kernel binary changes if the option was not
+selected.
+Justification
+=============
+Getting each entry or set of entries from /proc requires lseek() and
+read(), with the kernel converting from binary to ASCII, copying to
+user space then the application converts from ASCII back to binary.
+There is a lot of kernel overhead which is the last thing you want for
+a performance reporting system.
+Extracting an individual entry from an array of (m cpus)*(n performance
+counters) via /proc is awkward.  The lack of kernel state for a /proc
+file means that the only ways to read data are to read everything every
+time (very expensive) or to overload the file->f_pos field as a
+instance number instead of a byte offset.  Neither approach works when
+the data is changing between successive calls to read(), e.g. when
+devices are added or deleted to a system, when cpus are added or
+deleted on the fly (yes, people are working on that feature), or when
+partitions are being mounted and unmounted.
+When f_pos is a byte offset it is impossible to give consistent
+results, even when counters are not added or deleted.
+  read(fd, buf, 1024), end of buffer gets value=9999
+  counter is updated to 10000
+  read(fd, buf, 1024), the size of the ASCII representation has
+  changed, start of next buffer gets '0'.  Result seen by user space is
+  'value=99990'.
+Treating f_pos as an instance number breaks when counters are added or
+deleted while the data is being read.  You either get double reporting
+or entries are not returned.  When f_pos is an instance number, you
+have the problem of selecting which instances you want to read.  How does
+user space map from cpu 17, /dev/ide/host0/bus0/target0/lun0/part5,
+write I/O counter to the kernel's instance number in /proc?
+In either case there is unnecessary overhead for each call into kernel
+space and out again, with context switches and binary -> ASCII ->
+binary conversion.
+Proposed ABI
+============
+The aim is to provide access to performance counters direct from user
+space via mmap().  This immediately removes the overhead of context
+switches, of binary <=> ASCII conversion and of kernel to user space
+copying.  The application opens a misc device and does mmap on the
+device to map the kernel counter pages, read only, into user space.
+The application can access any value in the counters by direct address,
+no context switch required.  User space accesses to the counters are
+lock free (no need for kernel calls to get a semaphore) and can cope
+with changes to the number of cpus, to the number of counters and to
+the value of an individual counter.
+The start of the mmapped data is a structure which defines the rest of
+the data.  This must be self defining to avoid version skew between
+kernel and user space code.  Among the fields in the header structure
+are
+ int  version; /* == PERF_VERSION for userland to check */
+ int  size;    /* size of header */
+ int  nr_cpus; /* == NR_CPUS */
+ /* Generation numbers */
+ long gen1;    /* Bumped when an instance is added or deleted */
+ long gen2;
+plus values to let the application map from cpu m, instance n to an
+offset in the mmapped data.
+Every cpu has the same set of instance numbers so there is one counter
+for each instance number and cpu.  The data in kernel space is arranged
+to avoid cache ping pong, with per cpu tables of performance counters.
+In user space the counters appear as a fixed size header (one page)
+followed by p pages per cpu, p is the number of pages required to hold
+one counter for each instance.
+A separate but related misc device provides a list of instance names,
+this is a text file but it only has to be read when the application
+detects a change in the number of instances.  Every cpu has the same
+set of instance numbers, i.e. /dev/ide/host0/bus0/target0/lun0/part5
+will be instance 86 on all cpus.
+The gen[12] fields in the header tell the application if the number of
+instances has changed.  When an instance is being added or deleted -
+  kernel:
+    lock_perf_counters();      /* prevent other cpus accessing the data */
+    ++perf_header.gen1;        /* starting an instance meta data change */
+    smp_wmb();
+    add_instance_metadata();
+    smp_wmb();
+    ++perf_header.gen2;        /* tell user space update is complete */
+    smp_wmb();
+    unlock_perf_counters();
+    Adding the instance metadata includes assigning a new instance
+    number, saving the name and extending the per cpu counter pages if
+    necessary.
+  user space:  error checking omitted.
+    volatile struct perf_header *kernel_perf_header;
+    struct perf_header user_perf_header;
+    volatile long *p_gen1, *p_gen2;
+    int perf_fd = -1;
+    ...
+    while (1) {
+      if (perf_fd < 0) {
+        perf_fd = open(perf_counter_filename, O_RDONLY);
+        kernel_perf_header = mmap(NULL, sizeof(*kernel_perf_header),
+                                  PROT_READ, MAP_SHARED, perf_fd, 0);
+        p_gen1 = &(kernel_perf_header->gen1);
+        p_gen2 = &(kernel_perf_header->gen2);
+        save_gen1 = *p_gen1;
+        /* only read fields that are guaranteed to be present */
+        memcpy(&user_perf_header, kernel_perf_header, minimum_header_size);
+        if (user_perf_header.gen1 == *p_gen1 &&
+	    user_perf_header.gen1 == *p_gen2) {
+          map_rest_of_counters_into_user_space();
+          read_list_of_instances_and_names_into_user_space();
+        }
+      }
+      if (user_perf_header.gen1 != *p_gen1 ||
+          user_perf_header.gen1 != *p_gen2) {
+        /* instance metadata has changed or is changing */
+        close(perf_fd);
+        perf_fd = -1;
+        while (*p_gen1 != *p_gen2)
+          /* spin while metadata update is in progress, might nanosleep */ ;
+        continue;  /* reopen file to get new instance metadata */
+      }
+      copy_desired_counter_values();
+      if (*p_gen1 != user_perf_header.gen1)
+        continue; /* metadata has changed */
+      commit_counter_values_to_database();
+    }
+All counters are 64 bit, 4 Gb is not enough for everybody.  This raises
+its own problem, some architectures do not have atomic reads, writes or
+increments for 64 bit fields but must treat them as 2 32 bit words.
+This race exists.
+  user space:        kernel
+    read word 0
+                     read word 0
+		     read word 1
+		     update
+		     store word 0
+		     store word 1
+    read word 1
+That gets really interesting when the counter is about to overflow from
+2**32-1 to 2**32.  User space will read two words of zero.
+To close this race without a kernel call to get a semaphore (avoiding
+context switches), there is an int at the start of each cpu's data,
+this field counts the number of data updates in progress.  User space
+can see the int as part of the mmapped data, like this.
+  Global header page.
+    int flag                 )
+    performance counter 1    ) data for cpu 0, page aligned
+    performance counter 2... )
+    int flag                 )
+    performance counter 1    ) data for cpu 1, page aligned
+    performance counter 2... )
+The application calculates the address of the flag for the cpu it is
+interested in and the address of the counter for the instance it wants
+to read.  Then
+  user space:
+  copy_desired_counter_values()
+  {
+    volatile int *p_flag = /* address of flag for desired cpu */;
+    volatile __s64 *p_counter = /* address of counter for desired cpu and instance */;
+    __s64 counter; /* local copy */
+    do {
+      counter = *p_counter;
+    } while (!*p_flag && counter == *p_counter);
+  }
+      
+  kernel:
+    ++perf_flag_for_current_cpu;
+    smp_wmb();
+    counter += delta;
+    smp_wmb();
+    --perf_flag_for_current_cpu;
+    smp_wmb();
+Looping until counter == *p_counter ensures that user space always sees
+a stable value, even if the kernel is updating the counter at the same
+time.  A non-zero flag tells user space that an update is in progress
+so the data it got, while stable, might be invalid.
+The flag check is required because user space on one cpu can read data
+from another cpu while the second cpu is updating the counter.  The
+flag is per cpu and is only updated by the kernel on that cpu so an int
+is both smp and interrupt safe, it does not need to be atomic.
+smp_wmb() is used after each update to guarantee strong write ordering.
+* Fast user space access to kernel performance counters at memory speed.
+* No context switches.
+* No unnecessary copying from kernel to user space.
+* No wasteful conversion from binary to ASCII and back to binary.
+* No race conditions as instances are added or deleted.
+Kernel Functions
+================
+All functions become noop when the kernel is compiled without this ABI.
+int perf_add(const char *name);
+  Add a new instance called "name".  Returns the internal instance
+  number.  Instance numbers are constant for a given name until the
+  machine is rebooted.  A counter for this new instance is added to
+  each cpu's data area and initialized to zero.
+void perf_del(int instance);
+  The kernel no longer wants to count this instance type.  It is
+  debatable if we need this function, even for hotplug devices.  If a
+  device has been connected, disconnected and is reconnected should it
+  have the same instance number or not?  The answer is probably yes
+  which means that perf_del is not used.
+void perf_adjust(int instance, __s64 delta);
+  Adjust the value of the instance on the the current cpu by delta.
+  Cpu 0 is not allowed to change data belonging to cpu 1 and vice
+  versa so no cpu parameter.
+perf_add and perf_del can only be called from user context.
+perf_adjust can be called from user or interrupt context; there are no
+problems if user context updates one instance and interrupt context
+updates a different instance.  If the same instance can be updated from
+both user and interrupt context then it is the programmer's duty to
+serialize calls to perf_adjust() accordingly, in most cases this will
+fall under whichever lock the code is already using.
+Request For Comments
+====================
+As stated at the beginning, this is an optional ABI for large scale
+performance data collection, to avoid the severe problems with reading
+large amounts of data from /proc.  The ABI is not complete but this
+note gives enough of the framework to show how kernel and user space
+would interact to avoid all the existing performance problems.
+This approach should be capable of providing almost zero additional
+overhead for instrumented kernel code, or at least no more (and in some
+cases less) overhead than existing instrumentation.  We intend that
+instrumentation could be activated in production kernels (for large
+machines) and thus be capable of being monitored from user space with
+extensible tools like PCP, etc.
+Is this approach acceptable?  We are not going to bother writing the
+ABI unless there is demand for it and it stands a reasonable chance of
+getting into the standard kernel.
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+More majordomo info at  
+http://vger.kernel.org/majordomo-info.html
+Please read the FAQ at  
+http://www.tux.org/lkml/

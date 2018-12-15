@@ -1,0 +1,412 @@
+Date: Thu, 15 Sep 2005 03:59:35 +0900
+From: "Machida, Hiroyuki" <>
+Subject: Re: [PATCH][FAT] FAT dirent scan with hin take #3
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2005/9/14/269
+
+OGAWA Hirofumi wrote:
+	:
+> 
+> 
+> The fat_lookup_hint is one per task. And fat_lookup_hint is tracking
+> the task's access. If access is sequential, it returns the hint, and
+> if not, it returns 0.  I made the dirty patch just for explaining what
+> I said.
+Sorry late, at the last weekend I looked into the patch you post and run it.
+I got your idea, now. I would propose following changes on it and attached
+modified patch into this mail.
+1. The original patch has system wide 16 entries access-tracking buffer.
+I modified system has one access-tracking buffer for each mounted FS instance.
+And it allocates the buffer on mounting as a part of FS dependent super block.
+2. On looking up hints, the original patch try to find the entry which has
+same pid and dir. If matched entry is not found, it uses always zero.
+However we can expect locality beyond process, so  I changes a little bit,
+behavior of fail to find the matched entry.
+	try to find the entry which has same pid and dir.
+	if matched entry is not found, try to find recent access to same dir.
+3. With the original code, the access-tracking buffer can hold just one entry
+for one pid. I think it is better to have few entries for one pid.
+I modified patch to have up to 3 entires (less than 1/4 of total entries) for
+each pid.
+4. Originally window size to determine locality seems wide due to using max len
+of LFN(MSDOS_SLOTS), like;
+	WIN_BOTTOM = 5 * MSDOS_SLOTS * size of entry
+We can use the value based on statistic instead of MSDOS_SLOTS. I checked with
+my FC3 installed system, most files(over 99%) have less than or equal to 48
+chars file name length.  So use 9 instead of 21(MSDOS_SLOTS)
+5. Adding short name entry support.
+And I have fixed a bug which makes infinite loop on lookup empty dir
+after all files were removed.
+> However, these lookup-hint approaches seems the hack after all....
+> Hhmmm...
+I have another idea as following;
+  On reading blocks ahead, try to build dentry caches for all FAT dir entries
+  which reside in those blocks. And start dir-scan at some position
+  close to bottom of the latest read-ahead block, instead of zero.
+However, I guess this tends to consume dentry caches and it may have affects
+on other area.
+As you said, I think "lookup-hint" is hack, but not so bad. Because it has
+no side effect to other area and memory consumption is predictable.
+-- 
+Hiroyuki Machida
+Signed-off-by: Hiroyuki Machida <machida@sm.sony.co.jp>
+Signed-off-by: OGAWA Hirofumi <hirofumi@mail.parknet.co.jp>
+---
+ fs/fat/dir.c             |  232 ++++++++++++++++++++++++++++++++++++++++++++---
+ fs/fat/inode.c           |    7 +
+ include/linux/msdos_fs.h |   19 +++
+ 3 files changed, 246 insertions(+), 12 deletions(-)
+diff -r -up linux-2.6.13/fs/fat/dir.c linux-2.6.13-scan2/fs/fat/dir.c
+--- linux-2.6.13/fs/fat/dir.c	2005-08-29 08:41:01.000000000 +0900
++++ linux-2.6.13-scan2/fs/fat/dir.c	2005-09-14 17:20:38.220767449 +0900
+@@ -22,6 +22,185 @@
+ #include <linux/buffer_head.h>
+ #include <asm/uaccess.h>
+ 
++void fat_lkup_hint_init_sb(struct super_block *sb)
++{
++	struct msdos_sb_info *sbi = MSDOS_SB(sb);
++
++	sbi->lkup_hint_lock = SPIN_LOCK_UNLOCKED;
++	INIT_LIST_HEAD(&sbi->lkup_hint_head);
++	sbi->lkup_hint_freemap = 0;
++	sbi->lkup_hint_freemap = ~sbi->lkup_hint_freemap;
++}
++
++void fat_lkup_hint_inval(struct inode *dir)
++{
++	struct super_block *sb = dir->i_sb;
++	struct msdos_sb_info *sbi = MSDOS_SB(sb);
++	struct fat_lookup_hint *hint, *n;
++	int i;
++
++	spin_lock(&sbi->lkup_hint_lock);
++	list_for_each_entry_safe(hint, n, &sbi->lkup_hint_head, lru_list) {
++		if (hint->dir == dir) {
++			list_del_init(&hint->lru_list);
++			i = hint - &(sbi->lkup_hint[0]);
++			sbi->lkup_hint_freemap |= (1 << i);
++		}
++	}
++	spin_unlock(&sbi->lkup_hint_lock);
++}
++
++/* 
++ * AVG_MSDOS_SLOTS is selected so that it can store 48 chars file name length.
++ *
++ * According raugh observation, most files in Linux installed system have 
++ * less than or equal to 48 chars file name length. 
++ *
++ * Following is one of statistic information;
++ *
++ *	total # of files(*1) 			9193
++ *	max length of file name			52 chars
++ *
++ *	# of files over 48 chars name length	36
++ *	  % covered by 48 chars name length	 99.6%
++ *
++ *	# of files over 32 chars name length	517
++ *	  % covered by 32 chars name length	 94.3%
++ *
++ *	*1) # of file, dir and symlink which has over 2 chars 
++ *	file name length.
++ * 
++ */
++#define AVG_MSDOS_SLOTS	(8+1)
++#define WIN_LFN_TOP	(3 * AVG_MSDOS_SLOTS * sizeof(struct msdos_dir_entry))
++#define WIN_LFN_BOTTOM	(5 * AVG_MSDOS_SLOTS * sizeof(struct msdos_dir_entry))
++
++#define WIN_TOP		(3 * sizeof(struct msdos_dir_entry))
++#define WIN_BOTTOM	(5 * sizeof(struct msdos_dir_entry))
++
++static inline
++loff_t get_syswide_hint(loff_t pos, struct fat_lookup_hint *hint)
++{
++	/* 
++	 * NOTE: If you don't expect locality beyond process, 
++	 * make this return 0 always, instead of following.
++	 */
++	return  (pos == 0) ? hint->last_pos : pos;
++}
++
++static loff_t fat_lkup_hint_get(struct inode *dir, int is_lfn)
++{
++	struct super_block *sb = dir->i_sb;
++	struct fat_lookup_hint *hint;
++	struct msdos_sb_info *sbi = MSDOS_SB(sb);
++	loff_t win_top;
++	unsigned int rnd_flg;
++	loff_t pos = 0;
++
++	if (is_lfn) {
++		rnd_flg = FAT_LKUP_ST_LFN_RANDOM;
++		win_top = WIN_LFN_TOP;
++	} else {
++		rnd_flg = FAT_LKUP_ST_RANDOM;
++		win_top = WIN_TOP;
++	}
++
++	spin_lock(&sbi->lkup_hint_lock);
++	list_for_each_entry(hint, &sbi->lkup_hint_head, lru_list) {
++		if (hint->dir == dir) {
++			if (!(hint->state & rnd_flg)) {
++				if (hint->pid == current->pid)  {
++					pos = hint->last_pos;
++					break;
++				}
++				/* expect locality beyond process */
++				pos = get_syswide_hint(pos, hint);
++			}
++		}
++	}
++	spin_unlock(&sbi->lkup_hint_lock);
++	return max(0LL, pos - win_top);
++}
++
++/* 
++ * NOTE: If you don't want multiple entries for 
++ * same pid, set this to 1.
++ */
++#define LKUP_MULTIENT_MAX	(FAT_LKUP_HINT_MAX/4-1)
++
++
++/* caller must hold dir->i_sem */
++static void fat_lkup_hint_add(struct inode *dir, loff_t pos)
++{
++	struct super_block *sb = dir->i_sb;
++	struct fat_lookup_hint *p, *hint = NULL;
++	loff_t win_start, win_end;
++	struct msdos_sb_info *sbi = MSDOS_SB(sb);
++	int nr_pid_match = 0;
++	unsigned int state;
++
++	spin_lock(&sbi->lkup_hint_lock);
++	/* find out same pid entry */
++	list_for_each_entry(p, &sbi->lkup_hint_head, lru_list) {
++		if (p->pid == current->pid) {
++			nr_pid_match ++;
++			if (p->dir == dir) {
++				hint = p;
++				goto match;
++			}
++			if (!hint) 
++				hint = p;
++		}
++	}
++
++	if (nr_pid_match < LKUP_MULTIENT_MAX)
++		hint = NULL;
++
++	if (hint == NULL) {
++		int free_hint;
++		free_hint = ffs(sbi->lkup_hint_freemap);
++		if (free_hint) {
++			/* add the new entry */
++			free_hint --;
++			sbi->lkup_hint_freemap &= ~ (1<<(free_hint));
++			hint = &sbi->lkup_hint[free_hint];
++			INIT_LIST_HEAD(&hint->lru_list);
++			/* don't need to recheck hint */
++		} else {
++			/* replace the last entry */
++			struct list_head *p = sbi->lkup_hint_head.prev;
++			hint = list_entry(p, struct fat_lookup_hint, lru_list);
++		}
++		hint->pid = current->pid;
++		hint->dir = dir;
++		hint->last_pos = 0;
++	}
++
++match:
++	state = (FAT_LKUP_ST_RANDOM | FAT_LKUP_ST_LFN_RANDOM);
++	hint->last_pos = pos;
++	if (hint->dir != dir) {
++		hint->dir = dir;
++	} else {
++		win_start = hint->last_pos - WIN_TOP;
++		win_end = hint->last_pos + WIN_BOTTOM;
++		if (win_start <= pos && pos <= win_end) {
++			state &= ~FAT_LKUP_ST_RANDOM;
++		}
++		win_start = hint->last_pos - WIN_LFN_TOP;
++		win_end = hint->last_pos + WIN_LFN_BOTTOM;
++		if (win_start <= pos && pos <= win_end) {
++			state &= ~FAT_LKUP_ST_LFN_RANDOM;
++		}
++	}
++	hint->state = state;
++
++	/* update LRU list */
++	list_del(&hint->lru_list);
++	list_add(&hint->lru_list, &sbi->lkup_hint_head);	/* put hint to head */
++	spin_unlock(&sbi->lkup_hint_lock);
++}
++
+ static inline loff_t fat_make_i_pos(struct super_block *sb,
+ 				    struct buffer_head *bh,
+ 				    struct msdos_dir_entry *de)
+@@ -218,13 +397,23 @@ int fat_search_long(struct inode *inode,
+ 	int utf8 = sbi->options.utf8;
+ 	int anycase = (sbi->options.name_check != 's');
+ 	unsigned short opt_shortname = sbi->options.shortname;
+-	loff_t cpos = 0;
+ 	int chl, i, j, last_u, err;
++	loff_t cpos, start_off;
++	int reach_bottom = 0;
+ 
++	start_off = cpos = fat_lkup_hint_get(inode, 1);
+ 	err = -ENOENT;
+ 	while(1) {
+-		if (fat_get_entry(inode, &cpos, &bh, &de) == -1)
++top:
++		if (reach_bottom && cpos >= start_off)
+ 			goto EODir;
++		if (fat_get_entry(inode, &cpos, &bh, &de) == -1) {
++			if (!start_off || reach_bottom)
++				goto EODir;
++			reach_bottom++;
++			cpos = 0;
++			continue;
++		}
+ parse_record:
+ 		nr_slots = 0;
+ 		if (de->name[0] == DELETED_FLAG)
+@@ -274,8 +463,13 @@ parse_long:
+ 				if (ds->id & 0x40) {
+ 					unicode[offset + 13] = 0;
+ 				}
+-				if (fat_get_entry(inode, &cpos, &bh, &de) < 0)
+-					goto EODir;
++				if (fat_get_entry(inode, &cpos, &bh, &de) < 0) {
++					if (!start_off || reach_bottom)
++						goto EODir;
++					reach_bottom++;
++					cpos = 0;
++					goto top;
++				}
+ 				if (slot == 0)
+ 					break;
+ 				ds = (struct msdos_dir_slot *) de;
+@@ -363,6 +557,7 @@ Found:
+ 	sinfo->de = de;
+ 	sinfo->bh = bh;
+ 	sinfo->i_pos = fat_make_i_pos(sb, sinfo->bh, sinfo->de);
++	fat_lkup_hint_add(inode, sinfo->slot_off);
+ 	err = 0;
+ EODir:
+ 	if (unicode)
+@@ -838,16 +1033,29 @@ int fat_scan(struct inode *dir, const un
+ 	     struct fat_slot_info *sinfo)
+ {
+ 	struct super_block *sb = dir->i_sb;
++	int reach_bottom = 0;
++	loff_t start_off;
+ 
+-	sinfo->slot_off = 0;
++	start_off = sinfo->slot_off = fat_lkup_hint_get(dir, 0);
+ 	sinfo->bh = NULL;
+-	while (fat_get_short_entry(dir, &sinfo->slot_off, &sinfo->bh,
+-				   &sinfo->de) >= 0) {
+-		if (!strncmp(sinfo->de->name, name, MSDOS_NAME)) {
+-			sinfo->slot_off -= sizeof(*sinfo->de);
+-			sinfo->nr_slots = 1;
+-			sinfo->i_pos = fat_make_i_pos(sb, sinfo->bh, sinfo->de);
+-			return 0;
++	while (1) {
++		if  (fat_get_short_entry(dir, &sinfo->slot_off, &sinfo->bh,
++				         &sinfo->de) >= 0) {
++			if (!strncmp(sinfo->de->name, name, MSDOS_NAME)) {
++				sinfo->slot_off -= sizeof(*sinfo->de);
++				sinfo->nr_slots = 1;
++				sinfo->i_pos = fat_make_i_pos(sb, sinfo->bh, 
++							      sinfo->de);
++				fat_lkup_hint_add(dir, sinfo->slot_off);
++				return 0;
++			}
++			if (reach_bottom && (start_off <= sinfo->slot_off)) 
++				break;
++		} else {
++			if (!start_off || reach_bottom)
++				break;
++			reach_bottom ++;
++			sinfo->slot_off = 0;
+ 		}
+ 	}
+ 	return -ENOENT;
+diff -r -up linux-2.6.13/fs/fat/inode.c linux-2.6.13-scan2/fs/fat/inode.c
+--- linux-2.6.13/fs/fat/inode.c	2005-08-29 08:41:01.000000000 +0900
++++ linux-2.6.13-scan2/fs/fat/inode.c	2005-09-14 17:24:21.446091170 +0900
+@@ -342,6 +342,8 @@ static void fat_delete_inode(struct inod
+ 	clear_inode(inode);
+ }
+ 
++extern void fat_lkup_hint_inval(struct inode*);
++
+ static void fat_clear_inode(struct inode *inode)
+ {
+ 	struct msdos_sb_info *sbi = MSDOS_SB(inode->i_sb);
+@@ -349,6 +351,7 @@ static void fat_clear_inode(struct inode
+ 	if (is_bad_inode(inode))
+ 		return;
+ 	lock_kernel();
++	fat_lkup_hint_inval(inode);
+ 	spin_lock(&sbi->inode_hash_lock);
+ 	fat_cache_inval_inode(inode);
+ 	hlist_del_init(&MSDOS_I(inode)->i_fat_hash);
+@@ -1042,6 +1045,8 @@ static int fat_read_root(struct inode *i
+ 	return 0;
+ }
+ 
++extern void fat_lkup_hint_init_sb(struct super_block *sb);
++
+ /*
+  * Read the super block of an MS-DOS FS.
+  */
+@@ -1302,6 +1307,8 @@ int fat_fill_super(struct super_block *s
+ 		goto out_fail;
+ 	}
+ 
++	fat_lkup_hint_init_sb(sb);
++
+ 	return 0;
+ 
+ out_invalid:
+diff -r -up linux-2.6.13/include/linux/msdos_fs.h linux-2.6.13-scan2/include/linux/msdos_fs.h
+--- linux-2.6.13/include/linux/msdos_fs.h	2005-08-29 08:41:01.000000000 +0900
++++ linux-2.6.13-scan2/include/linux/msdos_fs.h	2005-09-14 17:22:38.223629408 +0900
+@@ -185,6 +185,19 @@ struct fat_slot_info {
+ #include <linux/nls.h>
+ #include <linux/fs.h>
+ 
++#define FAT_LKUP_HINT_MAX     16
++/* assume FAT_LKUP_HINT_MAX <= sizeof(long)*8 */
++
++struct fat_lookup_hint {
++	struct list_head lru_list;
++	pid_t pid;
++	struct inode *dir;
++	loff_t last_pos;
++#define FAT_LKUP_ST_RANDOM       1
++#define FAT_LKUP_ST_LFN_RANDOM       2
++	unsigned int state;
++};
++
+ struct fat_mount_options {
+ 	uid_t fs_uid;
+ 	gid_t fs_gid;
+@@ -241,6 +254,12 @@ struct msdos_sb_info {
+ 
+ 	spinlock_t inode_hash_lock;
+ 	struct hlist_head inode_hashtable[FAT_HASH_SIZE];
++
++	/* dirent lookup hints */
++	spinlock_t lkup_hint_lock;
++	struct list_head lkup_hint_head;
++	struct fat_lookup_hint lkup_hint[FAT_LKUP_HINT_MAX];
++	unsigned lkup_hint_freemap:FAT_LKUP_HINT_MAX;
+ };
+ 
+ #define FAT_CACHE_VALID	0	/* special case for valid cache */

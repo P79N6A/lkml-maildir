@@ -1,0 +1,155 @@
+Date: Wed, 09 Feb 2000 18:16:54 +0100
+From: Manfred Spraul <>
+Subject: Re: 2.3.43-pre[25] do not work with HIGHMEM=64GB
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/2/9/92
+
+Christoph Rohland wrote:
+> Unable to handle kernel NULL pointer dereference at virtual addres
+> s 00000088
+> *pde = 00104001
+> Oops: 0002
+> CPU:    5
+Strange. Ingo reported the same problem. You wrote that it crashed
+"later on". Is is possible that it occured when the first thread was
+scheduled to CPU 5? Then I have an idea what could have caused the
+crash.
+I've attached 2 patches:
+patch-1: bugfix for this problem.
+patch-2: extended debugging patch - this also removed Ingo's band-aid
+"__flush_tlb()"
+I was running both patches on top of 2.3.43-pre5 [HIGHMEM=off] without
+any problems, but then netscape didn't load :-(
+--
+	Manfred--- 2.3/arch/i386/kernel/setup.c	Tue Feb  8 09:22:17 2000
++++ build-2.3/arch/i386/kernel/setup.c	Tue Feb  8 16:35:56 2000
+@@ -1546,6 +1546,9 @@
+ 	if(current->mm)
+ 		BUG();
+ 	enter_lazy_tlb(&init_mm, current, nr);
++#ifdef CONFIG_SMP
++	cpu_tlbstate[nr].active_mm = &init_mm;
++#endif
+ 
+ 	t->esp0 = current->thread.esp0;
+ 	set_tss_desc(nr,t);
+--- 2.3/include/asm-i386/pgtable.h	Wed Feb  9 17:10:22 2000
++++ build-2.3/include/asm-i386/pgtable.h	Wed Feb  9 17:09:00 2000
+@@ -17,6 +17,18 @@
+ #include <asm/fixmap.h>
+ #include <linux/threads.h>
+ 
++extern void show_stack(unsigned long* esp);
++#ifndef DBG_TLBSTATE
++#define DBG_TLBSTATE
++struct tlb_state
++{
++	struct mm_struct *active_mm;
++	int state;
++};
++extern struct tlb_state cpu_tlbstate[NR_CPUS];
++#endif
++
++
+ extern pgd_t swapper_pg_dir[1024];
+ 
+ /* Caches aren't brain-dead on the intel. */
+@@ -36,6 +48,10 @@
+ 			"movl %0, %%cr3;              \n"		\
+ 			: "=r" (tmpreg)					\
+ 			:: "memory");					\
++		if(tmpreg != __pa(cpu_tlbstate[smp_processor_id()].active_mm->pgd)) { \
++			printk("cr3 error!\n"); \
++			show_stack(NULL); \
++		} \
+ 	} while (0)
+ 
+ /*
+@@ -55,6 +71,10 @@
+ 			: "r" (mmu_cr4_features & ~X86_CR4_PGE),	\
+ 			  "r" (mmu_cr4_features)			\
+ 			: "memory");					\
++		if(tmpreg != __pa(cpu_tlbstate[smp_processor_id()].active_mm->pgd)) { \
++			printk("cr3 error!\n"); \
++			show_stack(NULL); \
++		} \
+ 	} while (0)
+ 
+ extern unsigned long pgkern_mask;
+@@ -78,7 +98,15 @@
+ #define __flush_tlb_one(addr) __flush_tlb()
+ #else
+ #define __flush_tlb_one(addr) \
+-__asm__ __volatile__("invlpg %0": :"m" (*(char *) addr))
++	do { \
++		unsigned int tmpreg; \
++		__asm__ __volatile__("invlpg %0\n\t": :"m" (*(char *) addr)); \
++		__asm__ __volatile__("movl %%cr3,%0\n\t": "=r" (tmpreg));\
++		if(tmpreg != __pa(cpu_tlbstate[smp_processor_id()].active_mm->pgd)) { \
++			printk("cr3 error!\n"); \
++			show_stack(NULL); \
++		} \
++	} while(0)
+ #endif
+ 
+ /*
+--- 2.3/include/asm-i386/pgalloc.h	Wed Feb  9 17:10:22 2000
++++ build-2.3/include/asm-i386/pgalloc.h	Wed Feb  9 17:09:10 2000
+@@ -242,12 +242,15 @@
+ #define TLBSTATE_LAZY	2
+ #define TLBSTATE_OLD	3
+ 
++#ifndef DBG_TLBSTATE
++#define DBG_TLBSTATE
+ struct tlb_state
+ {
+ 	struct mm_struct *active_mm;
+ 	int state;
+ };
+ extern struct tlb_state cpu_tlbstate[NR_CPUS];
++#endif
+ 
+ 
+ #endif
+--- 2.3/arch/i386/kernel/smp.c	Wed Feb  9 17:10:13 2000
++++ build-2.3/arch/i386/kernel/smp.c	Wed Feb  9 17:30:17 2000
+@@ -348,11 +348,9 @@
+ 		} else
+ 			leave_mm(cpu);
+ 	} else {
+-		extern void show_stack (void *);
+ 		printk("hm #1: %p, %p.\n", flush_mm, cpu_tlbstate[cpu].active_mm);
+ 		show_stack(NULL);
+ 	}
+-	__flush_tlb();
+ 	ack_APIC_irq();
+ 	clear_bit(cpu, &flush_cpumask);
+ }
+@@ -382,7 +380,7 @@
+ 	 * Temporarily this turns IRQs off, so that lockups are
+ 	 * detected by the NMI watchdog.
+ 	 */
+-	spin_lock_irq(&tlbstate_lock);
++	spin_lock(&tlbstate_lock);
+ 	
+ 	flush_mm = mm;
+ 	flush_va = va;
+@@ -393,12 +391,14 @@
+ 	 */
+ 	send_IPI_mask(cpumask, INVALIDATE_TLB_VECTOR);
+ 
++	__cli();
+ 	while (flush_cpumask)
+ 		/* nothing. lockup detection does not belong here */;
++	__sti();
+ 
+ 	flush_mm = NULL;
+ 	flush_va = 0;
+-	spin_unlock_irq(&tlbstate_lock);
++	spin_unlock(&tlbstate_lock);
+ }
+ 	
+ void flush_tlb_current_task(void)

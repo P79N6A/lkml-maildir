@@ -1,0 +1,655 @@
+Date: Wed, 26 Jan 2000 19:54:28 +0100
+From: Manfred Spraul <>
+Subject: Re: buggy GFP_KERNEL allocators
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/1/26/146
+
+Ben LaHaise wrote:
+> 
+> Hello Rik & all,
+> 
+> Here's a patch for two of the places that touch userspace after modifying
+> current->state.  Alan, could you include these in the next pre patch?
+> 
+>                 -ben
+write_wchan (in drivers/char/n_tty.c) is another place where user space
+it touched with current->state!= TASK_RUNNING.
+I've attached my "debug kernel" patch for 2.3, it detected these
+TASK_RUNNING buglets. Perhaps you can use it.
+--
+	Manfred
+P.S.: I hope my previous patch didn't make it to the list, I
+accidentially attached a 1 MB patch with .orig files and kernel
+disassembly. Sorry if I wasn't fast enough to stop it.// $Header$
+// Kernel Version:
+//  VERSION = 2
+//  PATCHLEVEL = 3
+//  SUBLEVEL = 39
+//  EXTRAVERSION =
+diff -u -r -N 2.3/arch/i386/kernel/irq.c build-2.3/arch/i386/kernel/irq.c
+--- 2.3/arch/i386/kernel/irq.c	Sat Jan  8 11:03:19 2000
++++ build-2.3/arch/i386/kernel/irq.c	Wed Jan 12 18:02:17 2000
+@@ -208,10 +208,21 @@
+ 		do_flush_tlb_local();
+ }
+ 
++extern void show_stack(unsigned long* stack);
++ 
++static void show_ipi(void* info)
++{
++	int cpu = smp_processor_id();
++
++	printk(KERN_EMERG "CPU %d: [irq %d bh %d]\n",
++			cpu, local_irq_count[cpu], local_bh_count[cpu]);
++	printk(KERN_EMERG "Stack dump:\n");
++	show_stack(NULL);
++
++}
++
+ static void show(char * str)
+ {
+-	int i;
+-	unsigned long *stack;
+ 	int cpu = smp_processor_id();
+ 
+ 	printk("\n%s, CPU %d:\n", str, cpu);
+@@ -219,13 +230,14 @@
+ 		atomic_read(&global_irq_count), local_irq_count[0], local_irq_count[1]);
+ 	printk("bh:   %d [%d %d]\n",
+ 		atomic_read(&global_bh_count), local_bh_count[0], local_bh_count[1]);
+-	stack = (unsigned long *) &stack;
+-	for (i = 40; i ; i--) {
+-		unsigned long x = *++stack;
+-		if (x > (unsigned long) &get_option && x < (unsigned long) &vsprintf) {
+-			printk("<[%08lx]> ", x);
+-		}
++	printk("Stack dump:\n");
++	show_stack(NULL);
++
++	if(hardirq_trylock(smp_processor_id())) {
++		smp_call_function(show_ipi, NULL, 1, 1);
++		hardirq_endlock(smp_processor_id());
+ 	}
++	printk("%s: spinning again.\n", str);
+ }
+ 	
+ #define MAXCOUNT 100000000
+diff -u -r -N 2.3/arch/i386/kernel/traps.c build-2.3/arch/i386/kernel/traps.c
+--- 2.3/arch/i386/kernel/traps.c	Tue Dec 21 09:57:59 1999
++++ build-2.3/arch/i386/kernel/traps.c	Thu Jan 13 16:41:07 2000
+@@ -124,19 +124,58 @@
+ 
+ /*
+  * These constants are for searching for possible module text
+- * segments.  VMALLOC_OFFSET comes from mm/vmalloc.c; MODULE_RANGE is
+- * a guess of how much space is likely to be vmalloced.
++ * segments. MODULE_RANGE is a guess of how much space is likely
++ * to be vmalloced.
+  */
+-#define VMALLOC_OFFSET (8*1024*1024)
+ #define MODULE_RANGE (8*1024*1024)
+ 
++void show_stack(unsigned long * esp)
++{
++	unsigned long *stack, addr, module_start, module_end;
++	int i;
++
++	if(esp == NULL)
++		esp = (unsigned long*)&esp;
++	stack = esp;
++	for(i=0; i < kstack_depth_to_print; i++) {
++		if (((long) stack & (2*PAGE_SIZE-1)) == 0)
++			break;
++		if (i && ((i % 8) == 0))
++			printk("\n       ");
++		printk("%08lx ", *stack++);
++	}
++	printk("\nCall Trace: ");
++	stack = esp;
++	i = 1;
++	module_start = VMALLOC_START;
++	module_end = module_start + MODULE_RANGE;
++	while (((long) stack & (2*PAGE_SIZE-1)) != 0) {
++		addr = *stack++;
++		/*
++		 * If the address is either in the text segment of the
++		 * kernel, or in the region which contains vmalloc'ed
++		 * memory, it *may* be the address of a calling
++		 * routine; if so, print it so that someone tracing
++		 * down the cause of the crash will be able to figure
++		 * out the call path that was taken.
++		 */
++		if (((addr >= (unsigned long) &_stext) &&
++		     (addr <= (unsigned long) &_etext)) ||
++		    ((addr >= module_start) && (addr <= module_end))) {
++			if (i && ((i % 8) == 0))
++				printk("\n       ");
++			printk("[<%08lx>] ", addr);
++			i++;
++		}
++	}
++}
++
+ static void show_registers(struct pt_regs *regs)
+ {
+ 	int i;
+ 	int in_kernel = 1;
+ 	unsigned long esp;
+ 	unsigned short ss;
+-	unsigned long *stack, addr, module_start, module_end;
+ 
+ 	esp = (unsigned long) (1+regs);
+ 	ss = __KERNEL_DS;
+@@ -160,43 +199,38 @@
+ 	 * time of the fault..
+ 	 */
+ 	if (in_kernel) {
++		pgd_t * pgdir;
++		pmd_t * pgmiddle;
++		pte_t * pgtable;
++		
+ 		printk("\nStack: ");
+-		stack = (unsigned long *) esp;
+-		for(i=0; i < kstack_depth_to_print; i++) {
+-			if (((long) stack & 4095) == 0)
+-				break;
+-			if (i && ((i % 8) == 0))
+-				printk("\n       ");
+-			printk("%08lx ", *stack++);
+-		}
+-		printk("\nCall Trace: ");
+-		stack = (unsigned long *) esp;
+-		i = 1;
+-		module_start = PAGE_OFFSET + (max_mapnr << PAGE_SHIFT);
+-		module_start = ((module_start + VMALLOC_OFFSET) & ~(VMALLOC_OFFSET-1));
+-		module_end = module_start + MODULE_RANGE;
+-		while (((long) stack & 4095) != 0) {
+-			addr = *stack++;
+-			/*
+-			 * If the address is either in the text segment of the
+-			 * kernel, or in the region which contains vmalloc'ed
+-			 * memory, it *may* be the address of a calling
+-			 * routine; if so, print it so that someone tracing
+-			 * down the cause of the crash will be able to figure
+-			 * out the call path that was taken.
+-			 */
+-			if (((addr >= (unsigned long) &_stext) &&
+-			     (addr <= (unsigned long) &_etext)) ||
+-			    ((addr >= module_start) && (addr <= module_end))) {
+-				if (i && ((i % 8) == 0))
+-					printk("\n       ");
+-				printk("[<%08lx>] ", addr);
+-				i++;
+-			}
+-		}
++		if(esp >= PAGE_OFFSET && esp < high_memory)
++			show_stack((unsigned long*)esp);
++		 else
++		 	printk("Bad stack pointer.");
++
+ 		printk("\nCode: ");
+-		for(i=0;i<20;i++)
+-			printk("%02x ", ((unsigned char *)regs->eip)[i]);
++		if(regs->eip < PAGE_OFFSET)
++			goto bad;
++
++		pgdir = pgd_offset(current->mm,regs->eip);
++		if(pgd_none(*pgdir) || pgd_bad(*pgdir))
++			goto bad;
++
++		pgmiddle = pmd_offset(pgdir,regs->eip);
++		if(pmd_none(*pgmiddle) || pmd_bad(*pgmiddle))
++			goto bad;
++
++		pgtable = pte_offset(pgmiddle,regs->eip);
++		if(!pte_present(*pgtable))
++		{
++bad:	
++			printk(" Bad EIP pointer.");
++		} else
++		{
++			for(i=0;i<20;i++)
++				printk("%02x ", ((unsigned char *)regs->eip)[i]);
++		}
+ 	}
+ 	printk("\n");
+ }	
+diff -u -r -N 2.3/drivers/char/n_tty.c build-2.3/drivers/char/n_tty.c
+--- 2.3/drivers/char/n_tty.c	Fri Oct 29 18:14:10 1999
++++ build-2.3/drivers/char/n_tty.c	Wed Jan 12 19:10:16 2000
+@@ -1094,7 +1094,9 @@
+ 				nr -= num;
+ 				if (nr == 0)
+ 					break;
++				set_current_state(TASK_RUNNING);
+ 				get_user(c, b);
++				set_current_state(TASK_INTERRUPTIBLE);
+ 				if (opost(c, tty) < 0)
+ 					break;
+ 				b++; nr--;
+@@ -1102,7 +1104,9 @@
+ 			if (tty->driver.flush_chars)
+ 				tty->driver.flush_chars(tty);
+ 		} else {
++			set_current_state(TASK_RUNNING);
+ 			c = tty->driver.write(tty, 1, b, nr);
++			set_current_state(TASK_INTERRUPTIBLE);
+ 			if (c < 0) {
+ 				retval = c;
+ 				goto break_out;
+diff -u -r -N 2.3/fs/namei.c build-2.3/fs/namei.c
+--- 2.3/fs/namei.c	Thu Jan  6 22:57:20 2000
++++ build-2.3/fs/namei.c	Wed Jan 12 20:14:04 2000
+@@ -780,16 +780,14 @@
+ 	char * tmp;
+ 	struct dentry * dentry;
+ 
+-	lock_kernel();
+-	error = -EPERM;
+ 	if (S_ISDIR(mode) || (!S_ISFIFO(mode) && !capable(CAP_MKNOD)))
+-		goto out;
++		return -EPERM;
+ 	tmp = getname(filename);
+-	error = PTR_ERR(tmp);
+ 	if (IS_ERR(tmp))
+-		goto out;
++		return PTR_ERR(tmp);
+ 
+ 	error = -EINVAL;
++	lock_kernel();
+ 	switch (mode & S_IFMT) {
+ 	case 0:
+ 		mode |= S_IFREG;	/* fallthrough */
+@@ -815,10 +813,9 @@
+ 		}
+ 		break;
+ 	}
++	unlock_kernel();
+ 	putname(tmp);
+ 
+-out:
+-	unlock_kernel();
+ 	return error;
+ }
+ 
+@@ -870,14 +867,14 @@
+ 	int error;
+ 	char * tmp;
+ 
+-	lock_kernel();
+ 	tmp = getname(pathname);
+-	error = PTR_ERR(tmp);
+-	if (!IS_ERR(tmp)) {
+-		error = do_mkdir(tmp,mode);
+-		putname(tmp);
+-	}
++	if(IS_ERR(tmp))
++		return PTR_ERR(tmp);
++	lock_kernel();
++	error = do_mkdir(tmp,mode);
+ 	unlock_kernel();
++	putname(tmp);
++
+ 	return error;
+ }
+ 
+@@ -965,14 +962,15 @@
+ 	int error;
+ 	char * tmp;
+ 
+-	lock_kernel();
+ 	tmp = getname(pathname);
+-	error = PTR_ERR(tmp);
+-	if (!IS_ERR(tmp)) {
+-		error = do_rmdir(tmp);
+-		putname(tmp);
+-	}
++	if(IS_ERR(tmp))
++		return PTR_ERR(tmp);
++	lock_kernel();
++	error = do_rmdir(tmp);
+ 	unlock_kernel();
++
++	putname(tmp);
++
+ 	return error;
+ }
+ 
+@@ -1018,14 +1016,14 @@
+ 	int error;
+ 	char * tmp;
+ 
+-	lock_kernel();
+ 	tmp = getname(pathname);
+-	error = PTR_ERR(tmp);
+-	if (!IS_ERR(tmp)) {
+-		error = do_unlink(tmp);
+-		putname(tmp);
+-	}
++	if(IS_ERR(tmp))
++		return PTR_ERR(tmp);
++	lock_kernel();
++	error = do_unlink(tmp);
+ 	unlock_kernel();
++	putname(tmp);
++
+ 	return error;
+ }
+ 
+@@ -1068,21 +1066,20 @@
+ {
+ 	int error;
+ 	char * from;
++	char * to;
+ 
+-	lock_kernel();
+ 	from = getname(oldname);
+-	error = PTR_ERR(from);
+-	if (!IS_ERR(from)) {
+-		char * to;
+-		to = getname(newname);
+-		error = PTR_ERR(to);
+-		if (!IS_ERR(to)) {
+-			error = do_symlink(from,to);
+-			putname(to);
+-		}
+-		putname(from);
++	if(IS_ERR(from))
++		return PTR_ERR(from);
++	to = getname(newname);
++	error = PTR_ERR(to);
++	if (!IS_ERR(to)) {
++		lock_kernel();
++		error = do_symlink(from,to);
++		unlock_kernel();
++		putname(to);
+ 	}
+-	unlock_kernel();
++	putname(from);
+ 	return error;
+ }
+ 
+@@ -1156,21 +1153,21 @@
+ {
+ 	int error;
+ 	char * from;
++		char * to;
+ 
+-	lock_kernel();
+ 	from = getname(oldname);
+-	error = PTR_ERR(from);
+-	if (!IS_ERR(from)) {
+-		char * to;
+-		to = getname(newname);
+-		error = PTR_ERR(to);
+-		if (!IS_ERR(to)) {
+-			error = do_link(from,to);
+-			putname(to);
+-		}
+-		putname(from);
++	if(IS_ERR(from))
++		return PTR_ERR(from);
++	to = getname(newname);
++	error = PTR_ERR(to);
++	if (!IS_ERR(to)) {
++		lock_kernel();
++		error = do_link(from,to);
++		unlock_kernel();
++		putname(to);
+ 	}
+-	unlock_kernel();
++	putname(from);
++
+ 	return error;
+ }
+ 
+@@ -1327,21 +1324,20 @@
+ {
+ 	int error;
+ 	char * from;
++	char * to;
+ 
+-	lock_kernel();
+ 	from = getname(oldname);
+-	error = PTR_ERR(from);
+-	if (!IS_ERR(from)) {
+-		char * to;
+-		to = getname(newname);
+-		error = PTR_ERR(to);
+-		if (!IS_ERR(to)) {
+-			error = do_rename(from,to);
+-			putname(to);
+-		}
+-		putname(from);
++	if(IS_ERR(from))
++		return PTR_ERR(from);
++	to = getname(newname);
++	error = PTR_ERR(to);
++	if (!IS_ERR(to)) {
++		lock_kernel();
++		error = do_rename(from,to);
++		unlock_kernel();
++		putname(to);
+ 	}
+-	unlock_kernel();
++	putname(from);
+ 	return error;
+ }
+ 
+diff -u -r -N 2.3/include/asm-i386/spinlock.h build-2.3/include/asm-i386/spinlock.h
+--- 2.3/include/asm-i386/spinlock.h	Tue Dec 21 09:58:09 1999
++++ build-2.3/include/asm-i386/spinlock.h	Thu Jan 13 14:25:52 2000
+@@ -4,6 +4,7 @@
+ #include <asm/atomic.h>
+ #include <asm/rwlock.h>
+ #include <asm/page.h>
++#include <asm/bitops.h>
+ 
+ extern int printk(const char * fmt, ...)
+ 	__attribute__ ((format (printf, 1, 2)));
+@@ -68,6 +69,7 @@
+ #define spin_unlock_string \
+ 	"lock ; btrl $0,%0"
+ 
++extern atomic_t spinlock_count;
+ extern inline void spin_lock(spinlock_t *lock)
+ {
+ #if SPINLOCK_DEBUG
+@@ -81,10 +83,12 @@
+ 	__asm__ __volatile__(
+ 		spin_lock_string
+ 		:"=m" (__dummy_lock(lock)));
++	atomic_inc(&spinlock_count);
+ }
+ 
+ extern inline void spin_unlock(spinlock_t *lock)
+ {
++	atomic_dec(&spinlock_count);
+ #if SPINLOCK_DEBUG
+ 	if (lock->magic != SPINLOCK_MAGIC)
+ 		BUG();
+@@ -96,7 +100,16 @@
+ 		:"=m" (__dummy_lock(lock)));
+ }
+ 
+-#define spin_trylock(lock) (!test_and_set_bit(0,(lock)))
++extern inline int spin_trylock(spinlock_t *lock)
++{
++	int old = test_and_set_bit(0,(lock));
++
++	if(old)
++		return 0;
++	
++	atomic_inc(&spinlock_count);
++	return 1;
++}
+ 
+ /*
+  * Read-write spinlocks, allowing multiple readers
+@@ -138,6 +151,7 @@
+ 
+ extern inline void read_lock(rwlock_t *rw)
+ {
++	atomic_inc(&spinlock_count);
+ #if SPINLOCK_DEBUG
+ 	if (rw->magic != RWLOCK_MAGIC)
+ 		BUG();
+@@ -147,6 +161,7 @@
+ 
+ extern inline void write_lock(rwlock_t *rw)
+ {
++	atomic_inc(&spinlock_count);
+ #if SPINLOCK_DEBUG
+ 	if (rw->magic != RWLOCK_MAGIC)
+ 		BUG();
+@@ -154,14 +169,25 @@
+ 	__build_write_lock(rw, "__write_lock_failed");
+ }
+ 
+-#define read_unlock(rw)		asm volatile("lock ; incl %0" :"=m" (__dummy_lock(&(rw)->lock)))
+-#define write_unlock(rw)	asm volatile("lock ; addl $" RW_LOCK_BIAS_STR ",%0":"=m" (__dummy_lock(&(rw)->lock)))
++#define read_unlock(rw)		\
++	do { \
++		atomic_dec(&spinlock_count); \
++		asm volatile("lock ; incl %0" :"=m" (__dummy_lock(&(rw)->lock))); \
++	} while(0)
++
++#define write_unlock(rw)	\
++	do { \
++		atomic_dec(&spinlock_count); \
++		asm volatile("lock ; addl $" RW_LOCK_BIAS_STR ",%0":"=m" (__dummy_lock(&(rw)->lock))); \
++	} while(0)
+ 
+ extern inline int write_trylock(rwlock_t *lock)
+ {
+ 	atomic_t *count = (atomic_t *)lock;
+-	if (atomic_sub_and_test(RW_LOCK_BIAS, count))
++	if (atomic_sub_and_test(RW_LOCK_BIAS, count)) {
++		atomic_inc(&spinlock_count);
+ 		return 1;
++	}
+ 	atomic_add(RW_LOCK_BIAS, count);
+ 	return 0;
+ }
+diff -u -r -N 2.3/include/asm-i386/uaccess.h build-2.3/include/asm-i386/uaccess.h
+--- 2.3/include/asm-i386/uaccess.h	Tue Oct 12 14:09:55 1999
++++ build-2.3/include/asm-i386/uaccess.h	Thu Jan 13 14:25:55 2000
+@@ -8,6 +8,8 @@
+ #include <linux/sched.h>
+ #include <asm/page.h>
+ 
++extern void try_sched(void);
++
+ #define VERIFY_READ 0
+ #define VERIFY_WRITE 1
+ 
+@@ -113,6 +115,7 @@
+ /* Careful: we have to cast the result to the type of the pointer for sign reasons */
+ #define get_user(x,ptr)							\
+ ({	int __ret_gu,__val_gu;						\
++	try_sched();							\
+ 	switch(sizeof (*(ptr))) {					\
+ 	case 1:  __get_user_x(1,__ret_gu,__val_gu,ptr); break;		\
+ 	case 2:  __get_user_x(2,__ret_gu,__val_gu,ptr); break;		\
+@@ -137,6 +140,7 @@
+ 
+ #define put_user(x,ptr)									\
+ ({	int __ret_pu;									\
++	try_sched();									\
+ 	switch(sizeof (*(ptr))) {							\
+ 	case 1:  __put_user_x(1,__ret_pu,(__typeof__(*(ptr)))(x),ptr); break;		\
+ 	case 2:  __put_user_x(2,__ret_pu,(__typeof__(*(ptr)))(x),ptr); break;		\
+@@ -544,6 +548,7 @@
+ static inline unsigned long
+ __constant_copy_to_user(void *to, const void *from, unsigned long n)
+ {
++	try_sched();
+ 	if (access_ok(VERIFY_WRITE, to, n))
+ 		__constant_copy_user(to,from,n);
+ 	return n;
+@@ -554,6 +559,7 @@
+ {
+ 	if (access_ok(VERIFY_READ, from, n))
+ 		__constant_copy_user_zeroing(to,from,n);
++	try_sched();
+ 	return n;
+ }
+ 
+@@ -561,12 +567,14 @@
+ __constant_copy_to_user_nocheck(void *to, const void *from, unsigned long n)
+ {
+ 	__constant_copy_user(to,from,n);
++	try_sched();
+ 	return n;
+ }
+ 
+ static inline unsigned long
+ __constant_copy_from_user_nocheck(void *to, const void *from, unsigned long n)
+ {
++	try_sched();
+ 	__constant_copy_user_zeroing(to,from,n);
+ 	return n;
+ }
+diff -u -r -N 2.3/kernel/exit.c build-2.3/kernel/exit.c
+--- 2.3/kernel/exit.c	Tue Dec  7 10:43:36 1999
++++ build-2.3/kernel/exit.c	Wed Jan 12 18:20:14 2000
+@@ -481,6 +481,7 @@
+ 				if (!(options & WUNTRACED) && !(p->flags & PF_PTRACED))
+ 					continue;
+ 				read_unlock(&tasklist_lock);
++				current->state = TASK_RUNNING;
+ 				retval = ru ? getrusage(p, RUSAGE_BOTH, ru) : 0; 
+ 				if (!retval && stat_addr) 
+ 					retval = put_user((p->exit_code << 8) | 0x7f, stat_addr);
+@@ -493,6 +494,7 @@
+ 				current->times.tms_cutime += p->times.tms_utime + p->times.tms_cutime;
+ 				current->times.tms_cstime += p->times.tms_stime + p->times.tms_cstime;
+ 				read_unlock(&tasklist_lock);
++				current->state = TASK_RUNNING;
+ 				retval = ru ? getrusage(p, RUSAGE_BOTH, ru) : 0;
+ 				if (!retval && stat_addr)
+ 					retval = put_user(p->exit_code, stat_addr);
+diff -u -r -N 2.3/kernel/sched.c build-2.3/kernel/sched.c
+--- 2.3/kernel/sched.c	Sat Jan  8 11:03:45 2000
++++ build-2.3/kernel/sched.c	Wed Jan 12 19:55:05 2000
+@@ -1186,3 +1186,25 @@
+ 	atomic_inc(&init_mm.mm_count);
+ }
+ 
++atomic_t spinlock_count = ATOMIC_INIT(0);
++void show_stack(unsigned long* esp);
++
++void try_sched(void)
++{
++	int lock_count = atomic_read(&spinlock_count);
++	if(current->lock_depth >= 0)
++		lock_count--;
++	if(lock_count != 0) {
++		printk(KERN_EMERG "schedule() called while caller owned a spinlock.\n");
++		atomic_set(&spinlock_count,0);
++		show_stack(NULL);
++		return;
++	}
++	if(current->state == TASK_INTERRUPTIBLE ||
++		current->state == TASK_UNINTERRUPTIBLE) {
++		printk(KERN_EMERG "task running around with state != RUNNING.\n");
++		show_stack(NULL);
++	}
++	schedule_timeout(80);
++}
++
+diff -u -r -N 2.3/mm/slab.c build-2.3/mm/slab.c
+--- 2.3/mm/slab.c	Sat Jan  8 11:03:45 2000
++++ build-2.3/mm/slab.c	Wed Jan 12 17:35:52 2000
+@@ -1667,6 +1667,8 @@
+ {
+ 	cache_sizes_t	*csizep = cache_sizes;
+ 
++	if(flags & __GFP_WAIT)
++		try_sched();
+ 	for (; csizep->cs_size; csizep++) {
+ 		if (size > csizep->cs_size)
+ 			continue;

@@ -1,0 +1,183 @@
+Date: Thu, 1 Apr 1999 11:47:39 -0500 (EST)
+From: "Robert M. Fleischman" <>
+Subject: mmap() and threads BUG
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/4/1/78
+
+The following test program illustrates that when many threads do
+non-overlapping read's and write's to a shared file using mmap(), the
+data read does not match the data written.
+It seems that if you use mmap(),memcpy(),munmap() to read/write to a
+portion of a file, you can get corrupt data. There appears to be no
+thread-safe alternative besides this method to do offset-thread-safe
+reads and writes on Linux.
+We are using RedHat's kernel 2.0.36-3, and glibc 2.0.7-29.
+Does this program work on the "2.2" kernels?
+This program makes it appear that mmap() is really broken in 2.0.36.
+-Rob
+----
+/*****************************************************************************
+File:     writerTestLinux.C
+Contents: mmap() Bug Illustration
+Created:  1-Apr-1999
+Compile as:
+    g++ -D_REENTRANT -Wall -Werror -g -o writerTestLinux writerTestLinux.C -lpthread
+Description:
+    This program spawns 10 threads that write and then read data from
+a file using mmap() [mostly because pread/pwrite don't exist on
+Linux]. The program shows that although the data being written and
+read do not overlap, the data becomes corrupt.
+Operation:
+	
+    We create a large file filled with 'x's
+    We create 10 threads. Each with a "letter" (a,b,c etc.) to write into the
+	file.
+    Each thread, reserves a 500 byte chunk of the file by locking the
+	globalOffset variable, incrementing it by 500, and unlocking
+    Now that the "chunk" is reserved, the thread write's and read's
+	its "letter" to the reserved region of the file.
+    It compares what it read to what it wrote and dies if they don't match.
+Theory/Guess:
+    Because we don't have pread/pwrite, we have to use mmap(). mmap() requires
+page alignment on the "offset" parameter. This causes us to mmap() a region
+larger than what we are writing/reading. Although we don't TOUCH those extra
+bits, perhaps there is a bug/race-condition involving overlapping mmap()'s 
+that causes the data to become corrupt.
+*****************************************************************************/
+#include <assert.h>
+#include <fcntl.h>
+#include <memory.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/mman.h>
+#include <sys/time.h>
+#include <unistd.h>
+unsigned int threadCount = 10;
+const char *fileName = "testFile";
+pthread_mutex_t offsetLock;
+size_t globalOffset = 0;
+int fd = -1;
+//
+// Linux doesn't have "pread()/pwrite()", so, we emulate it using mmap().
+//  We do, of course, have to play a little page alignment trick. Not 
+//  too tricky though.
+//
+static bool preadLinuxEmulation(int fd, void *buf, size_t nbyte, off_t offset)
+{
+    if (!buf || (offset < 0)) { return false; }
+    int modulo = offset % ::getpagesize();
+    caddr_t address = static_cast<caddr_t>(::mmap(0, nbyte + modulo,
+						  PROT_READ, MAP_SHARED, fd,
+						  offset - modulo));
+    if (address == MAP_FAILED) { return false; }
+    ::memcpy(buf, address + modulo, nbyte);
+    if (::munmap(address, nbyte + modulo)) { return false; }
+    return true;
+}
+static bool pwriteLinuxEmulation(int fd, void *buf, size_t nbyte, off_t offset)
+{
+    if (!buf || (offset < 0)) { return false; }
+    int modulo = offset % ::getpagesize();
+    caddr_t outBuf = static_cast<caddr_t>(::mmap(0, nbyte + modulo,
+						 PROT_READ | PROT_WRITE, 
+						 MAP_SHARED, fd, 
+						 offset - modulo));
+    if (outBuf == MAP_FAILED) { return false; }
+    ::memcpy(outBuf + modulo, buf, nbyte);
+    if (::munmap(outBuf, nbyte + modulo)) { return false; }
+    return true;
+}
+static void *writeThread(void *arg)
+{
+    // Get the Letter to write() from the argument
+    char letter = *(static_cast<char *>(arg));
+    delete arg;
+    // We are going to write 500 bytes of our letter to SOMEPLACE in the file!
+    char bufIn[500], bufOut[500];
+    ::memset(bufIn, letter, 500);
+    ::printf("Thread %c starting Write/Read Loop.\n", letter);
+    for (int x = 0; x < 10000; ++x) {
+	// SAFELY grab an offset so you don't overlap another thread.
+	::pthread_mutex_lock(&offsetLock);
+	size_t offset = globalOffset;
+	globalOffset += 500;
+	::pthread_mutex_unlock(&offsetLock);
+	// Write and Read to the file!
+	assert(pwriteLinuxEmulation(fd, bufIn, 500, offset));
+	assert(preadLinuxEmulation(fd, bufOut, 500, offset));	
+	// What you read, BETTER match what you wrote!!!
+	if (::memcmp(bufIn, bufOut, 500)) {
+	    //
+	    // YUCK!!!! MMAP() IS BROKEN!!!!
+	    //
+	    ::printf("mmap() is seriously broken!\n");
+	    ::printf("Thread %c wrote data at %u that doesn't match the read that followed\n", letter, offset);
+	    char buf[501]; 
+	    buf[500] = '\0'; 
+	    ::memcpy(buf, bufIn, 500);
+	    ::printf("Data written: %s\n", buf);
+	    ::memcpy(buf, bufOut, 500);
+	    ::printf("Data read: %s\n", buf);
+	    ::abort();
+	}
+    }
+    ::printf("%c Exiting.\n", letter);
+    return 0;
+}
+int main(int, char **)
+{
+    ::printf("Initializing File\n");
+    ::unlink(fileName);
+    // Create a 8192 * 10000 byte file full of "x"'s
+    char buf[8192];
+    ::memset(buf, 'x', sizeof(buf));
+    fd = ::open(fileName, O_RDWR | O_CREAT, 0666);
+    assert(fd != -1);
+    for (int x = 0; x < 10000; ++x) {
+	assert(::write(fd, buf, sizeof(buf)) == sizeof(buf));
+    }
+    // Initialize the global offset lock (to keep things synchronized)
+    pthread_mutexattr_t attr;
+    assert(!::pthread_mutexattr_init(&attr));
+    assert(!::pthread_mutex_init(&offsetLock, &attr));
+    assert(!::pthread_mutexattr_destroy(&attr));
+    // Okay, "fileName" is now a big file full of "x"'s
+    // Start some threads, each assigned a letter ("a", "b", "c", etc.)  to
+    // begin writing and reading from that file.
+    ::printf("Starting Threads\n");
+    char argument = 'a'; // Start with the letter 'a'
+    for (unsigned int k = 0; k < threadCount; ++k) {
+	// Initialize Thread Attributes
+	pthread_t tid;
+	pthread_attr_t attr;
+	assert(!::pthread_attr_init(&attr));
+	assert(!::pthread_attr_setdetachstate(&attr,
+					      PTHREAD_CREATE_DETACHED));
+	assert(!::pthread_attr_setscope(&attr, PTHREAD_SCOPE_SYSTEM));
+	// Spawn the thread
+	assert(!::pthread_create(&tid, &attr, writeThread, 
+				 new char(argument)));
+	// Cleanup Thread Attributes
+	assert(!::pthread_attr_destroy(&attr));
+	++argument; // Go to the next letter
+    }
+    
+    // Just sleep for 30 seconds.
+    ::printf("Waiting for Threads\n");
+    timeval timeout;
+    timeout.tv_sec = 30;
+    timeout.tv_usec = 0;
+    ::select(0, 0, 0, 0, &timeout); 
+    ::printf("Test Exiting\n");
+    ::unlink(fileName);
+    return EXIT_SUCCESS;
+}
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

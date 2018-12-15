@@ -1,0 +1,155 @@
+Date: Fri, 26 Mar 1999 22:20:02 +0100 (MET)
+From: (Guest section DW)
+Subject: Re: swapon crashes computer
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/3/26/152
+
+    From: Manfred Spraul <masp0008@stud.uni-sb.de>
+    I have one IDE disk:
+    /dev/hda1: ext2, root
+    /dev/hda2: swapspace
+    if I run the following commands, the filesystem becomes unusable:
+    # swapoff /dev/hda2
+    # swapon /dev/hda1        #<<< NOT A TYPO, really /dev/hda1
+    The second call does fails, but afterwards ll_rw_block printk()'s:
+    "device /dev/hda1: only 4096-char blocks implemented (1024)".
+    I must reboot and fsck afterwards, even SysRq doesn't sync/unmount.
+The reason is clear:
+sys_swapon (in mm/swapfile.c) does set_blocksize(p->swap_device, PAGE_SIZE);
+Maybe the cleanest patch would have set_blocksize return the original
+value, so that a failed swapon can restore the original state of affairs:
+That would be something like the below.
+Andries
+P.S. I do not understand why there are two calls set_blocksize() in
+this swapfile.c. Is that an editing mistake? 
+-------------------------------------------------------------------
+diff -u --recursive --new-file ../linux-2.2.4/linux/fs/buffer.c ./linux/fs/buffer.c
+--- ../linux-2.2.4/linux/fs/buffer.c	Wed Mar 24 20:08:04 1999
++++ ./linux/fs/buffer.c	Fri Mar 26 21:59:04 1999
+@@ -627,25 +627,28 @@
+ 	return 0;
+ }
+ 
+-void set_blocksize(kdev_t dev, int size)
++/* return 0 if nothing changed, old blocksize otherwise */
++int set_blocksize(kdev_t dev, int size)
+ {
+ 	extern int *blksize_size[];
+-	int i, nlist;
++	int i, nlist, obs;
+ 	struct buffer_head * bh, *bhnext;
+ 
+ 	if (!blksize_size[MAJOR(dev)])
+-		return;
++		return 0;
+ 
+ 	/* Size must be a power of two, and between 512 and PAGE_SIZE */
+ 	if (size > PAGE_SIZE || size < 512 || (size & (size-1)))
+ 		panic("Invalid blocksize passed to set_blocksize");
+ 
+-	if (blksize_size[MAJOR(dev)][MINOR(dev)] == 0 && size == BLOCK_SIZE) {
++	obs = blksize_size[MAJOR(dev)][MINOR(dev)];
++
++	if (obs == 0 && size == BLOCK_SIZE) {
+ 		blksize_size[MAJOR(dev)][MINOR(dev)] = size;
+-		return;
++		return 0;
+ 	}
+-	if (blksize_size[MAJOR(dev)][MINOR(dev)] == size)
+-		return;
++	if (obs == size)
++		return 0;
+ 	sync_buffers(dev, 2);
+ 	blksize_size[MAJOR(dev)][MINOR(dev)] = size;
+ 
+@@ -675,6 +678,7 @@
+ 			remove_from_hash_queue(bh);
+ 		}
+ 	}
++	return obs;
+ }
+ 
+ /*
+diff -u --recursive --new-file ../linux-2.2.4/linux/fs/devices.c ./linux/fs/devices.c
+--- ../linux-2.2.4/linux/fs/devices.c	Wed Dec 23 20:39:49 1998
++++ ./linux/fs/devices.c	Fri Feb 19 23:46:56 1999
+@@ -228,7 +228,7 @@
+  */
+ int blkdev_open(struct inode * inode, struct file * filp)
+ {
+-	int ret = -ENODEV;
++	int ret = -ENXIO;
+ 	filp->f_op = get_blkfops(MAJOR(inode->i_rdev));
+ 	if (filp->f_op != NULL){
+ 		ret = 0;
+diff -u --recursive --new-file ../linux-2.2.4/linux/include/linux/fs.h ./linux/include/linux/fs.h
+--- ../linux-2.2.4/linux/include/linux/fs.h	Wed Mar 24 20:08:09 1999
++++ ./linux/include/linux/fs.h	Fri Mar 26 21:55:01 1999
+@@ -842,7 +842,7 @@
+ 	if (buf)
+ 		__bforget(buf);
+ }
+-extern void set_blocksize(kdev_t dev, int size);
++extern int set_blocksize(kdev_t dev, int size);
+ extern unsigned int get_hardblocksize(kdev_t dev);
+ extern struct buffer_head * bread(kdev_t dev, int block, int size);
+ extern struct buffer_head * breada(kdev_t dev,int block, int size, 
+diff -u --recursive --new-file ../linux-2.2.4/linux/include/linux/genhd.h ./linux/include/linux/genhd.h
+--- ../linux-2.2.4/linux/include/linux/genhd.h	Wed Mar 24 20:08:09 1999
++++ ./linux/include/linux/genhd.h	Wed Mar 24 20:08:37 1999
+@@ -39,7 +39,7 @@
+ #endif
+ 
+ #define DM6_PARTITION		0x54	/* has DDO: use xlated geom & offset */
+-#define EZD_PARTITION		0x55	/* EZ-DRIVE:  same as DM6 (we think) */
++#define EZD_PARTITION		0x55	/* EZ-DRIVE: remap sector 0 to 1 */
+ #define DM6_AUX1PARTITION	0x51	/* no DDO:  use xlated geom */
+ #define DM6_AUX3PARTITION	0x53	/* no DDO:  use xlated geom */
+ 	
+diff -u --recursive --new-file ../linux-2.2.4/linux/mm/swapfile.c ./linux/mm/swapfile.c
+--- ../linux-2.2.4/linux/mm/swapfile.c	Wed Mar 10 01:54:27 1999
++++ ./linux/mm/swapfile.c	Fri Mar 26 22:05:22 1999
+@@ -484,6 +484,7 @@
+ 	struct dentry * swap_dentry;
+ 	unsigned int type;
+ 	int i, j, prev;
++	int old_blocksize = 0;
+ 	int error = -EPERM;
+ 	struct file filp;
+ 	static int least_priority = 0;
+@@ -531,14 +532,16 @@
+ 
+ 	if (S_ISBLK(swap_dentry->d_inode->i_mode)) {
+ 		p->swap_device = swap_dentry->d_inode->i_rdev;
+-		set_blocksize(p->swap_device, PAGE_SIZE);
++		old_blocksize = set_blocksize(p->swap_device, PAGE_SIZE);
+ 		
+ 		filp.f_dentry = swap_dentry;
+ 		filp.f_mode = 3; /* read write */
+ 		error = blkdev_open(swap_dentry->d_inode, &filp);
+ 		if (error)
+ 			goto bad_swap_2;
+-		set_blocksize(p->swap_device, PAGE_SIZE);
++#if 0
++		set_blocksize(p->swap_device, PAGE_SIZE); /* again? */
++#endif
+ 		error = -ENODEV;
+ 		if (!p->swap_device ||
+ 		    (blk_size[MAJOR(p->swap_device)] &&
+@@ -691,6 +694,8 @@
+ 	if(filp.f_op && filp.f_op->release)
+ 		filp.f_op->release(filp.f_dentry->d_inode,&filp);
+ bad_swap_2:
++	if (old_blocksize)
++		set_blocksize(p->swap_device, old_blocksize);
+ 	if (p->swap_lockmap)
+ 		vfree(p->swap_lockmap);
+ 	if (p->swap_map)
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

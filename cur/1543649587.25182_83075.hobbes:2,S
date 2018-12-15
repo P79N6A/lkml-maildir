@@ -1,0 +1,163 @@
+Date: 23 Oct 2002 10:53:17 -0700
+From: Michael Hohnbaum <>
+Subject: [PATCH 2.5.44] Simple NUMA Scheduler rev4 (1/2)
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2002/10/23/220
+
+Attached is my simple NUMA scheduler patch.  It has been split into
+two separate patches, the first part is a modification to 
+find_busiest_queue to favor runqueues for processors on the same
+node.  Care was taken to ensure that the change to find_busiest_queue
+would not change the selection criteria used for non-NUMA machines.
+The second patch adds logic to exec to place the exec'd task on
+the least loaded runqueue, thus avoiding the need to move the task
+to a different (potentially off-node) runqueue in the immediate 
+future.  This patch needs the first patch to apply, but could be
+easily changed to apply to a kernel without the first patch.
+There are no functional changes between these two patches and the
+patch provided for 2.5.43.  As stated then:
+On NUMA systems these two changes have shown performance gains 
+in the 5 - 10% range depending on tests.  Some micro-benchmarks 
+provided by Erich Focht which stress the memory subsystem show
+a doubling in performance.
+The simple NUMA scheduler patch has been included in the
+linux-2.5.44dcl1 kernel so has seen additional testing with no
+issues reported.  I would welcome additional testers or inclusion
+in other 2.5 kernel trees.  
+-- 
+Michael Hohnbaum                      503-578-5486
+hohnbaum@us.ibm.com                   T/L 775-5486
+--- clean-2.5.44/kernel/sched.c	Wed Oct 23 09:25:06 2002
++++ linux-2.5.44/kernel/sched.c	Wed Oct 23 09:24:41 2002
+@@ -32,6 +32,7 @@
+ #include <linux/delay.h>
+ #include <linux/timer.h>
+ #include <linux/rcupdate.h>
++#include <asm/topology.h>
+ 
+ /*
+  * Convert user-nice values [ -20 ... 0 ... 19 ]
+@@ -639,15 +640,35 @@ static inline unsigned int double_lock_b
+  */
+ static inline runqueue_t *find_busiest_queue(runqueue_t *this_rq, int this_cpu, int idle, int *imbalance)
+ {
+-	int nr_running, load, max_load, i;
+-	runqueue_t *busiest, *rq_src;
++	int nr_running, load, max_load_on_node, max_load_off_node, i;
++	runqueue_t *busiest, *busiest_on_node, *busiest_off_node, *rq_src;
+ 
+ 	/*
+-	 * We search all runqueues to find the most busy one.
++	 * This routine is designed to work on NUMA systems.  For
++	 * non-NUMA systems, everything ends up being on the same
++	 * node and most of the NUMA specific logic is optimized
++	 * away by the compiler.
++	 * 
++	 * We must look at each runqueue to update prev_nr_running.
++	 * As we do so, we find the busiest runqueue on the same
++	 * node, and the busiest runqueue off the node.  After
++	 * determining the busiest from each we first see if the
++	 * busiest runqueue on node meets the imbalance criteria.
++	 * If not, then we check the off queue runqueue.  Note that
++	 * we require a higher level of imbalance for choosing an
++	 * off node runqueue.
++	 *
++	 * For off-node, we only move at most one process, so imbalance
++	 * is always set to one for off-node runqueues.
++	 * 
+ 	 * We do this lockless to reduce cache-bouncing overhead,
+ 	 * we re-check the 'best' source CPU later on again, with
+ 	 * the lock held.
+ 	 *
++	 * Note that this routine is called with the current runqueue
++	 * locked, and if a runqueue is found (return != NULL), then
++	 * that runqueue is returned locked, also.
++	 *
+ 	 * We fend off statistical fluctuations in runqueue lengths by
+ 	 * saving the runqueue length during the previous load-balancing
+ 	 * operation and using the smaller one the current and saved lengths.
+@@ -669,8 +690,12 @@ static inline runqueue_t *find_busiest_q
+ 	else
+ 		nr_running = this_rq->prev_nr_running[this_cpu];
+ 
++	busiest_on_node = NULL;
++	busiest_off_node = NULL;
+ 	busiest = NULL;
+-	max_load = 1;
++	max_load_on_node = 1;
++	max_load_off_node = 3;
++	
+ 	for (i = 0; i < NR_CPUS; i++) {
+ 		if (!cpu_online(i))
+ 			continue;
+@@ -682,33 +707,44 @@ static inline runqueue_t *find_busiest_q
+ 			load = this_rq->prev_nr_running[i];
+ 		this_rq->prev_nr_running[i] = rq_src->nr_running;
+ 
+-		if ((load > max_load) && (rq_src != this_rq)) {
+-			busiest = rq_src;
+-			max_load = load;
++		if (__cpu_to_node(i) == __cpu_to_node(this_cpu)) {
++			if ((load > max_load_on_node) && (rq_src != this_rq)) {
++				busiest_on_node = rq_src;
++				max_load_on_node = load;
++			}
++		} else {
++			if (load > max_load_off_node)  {
++				busiest_off_node = rq_src;
++				max_load_off_node = load;
++			}
+ 		}
+ 	}
+-
+-	if (likely(!busiest))
+-		goto out;
+-
+-	*imbalance = (max_load - nr_running) / 2;
+-
+-	/* It needs an at least ~25% imbalance to trigger balancing. */
+-	if (!idle && (*imbalance < (max_load + 3)/4)) {
+-		busiest = NULL;
+-		goto out;
++	if (busiest_on_node) {
++		/* on node balancing happens if there is > 125% difference */
++		*imbalance = (max_load_on_node - nr_running) / 2;
++		if (idle || (*imbalance >=  (max_load_on_node + 3)/4)) {
++			busiest = busiest_on_node;
++		}
+ 	}
+-
+-	nr_running = double_lock_balance(this_rq, busiest, this_cpu, idle, nr_running);
+-	/*
+-	 * Make sure nothing changed since we checked the
+-	 * runqueue length.
+-	 */
+-	if (busiest->nr_running <= nr_running + 1) {
+-		spin_unlock(&busiest->lock);
+-		busiest = NULL;
++	if (busiest_off_node && !busiest) {
++		/* off node balancing requires 400% difference */
++		/*if ((nr_running*4 >= max_load_off_node) && !idle) */
++		if (nr_running*4 >= max_load_off_node) 
++			return NULL;
++		busiest = busiest_off_node; 
++		*imbalance = 1;
++	} 
++	if (busiest) {
++		nr_running = double_lock_balance(this_rq, busiest, this_cpu, idle, nr_running);
++		/*
++		 * Make sure nothing changed since we checked the
++		 * runqueue length.
++		 */
++		if (busiest->nr_running <= nr_running + 1) {
++			spin_unlock(&busiest->lock);
++			busiest = NULL;
++		}
+ 	}
+-out:
+ 	return busiest;
+ }
+ 

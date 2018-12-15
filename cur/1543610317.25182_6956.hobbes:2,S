@@ -1,0 +1,283 @@
+Date: Thu, 22 Nov 2001 09:59:47 +0100 (CET)
+From: Ingo Molnar <>
+Subject: [patch] sched_[set|get]_affinity() syscall, 2.4.15-pre9
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2001/11/22/25
+
+the attached set-affinity-A1 patch is relative to the scheduler
+fixes/cleanups in 2.4.15-pre9. It implements the following two
+new system calls:
+ asmlinkage int sys_sched_set_affinity(pid_t pid, unsigned int mask_len,
+    unsigned long *new_mask_ptr);
+ asmlinkage int sys_sched_get_affinity(pid_t pid, unsigned int
+    *user_mask_len_ptr, unsigned long *user_mask_ptr);
+as a testcase, softirq.c is updated to use this mechanizm, plus see the
+attached loop_affine.c code.
+the sched_set_affinity() syscall also ensures that the target process will
+run on the right CPU (or CPUs).
+I think this interface is the right way to expose user-selectable affinity
+to user-space - there are more complex affinity interfaces in existence,
+but i believe that the discovery of actual caching hierarchy is and should
+be up to a different mechanizm, i dont think it should be mixed into the
+affinity syscalls. Using a mask of linear CPU IDs is IMO sufficient to
+express user-space affinity wishes.
+There are no security issues wrt. cpus_allowed, so these syscalls are
+available to every process. (there are permission restrictions of course,
+similar to those of existing scheduler syscalls.)
+sched_get_affinity(pid, &mask_len, NULL) can be used to query the kernel's
+supported CPU bitmask length. This should help us in achieving a stable
+libc interface once we get over the 32/64 CPUs limit.
+the attached loop_affine.c code tests both syscalls:
+ mars:~> ./loop_affine
+ current process's affinity: 4 bytes mask, value 000000ff.
+ trying to set process: affinity to 00000001.
+ current process's affinity: 4 bytes mask, value 00000001.
+ speed: 2162052 loops.
+ speed: 2162078 loops.
+ [...]
+i've tested the patch on both SMP and UP systems. On UP the syscalls are
+pretty pointless, but they show that the internal state of the scheduler
+folds nicely into the UP case as well:
+ mars:~> ./loop_affine
+ current process's affinity: 4 bytes mask, value 00000001.
+ trying to set process: affinity to 00000001.
+ current process's affinity: 4 bytes mask, value 00000001.
+ speed: 2160880 loops.
+ speed: 2160511 loops.
+ [...]
+comments? Is there any reason to do a more complex interface than this?
+	Ingo
+--- linux/kernel/sched.c.orig	Wed Nov 21 11:12:05 2001
++++ linux/kernel/sched.c	Wed Nov 21 11:44:41 2001
+@@ -1112,6 +1112,132 @@
+ 	return retval;
+ }
+ 
++/*
++ * sys_sched_set_affinity - Set the CPU affinity mask.
++ *
++ * @pid: the PID of the process
++ * @mask_len: length of the bitfield
++ * @new_mask_ptr: user-space pointer to the new CPU mask bitfield
++ */
++asmlinkage int sys_sched_set_affinity(pid_t pid, unsigned int mask_len, unsigned long *new_mask_ptr)
++{
++	int ret, reschedule = 0;
++	unsigned long new_mask;
++	struct task_struct *p;
++
++	/*
++	 * Right now we support an 'unsigned long' bitmask - this can
++	 * be extended without changing the syscall interface.
++	 */
++	if (mask_len < sizeof(new_mask))
++		return -EINVAL;
++
++	if (copy_from_user(&new_mask, new_mask_ptr, sizeof(new_mask)))
++		return -EFAULT;
++
++	new_mask &= cpu_online_map;
++	if (!new_mask)
++		return -EINVAL;
++
++	read_lock_irq(&tasklist_lock);
++	spin_lock(&runqueue_lock);
++
++	ret = -ESRCH;
++	p = find_process_by_pid(pid);
++	if (!p)
++		goto out_unlock;
++
++	ret = -EPERM;
++	if ((current->euid != p->euid) && (current->euid != p->uid) &&
++			!capable(CAP_SYS_NICE))
++		goto out_unlock;
++	p->cpus_allowed = new_mask;
++	if (!(p->cpus_runnable & p->cpus_allowed)) {
++		if (p == current)
++			reschedule = 1;
++#ifdef CONFIG_SMP
++		else  {
++			/*
++			 * If running on a different CPU then
++			 * trigger a reschedule to get the process
++			 * moved to a legal CPU:
++			 */
++			p->need_resched = 1;
++			smp_send_reschedule(p->processor);
++		}
++#endif
++	}
++	ret = 0;
++out_unlock:
++	spin_unlock(&runqueue_lock);
++	read_unlock_irq(&tasklist_lock);
++
++	/*
++	 * Reschedule once if the current CPU is not in
++	 * the affinity mask. (do the reschedule here so
++	 * that kernel internal processes can call this
++	 * interface as well.)
++	 */
++	if (reschedule)
++		schedule();
++
++	return ret;
++}
++
++/*
++ * sys_sched_get_affinity - Set the CPU affinity mask.
++ *
++ * @pid: the PID of the process
++ * @mask_len_ptr: user-space pointer to the length of the bitfield
++ * @new_mask_ptr: user-space pointer to the CPU mask bitfield
++ */
++asmlinkage int sys_sched_get_affinity(pid_t pid, unsigned int *user_mask_len_ptr, unsigned long *user_mask_ptr)
++{
++	unsigned int mask_len, user_mask_len;
++	unsigned long mask;
++	struct task_struct *p;
++	int ret;
++
++	mask_len = sizeof(mask);
++
++	if (copy_from_user(&user_mask_len, user_mask_len_ptr, sizeof(user_mask_len)))
++		return -EFAULT;
++	if (copy_to_user(user_mask_len_ptr, &mask_len, sizeof(mask_len)))
++		return -EFAULT;
++	/*
++	 * Exit if we cannot copy the full bitmask into user-space.
++	 * But above we have copied the desired mask length to user-space
++	 * already, so user-space has a chance to fix up.
++	 */
++	if (user_mask_len < mask_len)
++		return -EINVAL;
++
++	read_lock_irq(&tasklist_lock);
++	spin_lock(&runqueue_lock);
++
++	ret = -ESRCH;
++	p = find_process_by_pid(pid);
++	if (!p)
++		goto out_unlock;
++
++	ret = -EPERM;
++	if ((current->euid != p->euid) && (current->euid != p->uid) &&
++			!capable(CAP_SYS_NICE))
++		goto out_unlock;
++
++	mask = p->cpus_allowed & cpu_online_map;
++	ret = 0;
++out_unlock:
++	spin_unlock(&runqueue_lock);
++	read_unlock_irq(&tasklist_lock);
++
++	if (ret)
++		return ret;
++	if (copy_to_user(user_mask_ptr, &mask, sizeof(mask)))
++		return -EFAULT;
++	return 0;
++}
++
+ static void show_task(struct task_struct * p)
+ {
+ 	unsigned long free = 0;
+--- linux/kernel/softirq.c.orig	Wed Nov 21 11:12:05 2001
++++ linux/kernel/softirq.c	Wed Nov 21 11:24:10 2001
+@@ -363,15 +363,17 @@
+ {
+ 	int bind_cpu = (int) (long) __bind_cpu;
+ 	int cpu = cpu_logical_map(bind_cpu);
++	unsigned long cpu_mask = 1UL << cpu;
+ 
+ 	daemonize();
+ 	current->nice = 19;
+ 	sigfillset(&current->blocked);
+ 
+ 	/* Migrate to the right CPU */
+-	current->cpus_allowed = 1UL << cpu;
+-	while (smp_processor_id() != cpu)
+-		schedule();
++	if (sys_sched_set_affinity(0, sizeof(cpu_mask), &cpu_mask))
++		BUG();
++	if (smp_processor_id() != cpu)
++		BUG();
+ 
+ 	sprintf(current->comm, "ksoftirqd_CPU%d", bind_cpu);
+ 
+--- linux/include/linux/sched.h.orig	Wed Nov 21 11:19:56 2001
++++ linux/include/linux/sched.h	Wed Nov 21 11:39:36 2001
+@@ -589,6 +589,8 @@
+ #define wake_up_interruptible_sync(x)	__wake_up_sync((x),TASK_INTERRUPTIBLE, 1)
+ #define wake_up_interruptible_sync_nr(x) __wake_up_sync((x),TASK_INTERRUPTIBLE,  nr)
+ asmlinkage long sys_wait4(pid_t pid,unsigned int * stat_addr, int options, struct rusage * ru);
++asmlinkage int sys_sched_set_affinity(pid_t pid, unsigned int mask_len, unsigned long *new_mask_ptr);
++asmlinkage int sys_sched_get_affinity(pid_t pid, unsigned int *user_mask_len_ptr, unsigned long *user_mask_ptr);
+ 
+ extern int in_group_p(gid_t);
+ extern int in_egroup_p(gid_t);
+--- linux/arch/i386/kernel/entry.S.orig	Wed Nov 21 11:12:36 2001
++++ linux/arch/i386/kernel/entry.S	Wed Nov 21 11:35:24 2001
+@@ -622,6 +622,8 @@
+ 	.long SYMBOL_NAME(sys_ni_syscall)	/* Reserved for Security */
+ 	.long SYMBOL_NAME(sys_gettid)
+ 	.long SYMBOL_NAME(sys_readahead)	/* 225 */
++	.long SYMBOL_NAME(sys_sched_set_affinity)
++	.long SYMBOL_NAME(sys_sched_get_affinity)
+ 
+ 	.rept NR_syscalls-(.-sys_call_table)/4
+ 		.long SYMBOL_NAME(sys_ni_syscall)
+/*
+ * Simple loop testing the CPU-affinity syscall.
+ */
+#include <time.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <linux/unistd.h>
+#define __NR_sched_set_affinity 226
+_syscall3 (int, sched_set_affinity, pid_t, pid, unsigned int, mask_len, unsigned long *, mask)
+#define __NR_sched_get_affinity 227
+_syscall3 (int, sched_get_affinity, pid_t, pid, unsigned int *, mask_len, unsigned long *, mask)
+int main (void)
+{
+	int ret;
+	unsigned int now, count, mask_len, iteration;
+	unsigned long mask, new_mask = (1 << 0);
+	ret = sched_get_affinity(0, &mask_len, &mask);
+	if (ret) {
+		printf("sched_get_affinity returned %d, exiting.\n", ret);
+		return -1;
+	}
+	printf("current process's affinity: %d bytes mask, value %08lx.\n",
+		mask_len, mask);
+	printf("trying to set process: affinity to %08lx.\n", new_mask);	
+	ret = sched_set_affinity(0, sizeof(new_mask), &new_mask);
+	if (ret) {
+		printf("sched_set_affinity returned %d, exiting.\n", ret);
+		return -1;
+	}
+	ret = sched_get_affinity(0, &mask_len, &mask);
+	if (ret) {
+		printf("sched_get_affinity returned %d, exiting.\n", ret);
+		return -1;
+	}
+	printf("current process's affinity: %d bytes mask, value %08lx.\n",
+		mask_len, mask);
+	iteration = 0;
+repeat:
+	now = time(0);
+	count = 0;
+	for (;;) {
+		count++;
+		if (time(0) != now)
+			break;
+	}
+	if (iteration)
+		printf("speed: %d loops.\n", count);
+	iteration++;
+	goto repeat;
+	return 0;
+}

@@ -1,0 +1,239 @@
+Date: Wed, 13 Sep 2000 01:30:55 +1100
+From: Andrew Morton <>
+Subject: [patch] Card services & yenta driver
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/9/12/212
+
+Finally some clarity with what is going on inside this Dell CPx650
+laptop (TI PCI1225 Cardbus bridge).  Yes, it _is_ contact bounce.  It
+seems to find the 3com NIC particularly offensive - the card can easily
+bounce out 150 milliseconds after the first insertion interrupt.
+The user-visible effect of contact bounce is the message "cs: socket
+xxxxxxxx timed out during reset".  What happens is that the insertion
+causes an interrupt, we wait for setup_delay to expire, then we apply
+power.  The card becomes ready about 10 milliseconds later (according
+to CB_PWRCYCLE).  Then the card bounces in and out of the socket.  The
+card is auto-powered down and doesn't come back up.  Hence the timeout.
+On to the patch:
+- During the conversion from timer-based to thread-based control,
+  several of the magical delays in cs.c (setup_delay, resume_delay,
+  shutdown_delay) got themselves accidentally reduced by a factor of
+  ten.  
+  These have been set back to what they are in David's latest
+  release.  Everything is now in terms of centiseconds (1 cs = 1/100th
+  of a second).  Not a particularly user-friendly unit, but it
+  preserves module parm compatibility with pcmcia-cs.
+  There is one subtle change here: in pcmcia-cs the module parameter:
+        options cs.o setup_delay=100
+  means to delay 100 jiffies.  With this patch, it means 100
+  centiseconds.  These are equivalent if HZ=100, but the delays in
+  pcmcia_cs will vary inversely with variations in HZ.
+- Capriciously doubled the value of setup_delay to 10 centiseconds.
+- Changed the "socket timed out" message to tell people to try
+  increasing the value of setup_delay.
+- Debouncing.
+  This is a bug in the current implementation.  When a card is
+  inserted, we take an interrupt and the thread is scheduled.  If,
+  during the thread execution, the card bounces out and in (very
+  likely), an additional interrupt is generated and
+  socket->events:SS_DETECT is set.  When parse_events returns, the
+  thread sees the buffered insertion event and calls parse_events
+  again.  parse_events has no choice but to power down the card, kick
+  out the driver, reload the driver, beep, beep, beep.
+  There are a number of ways of addressing this, and a lot of them
+  won't work.  This patch treats `setup_delay' as the debounce period. 
+  When this delay expires it sends a message to the low-level driver
+  telling it that the debounce period has ended, and that it should now
+  forget any buffered insertion events which it had saved up.  This was
+  implemented via the new "one shot" flag socket_state_t.flags:SS_DEBOUNCED.
+  Now, clearing events:SS_DETECT after the expiry of setup_delay begs
+  the question "what if the card has really been ejected"? That's OK,
+  because setup_socket checks this - if the card isn't there then it
+  takes the "no card" path and everything is happy (I tested this).
+  Finally, if we _do_ get contact bounce even after the expiry of
+  setup_delay, we get a reset timeout and the card services state
+  machine gives up.  But there is now a buffered-up insertion event! So
+  parse_events is again called and everything works out.
+BTW: It appears that these Cardbus controllers have protection
+circuitry which turns off the voltages when the card is unplugged. 
+With this controller, the voltage remains off even when the card
+bounces back in again (fair enough).  So the controller is in a state
+where the CB_SOCKET_CONTROL register has the value 0x33, but there is
+no voltage at the card.  So this test in yenta_set_power():
+        if (reg != cb_readl(socket, CB_SOCKET_CONTROL))
+                cb_writel(socket, CB_SOCKET_CONTROL, reg);
+prevents us from powering the card back up.  If the test is removed,
+then the act of writing 0x33 to a register which already has a value of
+0x33 _does_ power the card up.  But this is just FYI.  I left the test
+in.
+--- linux-2.4.0-test8/include/pcmcia/ss.h	Sat Sep  9 16:19:30 2000
++++ linux-akpm/include/pcmcia/ss.h	Wed Sep 13 00:13:06 2000
+@@ -82,6 +82,7 @@
+ #define SS_DMA_MODE	0x0080
+ #define SS_SPKR_ENA	0x0100
+ #define SS_OUTPUT_ENA	0x0200
++#define SS_DEBOUNCED	0x0400	/* Tell driver that the debounce delay has ended */
+ 
+ /* Flags for I/O port and memory windows */
+ #define MAP_ACTIVE	0x01
+--- linux-2.4.0-test8/drivers/pcmcia/cardbus.c	Sat Sep  9 16:19:26 2000
++++ linux-akpm/drivers/pcmcia/cardbus.c	Wed Sep 13 00:13:06 2000
+@@ -58,11 +58,6 @@
+ #include <asm/irq.h>
+ #include <asm/io.h>
+ 
+-#ifndef PCMCIA_DEBUG
+-#define PCMCIA_DEBUG 1
+-#endif
+-static int pc_debug = PCMCIA_DEBUG;
+-
+ #define IN_CARD_SERVICES
+ #include <pcmcia/version.h>
+ #include <pcmcia/cs_types.h>
+@@ -72,6 +67,11 @@
+ #include <pcmcia/cistpl.h>
+ #include "cs_internal.h"
+ #include "rsrc_mgr.h"
++
++#ifndef PCMCIA_DEBUG
++#define PCMCIA_DEBUG 1
++#endif
++static int pc_debug = PCMCIA_DEBUG;
+ 
+ /*====================================================================*/
+ 
+--- linux-2.4.0-test8/drivers/pcmcia/cs.c	Sat Sep  9 16:19:26 2000
++++ linux-akpm/drivers/pcmcia/cs.c	Wed Sep 13 00:13:06 2000
+@@ -103,13 +103,13 @@
+ 
+ #define INT_MODULE_PARM(n, v) static int n = v; MODULE_PARM(n, "i")
+ 
+-INT_MODULE_PARM(setup_delay,	HZ/20);		/* ticks */
+-INT_MODULE_PARM(resume_delay,	HZ/5);		/* ticks */
+-INT_MODULE_PARM(shutdown_delay,	HZ/40);		/* ticks */
+-INT_MODULE_PARM(vcc_settle,	400);		/* msecs */
++INT_MODULE_PARM(setup_delay,	10);		/* centiseconds */
++INT_MODULE_PARM(resume_delay,	20);		/* centiseconds */
++INT_MODULE_PARM(shutdown_delay,	3);		/* centiseconds */
++INT_MODULE_PARM(vcc_settle,	40);		/* centiseconds */
+ INT_MODULE_PARM(reset_time,	10);		/* usecs */
+-INT_MODULE_PARM(unreset_delay,	100);		/* msecs */
+-INT_MODULE_PARM(unreset_check,	100);		/* msecs */
++INT_MODULE_PARM(unreset_delay,	10);		/* centiseconds */
++INT_MODULE_PARM(unreset_check,	10);		/* centiseconds */
+ INT_MODULE_PARM(unreset_limit,	30);		/* unreset_check's */
+ 
+ /* Access speed for attribute memory windows */
+@@ -446,10 +446,13 @@
+ 
+ static int send_event(socket_info_t *s, event_t event, int priority);
+ 
+-static void msleep(unsigned int msec)
++/*
++ * Sleep for n_cs centiseconds (1 cs = 1/100th of a second)
++ */
++static void cs_sleep(unsigned int n_cs)
+ {
+ 	current->state = TASK_INTERRUPTIBLE;
+-	schedule_timeout( (msec * HZ + 999) / 1000);
++	schedule_timeout( (n_cs * HZ + 99) / 100);
+ }
+ 
+ static void shutdown_socket(socket_info_t *s)
+@@ -504,7 +507,7 @@
+ 		if (!(val & SS_PENDING))
+ 			break;
+ 		if (--setup_timeout) {
+-			msleep(100);
++			cs_sleep(10);
+ 			continue;
+ 		}
+ 		printk(KERN_NOTICE "cs: socket %p voltage interrogation"
+@@ -516,7 +519,7 @@
+ 	if (val & SS_DETECT) {
+ 		DEBUG(1, "cs: setup_socket(%p): applying power\n", s);
+ 		s->state |= SOCKET_PRESENT;
+-		s->socket.flags = 0;
++		s->socket.flags &= SS_DEBOUNCED;
+ 		if (val & SS_3VCARD)
+ 		    s->socket.Vcc = s->socket.Vpp = 33;
+ 		else if (!(val & SS_XVCARD))
+@@ -533,7 +536,7 @@
+ #endif
+ 		}
+ 		set_socket(s, &s->socket);
+-		msleep(vcc_settle);
++		cs_sleep(vcc_settle);
+ 		reset_socket(s);
+ 		ret = 1;
+ 	} else {
+@@ -561,7 +564,7 @@
+     udelay((long)reset_time);
+     s->socket.flags &= ~SS_RESET;
+     set_socket(s, &s->socket);
+-    msleep(unreset_delay);
++    cs_sleep(unreset_delay/10);
+     unreset_socket(s);
+ } /* reset_socket */
+ 
+@@ -580,11 +583,11 @@
+ 			break;
+ 		DEBUG(2, "cs: socket %d not ready yet\n", s->sock);
+ 		if (--setup_timeout) {
+-			msleep(unreset_check);
++			cs_sleep(unreset_check);
+ 			continue;
+ 		}
+ 		printk(KERN_NOTICE "cs: socket %p timed out during"
+-			" reset\n", s);
++			" reset.  Try increasing setup_delay.\n", s);
+ 		s->state &= ~EVENT_MASK;
+ 		return;
+ 	}
+@@ -656,7 +659,7 @@
+ 	DEBUG(0, "cs: flushing pending setup\n");
+ 	s->state &= ~EVENT_MASK;
+     }
+-    msleep(shutdown_delay);
++    cs_sleep(shutdown_delay);
+     s->state &= ~SOCKET_PRESENT;
+     shutdown_socket(s);
+ }
+@@ -679,11 +682,13 @@
+ 	    }
+ 	    s->state |= SOCKET_SETUP_PENDING;
+ 	    if (s->state & SOCKET_SUSPEND)
+-		msleep(resume_delay);
++		cs_sleep(resume_delay);
+ 	    else
+-		msleep(setup_delay);
++		cs_sleep(setup_delay);
++	    s->socket.flags |= SS_DEBOUNCED;
+ 	    if (setup_socket(s) == 0)
+ 		s->state &= ~SOCKET_SETUP_PENDING;
++	    s->socket.flags &= ~SS_DEBOUNCED;
+ 	}
+     }
+     if (events & SS_BATDEAD)
+--- linux-2.4.0-test8/drivers/pcmcia/yenta.c	Sat Sep  9 16:19:26 2000
++++ linux-akpm/drivers/pcmcia/yenta.c	Wed Sep 13 00:13:06 2000
+@@ -233,6 +233,11 @@
+ {
+ 	u16 bridge;
+ 
++	if (state->flags & SS_DEBOUNCED) {
++		/* The insertion debounce period has ended.  Clear any pending insertion events */
++		socket->events &= ~SS_DETECT;
++		state->flags &= ~SS_DEBOUNCED;		/* SS_DEBOUNCED is oneshot */
++	}
+ 	yenta_set_power(socket, state);
+ 	socket->io_irq = state->io_irq;
+ 	bridge = config_readw(socket, CB_BRIDGE_CONTROL) & ~(CB_BRIDGE_CRST | CB_BRIDGE_INTR);
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+Please read the FAQ at 
+http://www.tux.org/lkml/

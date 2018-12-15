@@ -1,0 +1,281 @@
+Date: Sat, 6 Feb 1999 21:00:51 -0500 (EST)
+From: Alexander Viro <>
+Subject: Re: Linux-2.2.2-pre2..
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/2/6/117
+
+On Sat, 6 Feb 1999, Linus Torvalds wrote:
+> 
+> 
+> On Sat, 6 Feb 1999, Alexander Viro wrote:
+> >
+> > 	Because It's Done That Way (tm). The simplest way to fix it would
+> > probably be switching to slabs instead of using raw pages.
+> 
+> It used to use slabs, and memory usage was _horrible_.
+> 
+> > 	Linus, do you have any objections against it? If it's OK for you
+> > I'll roll a patch and submit it.
+> 
+> We had it already for a short moment in the 2.1.x series, and it simply
+> didn't work very well. It had all the slab problems with multi-page
+> allocations, and inodes also have very hard-to-predict allocation
+> lifetimes, so what happened was that when you allocated a lot of inodes,
+> the pages were almost never freed back to the page pool, because there was
+> often a few inodes holding things locked down anyway.
+> 
+> It's a long time ago, but I essentially reverted it within a few releases
+> because _I_ had problems with it (and that's on machines with plenty of
+> memory).
+> 
+> > 	Another question: we still have a race in rename() on UNIX
+> > filsystems (d_invalidate() stuff).
+> 
+> Remind me..
+If rename() is going to overwrite an existing directory it should check
+that it's empty and (obvious race prevention) nobody else uses it.
+Current code does shrink_dcache_parent() on the victim and then checks
+d_count. It is not enough, since we are leaving the victim hashed and
+anybody can grab it while we are checking emptiness and start to mess
+with it.
+Proposed fix: instead of
+	if (new_dentry->d_count>1)
+		shrink_dcache_parent(new_dentry);
+	if (new_dentry->d_count>1)
+		fail with -EBUSY
+	check emptiness
+	...
+	...
+	...
+	d_move(old_dentry,new_dentry);
+do
+	if (d_invalidate(new_dentry)<0)
+		fail with -EBUSY
+	need_rehash=1;
+	check emptiness
+	...
+	...
+	...
+	if (need_rehash)
+		d_rehash(new_dentry);
+	d_move(old_dentry,new_dentry);
+	That is, try to unhash the victim, say EBUSY if failed, remember to
+rehash it before d_move(), do emptiness check (we are safe now), do the
+rest of rename, rehash the victim if needed and do d_move().
+	This should be done for affs, ext2, minix, sysvfs, ufs and coda.
+vfat already does exactly that. So there... It's about 6-7 changed lines
+in each fs. I'm attaching the patch against 2.2.2-pre2. Apply if you think
+that it's suitable for 2.2.early. Race is real, so...
+								Cheers,
+									Al
+--- linux-2.2.2-pre2/fs/affs/namei.c	Thu Dec 24 04:36:44 1998
++++ linux.bird/fs/affs/namei.c	Sat Feb  6 20:17:18 1999
+@@ -528,6 +528,7 @@
+ 	unsigned long		 old_ino;
+ 	unsigned long		 new_ino;
+ 	int			 retval;
++	int			 need_rehash = 0;
+ 
+ 	pr_debug("AFFS: rename(old=%lu,\"%*s\" (inode=%p) to new=%lu,\"%*s\" (inode=%p))\n",
+ 		 old_dir->i_ino,old_dentry->d_name.len,old_dentry->d_name.name,old_inode,
+@@ -564,11 +565,10 @@
+ 		if (is_subdir(new_dentry, old_dentry))
+ 			goto end_rename;
+ 		if (new_inode) {
+-			if (new_dentry->d_count > 1)
+-				shrink_dcache_parent(new_dentry);
+ 			retval = -EBUSY;
+-			if (new_dentry->d_count > 1)
++			if (d_invalidate(new_dentry)<0)
+ 				goto end_rename;
++			need_rehash = 1;
+ 			retval = -ENOTEMPTY;
+ 			if (!empty_dir(new_bh,AFFS_I2HSIZE(new_inode)))
+ 				goto end_rename;
+@@ -604,6 +604,8 @@
+ 	mark_inode_dirty(new_dir);
+ 	mark_inode_dirty(old_dir);
+ 	mark_buffer_dirty(old_bh,1);
++	if (need_rehash)
++		d_rehash(new_dentry);
+ 	d_move(old_dentry,new_dentry);
+ 	
+ end_rename:
+--- linux-2.2.2-pre2/fs/coda/dir.c	Tue Jan 26 01:16:59 1999
++++ linux.bird/fs/coda/dir.c	Sat Feb  6 20:19:04 1999
+@@ -549,6 +549,7 @@
+ 	struct inode *new_inode = new_dentry->d_inode;
+         struct coda_inode_info *new_cnp, *old_cnp;
+         int error;
++	int need_rehash = 0;
+ 
+ 	ENTRY;
+ 	coda_vfs_stat.rename++;
+@@ -570,14 +571,9 @@
+ 
+ 	/* make sure target is not in use */
+ 	if (new_inode && S_ISDIR(new_inode->i_mode)) { 
+-		/*
+-                 * Prune any children before testing for busy.
+-                 */
+-                if (new_dentry->d_count > 1)
+-                        shrink_dcache_parent(new_dentry);
+-
+-                if (new_dentry->d_count > 1)
++		if (d_invalidate(new_dentry)<0)
+                         return -EBUSY;
++		need_rehash = 1;
+         }
+ 
+ 	/* the C library will do unlink/create etc */
+@@ -599,6 +595,8 @@
+ 	coda_flag_inode(new_dir, C_VATTR);
+ 
+ 	CDEBUG(D_INODE, "result %d\n", error); 
++	if (need_rehash)
++		d_rehash(new_dentry);
+ 	d_move(old_dentry, new_dentry);
+ 
+ 	EXIT;
+--- linux-2.2.2-pre2/fs/ext2/namei.c	Thu Dec 24 04:36:46 1998
++++ linux.bird/fs/ext2/namei.c	Sat Feb  6 20:21:02 1999
+@@ -868,6 +868,7 @@
+ 	struct buffer_head * old_bh, * new_bh, * dir_bh;
+ 	struct ext2_dir_entry_2 * old_de, * new_de;
+ 	int retval;
++	int need_rehash = 0;
+ 
+ 	old_bh = new_bh = dir_bh = NULL;
+ 	retval = -ENAMETOOLONG;
+@@ -905,12 +906,10 @@
+ 		if (is_subdir(new_dentry, old_dentry))
+ 			goto end_rename;
+ 		if (new_inode) {
+-			/* Prune any children before testing for busy */
+-			if (new_dentry->d_count > 1)
+-				shrink_dcache_parent(new_dentry);
+ 			retval = -EBUSY;
+-			if (new_dentry->d_count > 1)
++			if (d_invalidate(new_dentry)<0)
+ 				goto end_rename;
++			need_rehash = 1;
+ 			retval = -ENOTEMPTY;
+ 			if (!empty_dir (new_inode))
+ 				goto end_rename;
+@@ -978,6 +977,8 @@
+ 	}
+ 
+ 	/* Update the dcache */
++	if (need_rehash)
++		d_rehash(new_dentry);
+ 	d_move(old_dentry, new_dentry);
+ 	retval = 0;
+ 
+--- linux-2.2.2-pre2/fs/minix/namei.c	Thu Dec 24 04:36:46 1998
++++ linux.bird/fs/minix/namei.c	Sat Feb  6 20:22:35 1999
+@@ -612,6 +612,7 @@
+ 	struct minix_dir_entry * old_de, * new_de;
+ 	struct minix_sb_info * info;
+ 	int retval;
++	int need_rehash = 0;
+ 
+ 	info = &old_dir->i_sb->u.minix_sb;
+ 	goto start_up;
+@@ -649,15 +650,13 @@
+ 		if (is_subdir(new_dentry, old_dentry))
+ 			goto end_rename;
+ 		if (new_inode) {
+-			/* Prune any children before testing for busy */
+-			if (new_dentry->d_count > 1)
+-				shrink_dcache_parent(new_dentry);
+ 			retval = -EBUSY;
+-			if (new_dentry->d_count > 1)
++			if (d_invalidate(new_dentry)<0)
++				goto end_rename;
++			need_rehash = 1;
+ 			retval = -ENOTEMPTY;
+ 			if (!empty_dir(new_inode))
+ 				goto end_rename;
+-			retval = -EBUSY;
+ 		}
+ 		retval = -EIO;
+ 		dir_bh = minix_bread(old_inode,0,0);
+@@ -714,6 +713,8 @@
+ 		}
+ 	}
+ 	/* Update the dcache */
++	if (need_rehash)
++		d_rehash(new_dentry);
+ 	d_move(old_dentry, new_dentry);
+ 	retval = 0;
+ end_rename:
+--- linux-2.2.2-pre2/fs/sysv/namei.c	Thu Dec 31 20:06:01 1998
++++ linux.bird/fs/sysv/namei.c	Sat Feb  6 20:24:06 1999
+@@ -600,6 +600,7 @@
+ 	struct buffer_head * old_bh, * new_bh, * dir_bh;
+ 	struct sysv_dir_entry * old_de, * new_de;
+ 	int retval;
++	int need_rehash = 0;
+ 
+ 	goto start_up;
+ try_again:
+@@ -636,11 +637,10 @@
+ 		if (is_subdir(new_dentry, old_dentry))
+ 			goto end_rename;
+ 		if (new_inode) {
+-			if (new_dentry->d_count > 1)
+-				shrink_dcache_parent(new_dentry);
+ 			retval = -EBUSY;
+-			if (new_dentry->d_count > 1)
++			if (d_invalidate(new_dentry)<0)
+ 				goto end_rename;
++			need_rehash = 1;
+ 			retval = -ENOTEMPTY;
+ 			if (!empty_dir(new_inode))
+ 				goto end_rename;
+@@ -695,6 +695,8 @@
+ 			mark_inode_dirty(new_dir);
+ 		}
+ 	}
++	if (need_rehash)
++		d_rehash(new_dentry);
+ 	d_move(old_dentry, new_dentry);
+ 	retval = 0;
+ end_rename:
+--- linux-2.2.2-pre2/fs/ufs/namei.c	Sat Jan 23 04:54:53 1999
++++ linux.bird/fs/ufs/namei.c	Sat Feb  6 20:25:42 1999
+@@ -931,6 +931,7 @@
+ 	struct ufs_dir_entry * old_de, * new_de;
+ 	int retval;
+ 	unsigned flags, swab;
++	int need_rehash = 0;
+ 	
+ 	sb = old_dir->i_sb;
+ 	flags = sb->u.ufs_sb.s_flags;
+@@ -975,12 +976,10 @@
+ 		if (is_subdir(new_dentry, old_dentry))
+ 			goto end_rename;
+ 		if (new_inode) {
+-			/* Prune any children before testing for busy */
+-			if (new_dentry->d_count > 1)
+-				shrink_dcache_parent(new_dentry);
+ 			retval = -EBUSY;
+-			if (new_dentry->d_count > 1)
++			if (d_invalidate(new_dentry)<0)
+ 				goto end_rename;
++			need_rehash = 1;
+ 			retval = -ENOTEMPTY;
+ 			if (!ufs_empty_dir (new_inode))
+ 				goto end_rename;
+@@ -1043,6 +1042,8 @@
+ 	}
+ 
+ 	/* Update the dcache */
++	if (need_rehash)
++		d_rehash(new_dentry);
+ 	d_move(old_dentry, new_dentry);
+ 	retval = 0;
+ end_rename:

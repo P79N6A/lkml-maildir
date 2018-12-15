@@ -1,0 +1,566 @@
+Date: Thu, 22 Jan 2009 10:32:17 +0800
+From: Huang Ying <>
+Subject: Re: [RFC] per-CPU cryptd thread implementation based on workqueue
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2009/1/21/389
+
+On Fri, 2009-01-16 at 11:31 +0800, Herbert Xu wrote:
+> On Fri, Jan 16, 2009 at 11:10:36AM +0800, Huang Ying wrote:
+> > 
+> > The scalability of current cryptd implementation is not good. So a
+> > per-CPU cryptd kthread implementation is necessary. The per-CPU kthread
+> > pool implementation need to consider many issues such as CPU hotplug, so
+> > I suggest to base cryptd kthread implementation on workqueue, that is,
+> > create a dedicate workqueue for crypto subsystem. This way, chainiv can
+> > use this crypto workqueue too.
+> 
+> Yes that sounds like a great idea.
+> 
+> > I will implement it if you have no plan to do it yourself.
+> 
+> Please do.
+This is the first attempt to use a dedicate workqueue for crypto. It is
+not intended to be merged. Please feedback your comments, especially on
+desgin.
+Best Regards,
+Huang Ying
+---------------------------------------------------->
+Use dedicate workqueue for crypto
+- A dedicated workqueue named kcrypto_wq is created.
+- chainiv uses kcrypto_wq instead of keventd_wq.
+- For cryptd, struct cryptd_queue is defined to be a per-CPU queue,
+  which holds one struct cryptd_cpu_queue for each CPU. In struct
+  cryptd_cpu_queue, a struct crypto_queue holds all requests for the
+  CPU, a struct work_struct is used to run all requests for the CPU.
+Signed-off-by: Huang Ying <ying.huang@intel.com>
+---
+ crypto/Kconfig             |    5 
+ crypto/Makefile            |    2 
+ crypto/chainiv.c           |    3 
+ crypto/cryptd.c            |  257 +++++++++++++++++++++++++--------------------
+ crypto/crypto_wq.c         |   39 ++++++
+ include/crypto/crypto_wq.h |    7 +
+ 6 files changed, 203 insertions(+), 110 deletions(-)
+--- a/crypto/Kconfig
++++ b/crypto/Kconfig
+@@ -56,6 +56,7 @@ config CRYPTO_BLKCIPHER2
+ 	tristate
+ 	select CRYPTO_ALGAPI2
+ 	select CRYPTO_RNG2
++	select CRYPTO_WORKQUEUE
+ 
+ config CRYPTO_HASH
+ 	tristate
+@@ -106,11 +107,15 @@ config CRYPTO_NULL
+ 	help
+ 	  These are 'Null' algorithms, used by IPsec, which do nothing.
+ 
++config CRYPTO_WORKQUEUE
++       tristate
++
+ config CRYPTO_CRYPTD
+ 	tristate "Software async crypto daemon"
+ 	select CRYPTO_BLKCIPHER
+ 	select CRYPTO_HASH
+ 	select CRYPTO_MANAGER
++	select CRYPTO_WORKQUEUE
+ 	help
+ 	  This is a generic software asynchronous crypto daemon that
+ 	  converts an arbitrary synchronous software crypto algorithm
+--- a/crypto/Makefile
++++ b/crypto/Makefile
+@@ -5,6 +5,8 @@
+ obj-$(CONFIG_CRYPTO) += crypto.o
+ crypto-objs := api.o cipher.o digest.o compress.o
+ 
++obj-$(CONFIG_CRYPTO_WORKQUEUE) += crypto_wq.o
++
+ obj-$(CONFIG_CRYPTO_FIPS) += fips.o
+ 
+ crypto_algapi-$(CONFIG_PROC_FS) += proc.o
+--- /dev/null
++++ b/crypto/crypto_wq.c
+@@ -0,0 +1,39 @@
++/*
++ * Workqueue for crypto subsystem
++ *
++ * Copyright (c) 2009 Intel Corp.
++ *   Author: Huang Ying <ying.huang@intel.com>
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the Free
++ * Software Foundation; either version 2 of the License, or (at your option)
++ * any later version.
++ *
++ */
++
++#include <linux/workqueue.h>
++#include <crypto/algapi.h>
++#include <crypto/crypto_wq.h>
++
++struct workqueue_struct *kcrypto_wq;
++EXPORT_SYMBOL_GPL(kcrypto_wq);
++
++static int __init crypto_wq_init(void)
++{
++	kcrypto_wq = create_workqueue("crypto");
++	if (unlikely(!kcrypto_wq))
++		return -ENOMEM;
++	return 0;
++}
++
++static void __exit crypto_wq_exit(void)
++{
++	if (likely(kcrypto_wq))
++		destroy_workqueue(kcrypto_wq);
++}
++
++module_init(crypto_wq_init);
++module_exit(crypto_wq_exit);
++
++MODULE_LICENSE("GPL");
++MODULE_DESCRIPTION("Workqueue for crypto subsystem");
+--- /dev/null
++++ b/include/crypto/crypto_wq.h
+@@ -0,0 +1,7 @@
++#ifndef CRYPTO_WQ_H
++#define CRYPTO_WQ_H
++
++#include <linux/workqueue.h>
++
++extern struct workqueue_struct *kcrypto_wq;
++#endif
+--- a/crypto/cryptd.c
++++ b/crypto/cryptd.c
+@@ -13,30 +13,37 @@
+ #include <crypto/algapi.h>
+ #include <crypto/internal/hash.h>
+ #include <crypto/cryptd.h>
++#include <crypto/crypto_wq.h>
+ #include <linux/err.h>
+ #include <linux/init.h>
+ #include <linux/kernel.h>
+-#include <linux/kthread.h>
+ #include <linux/list.h>
+ #include <linux/module.h>
+-#include <linux/mutex.h>
+ #include <linux/scatterlist.h>
+ #include <linux/sched.h>
+ #include <linux/slab.h>
+ #include <linux/spinlock.h>
+ 
+-#define CRYPTD_MAX_QLEN 100
++#define CRYPTD_MAX_CPU_QLEN 100
+ 
+-struct cryptd_state {
++enum {
++	CRYPTD_STATE_INUSE,
++};
++
++struct cryptd_cpu_queue {
++	unsigned long state;
+ 	spinlock_t lock;
+-	struct mutex mutex;
+ 	struct crypto_queue queue;
+-	struct task_struct *task;
++	struct work_struct work;
++};
++
++struct cryptd_queue {
++	struct cryptd_cpu_queue *cpu_queue;
+ };
+ 
+ struct cryptd_instance_ctx {
+ 	struct crypto_spawn spawn;
+-	struct cryptd_state *state;
++	struct cryptd_queue *queue;
+ };
+ 
+ struct cryptd_blkcipher_ctx {
+@@ -55,11 +62,121 @@ struct cryptd_hash_request_ctx {
+ 	crypto_completion_t complete;
+ };
+ 
+-static inline struct cryptd_state *cryptd_get_state(struct crypto_tfm *tfm)
++static void cryptd_queue_work(struct work_struct *work);
++
++int cryptd_init_queue(struct cryptd_queue *queue, unsigned int max_cpu_qlen)
++{
++	int cpu;
++	struct cryptd_cpu_queue *cpu_queue;
++
++	queue->cpu_queue = alloc_percpu(struct cryptd_cpu_queue);
++	if (!queue->cpu_queue)
++		return -ENOMEM;
++	for_each_possible_cpu(cpu) {
++		cpu_queue = per_cpu_ptr(queue->cpu_queue, cpu);
++		spin_lock_init(&cpu_queue->lock);
++		crypto_init_queue(&cpu_queue->queue, max_cpu_qlen);
++		INIT_WORK(&cpu_queue->work, cryptd_queue_work);
++	}
++	return 0;
++}
++
++void cryptd_fini_queue(struct cryptd_queue *queue)
++{
++	int cpu;
++	struct cryptd_cpu_queue *cpu_queue;
++
++	for_each_possible_cpu(cpu) {
++		cpu_queue = per_cpu_ptr(queue->cpu_queue, cpu);
++		BUG_ON(cpu_queue->queue.qlen);
++	}
++	free_percpu(queue->cpu_queue);
++}
++
++int cryptd_enqueue_request(struct cryptd_queue *queue,
++			   struct crypto_async_request *request)
++{
++	int cpu, err, queued;
++	struct cryptd_cpu_queue *cpu_queue;
++
++	cpu = get_cpu();
++	cpu_queue = per_cpu_ptr(queue->cpu_queue, cpu);
++	spin_lock_bh(&cpu_queue->lock);
++	err = crypto_enqueue_request(&cpu_queue->queue, request);
++	spin_unlock_bh(&cpu_queue->lock);
++	/* INUSE should be set after queue->qlen assigned, but
++	 * spin_unlock_bh imply a memory barrior already */
++	if (!test_and_set_bit_lock(CRYPTD_STATE_INUSE, &cpu_queue->state)) {
++		queued = queue_work(kcrypto_wq, &cpu_queue->work);
++		BUG_ON(!queued);
++	}
++	put_cpu();
++
++	return err;
++}
++
++int cryptd_tfm_in_queue(struct cryptd_queue *queue, struct crypto_tfm *tfm)
++{
++	int cpu, in_queue;
++	struct cryptd_cpu_queue *cpu_queue;
++
++	for_each_possible_cpu(cpu) {
++		cpu_queue = per_cpu_ptr(queue->cpu_queue, cpu);
++		spin_lock_bh(&cpu_queue->lock);
++		in_queue = crypto_tfm_in_queue(&cpu_queue->queue, tfm);
++		spin_unlock_bh(&cpu_queue->lock);
++		if (in_queue)
++			return 1;
++	}
++	return 0;
++}
++
++static void cryptd_queue_work_done(struct cryptd_cpu_queue *cpu_queue)
++{
++	int queued;
++
++	if (!cpu_queue->queue.qlen) {
++		clear_bit_unlock(CRYPTD_STATE_INUSE, &cpu_queue->state);
++		/* queue.qlen must be checked after INUSE bit cleared */
++		smp_mb();
++		if (!cpu_queue->queue.qlen ||
++		    test_and_set_bit_lock(CRYPTD_STATE_INUSE,
++					  &cpu_queue->state))
++			return;
++	}
++
++	queued = queue_work(kcrypto_wq, &cpu_queue->work);
++	BUG_ON(!queued);
++}
++
++static void cryptd_queue_work(struct work_struct *work)
++{
++	struct cryptd_cpu_queue *cpu_queue =
++		container_of(work, struct cryptd_cpu_queue, work);
++	struct crypto_async_request *req, *backlog;
++
++	/* Only handle one request at a time to avoid hogging crypto
++	 * workqueue */
++	spin_lock_bh(&cpu_queue->lock);
++	backlog = crypto_get_backlog(&cpu_queue->queue);
++	req = crypto_dequeue_request(&cpu_queue->queue);
++	spin_unlock_bh(&cpu_queue->lock);
++
++	if (!req)
++		goto out;
++
++	if (backlog)
++		backlog->complete(backlog, -EINPROGRESS);
++	req->complete(req, 0);
++out:
++	cryptd_queue_work_done(cpu_queue);
++}
++
++static inline struct cryptd_queue *cryptd_get_queue(struct crypto_tfm *tfm)
+ {
+ 	struct crypto_instance *inst = crypto_tfm_alg_instance(tfm);
+ 	struct cryptd_instance_ctx *ictx = crypto_instance_ctx(inst);
+-	return ictx->state;
++	return ictx->queue;
+ }
+ 
+ static int cryptd_blkcipher_setkey(struct crypto_ablkcipher *parent,
+@@ -131,19 +248,13 @@ static int cryptd_blkcipher_enqueue(stru
+ {
+ 	struct cryptd_blkcipher_request_ctx *rctx = ablkcipher_request_ctx(req);
+ 	struct crypto_ablkcipher *tfm = crypto_ablkcipher_reqtfm(req);
+-	struct cryptd_state *state =
+-		cryptd_get_state(crypto_ablkcipher_tfm(tfm));
+-	int err;
++	struct cryptd_queue *queue =
++		cryptd_get_queue(crypto_ablkcipher_tfm(tfm));
+ 
+ 	rctx->complete = req->base.complete;
+ 	req->base.complete = complete;
+ 
+-	spin_lock_bh(&state->lock);
+-	err = ablkcipher_enqueue_request(&state->queue, req);
+-	spin_unlock_bh(&state->lock);
+-
+-	wake_up_process(state->task);
+-	return err;
++	return cryptd_enqueue_request(queue, &req->base);
+ }
+ 
+ static int cryptd_blkcipher_encrypt_enqueue(struct ablkcipher_request *req)
+@@ -177,21 +288,17 @@ static int cryptd_blkcipher_init_tfm(str
+ static void cryptd_blkcipher_exit_tfm(struct crypto_tfm *tfm)
+ {
+ 	struct cryptd_blkcipher_ctx *ctx = crypto_tfm_ctx(tfm);
+-	struct cryptd_state *state = cryptd_get_state(tfm);
++	struct cryptd_queue *queue = cryptd_get_queue(tfm);
+ 	int active;
+ 
+-	mutex_lock(&state->mutex);
+-	active = ablkcipher_tfm_in_queue(&state->queue,
+-					 __crypto_ablkcipher_cast(tfm));
+-	mutex_unlock(&state->mutex);
+-
++	active = cryptd_tfm_in_queue(queue, tfm);
+ 	BUG_ON(active);
+ 
+ 	crypto_free_blkcipher(ctx->child);
+ }
+ 
+ static struct crypto_instance *cryptd_alloc_instance(struct crypto_alg *alg,
+-						     struct cryptd_state *state)
++						     struct cryptd_queue *queue)
+ {
+ 	struct crypto_instance *inst;
+ 	struct cryptd_instance_ctx *ctx;
+@@ -214,7 +321,7 @@ static struct crypto_instance *cryptd_al
+ 	if (err)
+ 		goto out_free_inst;
+ 
+-	ctx->state = state;
++	ctx->queue = queue;
+ 
+ 	memcpy(inst->alg.cra_name, alg->cra_name, CRYPTO_MAX_ALG_NAME);
+ 
+@@ -232,7 +339,7 @@ out_free_inst:
+ }
+ 
+ static struct crypto_instance *cryptd_alloc_blkcipher(
+-	struct rtattr **tb, struct cryptd_state *state)
++	struct rtattr **tb, struct cryptd_queue *queue)
+ {
+ 	struct crypto_instance *inst;
+ 	struct crypto_alg *alg;
+@@ -242,7 +349,7 @@ static struct crypto_instance *cryptd_al
+ 	if (IS_ERR(alg))
+ 		return ERR_CAST(alg);
+ 
+-	inst = cryptd_alloc_instance(alg, state);
++	inst = cryptd_alloc_instance(alg, queue);
+ 	if (IS_ERR(inst))
+ 		goto out_put_alg;
+ 
+@@ -290,14 +397,10 @@ static int cryptd_hash_init_tfm(struct c
+ static void cryptd_hash_exit_tfm(struct crypto_tfm *tfm)
+ {
+ 	struct cryptd_hash_ctx *ctx = crypto_tfm_ctx(tfm);
+-	struct cryptd_state *state = cryptd_get_state(tfm);
++	struct cryptd_queue *queue = cryptd_get_queue(tfm);
+ 	int active;
+ 
+-	mutex_lock(&state->mutex);
+-	active = ahash_tfm_in_queue(&state->queue,
+-				__crypto_ahash_cast(tfm));
+-	mutex_unlock(&state->mutex);
+-
++	active = cryptd_tfm_in_queue(queue, tfm);
+ 	BUG_ON(active);
+ 
+ 	crypto_free_hash(ctx->child);
+@@ -324,19 +427,13 @@ static int cryptd_hash_enqueue(struct ah
+ {
+ 	struct cryptd_hash_request_ctx *rctx = ahash_request_ctx(req);
+ 	struct crypto_ahash *tfm = crypto_ahash_reqtfm(req);
+-	struct cryptd_state *state =
+-		cryptd_get_state(crypto_ahash_tfm(tfm));
+-	int err;
++	struct cryptd_queue *queue =
++		cryptd_get_queue(crypto_ahash_tfm(tfm));
+ 
+ 	rctx->complete = req->base.complete;
+ 	req->base.complete = complete;
+ 
+-	spin_lock_bh(&state->lock);
+-	err = ahash_enqueue_request(&state->queue, req);
+-	spin_unlock_bh(&state->lock);
+-
+-	wake_up_process(state->task);
+-	return err;
++	return cryptd_enqueue_request(queue, &req->base);
+ }
+ 
+ static void cryptd_hash_init(struct crypto_async_request *req_async, int err)
+@@ -469,7 +566,7 @@ static int cryptd_hash_digest_enqueue(st
+ }
+ 
+ static struct crypto_instance *cryptd_alloc_hash(
+-	struct rtattr **tb, struct cryptd_state *state)
++	struct rtattr **tb, struct cryptd_queue *queue)
+ {
+ 	struct crypto_instance *inst;
+ 	struct crypto_alg *alg;
+@@ -479,7 +576,7 @@ static struct crypto_instance *cryptd_al
+ 	if (IS_ERR(alg))
+ 		return ERR_PTR(PTR_ERR(alg));
+ 
+-	inst = cryptd_alloc_instance(alg, state);
++	inst = cryptd_alloc_instance(alg, queue);
+ 	if (IS_ERR(inst))
+ 		goto out_put_alg;
+ 
+@@ -503,7 +600,7 @@ out_put_alg:
+ 	return inst;
+ }
+ 
+-static struct cryptd_state state;
++static struct cryptd_queue queue;
+ 
+ static struct crypto_instance *cryptd_alloc(struct rtattr **tb)
+ {
+@@ -515,9 +612,9 @@ static struct crypto_instance *cryptd_al
+ 
+ 	switch (algt->type & algt->mask & CRYPTO_ALG_TYPE_MASK) {
+ 	case CRYPTO_ALG_TYPE_BLKCIPHER:
+-		return cryptd_alloc_blkcipher(tb, &state);
++		return cryptd_alloc_blkcipher(tb, &queue);
+ 	case CRYPTO_ALG_TYPE_DIGEST:
+-		return cryptd_alloc_hash(tb, &state);
++		return cryptd_alloc_hash(tb, &queue);
+ 	}
+ 
+ 	return ERR_PTR(-EINVAL);
+@@ -572,82 +669,24 @@ void cryptd_free_ablkcipher(struct crypt
+ }
+ EXPORT_SYMBOL_GPL(cryptd_free_ablkcipher);
+ 
+-static inline int cryptd_create_thread(struct cryptd_state *state,
+-				       int (*fn)(void *data), const char *name)
+-{
+-	spin_lock_init(&state->lock);
+-	mutex_init(&state->mutex);
+-	crypto_init_queue(&state->queue, CRYPTD_MAX_QLEN);
+-
+-	state->task = kthread_run(fn, state, name);
+-	if (IS_ERR(state->task))
+-		return PTR_ERR(state->task);
+-
+-	return 0;
+-}
+-
+-static inline void cryptd_stop_thread(struct cryptd_state *state)
+-{
+-	BUG_ON(state->queue.qlen);
+-	kthread_stop(state->task);
+-}
+-
+-static int cryptd_thread(void *data)
+-{
+-	struct cryptd_state *state = data;
+-	int stop;
+-
+-	current->flags |= PF_NOFREEZE;
+-
+-	do {
+-		struct crypto_async_request *req, *backlog;
+-
+-		mutex_lock(&state->mutex);
+-		__set_current_state(TASK_INTERRUPTIBLE);
+-
+-		spin_lock_bh(&state->lock);
+-		backlog = crypto_get_backlog(&state->queue);
+-		req = crypto_dequeue_request(&state->queue);
+-		spin_unlock_bh(&state->lock);
+-
+-		stop = kthread_should_stop();
+-
+-		if (stop || req) {
+-			__set_current_state(TASK_RUNNING);
+-			if (req) {
+-				if (backlog)
+-					backlog->complete(backlog,
+-							  -EINPROGRESS);
+-				req->complete(req, 0);
+-			}
+-		}
+-
+-		mutex_unlock(&state->mutex);
+-
+-		schedule();
+-	} while (!stop);
+-
+-	return 0;
+-}
+-
+ static int __init cryptd_init(void)
+ {
+ 	int err;
+ 
+-	err = cryptd_create_thread(&state, cryptd_thread, "cryptd");
++	err = cryptd_init_queue(&queue, CRYPTD_MAX_CPU_QLEN);
+ 	if (err)
+ 		return err;
+ 
+ 	err = crypto_register_template(&cryptd_tmpl);
+ 	if (err)
+-		kthread_stop(state.task);
++		cryptd_fini_queue(&queue);
+ 
+ 	return err;
+ }
+ 
+ static void __exit cryptd_exit(void)
+ {
+-	cryptd_stop_thread(&state);
++	cryptd_fini_queue(&queue);
+ 	crypto_unregister_template(&cryptd_tmpl);
+ }
+ 
+--- a/crypto/chainiv.c
++++ b/crypto/chainiv.c
+@@ -15,6 +15,7 @@
+ 
+ #include <crypto/internal/skcipher.h>
+ #include <crypto/rng.h>
++#include <crypto/crypto_wq.h>
+ #include <linux/err.h>
+ #include <linux/init.h>
+ #include <linux/kernel.h>
+@@ -133,7 +134,7 @@ static int async_chainiv_schedule_work(s
+ 			goto out;
+ 	}
+ 
+-	queued = schedule_work(&ctx->postponed);
++	queued = queue_work(kcryptd_wq, &ctx->postponed);
+ 	BUG_ON(!queued);
+ 
+ out:
+[unhandled content-type:application/pgp-signature]

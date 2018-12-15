@@ -1,0 +1,580 @@
+Date: Thu, 2 Jan 2003 14:06:41 +0100 (CET)
+From: Steffen Persvold <>
+Subject: One-way Gigabit Ethernet TCP performance with Jumbo frames
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2003/1/2/78
+
+Hi all,
+Lately I've been testing out two Gigabit Ethernet adapters on Pentium 4 
+Xeon platforms; onboard Intel 82544GC (e1000 driver) and onboard Broadcom 
+BCM5701 (tg3 driver), and I'm experiencing some wierd behaviour on 
+one-way tests (ping-ping). The machines I'm testing is connected back to 
+back (i.e no switch) and are fairly fast systems (Dual Xeon 2.4 GHz, 1GB 
+memory) configured to use Jumbo frames (9000 bytes).
+With ping-pong traffic (the attached program run with -bo, or NetPipe 
+default) the bandwidth performance is close to wire speed (123 MByte/sec) 
+and the ping-pong/2 latency is ~30us with both GbE devices.
+But, when running a one-way test (where one machine only sends, and the 
+other only receives, i.e ping-ping) there is a serious dip in the 
+performance curve at ~768 bytes and the bandwidth levels out at approx 
+60 MByte/sec (about half of peak) regadless of application and GbE device. 
+However, if the benchmark applications are started at 2048 bytes (and not 
+0 which is default), or the MTU is set to standard 1500 bytes, there is no 
+such "dip" in the performance curve.
+Is there a new "silly window" syndrome going on here ? Both applications 
+use TCP_NODELAY.
+I'll appreciate any feedback, and I'm happy to assist in the debugging 
+process testing out patches etc.
+PS
+Attached you'll find a yet another "bandwidth" program which measures TCP 
+performance i three ways; ping-ping (one-way), ping-pong, and exchange 
+(two way). Should compile fine with gcc -O2, and you must start a server 
+process (-Ts) on one machine and a client process (-Tc -s <server>) on the 
+other machine.
+DS
+Best regards,
+ -- 
+  Steffen Persvold   |       Scali AS      
+ mailto:sp@scali.com |  
+http://www.scali.com
+Tel: (+47) 2262 8950 |   Olaf Helsets vei 6
+Fax: (+47) 2262 8951 |   N0621 Oslo, NORWAY
+#define MODULE    "BANDWIDTH"
+#define MODULE_ID "@(#)$Id: bandwidth.c,v 1.7 2002/12/26 13:51:44 sp Exp $"
+/* Copyright Notice ----------------------------------------------------------
+//
+// bandwidth.c: point-to-point performance benchmark
+//
+// Copyright (C) 2001  Scali AS   
+//
+// This program is free software; you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation; either version 2 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program; if not, write to the Free Software
+// Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+// ---------------------------------------------------------------------------
+*/
+/* Module --------------------------------------------------------------------
+// 
+// $RCSfile: bandwidth.c,v $
+// 
+// CREATED
+//   Author: hob (Hakon Ording Bugge)
+//   Date:   2001/02/28 16:28:41
+// 
+// LAST CHANGED
+//   $Author: sp $
+//   $Date: 2002/12/26 13:51:44 $
+// 
+// DESCRIPTION
+//   This program serves the purpose of assessing point-to-point performance
+/    of an DAT implementation.
+//   
+// WARNING
+//   Scali considers this program not to be the *best* program for measuring
+//   performance, but it is included for its simplicity. Scali considers
+//   collective operations to be more valuable in assesing a clusters'
+//   performance, hence, use Pallas PMB or mpptest instead.
+//   
+//   
+// -------------------------------------------------------------------------*/
+/* Dependencies ------------------------------------------------------------*/
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <signal.h>
+#include <assert.h>
+#include <errno.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <arpa/inet.h>
+#include <sys/time.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+/* Constants ---------------------------------------------------------------*/
+#define PORT 1230
+#define DO_PING_PING 1
+#define DO_PING_PONG 2
+#define DO_EXCHANGE  4
+#ifndef MIN
+#define MIN(a,b) ((a) < (b) ? (a) : (b))
+#endif
+/* Typedefs ----------------------------------------------------------------*/
+typedef void (*bench_rout_t)(int, char *, char *, int);
+typedef struct {
+      bench_rout_t bench;
+      char *mnem;
+      int scale;
+      int mask;
+} bench_desc_t;
+/* Globals -----------------------------------------------------------------*/
+static int me=-1;
+static int touch_tx_initially=1;
+static int touch_tx_always=0;
+static int touch_rx=0;
+static int align=0;
+static int bench_mask=0;
+static int msg_min=1, msg_max=16*1024*1024;
+static double tgoal=0.1, tres;
+static int bufsz = 262144;
+static int sockfd = -1;
+static const int min_iter=2;
+/* -------------------------------------------------------------------------*/
+static void
+bw_exit(int exit_code)
+{
+   if (sockfd >= 0)
+      close(sockfd);
+   exit(exit_code);
+}
+/* -------------------------------------------------------------------------*/
+static void
+bw_send(void *buf, int len)
+{
+   int sts;
+   sts = send(sockfd, buf, len, MSG_NOSIGNAL);
+   if (sts != len)
+      bw_exit(1);
+}
+static void
+bw_recv(void *buf, int len)
+{
+   int sts;
+   sts = recv(sockfd, buf, len, MSG_WAITALL);
+   if (sts != len)
+      bw_exit(1);
+}
+static void
+bw_sendrecv(void *buf1, void *buf2, int len)
+{
+   char *_buf1 = (char *)buf1;
+   char *_buf2 = (char *)buf2;
+   while (len > 0) {
+      int l = MIN(bufsz/2, len);
+      bw_send(buf1, l);
+      bw_recv(buf2, l);
+      len -= l;
+      _buf1 += l;
+      _buf2 += l;
+   }
+}
+/* -------------------------------------------------------------------------*/
+static double
+bw_wtime(void)
+{
+   struct timeval tp;
+   gettimeofday(&tp, NULL);
+   return ((double) tp.tv_sec + (double) tp.tv_usec * 1e-6);
+}
+/* -------------------------------------------------------------------------*/
+static void
+ping_ping(int iter, char *buf, char *spare, int len) {
+   int i;
+   for (i=0; i < iter; i++) {
+      if (me == 0) {
+         if (touch_tx_always) memset(buf, 0, len);
+	 bw_send(buf, len);
+      } else {
+	 bw_recv(buf, len);
+	 if (touch_rx) memcmp(buf, buf, len);
+      }
+   }
+}
+static void
+ping_pong(int iter, char *buf, char *spare, int len) {
+   int i;
+   for (i=0; i < iter; i++) {
+      if (me == 0) {
+         if (touch_tx_always) memset(buf, 0, len);
+	 bw_send(buf, len);
+	 bw_recv(buf, len);
+	 if (touch_rx) memcmp(buf, buf, len);
+      } else {
+	 bw_recv(buf, len);
+	 if (touch_rx) memcmp(buf, buf, len);
+         if (touch_tx_always) memset(buf, 0, len);
+	 bw_send(buf, len);
+      }
+   }
+}
+static void
+exchange(int iter, char *buf1, char *buf2, int len) {
+   int i;
+   for (i=0; i < iter; i++) {
+      if (touch_tx_always) memset(buf1, 0, len);
+      bw_sendrecv(buf1, buf2, len);
+      if (touch_rx) memcmp(buf2, buf2, len);
+   }
+}
+static bench_desc_t bench[] = { 
+   { ping_ping, "ping-ping",              1, DO_PING_PING },
+   { ping_pong, "ping-pong",              2, DO_PING_PONG },
+   { exchange,  "exchange",               2, DO_EXCHANGE  },
+   { NULL,      "none",      0 },
+};
+/* -------------------------------------------------------------------------*/
+static void
+print_header(char *str) {
+   int i;
+   
+   if (me == 0) {
+      printf("Benchmark %s\n", str);
+      for (i=0; i < strlen(str)+strlen("Benchmark "); ++i) printf("=");
+      printf("\n");
+      printf("%14s %14s %14s %14s %14s\n",
+	     "lenght", "iterations", "elapsed time", "transfer rate", "latency");
+      printf("%14s %14s %14s %14s %14s\n",
+	     "(bytes)", "(count)", "(seconds)", "(Mbytes/s)", "(usec)");
+      printf("--------------------------------------------------------------------------\n");
+   }
+}
+static void
+measure(bench_rout_t rout, int scale, int sz) {
+   int i, iter = 0;
+   static int prev_iter = 0;
+   static bench_rout_t prev_rout = NULL;
+   char               *p1 = (char *)(align ? valloc : malloc)(sz),
+		      *p2 = (char *)(align ? valloc : malloc)(sz);
+   double              t, tmin, s;
+   
+   if (touch_tx_initially) memset(p1, 0, sz);
+   /*
+    * Only spend time calculating a new iteration count if
+    *    1) we have a new test function
+    *       or
+    *    2) we are not down to min_iter number of iterations yet
+    */
+   if (prev_rout != rout || prev_iter > min_iter) {
+      /* First, quick evaluation to find the correct no of iterations */
+      for (iter=1; 1; iter+= iter) {
+	 tmin = 9999.;
+	 for (i=0; i < 3; ++i) { /* minimum of 3 times seems good */
+	    rout(1, p1, p2, sz);
+	    t = bw_wtime();
+	    rout(iter, p1, p2, sz);
+	    t = bw_wtime() - t;
+	    bw_sendrecv(&t, &s, sizeof(double));
+	    t = (t + s) / 2;
+	    tmin =  (t < tmin) ? t : tmin;
+	 }
+	 
+	 if (tmin > 10.0*tres) break;
+      }
+      /* compute estimated no iterations to reach tgoal */
+      iter = iter * (tgoal / tmin);
+   }
+   if (iter < min_iter) iter = min_iter; /* at least min_iter iterations */
+   /* measure with one dry run first to get things settled in cache */
+   rout(1, p1, p2, sz);
+   t = bw_wtime();
+   rout(iter, p1, p2, sz);
+   t = bw_wtime() - t;
+   
+   bw_sendrecv(&t, &s, sizeof(double));
+   t = (t + s) / 2;
+   if (t <= 0.0) t = tres;  /* avoid crash ... */
+   if (me == 0) {
+      printf("%14d %14d %14.3f %14.1f %14.1f\n",
+	     sz, iter, t,
+	     sz*(double)iter*(double)scale*1e-6/t,
+	     t*1e6/(double)iter/(double)scale);
+   }
+   
+   free(p2);
+   free(p1);
+   prev_iter = iter;
+   prev_rout = rout;
+}
+static void
+do_usage(void)
+{
+   printf("Usage: sock_bandwidth -T <s|c> [-s server] [-b i|o|x] [-h] [-m min] [-M max] [-t tgoal] [-V] [-z mask]\n");
+}
+static void
+do_help(void)
+{
+   do_usage();
+   printf(
+      "     -T <c|s>     : Run as Client or Server.\n"
+      "     -h           : Prints this message.\n"
+      "     \n"
+      "     These parameters are only valid on the client :\n"
+      "     \n"
+      "     -s <server>  : Server to connect to. Default localhost.\n"
+      "     -a           : Force page-aligned buffer allocation. Default off.\n"
+      "     -b <i|o|x>   : Benchmark to run, pIng-pIng, ping-pOng, or eXchange.\n"
+      "                    Default all.\n"
+      "     -m <int>     : Minimum message length. Default 0.\n"
+      "     -M <int>     : Maximum message length. Default 16M.\n"
+      "     -t <float>   : Specifies the goal for the elapsed time used per test.\n"
+      "                    Default %.1f\n"
+      "     -V           : Prints version.\n"
+      "     -z <mask>    : Buffer initialization/touch. Default 1.\n"
+      "         mask&1   : Initial initialization of send buffer.\n"
+      "         mask&2   : Initialization of send buffer before every send.\n"
+      "         mask&4   : Read receive buffer after message has been received.\n",
+      tgoal);
+}
+/* -------------------------------------------------------------------------*/
+static int
+bw_init(int argc, char **argv)
+{
+   extern char *optarg;
+   int one = 1;
+   int c;
+   char *server_name = "localhost";
+   while ((c = getopt(argc, argv, "T:s:hab:m:M:t:Vz:")) != EOF) {
+      switch (c) {
+	 case 'T':
+	    switch (*optarg) {
+	       case 'c':
+		  me = 0;
+		  break;
+	       case 's':
+		  me = 1;
+		  break;
+	       default:
+		  do_usage();
+		  bw_exit(3);
+	    }
+	    break;
+	    
+	 case 's':
+	    if (me != 0) {
+	       do_usage();
+	       bw_exit(3);
+	    }
+	    server_name = optarg;
+	    break;
+	 case 'h':
+	    do_help();
+	    bw_exit(0);
+	    break;
+	 case 'a':
+	    if (me != 0) {
+	       do_usage();
+	       bw_exit(3);
+	    }
+	    align = 1;
+	    break;
+	    
+	 case 'b':
+	    if (me != 0) {
+	       do_usage();
+	       bw_exit(3);
+	    }
+	    switch (*optarg) {
+	       case 'i':
+		  bench_mask|= DO_PING_PING;
+		  break;
+		  
+	       case 'o':
+		  bench_mask|= DO_PING_PONG;
+		  break;
+		  
+	       case 'x':
+		  bench_mask|= DO_EXCHANGE;
+		  break;
+		  
+	       case '?':
+		  do_usage();
+		  bw_exit(3);
+		  break;
+	    }
+	    break;
+	 case 'm':
+	    if (me != 0) {
+	       do_usage();
+	       bw_exit(3);
+	    }
+	    msg_min = atoi(optarg);
+	    break;
+	    
+	 case 'M':
+	    if (me != 0) {
+	       do_usage();
+	       bw_exit(3);
+	    }
+	    msg_max = atoi(optarg);
+	    break;
+	    
+	 case 't':
+	    if (me != 0) {
+	       do_usage();
+	       bw_exit(3);
+	    }
+	    tgoal = atof(optarg);
+	    break;
+	 case 'V':
+	    if (me != 0) {
+	       do_usage();
+	       bw_exit(3);
+	    }
+	    printf("%s\n", MODULE_ID);
+	    break;
+	 case 'z':
+	    if (me != 0) {
+	       do_usage();
+	       bw_exit(3);
+	    }
+	    touch_tx_initially = atoi(optarg) & 1;
+	    touch_tx_always    = atoi(optarg) & 2;
+	    touch_rx           = atoi(optarg) & 4;
+	    break;
+	 default:
+	    do_usage();
+	    bw_exit(2);
+      }
+   }
+   if (me < 0) {
+      do_usage();
+      bw_exit(2);
+   }
+   if (msg_min < 1)
+      msg_min = 1;
+   sockfd = socket(AF_INET, SOCK_STREAM, 0);
+   if (sockfd < 0)
+      bw_exit(2);
+      
+   if (me == 0) {
+      struct hostent *hent;
+      struct sockaddr_in sin;
+   
+      hent = gethostbyname(server_name);
+      if (hent == NULL) {
+	 printf("gethostbyname error: %s", hstrerror(h_errno));
+	 bw_exit(h_errno);
+      }
+      memcpy(&sin.sin_addr, hent->h_addr_list[0], hent->h_length);
+      sin.sin_family = AF_INET;
+      sin.sin_port = htons(PORT);
+      if (connect(sockfd, (struct sockaddr *)&sin, sizeof(struct sockaddr_in)) < 0) {
+	 printf("connect failed, errno = %s", strerror(errno));
+	 bw_exit(errno);
+      }
+   } else {
+      int newfd;
+      struct sockaddr_in sin;
+      struct sockaddr_in peeraddr;
+      int peeraddr_len = sizeof(peeraddr);
+      
+      if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) < 0)
+	 printf("setsockopt SO_REUSEADDR failes!, errno = %s\n", strerror(errno));
+      sin.sin_port        = htons(PORT);
+      sin.sin_family      = AF_INET;
+      sin.sin_addr.s_addr = INADDR_ANY;
+      if (bind(sockfd, (struct sockaddr *) &sin, sizeof(struct sockaddr_in)) < 0) {
+	 printf("bind failed, errno = %s", strerror(errno));
+	 bw_exit(errno);
+      }
+      if (listen(sockfd, 5) < 0) {
+	 printf("listen failed, errno = %s", strerror(errno));
+	 bw_exit(errno);
+      }
+      if ((newfd = accept(sockfd, (struct sockaddr *) &peeraddr, &peeraddr_len)) < 0) {
+	 printf("listen failed, errno = %s", strerror(errno));
+	 bw_exit(errno);
+      }
+      close(sockfd);
+      sockfd = newfd;
+   }
+   {
+      char *envstring = NULL;
+      envstring = getenv("BUFSZ");
+      if (envstring)
+         bufsz = strtol(envstring, NULL, 0);
+      if (bufsz > 0) {
+         if (setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &bufsz, sizeof(bufsz)) < 0)
+	    printf("setsockopt SO_SNDBUF failed! errno = %s\n", strerror(errno));
+         if (setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &bufsz, sizeof(bufsz)) < 0)
+	    printf("setsockopt SO_RCVBUF failed! errno = %s", strerror(errno));
+      }
+      envstring = getenv("NODELAY");
+      if (envstring)
+         one = strtol(envstring, NULL, 0) & 1;
+      
+      if (setsockopt(sockfd, SOL_TCP, TCP_NODELAY, &one, sizeof(one)) < 0)
+	 printf("setsockopt TCP_NODELAY failed! errno = %s", strerror(errno));
+   }
+   return 0;
+}
+/* -------------------------------------------------------------------------*/
+/* -------------------------------------------------------------------------*/
+int main(int argc, char **argv)
+{
+   int j, inc, sz;
+   double t1, t2, best_tres;
+   
+   if (bw_init(argc, argv) != 0)
+      bw_exit(3);
+ 
+   /* find clock resolution */
+   for (j=0, best_tres=1e6; j<10; ++j) {
+      for (t1=bw_wtime(); (t2=bw_wtime()) == t1;);
+      t2 = t2 - t1;
+      
+      bw_sendrecv(&t2, &tres, sizeof(double));
+      tres = (tres + t2) / 2;
+      if (tres < best_tres) best_tres=tres;
+   }
+   tres = best_tres;
+   if (me == 0) {
+      int inta[16];
+      inta[0] = touch_tx_initially;
+      inta[1] = touch_tx_always;
+      inta[2] = touch_rx;
+      inta[3] = align;
+      inta[4] = bench_mask;
+      inta[5] = msg_min;
+      inta[6] = msg_max;
+      bw_send(inta, 7 * sizeof(int));
+      bw_send(&tgoal, sizeof(double));
+   } else {
+      int inta[16];
+      bw_recv(inta, 7 * sizeof(int));
+      bw_recv(&tgoal, sizeof(double));
+      touch_tx_initially = inta[0];
+      touch_tx_always = inta[1];
+      touch_rx = inta[2];
+      align = inta[3];
+      bench_mask = inta[4];
+      msg_min = inta[5];
+      msg_max = inta[6];
+   }
+  
+   /* if no benchmarks have been specified, we default to all */
+   if (!bench_mask) bench_mask = DO_PING_PING|DO_PING_PONG|DO_EXCHANGE;
+   if (me == 0)
+      printf("Resolution (usec): %f\n", tres*1e6);
+   
+   for (j=0; bench[j].bench; ++j) {
+      if (!(bench_mask & bench[j].mask)) continue;
+	  
+      print_header(bench[j].mnem);
+      inc = msg_min >> 2;
+      for (sz=msg_min; sz <= msg_max; sz+=inc) {
+	 if (sz < 4) {
+	    inc = 1;
+	 } else {
+	    if (!(sz & inc)) inc+=inc; /* Got this? */
+	 }
+	 measure(bench[j].bench, bench[j].scale, sz);
+      }
+      if (me == 0) printf("\n\n");
+   }
+   bw_exit(0);
+   return 0;
+}

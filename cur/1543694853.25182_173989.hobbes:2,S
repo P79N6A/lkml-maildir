@@ -1,0 +1,311 @@
+Date: Mon, 20 Oct 2003 19:56:33 -0700
+From: "Pallipadi, Venkatesh" <>
+Subject: [PATCH] 2/3 Dynamic cpufreq governor and updates to ACPI P-state driver
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2003/10/20/266
+
+Patch 2/3: Introduce HT-synchronization in the ACPI P-state 
+Driver, to take care of shared CPU frequency between HT siblings.
+diffstat dbs2.patch 
+arch/i386/kernel/cpu/cpufreq/acpi.c |  169
+++++++++++++++++++++++++++++++++++--
+include/acpi/processor.h            |   15 +++
+2 files changed, 178 insertions(+), 6 deletions(-)
+diff -purN linux-2.6.0-test7/arch/i386/kernel/cpu/cpufreq/acpi.c
+linux-2.6.0-test7-dbs/arch/i386/kernel/cpu/cpufreq/acpi.c
+--- linux-2.6.0-test7/arch/i386/kernel/cpu/cpufreq/acpi.c
+2003-10-20 13:31:10.000000000 -0700
++++ linux-2.6.0-test7-dbs/arch/i386/kernel/cpu/cpufreq/acpi.c
+2003-10-20 13:29:41.000000000 -0700
+@@ -34,6 +34,7 @@
+ #include <asm/io.h>
+ #include <asm/delay.h>
+ #include <asm/uaccess.h>
++#include <linux/sem.h>
+ 
+ #include <linux/acpi.h>
+ #include <acpi/processor.h>
+@@ -362,7 +363,8 @@ acpi_processor_set_performance (
+ 	cpufreq_freqs.new = perf->states[state].core_frequency * 1000;
+ 
+ 	/* notify cpufreq */
+-	cpufreq_notify_transition(&cpufreq_freqs, CPUFREQ_PRECHANGE);
++	perf->domainp->cpufreq_notify_transition_ptr(
++			&cpufreq_freqs, CPUFREQ_PRECHANGE);
+ 
+ 	/*
+ 	 * First we write the target state's 'control' value to the
+@@ -390,14 +392,17 @@ acpi_processor_set_performance (
+ 	value = param.retval;
+ 
+ 	/* notify cpufreq */
+-	cpufreq_notify_transition(&cpufreq_freqs, CPUFREQ_POSTCHANGE);
++	perf->domainp->cpufreq_notify_transition_ptr(
++			&cpufreq_freqs, CPUFREQ_POSTCHANGE);
+ 
+ 	if (value != (u16) perf->states[state].status) {
+ 		unsigned int tmp = cpufreq_freqs.new;
+ 		cpufreq_freqs.new = cpufreq_freqs.old;
+ 		cpufreq_freqs.old = tmp;
+-		cpufreq_notify_transition(&cpufreq_freqs,
+CPUFREQ_PRECHANGE);
+-		cpufreq_notify_transition(&cpufreq_freqs,
+CPUFREQ_POSTCHANGE);
++		perf->domainp->cpufreq_notify_transition_ptr(
++				&cpufreq_freqs, CPUFREQ_PRECHANGE);
++		perf->domainp->cpufreq_notify_transition_ptr(
++				&cpufreq_freqs, CPUFREQ_POSTCHANGE);
+ 		ACPI_DEBUG_PRINT((ACPI_DB_WARN, "Transition failed\n"));
+ 		return_VALUE(-ENODEV);
+ 	}
+@@ -568,7 +573,8 @@ acpi_cpufreq_target (
+ 	if (result)
+ 		return_VALUE(result);
+ 
+-	result = acpi_processor_set_performance (perf, next_state);
++	result = perf->domainp->acpi_processor_set_performance_ptr(
++			perf, next_state);
+ 
+ 	return_VALUE(result);
+ }
+@@ -630,6 +636,144 @@ acpi_processor_get_performance_info (
+ 	return_VALUE(0);
+ }
+ 
++static struct acpi_processor_domain acpi_processor_domain_def = {
++	.sem = __MUTEX_INITIALIZER(acpi_processor_domain_def.sem),
++	.ref_cnt = 0,
++	.acpi_processor_set_performance_ptr =
+acpi_processor_set_performance,
++	.cpufreq_notify_transition_ptr = cpufreq_notify_transition,
++};
++
++#ifdef CONFIG_X86_HT
++static void cpufreq_notify_transition_ht(struct cpufreq_freqs
+*cpufreq_freqs, unsigned int state)
++{
++	unsigned int cpu = cpufreq_freqs->cpu;
++	ACPI_FUNCTION_TRACE("cpufreq_notify_transition_ht");
++	cpufreq_notify_transition(cpufreq_freqs, state);
++	cpufreq_freqs->cpu = cpu_sibling_map[cpu];
++	cpufreq_notify_transition(cpufreq_freqs, state);
++	cpufreq_freqs->cpu = cpu;
++	return_VOID;
++}
++
++static int acpi_processor_set_performance_ht(struct
+acpi_processor_performance *perf, int state)
++{
++	struct acpi_processor_domain 	*domainp = perf->domainp;
++	int		result = 0;
++	int 		i;
++	int 		lo_state; /* highest freq */
++
++	ACPI_FUNCTION_TRACE("acpi_processor_set_performance_ht");
++	down(&(domainp->sem));
++	/*
++	 * Transition into new state, only if it is the lowest among
++	 * all sibling requested states.
++	 * semaphore below should be held across the package.
++	 */
++	perf->requested_state = state;
++	lo_state = state;
++	for (i = 0; i < domainp->ref_cnt; i++) {
++		if (performance[domainp->members[i]].requested_state <
+lo_state)
++			lo_state = 
++
+performance[domainp->members[i]].requested_state;
++	}
++
++	if (lo_state == domainp->cur_state) {
++		up(&(domainp->sem));
++		return_VALUE(0);
++	}
++
++	result = acpi_processor_set_performance(perf, lo_state);
++	if (result == 0) {
++		domainp->cur_state = lo_state;
++		for (i = 0; i < domainp->ref_cnt; i++)
++			performance[domainp->members[i]].state =
+lo_state;
++	}
++
++	up(&(domainp->sem));
++	return_VALUE(result);
++}
++
++static int
++acpi_processor_domain_ht_init(
++		struct acpi_processor_performance *perf, int cpu)
++{
++	int sibling_cpu = cpu_sibling_map[cpu];
++	struct acpi_processor_domain *domainp;
++
++	ACPI_FUNCTION_TRACE("acpi_processor_domain_ht_init");
++	if (cpu < sibling_cpu) {
++		domainp = kmalloc(sizeof(struct acpi_processor_domain),
++				GFP_KERNEL);
++		if (domainp == NULL)
++			return_VALUE(-ENOMEM);
++
++		init_MUTEX(&(domainp->sem));
++		domainp->acpi_processor_set_performance_ptr = 
++				acpi_processor_set_performance_ht;
++		domainp->cpufreq_notify_transition_ptr = 
++				cpufreq_notify_transition_ht;
++		domainp->cur_state = 0;
++		domainp->ref_cnt = 0;
++		domainp->members[domainp->ref_cnt] = cpu;
++		domainp->ref_cnt++;
++		perf[cpu].domainp = domainp;
++	} else {
++		perf[cpu].domainp = perf[sibling_cpu].domainp;
++		domainp = perf[cpu].domainp;
++		if (domainp->ref_cnt == ACPI_MAX_CPUS_PER_DOMAIN) {
++			ACPI_DEBUG_PRINT((ACPI_DB_ERROR,
++				"Only %d CPUS per domain is
+supported\n",
++				ACPI_MAX_CPUS_PER_DOMAIN));
++			return_VALUE(-1);
++		}
++		domainp->members[domainp->ref_cnt] = cpu;
++		domainp->ref_cnt++;
++	}
++	return_VALUE(0);
++}
++#endif /* CONFIG_X86_HT */
++
++static int
++acpi_processor_domain_init(struct acpi_processor_performance *perf, int
+cpu)
++{
++
++#ifdef CONFIG_X86_HT
++	int ht_present = ((cpu_has_ht) && (smp_num_siblings == 2));
++#endif
++
++	ACPI_FUNCTION_TRACE("acpi_processor_domain_init");
++
++#ifdef CONFIG_X86_HT
++	if (ht_present) {
++		int retval;
++		retval = acpi_processor_domain_ht_init(perf, cpu);
++		return_VALUE(retval);
++	}
++	/* FALLTHRU and use default domain structure */
++#endif
++	perf[cpu].domainp = &acpi_processor_domain_def;
++	return_VALUE(0);
++}
++
++static void
++acpi_processor_domain_exit(struct acpi_processor_performance *perf, int
+cpu)
++{
++	ACPI_FUNCTION_TRACE("acpi_processor_domain_exit");
++#ifdef CONFIG_X86_HT
++	if (!perf[cpu].domainp)
++		return_VOID;
++
++	if (perf[cpu].domainp == &acpi_processor_domain_def)
++		return_VOID;
++
++	perf[cpu].domainp->ref_cnt--;
++	if (perf[cpu].domainp->ref_cnt == 0) {
++		kfree(perf[cpu].domainp);
++		perf[cpu].domainp = NULL;
++	}
++#endif /* CONFIG_X86_HT */
++	return_VOID;
++}
+ 
+ static int
+ acpi_cpufreq_cpu_init (
+@@ -742,8 +886,13 @@ acpi_cpufreq_init (void)
+ 
+ 	/* register struct acpi_processor_performance performance */
+ 	for (i=0; i<NR_CPUS; i++) {
+-		if (cpu_online(i))
++		if (cpu_online(i)) {
+ 
+acpi_processor_register_performance(&performance[i], &pr, i);
++			if (acpi_processor_domain_init(performance, i) <
+0) {
++				result = -ENOMEM;
++				goto err0;
++			}
++		}
+ 	}
+ 
+ 	/* initialize  */
+@@ -804,6 +953,10 @@ acpi_cpufreq_init (void)
+ 	cpufreq_unregister_driver(&acpi_cpufreq_driver);
+ 	
+  err0:
++	for (i = 0; i < NR_CPUS; i++)
++		if (cpu_online(i))
++			acpi_processor_domain_exit(performance, i);
++
+ 	/* unregister struct acpi_processor_performance performance */
+ 	for (i=0; i<NR_CPUS; i++) {
+ 		if (performance[i].pr) {
+@@ -842,6 +995,10 @@ acpi_cpufreq_exit (void)
+ 		}
+ 	}
+ 
++	for (i = 0; i < NR_CPUS; i++)
++		if (cpu_online(i))
++			acpi_processor_domain_exit(performance, i);
++
+ 	kfree(performance);
+ 
+ 	return_VOID;
+diff -purN linux-2.6.0-test7/include/acpi/processor.h
+linux-2.6.0-test7-dbs/include/acpi/processor.h
+--- linux-2.6.0-test7/include/acpi/processor.h	2003-10-20
+13:31:10.000000000 -0700
++++ linux-2.6.0-test7-dbs/include/acpi/processor.h	2003-10-20
+13:08:11.000000000 -0700
+@@ -2,6 +2,7 @@
+ #define __ACPI_PROCESSOR_H
+ 
+ #include <linux/kernel.h>
++#include <linux/sem.h>
+ 
+ #define ACPI_PROCESSOR_BUSY_METRIC	10
+ 
+@@ -74,6 +75,8 @@ struct acpi_processor_performance {
+ 	u16			status_register;
+ 	int			state_count;
+ 	int			space_id;
++	int			requested_state;
++	struct acpi_processor_domain *domainp;
+ 	struct acpi_processor_px states[ACPI_PROCESSOR_MAX_PERFORMANCE];
+ 	struct cpufreq_frequency_table
+freq_table[ACPI_PROCESSOR_MAX_PERFORMANCE];
+ 	struct acpi_processor   *pr;
+@@ -132,6 +135,18 @@ struct acpi_processor {
+ 	struct acpi_processor_limit limit;
+ };
+ 
++#define ACPI_MAX_CPUS_PER_DOMAIN 	2
++struct acpi_processor_domain {
++	/* Domain wide data */
++	struct semaphore	sem;
++	int 			cur_state;
++	int			ref_cnt;
++	int 			members[ACPI_MAX_CPUS_PER_DOMAIN];
++	/* Domain wide function pointers */
++	int (*acpi_processor_set_performance_ptr)(struct
+acpi_processor_performance *perf, int state);
++	void (*cpufreq_notify_transition_ptr)(struct cpufreq_freqs
+*cpufreq_freqs, unsigned int state);
++};
++
+ extern int acpi_processor_get_platform_limit (
+ 	struct acpi_processor*	pr);
+ extern int acpi_processor_register_performance ([unhandled content-type:application/octet-stream]

@@ -1,0 +1,463 @@
+Date: Fri, 1 Oct 1999 18:31:44 +0200 (MEST)
+From: Patrick Schaaf <>
+Subject: [PATCH] getsockopt() on netfilter-redirected socket
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/10/1/59
+
+Hi all,
+this afternoon I found out that the new netfilter code is missing an essential
+function of the old TRANSPARENT_PROXY implementation: in the old times, a user
+level process simply used getsockname() on an incoming socket to get at the
+original destination IP address and port, before the transparent redirect.
+As an example, that mechanism is used by squid for transparent proxying.
+I append a dirty-hack implementation, based on 2.3.18 and netfilter-0.1.9.
+I just hacked some suitable fields into 'struct sk_buff' and 'struct sock'
+to pass the info, and made the netfilter NAT tcp and udp mappings set the
+fields in the sk_buffs. Seems to work, I'm running that kernel right now,
+redirecting all kinds of HTTP connections out over a hacked single port
+ssh forwarder (see third attachment, a patch against ssh-1.2.27)
+What do you all think?
+best regards
+  Patrick Schaaf
+diff -urN linux-2.3.18/include/linux/skbuff.h linux-2.3.18-bof-1/include/linux/skbuff.h
+--- linux-2.3.18/include/linux/skbuff.h	Fri Oct  1 18:10:53 1999
++++ linux-2.3.18-bof-1/include/linux/skbuff.h	Fri Oct  1 16:26:21 1999
+@@ -116,6 +116,8 @@
+ 	__u32		nfreason;
+ 	/* Cache info */
+ 	__u32		nfcache;
++	__u32		nf_original_daddr;
++	__u16		nf_original_dest;
+ #ifdef CONFIG_NETFILTER_DEBUG
+         unsigned int nf_debug;
+ #endif
+diff -urN linux-2.3.18/include/net/sock.h linux-2.3.18-bof-1/include/net/sock.h
+--- linux-2.3.18/include/net/sock.h	Fri Oct  1 18:10:54 1999
++++ linux-2.3.18-bof-1/include/net/sock.h	Fri Oct  1 16:55:19 1999
+@@ -561,6 +561,10 @@
+ 
+ 	/* RPC layer private data */
+ 	void			*user_data;
++
++	/* Netfilter redirected socket information */
++	u32			nf_original_daddr;
++	u16			nf_original_dest;
+   
+ 	/* Callbacks */
+ 	void			(*state_change)(struct sock *sk);
+diff -urN linux-2.3.18/net/ipv4/af_inet.c linux-2.3.18-bof-1/net/ipv4/af_inet.c
+--- linux-2.3.18/net/ipv4/af_inet.c	Fri Oct  1 18:10:56 1999
++++ linux-2.3.18-bof-1/net/ipv4/af_inet.c	Fri Oct  1 16:42:45 1999
+@@ -703,11 +703,17 @@
+ 		sin->sin_port = sk->dport;
+ 		sin->sin_addr.s_addr = sk->daddr;
+ 	} else {
+-		__u32 addr = sk->rcv_saddr;
+-		if (!addr)
+-			addr = sk->saddr;
+-		sin->sin_port = sk->sport;
+-		sin->sin_addr.s_addr = addr;
++		if (sk->nf_original_daddr != 0
++			&& sk->nf_original_dest != 0) {
++			sin->sin_addr.s_addr = sk->nf_original_daddr;
++			sin->sin_port = sk->nf_original_dest;
++		} else {
++			__u32 addr = sk->rcv_saddr;
++			if (!addr)
++				addr = sk->saddr;
++			sin->sin_port = sk->sport;
++			sin->sin_addr.s_addr = addr;
++		}
+ 	}
+ 	*uaddr_len = sizeof(*sin);
+ 	return(0);
+diff -urN linux-2.3.18/net/ipv4/tcp_ipv4.c linux-2.3.18-bof-1/net/ipv4/tcp_ipv4.c
+--- linux-2.3.18/net/ipv4/tcp_ipv4.c	Fri Oct  1 18:10:56 1999
++++ linux-2.3.18-bof-1/net/ipv4/tcp_ipv4.c	Fri Oct  1 17:30:00 1999
+@@ -1548,6 +1548,12 @@
+ 	__tcp_v4_hash(newsk);
+ 	__tcp_inherit_port(sk, newsk);
+ 
++	if (skb->nf_original_daddr != 0 &&
++	    skb->nf_original_dest != 0) {
++		newsk->nf_original_daddr = skb->nf_original_daddr;
++		newsk->nf_original_dest = skb->nf_original_dest;
++	}
++
+ 	return newsk;
+ 
+ exit:
+@@ -1967,6 +1973,9 @@
+ 	tcp_synq_init(tp);
+ 
+ 	sk->tp_pinfo.af_tcp.af_specific = &ipv4_specific;
++
++	sk->nf_original_daddr = 0;
++	sk->nf_original_dest = 0;
+ 
+ 	return 0;
+ }diff -urN netfilter-0.1.9/NAT/ip_nat_core.c netfilter-0.1.9-bof-1/NAT/ip_nat_core.c
+--- netfilter-0.1.9/NAT/ip_nat_core.c	Mon Sep 27 10:50:17 1999
++++ netfilter-0.1.9-bof-1/NAT/ip_nat_core.c	Fri Oct  1 14:35:35 1999
+@@ -554,21 +554,25 @@
+ }
+ 
+ static void
+-manip_pkt(u_int16_t proto, struct iphdr *iph, size_t len,
++manip_pkt(struct sk_buff *skb, u_int16_t proto, struct iphdr *iph, size_t len,
+ 	  const struct ip_conntrack_manip *manip,
+ 	  enum ip_nat_manip_type maniptype)
+ {
+-	find_nat_proto(proto)->manip_pkt(iph, len, manip, maniptype);
+-
++	u_int32_t oldip = 0;
++	if (skb) skb->nf_original_dest = 0;
++	find_nat_proto(proto)->manip_pkt(skb, iph, len, manip, maniptype);
+ 	if (maniptype == IP_NAT_MANIP_SRC) {
+ 		iph->check = ip_nat_cheat_check(~iph->saddr, manip->ip,
+ 						iph->check);
++		oldip = iph->saddr;
+ 		iph->saddr = manip->ip;
+ 	} else {
+ 		iph->check = ip_nat_cheat_check(~iph->daddr, manip->ip,
+ 						iph->check);
++		oldip = iph->daddr;
+ 		iph->daddr = manip->ip;
+ 	}
++	if (skb) skb->nf_original_daddr = oldip;
+ #if 0
+ 	if (ip_fast_csum((u8 *)iph, iph->ihl) != 0)
+ 		DEBUGP("IP: checksum on packet bad.\n");
+@@ -582,6 +586,15 @@
+ #endif
+ }
+ 
++static void
++manip_pkt_skb(struct sk_buff *skb,
++	  const struct ip_conntrack_manip *manip,
++	  enum ip_nat_manip_type maniptype)
++{
++	manip_pkt(skb, skb->nh.iph->protocol, skb->nh.iph, skb->len,
++		manip, maniptype);
++}
++
+ /* Do packet manipulations according to binding. */
+ unsigned int
+ do_binding(struct ip_conntrack_tuple_hash *h,
+@@ -596,8 +609,7 @@
+ 	READ_LOCK(&ip_nat_lock);
+ 	IP_CONNTRACK_ASSERT(info->dirinfo[dir].num_manips < 3);
+ 	for (i = 0; i < info->dirinfo[dir].num_manips; i++) {
+-		manip_pkt((*pskb)->nh.iph->protocol, (*pskb)->nh.iph, 
+-			  (*pskb)->len,
++		manip_pkt_skb(*pskb,
+ 			  &info->dirinfo[dir].manipulation[i].manip,
+ 			  info->dirinfo[dir].manipulation[i].maniptype);
+ 	}
+@@ -625,7 +637,7 @@
+ 	/* Map inner packet first; do this REVERSE of normal. */
+ 	IP_CONNTRACK_ASSERT(info->dirinfo[conn_dir].num_manips < 3);
+ 	for (i = 0; i < info->dirinfo[conn_dir].num_manips; i++) {
+-		manip_pkt(inner->protocol, inner, 
++		manip_pkt(0, inner->protocol, inner, 
+ 			  skb->len - ((void *)inner - (void *)iph),
+ 			  &info->dirinfo[conn_dir].manipulation[i].manip,
+ 			  !info->dirinfo[conn_dir].manipulation[i].maniptype);
+@@ -646,7 +658,7 @@
+ 	/* Use mapping to map outer packet: 0 give no per-proto mapping */
+ 	IP_CONNTRACK_ASSERT(info->dirinfo[conn_dir].num_manips < 3);
+ 	for (i = 0; i < info->dirinfo[conn_dir].num_manips; i++) {
+-		manip_pkt(0, iph, skb->len,
++		manip_pkt(0, 0, iph, skb->len,
+ 			  &info->dirinfo[conn_dir].manipulation[i].manip,
+ 			  info->dirinfo[conn_dir].manipulation[i].maniptype);
+ 	}
+diff -urN netfilter-0.1.9/NAT/protocols/ip_nat_icmp.c netfilter-0.1.9-bof-1/NAT/protocols/ip_nat_icmp.c
+--- netfilter-0.1.9/NAT/protocols/ip_nat_icmp.c	Mon Jul 26 15:20:27 1999
++++ netfilter-0.1.9-bof-1/NAT/protocols/ip_nat_icmp.c	Fri Oct  1 14:37:57 1999
+@@ -46,7 +46,7 @@
+ }
+ 
+ static void
+-icmp_manip_pkt(struct iphdr *iph, size_t len,
++icmp_manip_pkt(struct sk_buff *skb, struct iphdr *iph, size_t len,
+ 	       const struct ip_conntrack_manip *manip,
+ 	       enum ip_nat_manip_type maniptype)
+ {
+diff -urN netfilter-0.1.9/NAT/protocols/ip_nat_tcp.c netfilter-0.1.9-bof-1/NAT/protocols/ip_nat_tcp.c
+--- netfilter-0.1.9/NAT/protocols/ip_nat_tcp.c	Mon Jul 26 15:20:27 1999
++++ netfilter-0.1.9-bof-1/NAT/protocols/ip_nat_tcp.c	Fri Oct  1 14:37:10 1999
+@@ -72,7 +72,7 @@
+ }
+ 
+ static void
+-tcp_manip_pkt(struct iphdr *iph, size_t len,
++tcp_manip_pkt(struct sk_buff *skb, struct iphdr *iph, size_t len,
+ 	      const struct ip_conntrack_manip *manip,
+ 	      enum ip_nat_manip_type maniptype)
+ {
+@@ -89,6 +89,7 @@
+ 		oldip = iph->daddr;
+ 		portptr = &hdr->dest;
+ 	}
++	if (skb) skb->nf_original_dest = *portptr;
+ 	hdr->check = ip_nat_cheat_check(~oldip, manip->ip,
+ 					ip_nat_cheat_check(*portptr ^ 0xFFFF,
+ 							   manip->u.tcp.port,
+diff -urN netfilter-0.1.9/NAT/protocols/ip_nat_udp.c netfilter-0.1.9-bof-1/NAT/protocols/ip_nat_udp.c
+--- netfilter-0.1.9/NAT/protocols/ip_nat_udp.c	Mon Jul 26 15:20:27 1999
++++ netfilter-0.1.9-bof-1/NAT/protocols/ip_nat_udp.c	Fri Oct  1 14:37:00 1999
+@@ -70,7 +70,7 @@
+ }
+ 
+ static void
+-udp_manip_pkt(struct iphdr *iph, size_t len,
++udp_manip_pkt(struct sk_buff *skb, struct iphdr *iph, size_t len,
+ 	      const struct ip_conntrack_manip *manip,
+ 	      enum ip_nat_manip_type maniptype)
+ {
+@@ -87,6 +87,7 @@
+ 		oldip = iph->daddr;
+ 		portptr = &hdr->dest;
+ 	}
++	if (skb) skb->nf_original_dest = *portptr;
+ 	hdr->check = ip_nat_cheat_check(~oldip, manip->ip,
+ 					ip_nat_cheat_check(*portptr ^ 0xFFFF,
+ 							   manip->u.udp.port,
+diff -urN netfilter-0.1.9/NAT/protocols/ip_nat_unknown.c netfilter-0.1.9-bof-1/NAT/protocols/ip_nat_unknown.c
+--- netfilter-0.1.9/NAT/protocols/ip_nat_unknown.c	Mon Jul 26 15:20:27 1999
++++ netfilter-0.1.9-bof-1/NAT/protocols/ip_nat_unknown.c	Fri Oct  1 14:38:38 1999
+@@ -29,7 +29,7 @@
+ }
+ 
+ static void
+-unknown_manip_pkt(struct iphdr *iph, size_t len,
++unknown_manip_pkt(struct sk_buff *skb, struct iphdr *iph, size_t len,
+ 		  const struct ip_conntrack_manip *manip,
+ 		  enum ip_nat_manip_type maniptype)
+ {
+diff -urN netfilter-0.1.9/include/NAT/ip_nat_protocol.h netfilter-0.1.9-bof-1/include/NAT/ip_nat_protocol.h
+--- netfilter-0.1.9/include/NAT/ip_nat_protocol.h	Mon Jul 26 15:20:29 1999
++++ netfilter-0.1.9-bof-1/include/NAT/ip_nat_protocol.h	Fri Oct  1 14:39:21 1999
+@@ -19,7 +19,7 @@
+ 
+ 	/* Do a packet translation according to the ip_nat_proto_manip
+ 	 * and manip type. */
+-	void (*manip_pkt)(struct iphdr *iph, size_t len,
++	void (*manip_pkt)(struct sk_buff *, struct iphdr *iph, size_t len,
+ 			  const struct ip_conntrack_manip *manip,
+ 			  enum ip_nat_manip_type maniptype);
+ diff -urN ssh-1.2.27/README.NETFILTER ssh-1.2.27-bof-1/README.NETFILTER
+--- ssh-1.2.27/README.NETFILTER	Thu Jan  1 01:00:00 1970
++++ ssh-1.2.27-bof-1/README.NETFILTER	Fri Oct  1 12:17:06 1999
+@@ -0,0 +1,53 @@
++Notes on the integration of the new Linux netfilter code (post 2.3.18)
++
++This integration provides two distinct mechanisms. Both methods make
++using ssh port forwarding very easy to do, by using the netfilter code
++to make forwardings transparent to applications.
++
++1.) Manual Forwarding with automatic NAT, using '-N'
++
++In the first model, you create a port forwarding as usual, with the '-L'
++command line option to ssh. However, you also specify '-N' (for NAT),
++and ssh will automatically create a NAT entry linkling the real destination
++and port to the new local port. In this scenario, you can even get away
++with not specifying the local port number to '-L' - ssh will pick a free
++one automatically. When the ssh process terminates, the NAT entry will
++be removed again. NOTE: creating NAT rules requires root priviledge.
++If the calling user is not root, ssh will prompt for the root password
++before it installs, or deinstalls, the NAT rule. As user errors are to be
++anticipated, this means that over time undeleted NAT rules with no matching
++ssh process will gather, and need to be removed by hand.
++
++Let's say you start 'ssh -N -L 3333:somehost:80 proxyhost'. This will connect
++you to "proxyhost", wait for connections on local port 3333, and forward
++them onto a new connection between "proxyhost" and "somehost:80". In addition,
++the following 'ipnatctl' command will be run automatically:
++
++	ipnatctl -I -b destination -p tcp -d somehost --dport 80 \
++		-m redirect --to 3333
++
++2.) Any-Forwarding using 'ssh -X' and 'ipnatctl'
++
++Under the second mechanism, you run one ssh connection to somewhere as
++a forwarding connection, but you only specify the local port with '-L',
++along with the '-X' option instructing the ssh process to dynamically
++determine the host to forward to. Then, whenever a connection comes in
++on the local port, getsockname() is used to retrieve the "real" host and
++port to forward to. This means that now the transparent proxy redirect
++mechanism of netfilter can be used to forward to any number of destinations,
++by using one 'ipnatctl' command per destination - they will all multiplex
++through the one ssh connection.
++
++As an example, you start 'ssh -X -L 3333 proxyhost'. You get the normal ssh
++connection. Now, you add forwarding destinations like this:
++
++	ipnatctl -I -b destination -p tcp -d somehost --dport 80 \
++		-m redirect --to 3333
++	ipnatctl -I -b destination -p tcp -d otherhost --dport 80 \
++		-m redirect --to 3333
++	...
++
++Now, whenever one of those hosts is used, e.g. by giving '
+http://somehost/xxx
+'
++as an URL to a web browser on the local host (or a host behind it!), the
++ssh connection will be used, and the real connection will run from "proxyhost"
++to "somehost:80".
+diff -urN ssh-1.2.27/newchannels.c ssh-1.2.27-bof-1/newchannels.c
+--- ssh-1.2.27/newchannels.c	Wed May 12 13:19:27 1999
++++ ssh-1.2.27-bof-1/newchannels.c	Fri Oct  1 13:01:52 1999
+@@ -971,6 +971,9 @@
+              port. */
+           if (FD_ISSET(ch->sock, readset))
+             {
++	      char *forward_host = ch->path;
++	      int forward_port = ch->host_port;
++	      if (0 != strcmp(ch->path, "REDIRECT") || ch->host_port != 0)
+               debug("Connection to port %d forwarding to %.100s:%d requested.",
+                     ch->listening_port, ch->path, ch->host_port);
+               addrlen = sizeof(addr);
+@@ -986,6 +989,21 @@
+                        ch->listening_port, remote_hostname,
+                        get_peer_port(newsock));
+               xfree(remote_hostname);
++	      if (0 == strcmp(ch->path, "REDIRECT") && ch->host_port == 0)
++	        {
++		  struct sockaddr_in sa;
++		  int sal = sizeof(sa);
++		  if (0 != getsockname(newsock, (struct sockaddr *)&sa, &sal))
++		    {
++                      error("getsockname: %.100s", strerror(errno));
++                      break;
++		    }
++		  forward_host = inet_ntoa(sa.sin_addr);
++		  forward_port = ntohs(sa.sin_port);
++		  debug(buf);
++                  debug("Connection to port %d forwarding to %.100s:%d requested.",
++                    ch->listening_port, forward_host, forward_port);
++	        }
+ #ifdef LIBWRAP
+               {
+                 struct request_info req;
+@@ -1028,8 +1046,8 @@
+                                        xstrdup(buf));
+               packet_start(SSH_MSG_PORT_OPEN);
+               packet_put_int(newch);
+-              packet_put_string(ch->path, strlen(ch->path));
+-              packet_put_int(ch->host_port);
++              packet_put_string(forward_host, strlen(forward_host));
++              packet_put_int(forward_port);
+               if (have_hostname_in_open)
+                 packet_put_string(buf, strlen(buf));
+               packet_send();
+@@ -1407,7 +1425,7 @@
+   int ch, sock;
+   struct sockaddr_in sin;
+ 
+-  if (strlen(host) > sizeof(channels[0].path) - 1)
++  if (host && strlen(host) > sizeof(channels[0].path) - 1)
+     packet_disconnect("Forward host name too long.");
+   
+   /* Create a port to listen for the host. */
+@@ -1445,8 +1463,16 @@
+   /* Allocate a channel number for the socket. */
+   ch = channel_allocate(SSH_CHANNEL_PORT_LISTENER, sock,
+                         xstrdup("port listener"));
+-  strcpy(channels[ch].path, host); /* note: host name stored here */
+-  channels[ch].host_port = host_port; /* port on host to connect to */
++  if (host != NULL)
++    {
++      strcpy(channels[ch].path, host); /* note: host name stored here */
++      channels[ch].host_port = host_port; /* port on host to connect to */
++    }
++  else
++    {
++      strcpy(channels[ch].path, "REDIRECT"); /* note: host name stored here */
++      channels[ch].host_port = 0; /* port on host to connect to */
++    }
+   channels[ch].listening_port = port; /* port being listened */
+ }  
+ 
+diff -urN ssh-1.2.27/readconf.c ssh-1.2.27-bof-1/readconf.c
+--- ssh-1.2.27/readconf.c	Wed May 12 13:19:27 1999
++++ ssh-1.2.27-bof-1/readconf.c	Fri Oct  1 12:39:05 1999
+@@ -239,7 +239,7 @@
+     fatal("Too many local forwards (max %d).", SSH_MAX_FORWARDS_PER_DIRECTION);
+   fwd = &options->local_forwards[options->num_local_forwards++];
+   fwd->port = port;
+-  fwd->host = xstrdup(host);
++  fwd->host = host ? xstrdup(host) : NULL;
+   fwd->host_port = host_port;
+ }
+ 
+diff -urN ssh-1.2.27/ssh.c ssh-1.2.27-bof-1/ssh.c
+--- ssh-1.2.27/ssh.c	Wed May 12 13:19:28 1999
++++ ssh-1.2.27-bof-1/ssh.c	Fri Oct  1 12:56:47 1999
+@@ -313,6 +313,7 @@
+   fprintf(stderr, "  -p port     Connect to this port.  Server must be on the same port.\n");
+   fprintf(stderr, "  -P          Don't use privileged source port.\n");
+ #ifndef SSH_NO_PORT_FORWARDING
++  fprintf(stderr, "  -X listen-port             Forward local port to redirected remote address\n");
+   fprintf(stderr, "  -L listen-port:host:port   Forward local port to remote address\n");
+   fprintf(stderr, "  -R listen-port:host:port   Forward remote port to local address\n");
+   fprintf(stderr, "              These cause %s to listen for connections on a port, and\n", av0);
+@@ -504,7 +505,7 @@
+       opt = av[optind][1];
+       if (!opt)
+         usage();
+-      if (strchr("eilcpLRo", opt)) /* options with arguments */
++      if (strchr("eilcpXLRo", opt)) /* options with arguments */
+         {
+           optarg = av[optind] + 2;
+           if (strcmp(optarg, "") == 0)
+@@ -644,6 +645,18 @@
+ #endif
+           break;
+ 
++        case 'X':
++#ifndef SSH_NO_PORT_FORWARDING
++          if (sscanf(optarg, "%d", &fwd_port) != 1)
++            {
++              fprintf(stderr, "Bad forwarding specification '%s'.\n", optarg);
++              usage();
++              /*NOTREACHED*/
++            }
++          add_local_forward(&options, fwd_port, NULL, 0);
++#endif
++          break;
++
+         case 'L':
+ #ifndef SSH_NO_PORT_FORWARDING
+           if (sscanf(optarg, "%d:%255[^:]:%d", &fwd_port, buf, 
+@@ -1021,13 +1034,24 @@
+   /* Initiate local TCP/IP port forwardings. */
+   for (i = 0; i < options.num_local_forwards; i++)
+     {
+-      debug("Connections to local port %d forwarded to remote address %.200s:%d",
++      if (options.local_forwards[i].host != NULL)
++        {
++          debug("Connections to local port %d forwarded to remote address %.200s:%d",
+             options.local_forwards[i].port, options.local_forwards[i].host, 
+             options.local_forwards[i].host_port);
+-      channel_request_local_forwarding(options.local_forwards[i].port,
++          channel_request_local_forwarding(options.local_forwards[i].port,
+                                        options.local_forwards[i].host,
+                                        options.local_forwards[i].host_port,
+                                        options.gateway_ports);
++    	}
++      else
++        {
++          debug("Connections to local port %d forwarded to redirected remote addresses",
++            options.local_forwards[i].port);
++          channel_request_local_forwarding(options.local_forwards[i].port,
++                                       NULL, 0,
++                                       options.gateway_ports);
++	}
+     }
+ 
+   /* Initiate remote TCP/IP port forwardings. */

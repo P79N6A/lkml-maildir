@@ -1,0 +1,829 @@
+Date: Fri, 04 Feb 2005 15:03:17 +0100
+From: Christophe Saout <>
+Subject: Re: [dm-crypt] Re: dm-crypt crypt_status reports key?
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2005/2/4/118
+
+Am Mittwoch, den 02.02.2005, 20:05 -0800 schrieb Matt Mackall:
+> Dunno here, seems that having one tool that gave the kernel a key named
+> "foo" and then telling dm-crypt to use key "foo" is probably not a bad
+> way to go. Then we don't have stuff like "echo <key> | dmsetup create"
+> and the like and the key-handling smarts can all be put in one
+> separate place.
+> 
+> Getting from here to there might be interesting though. Perhaps we can
+> teach dm-crypt to understand keys of the form "keyname:<foo>"? in
+> addition to raw keys to keep compatibility. Might even be possible to
+> push this down into crypt_decode_key() (or a smarter variant of same).
+I've hacked together a working implementation. It's just a prototype
+though. The patch requires that the key retention service is activated
+unconditionally. It would probably be better to introduce #ifdefs and
+the possibility turn of the cleartext key way in the kernel
+configuration.
+I've separated out the crypto configuration from the device-mapper
+configuration. Several device mappings can now share/reference the same
+key. This might be useful if you want to span your mapping over several
+devices (without stacking device mappings on top of each other). So
+basically the crypto and the device-mapper part of the configuration are
+in its own "classes" now. It makes even more sense now to rename IV
+operations to crypto/key operations (which only work on the new
+structure) like it's done in the LRW patch.
+This crypto configuration that I separated out can be referenced by the
+device-mapper target directly (old way) or indirectly by the new key
+retention service. It holds the cipher, chaining mode and IV mechanisms
+as well as the key itself.
+A dm table configuration line then looks like "0 1000000 crypt key
+my_key_name 0 /dev/bla 0".
+And dm-crypt.c is slowly getting large. Thirty functions already. Hmm.
+--- linux-2.6.11-rc3.orig/drivers/md/dm-crypt.c	2005-02-04 01:00:51.983910752 +0100
++++ linux-2.6.11-rc3/drivers/md/dm-crypt.c	2005-02-04 14:30:47.629117856 +0100
+@@ -13,6 +13,7 @@
+ #include <linux/mempool.h>
+ #include <linux/slab.h>
+ #include <linux/crypto.h>
++#include <linux/key.h>
+ #include <linux/workqueue.h>
+ #include <asm/atomic.h>
+ #include <asm/scatterlist.h>
+@@ -48,14 +49,25 @@
+ 	int write;
+ };
+ 
+-struct crypt_config;
++/*
++ * key and associated crypto information
++ */
++struct crypt_key {
++	struct crypt_iv_operations *iv_gen_ops;
++	char *iv_mode;
++	void *iv_gen_private;
++	unsigned int iv_size;
++
++	struct crypto_tfm *tfm;
++	unsigned int key_size;
++	u8 key[0];
++};
+ 
+ struct crypt_iv_operations {
+-	int (*ctr)(struct crypt_config *cc, struct dm_target *ti,
+-	           const char *opts);
+-	void (*dtr)(struct crypt_config *cc);
+-	const char *(*status)(struct crypt_config *cc);
+-	int (*generator)(struct crypt_config *cc, u8 *iv, sector_t sector);
++	int (*ctr)(struct crypt_key *ck, const char *opts, char **error_msg);
++	void (*dtr)(struct crypt_key *ck);
++	const char *(*status)(struct crypt_key *ck);
++	int (*generator)(struct crypt_key *ck, u8 *iv, sector_t sector);
+ };
+ 
+ /*
+@@ -73,18 +85,9 @@
+ 	mempool_t *io_pool;
+ 	mempool_t *page_pool;
+ 
+-	/*
+-	 * crypto related data
+-	 */
+-	struct crypt_iv_operations *iv_gen_ops;
+-	char *iv_mode;
+-	void *iv_gen_private;
+ 	sector_t iv_offset;
+-	unsigned int iv_size;
+-
+-	struct crypto_tfm *tfm;
+-	unsigned int key_size;
+-	u8 key[0];
++	struct crypt_key *crypto;
++	struct key *key;
+ };
+ 
+ #define MIN_IOS        256
+@@ -121,16 +124,16 @@
+  * 
+http://article.gmane.org/gmane.linux.kernel.device-mapper.dm-crypt/454
+  */
+ 
+-static int crypt_iv_plain_gen(struct crypt_config *cc, u8 *iv, sector_t sector)
++static int crypt_iv_plain_gen(struct crypt_key *ck, u8 *iv, sector_t sector)
+ {
+-	memset(iv, 0, cc->iv_size);
++	memset(iv, 0, ck->iv_size);
+ 	*(u32 *)iv = cpu_to_le32(sector & 0xffffffff);
+ 
+ 	return 0;
+ }
+ 
+-static int crypt_iv_essiv_ctr(struct crypt_config *cc, struct dm_target *ti,
+-	                      const char *opts)
++static int crypt_iv_essiv_ctr(struct crypt_key *ck, const char *opts,
++                              char **error_msg)
+ {
+ 	struct crypto_tfm *essiv_tfm;
+ 	struct crypto_tfm *hash_tfm;
+@@ -139,19 +142,19 @@
+ 	u8 *salt;
+ 
+ 	if (opts == NULL) {
+-		ti->error = PFX "Digest algorithm missing for ESSIV mode";
++		*error_msg = PFX "Digest algorithm missing for ESSIV mode";
+ 		return -EINVAL;
+ 	}
+ 
+ 	/* Hash the cipher key with the given hash algorithm */
+ 	hash_tfm = crypto_alloc_tfm(opts, 0);
+ 	if (hash_tfm == NULL) {
+-		ti->error = PFX "Error initializing ESSIV hash";
++		*error_msg = PFX "Error initializing ESSIV hash";
+ 		return -EINVAL;
+ 	}
+ 
+ 	if (crypto_tfm_alg_type(hash_tfm) != CRYPTO_ALG_TYPE_DIGEST) {
+-		ti->error = PFX "Expected digest algorithm for ESSIV hash";
++		*error_msg = PFX "Expected digest algorithm for ESSIV hash";
+ 		crypto_free_tfm(hash_tfm);
+ 		return -EINVAL;
+ 	}
+@@ -159,63 +162,63 @@
+ 	saltsize = crypto_tfm_alg_digestsize(hash_tfm);
+ 	salt = kmalloc(saltsize, GFP_KERNEL);
+ 	if (salt == NULL) {
+-		ti->error = PFX "Error kmallocing salt storage in ESSIV";
++		*error_msg = PFX "Error kmallocing salt storage in ESSIV";
+ 		crypto_free_tfm(hash_tfm);
+ 		return -ENOMEM;
+ 	}
+ 
+-	sg.page = virt_to_page(cc->key);
+-	sg.offset = offset_in_page(cc->key);
+-	sg.length = cc->key_size;
++	sg.page = virt_to_page(ck->key);
++	sg.offset = offset_in_page(ck->key);
++	sg.length = ck->key_size;
+ 	crypto_digest_digest(hash_tfm, &sg, 1, salt);
+ 	crypto_free_tfm(hash_tfm);
+ 
+ 	/* Setup the essiv_tfm with the given salt */
+-	essiv_tfm = crypto_alloc_tfm(crypto_tfm_alg_name(cc->tfm),
++	essiv_tfm = crypto_alloc_tfm(crypto_tfm_alg_name(ck->tfm),
+ 	                             CRYPTO_TFM_MODE_ECB);
+ 	if (essiv_tfm == NULL) {
+-		ti->error = PFX "Error allocating crypto tfm for ESSIV";
++		*error_msg = PFX "Error allocating crypto tfm for ESSIV";
+ 		kfree(salt);
+ 		return -EINVAL;
+ 	}
+ 	if (crypto_tfm_alg_blocksize(essiv_tfm)
+-	    != crypto_tfm_alg_ivsize(cc->tfm)) {
+-		ti->error = PFX "Block size of ESSIV cipher does "
++	    != crypto_tfm_alg_ivsize(ck->tfm)) {
++		*error_msg = PFX "Block size of ESSIV cipher does "
+ 			        "not match IV size of block cipher";
+ 		crypto_free_tfm(essiv_tfm);
+ 		kfree(salt);
+ 		return -EINVAL;
+ 	}
+ 	if (crypto_cipher_setkey(essiv_tfm, salt, saltsize) < 0) {
+-		ti->error = PFX "Failed to set key for ESSIV cipher";
++		*error_msg = PFX "Failed to set key for ESSIV cipher";
+ 		crypto_free_tfm(essiv_tfm);
+ 		kfree(salt);
+ 		return -EINVAL;
+ 	}
+ 	kfree(salt);
+ 
+-	cc->iv_gen_private = (void *)essiv_tfm;
++	ck->iv_gen_private = (void *)essiv_tfm;
+ 	return 0;
+ }
+ 
+-static void crypt_iv_essiv_dtr(struct crypt_config *cc)
++static void crypt_iv_essiv_dtr(struct crypt_key *ck)
+ {
+-	crypto_free_tfm((struct crypto_tfm *)cc->iv_gen_private);
+-	cc->iv_gen_private = NULL;
++	crypto_free_tfm((struct crypto_tfm *)ck->iv_gen_private);
++	ck->iv_gen_private = NULL;
+ }
+ 
+-static int crypt_iv_essiv_gen(struct crypt_config *cc, u8 *iv, sector_t sector)
++static int crypt_iv_essiv_gen(struct crypt_key *ck, u8 *iv, sector_t sector)
+ {
+ 	struct scatterlist sg = { NULL, };
+ 
+-	memset(iv, 0, cc->iv_size);
++	memset(iv, 0, ck->iv_size);
+ 	*(u64 *)iv = cpu_to_le64(sector);
+ 
+ 	sg.page = virt_to_page(iv);
+ 	sg.offset = offset_in_page(iv);
+-	sg.length = cc->iv_size;
+-	crypto_cipher_encrypt((struct crypto_tfm *)cc->iv_gen_private,
+-	                      &sg, &sg, cc->iv_size);
++	sg.length = ck->iv_size;
++	crypto_cipher_encrypt((struct crypto_tfm *)ck->iv_gen_private,
++	                      &sg, &sg, ck->iv_size);
+ 
+ 	return 0;
+ }
+@@ -236,23 +239,24 @@
+                           struct scatterlist *in, unsigned int length,
+                           int write, sector_t sector)
+ {
+-	u8 iv[cc->iv_size];
++	struct crypt_key *ck = cc->crypto;
++	u8 iv[ck->iv_size];
+ 	int r;
+ 
+-	if (cc->iv_gen_ops) {
+-		r = cc->iv_gen_ops->generator(cc, iv, sector);
++	if (ck->iv_gen_ops) {
++		r = ck->iv_gen_ops->generator(ck, iv, sector);
+ 		if (r < 0)
+ 			return r;
+ 
+ 		if (write)
+-			r = crypto_cipher_encrypt_iv(cc->tfm, out, in, length, iv);
++			r = crypto_cipher_encrypt_iv(ck->tfm, out, in, length, iv);
+ 		else
+-			r = crypto_cipher_decrypt_iv(cc->tfm, out, in, length, iv);
++			r = crypto_cipher_decrypt_iv(ck->tfm, out, in, length, iv);
+ 	} else {
+ 		if (write)
+-			r = crypto_cipher_encrypt(cc->tfm, out, in, length);
++			r = crypto_cipher_encrypt(ck->tfm, out, in, length);
+ 		else
+-			r = crypto_cipher_decrypt(cc->tfm, out, in, length);
++			r = crypto_cipher_decrypt(ck->tfm, out, in, length);
+ 	}
+ 
+ 	return r;
+@@ -529,52 +533,34 @@
+ 	}
+ }
+ 
+-/*
+- * Construct an encryption mapping:
+- * <cipher> <key> <iv_offset> <dev_path> <start>
+- */
+-static int crypt_ctr(struct dm_target *ti, unsigned int argc, char **argv)
++static int crypt_key_ctr(struct crypt_key **retval, char *crypto,
++                         const u8 *key, unsigned int key_size,
++                         char **error_msg)
+ {
+-	struct crypt_config *cc;
++	unsigned int crypto_flags;
+ 	struct crypto_tfm *tfm;
+-	char *tmp;
++	struct crypt_key *ck;
+ 	char *cipher;
+ 	char *chainmode;
+ 	char *ivmode;
+ 	char *ivopts;
+-	unsigned int crypto_flags;
+-	unsigned int key_size;
+ 
+-	if (argc != 5) {
+-		ti->error = PFX "Not enough arguments";
+-		return -EINVAL;
++	ck = kmalloc(sizeof(*ck) + key_size * sizeof(u8), GFP_KERNEL);
++	if (ck == NULL) {
++		*error_msg = PFX "Out of memory allocating key data";
++		return -ENOMEM;
+ 	}
+ 
+-	tmp = argv[0];
+-	cipher = strsep(&tmp, "-");
+-	chainmode = strsep(&tmp, "-");
+-	ivopts = strsep(&tmp, "-");
++	memcpy(ck->key, key, key_size * sizeof(u8));
++
++	cipher = strsep(&crypto, "-");
++	chainmode = strsep(&crypto, "-");
++	ivopts = strsep(&crypto, "-");
+ 	ivmode = strsep(&ivopts, ":");
+ 
+-	if (tmp)
++	if (crypto)
+ 		DMWARN(PFX "Unexpected additional cipher options");
+ 
+-	key_size = strlen(argv[1]) >> 1;
+-
+-	cc = kmalloc(sizeof(*cc) + key_size * sizeof(u8), GFP_KERNEL);
+-	if (cc == NULL) {
+-		ti->error =
+-			PFX "Cannot allocate transparent encryption context";
+-		return -ENOMEM;
+-	}
+-
+-	cc->key_size = key_size;
+-	if ((!key_size && strcmp(argv[1], "-") != 0) ||
+-	    (key_size && crypt_decode_key(cc->key, argv[1], key_size) < 0)) {
+-		ti->error = PFX "Error decoding key";
+-		goto bad1;
+-	}
+-
+ 	/* Compatiblity mode for old dm-crypt cipher strings */
+ 	if (!chainmode || (strcmp(chainmode, "plain") == 0 && !ivmode)) {
+ 		chainmode = "cbc";
+@@ -587,123 +573,217 @@
+ 	else if (strcmp(chainmode, "ecb") == 0)
+ 		crypto_flags = CRYPTO_TFM_MODE_ECB;
+ 	else {
+-		ti->error = PFX "Unknown chaining mode";
++		*error_msg = PFX "Unknown chaining mode";
+ 		goto bad1;
+ 	}
+ 
+ 	if (crypto_flags != CRYPTO_TFM_MODE_ECB && !ivmode) {
+-		ti->error = PFX "This chaining mode requires an IV mechanism";
++		*error_msg = PFX "This chaining mode requires an IV mechanism";
+ 		goto bad1;
+ 	}
+ 
+ 	tfm = crypto_alloc_tfm(cipher, crypto_flags);
+ 	if (!tfm) {
+-		ti->error = PFX "Error allocating crypto tfm";
++		*error_msg = PFX "Error allocating crypto tfm";
+ 		goto bad1;
+ 	}
+ 	if (crypto_tfm_alg_type(tfm) != CRYPTO_ALG_TYPE_CIPHER) {
+-		ti->error = PFX "Expected cipher algorithm";
++		*error_msg= PFX "Expected cipher algorithm";
+ 		goto bad2;
+ 	}
+ 
+-	cc->tfm = tfm;
++	ck->tfm = tfm;
+ 
+ 	/*
+ 	 * Choose ivmode. Valid modes: "plain", "essiv:<esshash>".
+ 	 * See comments at iv code
+ 	 */
+-
+ 	if (ivmode == NULL)
+-		cc->iv_gen_ops = NULL;
++		ck->iv_gen_ops = NULL;
+ 	else if (strcmp(ivmode, "plain") == 0)
+-		cc->iv_gen_ops = &crypt_iv_plain_ops;
++		ck->iv_gen_ops = &crypt_iv_plain_ops;
+ 	else if (strcmp(ivmode, "essiv") == 0)
+-		cc->iv_gen_ops = &crypt_iv_essiv_ops;
++		ck->iv_gen_ops = &crypt_iv_essiv_ops;
+ 	else {
+-		ti->error = PFX "Invalid IV mode";
++		*error_msg = PFX "Invalid IV mode";
+ 		goto bad2;
+ 	}
+ 
+-	if (cc->iv_gen_ops && cc->iv_gen_ops->ctr &&
+-	    cc->iv_gen_ops->ctr(cc, ti, ivopts) < 0)
++	if (ck->iv_gen_ops && ck->iv_gen_ops->ctr &&
++	    ck->iv_gen_ops->ctr(ck, ivopts, error_msg) < 0)
+ 		goto bad2;
+ 
+ 	if (tfm->crt_cipher.cit_decrypt_iv && tfm->crt_cipher.cit_encrypt_iv)
+ 		/* at least a 64 bit sector number should fit in our buffer */
+-		cc->iv_size = max(crypto_tfm_alg_ivsize(tfm),
++		ck->iv_size = max(crypto_tfm_alg_ivsize(tfm),
+ 		                  (unsigned int)(sizeof(u64) / sizeof(u8)));
+ 	else {
+-		cc->iv_size = 0;
+-		if (cc->iv_gen_ops) {
++		ck->iv_size = 0;
++		if (ck->iv_gen_ops) {
+ 			DMWARN(PFX "Selected cipher does not support IVs");
+-			if (cc->iv_gen_ops->dtr)
+-				cc->iv_gen_ops->dtr(cc);
+-			cc->iv_gen_ops = NULL;
++			if (ck->iv_gen_ops->dtr)
++				ck->iv_gen_ops->dtr(ck);
++			ck->iv_gen_ops = NULL;
+ 		}
+ 	}
+ 
++	ck->key_size = key_size;
++	if (tfm->crt_cipher.cit_setkey(tfm, ck->key, key_size) < 0) {
++		*error_msg = PFX "Error setting key";
++		goto bad3;
++	}
++
++	if (ivmode && ck->iv_gen_ops) {
++		if (ivopts)
++			*(ivopts - 1) = ':';
++		ck->iv_mode = kmalloc(strlen(ivmode) + 1, GFP_KERNEL);
++		if (ck->iv_mode == NULL) {
++			*error_msg = PFX "Error kmallocing iv_mode string";
++			goto bad3;
++		}
++		strcpy(ck->iv_mode, ivmode);
++	} else
++		ck->iv_mode = NULL;
++
++	*retval = ck;
++	return 0;
++
++bad3:
++	if (ck->iv_gen_ops && ck->iv_gen_ops->dtr)
++		ck->iv_gen_ops->dtr(ck);
++bad2:
++	crypto_free_tfm(tfm);
++bad1:
++	kfree(ck);
++
++	return -EINVAL;
++}
++
++static void crypt_key_dtr(struct crypt_key *ck)
++{
++	if (ck->iv_mode)
++		kfree(ck->iv_mode);
++	if (ck->iv_gen_ops && ck->iv_gen_ops->dtr)
++		ck->iv_gen_ops->dtr(ck);
++	crypto_free_tfm(ck->tfm);
++	kfree(ck);
++}
++
++static struct key_type crypt_key_type;
++
++/*
++ * Construct an encryption mapping:
++ * <cipher> <key> <iv_offset> <dev_path> <start>
++ */
++static int crypt_ctr(struct dm_target *ti, unsigned int argc, char **argv)
++{
++	struct crypt_config *cc;
++	struct crypt_key *ck;
++	struct key *key = NULL;
++	int retval;
++
++	if (argc != 5) {
++		ti->error = PFX "Wrong argument count";
++		return -EINVAL;
++	}
++
++	if (strcmp(argv[0], "key") == 0) {
++		key = search_process_keyrings(&crypt_key_type, argv[1]);
++		if (IS_ERR(key)) {
++			ti->error = PFX "Key not found in process keyrings";
++			return PTR_ERR(key);
++		}
++
++		ck = key->payload.data;
++		BUG_ON(!ck);
++	} else {
++		unsigned int key_size;
++		int err;
++		u8 *key_data;
++
++		key_size = strlen(argv[1]) >> 1;
++		key_data = kmalloc(key_size, GFP_KERNEL);
++		if (key_data == NULL) {
++			ti->error = PFX "Out of memory allocating key buffer";
++			return -ENOMEM;
++		}
++
++		if ((!key_size && strcmp(argv[1], "-") != 0) ||
++		    (key_size &&
++		     crypt_decode_key(key_data, argv[1], key_size) < 0)) {
++			ti->error = PFX "Error decoding key";
++			kfree(key_data);
++			return -EINVAL;
++		}
++
++		err = crypt_key_ctr(&ck, argv[0], key_data, key_size,
++		                    &ti->error);
++
++		kfree(key);
++
++		if (err < 0)
++			return err;
++	}
++
++	retval = -ENOMEM;
++
++	cc = kmalloc(sizeof(*cc), GFP_KERNEL);
++	if (cc == NULL) {
++		ti->error =
++			PFX "Cannot allocate transparent encryption context";
++		goto bad1;
++	}
++
++	cc->crypto = ck;
++	cc->key = key;
++
+ 	cc->io_pool = mempool_create(MIN_IOS, mempool_alloc_slab,
+ 				     mempool_free_slab, _crypt_io_pool);
+ 	if (!cc->io_pool) {
+ 		ti->error = PFX "Cannot allocate crypt io mempool";
+-		goto bad3;
++		goto bad2;
+ 	}
+ 
+ 	cc->page_pool = mempool_create(MIN_POOL_PAGES, mempool_alloc_page,
+ 				       mempool_free_page, NULL);
+ 	if (!cc->page_pool) {
+ 		ti->error = PFX "Cannot allocate page mempool";
+-		goto bad4;
++		goto bad3;
+ 	}
+ 
+-	if (tfm->crt_cipher.cit_setkey(tfm, cc->key, key_size) < 0) {
+-		ti->error = PFX "Error setting key";
+-		goto bad5;
+-	}
++	retval = -EINVAL;
+ 
+ 	if (sscanf(argv[2], SECTOR_FORMAT, &cc->iv_offset) != 1) {
+ 		ti->error = PFX "Invalid iv_offset sector";
+-		goto bad5;
++		goto bad4;
+ 	}
+ 
+ 	if (sscanf(argv[4], SECTOR_FORMAT, &cc->start) != 1) {
+ 		ti->error = PFX "Invalid device sector";
+-		goto bad5;
++		goto bad4;
+ 	}
+ 
+ 	if (dm_get_device(ti, argv[3], cc->start, ti->len,
+ 	                  dm_table_get_mode(ti->table), &cc->dev)) {
+ 		ti->error = PFX "Device lookup failed";
+-		goto bad5;
++		goto bad4;
+ 	}
+ 
+-	if (ivmode && cc->iv_gen_ops) {
+-		if (ivopts)
+-			*(ivopts - 1) = ':';
+-		cc->iv_mode = kmalloc(strlen(ivmode) + 1, GFP_KERNEL);
+-		if (!cc->iv_mode) {
+-			ti->error = PFX "Error kmallocing iv_mode string";
+-			goto bad5;
+-		}
+-		strcpy(cc->iv_mode, ivmode);
+-	} else
+-		cc->iv_mode = NULL;
+-
+ 	ti->private = cc;
+ 	return 0;
+ 
+-bad5:
+-	mempool_destroy(cc->page_pool);
+ bad4:
+-	mempool_destroy(cc->io_pool);
++	mempool_destroy(cc->page_pool);
+ bad3:
+-	if (cc->iv_gen_ops && cc->iv_gen_ops->dtr)
+-		cc->iv_gen_ops->dtr(cc);
++	mempool_destroy(cc->io_pool);
+ bad2:
+-	crypto_free_tfm(tfm);
+-bad1:
+ 	kfree(cc);
+-	return -EINVAL;
++bad1:
++	if (key)
++		key_put(key);
++	else
++		crypt_key_dtr(ck);
++	return retval;
+ }
+ 
+ static void crypt_dtr(struct dm_target *ti)
+@@ -713,11 +793,11 @@
+ 	mempool_destroy(cc->page_pool);
+ 	mempool_destroy(cc->io_pool);
+ 
+-	if (cc->iv_mode)
+-		kfree(cc->iv_mode);
+-	if (cc->iv_gen_ops && cc->iv_gen_ops->dtr)
+-		cc->iv_gen_ops->dtr(cc);
+-	crypto_free_tfm(cc->tfm);
++	if (cc->key)
++		key_put(cc->key);
++	else
++		crypt_key_dtr(cc->crypto);
++
+ 	dm_put_device(ti, cc->dev);
+ 	kfree(cc);
+ }
+@@ -865,13 +945,51 @@
+ 	return -ENOMEM;
+ }
+ 
++static unsigned int crypt_key_status(struct crypt_key *ck, char *result,
++                                     unsigned int maxlen)
++{
++	const char *cipher;
++	const char *chainmode = NULL;
++	unsigned int sz = 0;
++
++	cipher = crypto_tfm_alg_name(ck->tfm);
++
++	switch(ck->tfm->crt_cipher.cit_mode) {
++	case CRYPTO_TFM_MODE_CBC:
++		chainmode = "cbc";
++		break;
++	case CRYPTO_TFM_MODE_ECB:
++		chainmode = "ecb";
++		break;
++	default:
++		BUG();
++	}
++
++	if (ck->iv_mode)
++		DMEMIT("%s-%s-%s ", cipher, chainmode, ck->iv_mode);
++	else
++		DMEMIT("%s-%s ", cipher, chainmode);
++
++	if (ck->key_size > 0) {
++		if ((maxlen - sz) < ((ck->key_size << 1) + 1))
++			return -ENOMEM;
++
++		crypt_encode_key(result + sz, ck->key, ck->key_size);
++		sz += ck->key_size << 1;
++	} else {
++		if (sz >= maxlen)
++			return -ENOMEM;
++		result[sz++] = '-';
++	}
++
++	return sz;
++}
++
+ static int crypt_status(struct dm_target *ti, status_type_t type,
+ 			char *result, unsigned int maxlen)
+ {
+ 	struct crypt_config *cc = (struct crypt_config *) ti->private;
+ 	char buffer[32];
+-	const char *cipher;
+-	const char *chainmode = NULL;
+ 	unsigned int sz = 0;
+ 
+ 	switch (type) {
+@@ -880,35 +998,12 @@
+ 		break;
+ 
+ 	case STATUSTYPE_TABLE:
+-		cipher = crypto_tfm_alg_name(cc->tfm);
+-
+-		switch(cc->tfm->crt_cipher.cit_mode) {
+-		case CRYPTO_TFM_MODE_CBC:
+-			chainmode = "cbc";
+-			break;
+-		case CRYPTO_TFM_MODE_ECB:
+-			chainmode = "ecb";
+-			break;
+-		default:
+-			BUG();
+-		}
+-
+-		if (cc->iv_mode)
+-			DMEMIT("%s-%s-%s ", cipher, chainmode, cc->iv_mode);
+-		else
+-			DMEMIT("%s-%s ", cipher, chainmode);
+-
+-		if (cc->key_size > 0) {
+-			if ((maxlen - sz) < ((cc->key_size << 1) + 1))
+-				return -ENOMEM;
+-
+-			crypt_encode_key(result + sz, cc->key, cc->key_size);
+-			sz += cc->key_size << 1;
+-		} else {
+-			if (sz >= maxlen)
+-				return -ENOMEM;
+-			result[sz++] = '-';
+-		}
++		if (cc->key) {
++			read_lock(&cc->key->lock);
++			DMEMIT("key %s", cc->key->description);
++			read_unlock(&cc->key->lock);
++		} else
++			sz = crypt_key_status(cc->crypto, result, maxlen);
+ 
+ 		format_dev_t(buffer, cc->dev->bdev->bd_dev);
+ 		DMEMIT(" " SECTOR_FORMAT " %s " SECTOR_FORMAT,
+@@ -918,6 +1013,85 @@
+ 	return 0;
+ }
+ 
++static int crypt_key_instantiate(struct key *key, const void *data,
++                                 size_t datalen)
++{
++	struct crypt_key *ck;
++	unsigned int len;
++	char *error_msg = NULL;
++	char *crypto;
++	int retval = -EINVAL;
++
++	len = strnlen(data, datalen);
++	if (len >= datalen)
++		return -EINVAL;
++
++	crypto = kmalloc(len + 1, GFP_KERNEL);
++	if (crypto < 0)
++		return -ENOMEM;
++	strcpy(crypto, (const char *)data);
++
++	data += len + 1;
++	datalen -= len + 1;
++
++	if (len < sizeof(u16))
++		goto bad1;
++
++	/* FIXME: byte ordering? Host byte ordering should be ok */
++	len = *(u16 *)data;
++	data += sizeof(u16);
++	datalen -= sizeof(u16);
++
++	if (datalen != len * sizeof(u8))
++		goto bad1;
++
++	retval = crypt_key_ctr(&ck, crypto, (u8 *)data, len, &error_msg);
++	if (retval < 0) {
++		DMERR("%s", error_msg);
++		goto bad1;
++	}
++
++	/* FIXME: An approximation of the payload size */
++	len = sizeof(*ck) + ck->key_size + sizeof(*ck->tfm);
++	retval = key_payload_reserve(key, len);
++	if (retval < 0)
++		goto bad2;
++
++	kfree(crypto);
++
++	key->payload.data = ck;
++
++	return 0;
++
++bad2:
++	crypt_key_dtr(ck);
++bad1:
++	kfree(crypto);
++	return retval;
++}
++
++static int crypt_key_match(const struct key *key, const void *description)
++{
++	return strcmp(key->description, description) == 0;
++}
++
++static void crypt_key_destroy(struct key *key)
++{
++	struct crypt_key *ck = (struct crypt_key *)key->payload.data;
++
++	if (ck)
++		crypt_key_dtr(ck);
++}
++
++static struct key_type crypt_key_type = {
++	.name		= "dm-crypt",
++	.def_datalen	= sizeof(struct crypt_key) +
++			  sizeof(struct crypto_tfm),
++	.instantiate	= crypt_key_instantiate,
++	.match		= crypt_key_match,
++	.destroy	= crypt_key_destroy,
++};
++
+ static struct target_type crypt_target = {
+ 	.name   = "crypt",
+ 	.version= {1, 1, 0},
+@@ -947,12 +1121,20 @@
+ 
+ 	r = dm_register_target(&crypt_target);
+ 	if (r < 0) {
+-		DMERR(PFX "register failed %d", r);
++		DMERR(PFX "dm register failed %d", r);
+ 		goto bad2;
+ 	}
+ 
++	r = register_key_type(&crypt_key_type);
++	if (r < 0) {
++		DMERR(PFX "key type register failed %d", r);
++		goto bad3;
++	}
++
+ 	return 0;
+ 
++bad3:
++	dm_unregister_target(&crypt_target);
+ bad2:
+ 	destroy_workqueue(_kcryptd_workqueue);
+ bad1:
+@@ -962,8 +1144,11 @@
+ 
+ static void __exit dm_crypt_exit(void)
+ {
+-	int r = dm_unregister_target(&crypt_target);
++	int r;
++
++	unregister_key_type(&crypt_key_type);
+ 
++	r = dm_unregister_target(&crypt_target);
+ 	if (r < 0)
+ 		DMERR(PFX "unregister failed %d", r);
+ [unhandled content-type:application/pgp-signature]

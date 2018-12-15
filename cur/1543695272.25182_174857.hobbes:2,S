@@ -1,0 +1,315 @@
+Date: Sat, 25 Oct 2003 12:54:41 -0700
+From: "Pallipadi, Venkatesh" <>
+Subject: [PATCH] 2/3 A dynamic cpufreq governor
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2003/10/25/63
+
+ondemand2.patch - basic cpufreq_ondemand governor, with some changes 
+since the last time.
+diffstat ondemand2.patch
+ Kconfig            |   15 +++
+ Makefile           |    1 
+ cpufreq_ondemand.c |  236
++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 252 insertions(+)
+diff -purN linux-2.6.0-test8/drivers/cpufreq/cpufreq_ondemand.c
+linux-2.6.0-test8-dbs/drivers/cpufreq/cpufreq_ondemand.c
+--- linux-2.6.0-test8/drivers/cpufreq/cpufreq_ondemand.c
+1969-12-31 16:00:00.000000000 -0800
++++ linux-2.6.0-test8-dbs/drivers/cpufreq/cpufreq_ondemand.c
+2003-10-25 13:38:27.000000000 -0700
+@@ -0,0 +1,236 @@
++/*
++ *  drivers/cpufreq/cpufreq_ondemand.c
++ *
++ *  Copyright (C)  2001 Russell King
++ *            (C)  2003 Venkatesh Pallipadi
+<venkatesh.pallipadi@intel.com>.
++ *                      Jun Nakajima <jun.nakajima@intel.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/smp.h>
++#include <linux/init.h>
++#include <linux/interrupt.h>
++#include <linux/ctype.h>
++#include <linux/cpufreq.h>
++#include <linux/sysctl.h>
++#include <linux/types.h>
++#include <linux/fs.h>
++#include <linux/sysfs.h>
++#include <linux/sched.h>
++#include <linux/kmod.h>
++#include <linux/workqueue.h>
++#include <linux/jiffies.h>
++#include <linux/config.h>
++#include <linux/kernel_stat.h>
++
++/*
++ * dbs is used in this file as a shortform for demandbased switching
++ * It helps to keep variable names smaller, simpler
++ */
++
++#define DEF_SAMPLING_RATE			(HZ/4)	/* 250ms */
++#define MIN_SAMPLING_RATE			(HZ/10)
++#define MAX_SAMPLING_RATE			(10*HZ)
++
++#define DEF_FREQUENCY_UP_THRESHOLD		(80)
++#define MIN_FREQUENCY_UP_THRESHOLD		(0)
++#define MAX_FREQUENCY_UP_THRESHOLD		(100)
++
++#define DEF_FREQUENCY_DOWN_THRESHOLD		(20)
++#define MIN_FREQUENCY_DOWN_THRESHOLD		(0)
++#define MAX_FREQUENCY_DOWN_THRESHOLD		(100)
++
++#define LOW_LATENCY_FREQUENCY_CHANGE_LIMIT 	(100*1000) /* in nS */
++
++static void do_dbs_timer(void *data);
++
++typedef struct {
++	struct cpufreq_policy 	*cur_policy;
++	unsigned int 		prev_cpu_idle;
++	unsigned int 		enable;
++} ____cacheline_aligned cpu_dbs_info_t;
++static cpu_dbs_info_t cpu_dbs_info[NR_CPUS];
++
++static unsigned int dbs_enable;	/* number of CPUs using this
+policy */
++
++static DECLARE_MUTEX 	(dbs_sem);
++static DECLARE_WORK	(dbs_work, do_dbs_timer, NULL);
++
++struct dbs_tuners {
++	unsigned int 		sampling_rate;
++	unsigned int		up_threshold;
++	unsigned int		down_threshold;
++};
++
++struct dbs_tuners dbs_tuners_ins = {
++	.sampling_rate = DEF_SAMPLING_RATE,
++	.up_threshold = DEF_FREQUENCY_UP_THRESHOLD,
++	.down_threshold = DEF_FREQUENCY_DOWN_THRESHOLD,
++};
++
++static void dbs_check_cpu(int cpu)
++{
++	unsigned int idle_ticks, up_idle_ticks, down_idle_ticks;
++
++	if (!cpu_dbs_info[cpu].enable)
++		return;
++
++	idle_ticks = kstat_cpu(cpu).cpustat.idle - 
++		cpu_dbs_info[cpu].prev_cpu_idle;
++	cpu_dbs_info[cpu].prev_cpu_idle = kstat_cpu(cpu).cpustat.idle;
++
++	/* 
++	 * The default safe range is 20% to 80% 
++	 * - If current idle time is less than 20%, then we try to 
++	 * increase frequency
++	 * - If current idle time is more than 80%, then we try to
++	 * decrease frequency
++	 */
++	up_idle_ticks = (100 - dbs_tuners_ins.up_threshold) *
++			dbs_tuners_ins.sampling_rate / 100;
++
++	if (idle_ticks < up_idle_ticks) {
++		cpufreq_driver_target(cpu_dbs_info[cpu].cur_policy,
++			cpu_dbs_info[cpu].cur_policy->cur + 1, 
++			CPUFREQ_RELATION_L);
++		return;
++	}
++
++	down_idle_ticks = (100 - dbs_tuners_ins.down_threshold) *
++			dbs_tuners_ins.sampling_rate / 100;
++
++	if (idle_ticks > down_idle_ticks ) {
++		cpufreq_driver_target(cpu_dbs_info[cpu].cur_policy,
++			cpu_dbs_info[cpu].cur_policy->cur - 1, 
++			CPUFREQ_RELATION_H);
++		return;
++	}
++}
++
++static void do_dbs_timer(void *data)
++{ 
++	int i;
++	down(&dbs_sem);
++	for (i = 0; i < NR_CPUS; i++)
++		if (cpu_online(i))
++			dbs_check_cpu(i);
++	schedule_delayed_work(&dbs_work, dbs_tuners_ins.sampling_rate); 
++	up(&dbs_sem);
++} 
++
++
++static inline void dbs_timer_init(void)
++{
++	INIT_WORK(&dbs_work, do_dbs_timer, NULL);
++	schedule_work(&dbs_work);
++	return;
++}
++
++static inline void dbs_timer_exit(void)
++{
++	cancel_delayed_work(&dbs_work);
++	return;
++}
++
++static int cpufreq_governor_dbs(struct cpufreq_policy *policy,
++				   unsigned int event)
++{
++	unsigned int cpu = policy->cpu;
++
++	switch (event) {
++	case CPUFREQ_GOV_START:
++		if ((!cpu_online(cpu)) || !policy->cur)
++			return -EINVAL;
++		if (policy->cpuinfo.transition_latency > 
++				LOW_LATENCY_FREQUENCY_CHANGE_LIMIT)
++			return -EINVAL;
++		if (cpu_dbs_info[cpu].enable) /* Already enabled */
++			break;
++
++		printk(KERN_DEBUG 
++			"ONDEMAND START: cpu %d, max %d, min %d, cur
+%d\n",
++			policy->cpu, policy->max, policy->min,
+policy->cur);
++		down(&dbs_sem);
++		cpu_dbs_info[cpu].cur_policy = policy;
++		cpu_dbs_info[cpu].prev_cpu_idle = 
++				kstat_cpu(cpu).cpustat.idle;
++		cpu_dbs_info[cpu].enable = 1;
++		dbs_enable++;
++		/*
++		 * Start the timerschedule work, when this governor
++		 * is used for first time
++		 */
++		if (dbs_enable == 1)
++			dbs_timer_init();
++		
++		up(&dbs_sem);
++		break;
++
++	case CPUFREQ_GOV_STOP:
++		printk(KERN_DEBUG 
++			"ONDEMAND STOP: cpu %d, max %d, min %d, cur
+%d\n",
++			policy->cpu, policy->max, policy->min,
+policy->cur);
++		down(&dbs_sem);
++		cpu_dbs_info[cpu].enable = 0;
++		dbs_enable--;
++		/*
++		 * Stop the timerschedule work, when this governor
++		 * is used for first time
++		 */
++		if (dbs_enable == 0) 
++			dbs_timer_exit();
++		
++		up(&dbs_sem);
++		break;
++
++	case CPUFREQ_GOV_LIMITS:
++		printk(KERN_DEBUG 
++			"ONDEMAND LIMIT: cpu %d, max %d, min %d, cur
+%d\n",
++			policy->cpu, policy->max, policy->min,
+policy->cur);
++		down(&dbs_sem);
++		if (policy->max < cpu_dbs_info[cpu].cur_policy->cur)
++			__cpufreq_driver_target(
++					cpu_dbs_info[cpu].cur_policy,
++				       	policy->max,
+CPUFREQ_RELATION_H);
++		else if (policy->min >
+cpu_dbs_info[cpu].cur_policy->cur)
++			__cpufreq_driver_target(
++					cpu_dbs_info[cpu].cur_policy,
++				       	policy->min,
+CPUFREQ_RELATION_L);
++		up(&dbs_sem);
++		break;
++	}
++	return 0;
++}
++
++struct cpufreq_governor cpufreq_gov_dbs = {
++	.name		= "ondemand",
++	.governor	= cpufreq_governor_dbs,
++	.owner		= THIS_MODULE,
++};
++EXPORT_SYMBOL(cpufreq_gov_dbs);
++
++static int __init cpufreq_gov_dbs_init(void)
++{
++	return cpufreq_register_governor(&cpufreq_gov_dbs);
++}
++
++static void __exit cpufreq_gov_dbs_exit(void)
++{
++	/* Make sure that the scheduled work is indeed not running */
++	flush_scheduled_work();
++	cpufreq_unregister_governor(&cpufreq_gov_dbs);
++}
++
++
++MODULE_AUTHOR ("Venkatesh Pallipadi <venkatesh.pallipadi@intel.com>");
++MODULE_DESCRIPTION ("'cpufreq_ondemand' - A dynamic cpufreq governor
+for "
++		"Low Latency Frequency Transition capable processors");
++MODULE_LICENSE ("GPL");
++
++module_init(cpufreq_gov_dbs_init);
++module_exit(cpufreq_gov_dbs_exit);
+diff -purN linux-2.6.0-test8/drivers/cpufreq/Kconfig
+linux-2.6.0-test8-dbs/drivers/cpufreq/Kconfig
+--- linux-2.6.0-test8/drivers/cpufreq/Kconfig	2003-10-17
+14:43:29.000000000 -0700
++++ linux-2.6.0-test8-dbs/drivers/cpufreq/Kconfig	2003-10-25
+13:34:09.000000000 -0700
+@@ -68,6 +68,21 @@ config CPU_FREQ_GOV_USERSPACE
+ 
+ 	  If in doubt, say Y.
+ 
++config CPU_FREQ_GOV_ONDEMAND
++	tristate "'ondemand' cpufreq policy governor"
++	depends on CPU_FREQ
++	help
++	  'ondemand' - This driver adds a dynamic cpufreq policy
+governor.
++	  The governor does a periodic polling and 
++	  changes frequency based on the CPU utilization.
++	  The support for this governor depends on CPU capability to
++	  do fast frequency switching (i.e, very low latency frequency
++	  transitions). 
++
++	  For details, take a look at linux/Documentation/cpu-freq.
++
++	  If in doubt, say N.
++
+ config CPU_FREQ_24_API
+ 	bool "/proc/sys/cpu/ interface (2.4. / OLD)"
+ 	depends on CPU_FREQ && SYSCTL && CPU_FREQ_GOV_USERSPACE
+diff -purN linux-2.6.0-test8/drivers/cpufreq/Makefile
+linux-2.6.0-test8-dbs/drivers/cpufreq/Makefile
+--- linux-2.6.0-test8/drivers/cpufreq/Makefile	2003-10-17
+14:43:38.000000000 -0700
++++ linux-2.6.0-test8-dbs/drivers/cpufreq/Makefile	2003-10-25
+13:34:09.000000000 -0700
+@@ -5,6 +5,7 @@ obj-$(CONFIG_CPU_FREQ)			+= cpufreq.o
+ obj-$(CONFIG_CPU_FREQ_GOV_PERFORMANCE)	+= cpufreq_performance.o
+ obj-$(CONFIG_CPU_FREQ_GOV_POWERSAVE)	+= cpufreq_powersave.o
+ obj-$(CONFIG_CPU_FREQ_GOV_USERSPACE)	+= cpufreq_userspace.o
++obj-$(CONFIG_CPU_FREQ_GOV_ONDEMAND)	+= cpufreq_ondemand.o
+ 
+ # CPUfreq cross-arch helpers
+ obj-$(CONFIG_CPU_FREQ_TABLE)		+= freq_table.o[unhandled content-type:application/octet-stream]

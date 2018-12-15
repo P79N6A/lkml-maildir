@@ -1,0 +1,204 @@
+Date: Fri, 13 Oct 2000 19:25:03 +0200
+From: "Dr. Werner Fink" <>
+Subject: [patch] For 2.4: syscall revoke.
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/10/13/55
+
+Hi,
+    hopefully this mail isn't lost because of a nervous `d' finger ;^)
+Last week I've finished the work on the system call revoke for 2.4 and
+done some changes on it suggested by the vendors security list.
+Due to the security issue of the syscall revoke, it would nice to see
+this patch going in 2.4.  This would help to close some open security
+issues (e.g. user usage of vcs/vcsa and other devices).
+This implementation of sys_revoke not only removes all references
+of a block or character special file but also all mmap vma's.
+The patch is done for 2.4.0-test9, nevertheless it should apply
+to 2.4.0-test10-pre2.
+          Werner
+--- arch/alpha/kernel/entry.S
++++ arch/alpha/kernel/entry.S	Thu Oct  5 17:13:27 2000
+@@ -837,7 +837,7 @@
+ 	.quad alpha_ni_syscall
+ 	.quad sys_ioctl
+ 	.quad alpha_ni_syscall			/* 55 */
+-	.quad alpha_ni_syscall
++	.quad sys_revoke
+ 	.quad sys_symlink
+ 	.quad sys_readlink
+ 	.quad sys_execve
+--- arch/i386/kernel/entry.S
++++ arch/i386/kernel/entry.S	Thu Oct  5 17:21:43 2000
+@@ -649,6 +649,7 @@
+ 	.long SYMBOL_NAME(sys_getdents64)	/* 220 */
+ 	.long SYMBOL_NAME(sys_fcntl64)
+ 	.long SYMBOL_NAME(sys_ni_syscall)	/* reserved for TUX */
++	.long SYMBOL_NAME(sys_revoke)		/* Should we recycle mpx ? */
+ 
+ 	/*
+ 	 * NOTE!! This doesn't have to be exact - we just have
+@@ -656,6 +657,6 @@
+ 	 * entries. Don't panic if you notice that this hasn't
+ 	 * been shrunk every time we add a new system call.
+ 	 */
+-	.rept NR_syscalls-221
++	.rept NR_syscalls-223
+ 		.long SYMBOL_NAME(sys_ni_syscall)
+ 	.endr
+--- fs/open.c
++++ fs/open.c	Tue Oct 10 11:55:46 2000
+@@ -846,3 +846,128 @@
+ 	}
+ 	return -EPERM;
+ }
++
++/*
++ * The routines below do nothing more than revoke a block or
++ * character special file.
++ */
++
++static int filp_revoke(struct file * filp, struct inode * inode);
++static struct file_operations revoke_file_ops;
++
++asmlinkage int sys_revoke(const char* filename)
++{
++	struct nameidata nd;
++	struct list_head *p;
++	struct super_block *sb;
++	int error = 0;
++
++	error = user_path_walk(filename, &nd);
++	if (error)
++		goto out;
++
++	error = -ENOENT;
++	if (!nd.dentry->d_inode)
++		goto dput_and_out;
++
++#ifndef REVOKE_DEBUG
++	error = -EINVAL;
++	if (!S_ISCHR(nd.dentry->d_inode->i_mode) &&
++	    !S_ISBLK(nd.dentry->d_inode->i_mode))
++		goto dput_and_out;
++#endif
++
++	error = -EPERM;
++	if ((current->fsuid != nd.dentry->d_inode->i_uid) ||
++	    !capable(CAP_FOWNER))
++		goto dput_and_out;
++
++	error = 0;
++	sb = nd.dentry->d_inode->i_sb;
++	file_list_lock();
++	for (p = sb->s_files.next; p != &sb->s_files; p = p->next) {
++		struct file * filp = list_entry(p, struct file, f_list);
++		struct inode * inode;
++
++		if (!filp || !filp->f_dentry)
++			continue;
++		if (nd.dentry != filp->f_dentry)
++			continue;
++		if (filp->f_op == &revoke_file_ops)
++			continue;
++		if (!(inode = filp->f_dentry->d_inode))
++			continue;
++
++		error = filp_revoke(filp, inode);
++	}
++	file_list_unlock();
++dput_and_out:
++	path_release(&nd);
++out:
++	return error;
++}
++
++static int return_EBADF(void) { return -EBADF; }
++#define EBADF_ERROR ((void *) (return_EBADF))
++
++static ssize_t	revoke_read	(struct file * filp, char * buf, size_t count,
++				 loff_t *ppos)
++{
++	return (ssize_t)0;
++}
++
++static int	revoke_release	(struct inode * inode, struct file * filp)
++{
++	fops_put(filp->f_op);
++	filp->f_op = NULL;
++	return 0;
++}
++
++static ssize_t	revoke_readv	(struct file *filp, const struct iovec *iov,
++				 unsigned long count, loff_t *ppos)
++{
++	return (ssize_t)0;
++}
++
++static struct file_operations revoke_file_ops = {
++	owner:		THIS_MODULE,
++	llseek:		EBADF_ERROR,
++	read:		revoke_read,
++	write:		EBADF_ERROR,
++	readdir:	EBADF_ERROR,
++	poll:		EBADF_ERROR,
++	ioctl:		EBADF_ERROR,
++	mmap:		EBADF_ERROR,
++	open:		EBADF_ERROR,
++	flush:		EBADF_ERROR,
++	release:	revoke_release,
++	fsync:		EBADF_ERROR,
++	fasync:		EBADF_ERROR,
++	lock:		EBADF_ERROR,
++	readv:		revoke_readv,
++	writev:		EBADF_ERROR
++};
++
++static int filp_revoke(struct file * filp, struct inode * inode)
++{
++	struct file_operations * fops = filp->f_op;
++	int error = 0;
++
++	down(&inode->i_sem);
++	if (!fops || !file_count(filp))
++		goto truncate_and_out;
++
++	filp->f_op = &revoke_file_ops;
++
++	if (fops->flush)
++		(void) fops->flush(filp);
++	if (fops->release)
++		error = fops->release(inode, filp);
++	fops_put(fops);
++
++truncate_and_out:
++	vmtruncate(inode, (loff_t)0);
++	up(&inode->i_sem);
++
++	return error;
++}
+--- include/asm-alpha/unistd.h
++++ include/asm-alpha/unistd.h	Thu Oct  5 17:20:03 2000
+@@ -57,7 +57,8 @@
+ 
+ #define __NR_ioctl		 54
+ #define __NR_osf_reboot		 55	/* not implemented */
+-#define __NR_osf_revoke		 56	/* not implemented */
++#define __NR_revoke		 56
++#define __NR_osf_revoke		 56	/* alias for revoke */
+ #define __NR_symlink		 57
+ #define __NR_readlink		 58
+ #define __NR_execve		 59
+--- include/asm-i386/unistd.h
++++ include/asm-i386/unistd.h	Thu Oct  5 17:18:58 2000
+@@ -227,6 +227,8 @@
+ #define __NR_madvise1		219	/* delete when C lib stub is removed */
+ #define __NR_getdents64		220
+ #define __NR_fcntl64		221
++/* #define __NR_tux		222 */
++#define __NR_revoke		223
+ 
+ /* user-visible error numbers are in the range -1 - -124: see <asm-i386/errno.h> */
+ 

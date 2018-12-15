@@ -1,0 +1,406 @@
+Date: Tue, 20 Jul 1999 02:06:47 -0400 (EDT)
+From: "Benjamin C.R. LaHaise" <>
+Subject: [PATCH] 2.3.11-5 Lazy TLB fixes/__switch_to bug
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/7/20/2
+
+Hello Ingo et al,
+Attached is a patch against 2.3.11-5 (sorry about CVS -- eagerly awaiting
+BitKeeper) that fixes what I think are major problems with the lazy tlb
+code for x86 (for non-x86 people, please note the added
+(get|put)_mmu_context and how SET_PAGE_DIR does the equivelent to a
+put_mmu_context): using mmget/put isn't a wise thing in schedule, in my
+opinion, as the mm context could retain quite a few resources until the
+last put.  Also, by incrementing mm->count, many optimizations were being
+disabled, even if they're still valid (the assumption I'm working on here
+is that the kernel mappings for pgds to pmds is done at boot time and
+never changed; any access of any other part of the pgd my a lazy tlb task
+is wholly invalid). 
+The mm_struct leak fix is based on the fix pointed out by Alexander Viro
+(once I saw his message pointing out the actual bug, the rest came easy --
+thanks Alex!): put_mmu_context is moved to schedule_tail.  I'm no longer
+seeing the bad pmd messages as task->mm is no longer changed on lazy tlb
+processes, so Alexander's patch for fixing task_struct->mm references
+isn't needed. 
+With these fixes, things *almost* worked, except something was freeing
+random pages, resulting in massive page cache corruption (2.3.11-[45] are
+DANGEROUS, and have resulted in some minor data trashing here).  It turns
+out that __switch_to wasn't preserving prev in %eax -- fixed by returning
+prev from __switch_to.  While I was at it, I made schedule_tail a FASTCALL
+(code is okay with gcc 2.7.2) since the value of interest was already in
+%eax.
+Phew!  Many thanks to Ingo for laying out the groundwork.
+		-ben
+--
+Hi!  I'm Signature Virus 99!  Copy me into your .signature and join the fun!
+Index: arch/i386/kernel/entry.S
+===================================================================
+RCS file: /blah-local/cvsroot/lin2.3/arch/i386/kernel/entry.S,v
+retrieving revision 1.1.1.1
+diff -u -u -r1.1.1.1 entry.S
+--- entry.S	1999/04/30 15:13:37	1.1.1.1
++++ entry.S	1999/07/20 05:07:49
+@@ -153,11 +153,10 @@
+ 	ALIGN
+ 	.globl	ret_from_fork
+ ret_from_fork:
+-#ifdef __SMP__
+-	pushl %ebx
++	/* %eax currently contains the return value from __switch_to,
++	 * which is struct task *prev -- just what schedule_tail needs. -ben
++	 */
+ 	call SYMBOL_NAME(schedule_tail)
+-	addl $4, %esp
+-#endif /* __SMP__ */
+ 	GET_CURRENT(%ebx)
+ 	jmp	ret_from_sys_call
+ 
+Index: arch/i386/kernel/process.c
+===================================================================
+RCS file: /blah-local/cvsroot/lin2.3/arch/i386/kernel/process.c,v
+retrieving revision 1.1.1.3
+diff -u -u -r1.1.1.3 process.c
+--- process.c	1999/07/15 05:10:49	1.1.1.3
++++ process.c	1999/07/20 05:30:09
+@@ -733,7 +733,7 @@
+  * more flexibility.
+  */
+ extern int cpus_initialized;
+-void __switch_to(struct task_struct *prev_p, struct task_struct *next_p)
++struct task_struct *__switch_to(struct task_struct *prev_p, struct task_struct *next_p)
+ {
+ 	struct soft_thread_struct *prev = &prev_p->thread,
+ 				 *next = &next_p->thread;
+@@ -807,6 +807,7 @@
+ 			 */
+ 			tss->bitmap = INVALID_IO_BITMAP_OFFSET;
+ 	}
++	return prev_p;
+ }
+ 
+ asmlinkage int sys_fork(struct pt_regs regs)
+Index: fs/buffer.c
+===================================================================
+RCS file: /blah-local/cvsroot/lin2.3/fs/buffer.c,v
+retrieving revision 1.1.1.14
+diff -u -u -r1.1.1.14 buffer.c
+--- buffer.c	1999/07/15 05:07:33	1.1.1.14
++++ buffer.c	1999/07/20 04:25:05
+@@ -44,6 +44,7 @@
+ #include <asm/uaccess.h>
+ #include <asm/io.h>
+ #include <asm/bitops.h>
++#include <asm/mmu_context.h>
+ 
+ #define NR_SIZES 7
+ static char buffersize_index[65] =
+@@ -1969,24 +1970,18 @@
+ 		goto out;
+ 
+ 	if (func == 1) {
+-		struct mm_struct *user_mm;
+ 		/*
+ 		 * bdflush will spend all of it's time in kernel-space,
+ 		 * without touching user-space, so we can switch it into
+ 		 * 'lazy TLB mode' to reduce the cost of context-switches
+ 		 * to and from bdflush.
+ 		 */
+-		user_mm = current->mm;
+-		mmget(user_mm);
+ 		current->flags |= PF_LAZY_TLB;
++		get_mmu_context(current, current);
+ 
+ 		error = sync_old_buffers();
+ 
+-		current->flags &= ~PF_LAZY_TLB;
+-		SET_PAGE_DIR(current, user_mm->pgd);
+-		mmput(current->mm);
+-		current->mm = user_mm;
+-
++		SET_PAGE_DIR(current, current->mm->pgd);	/* this does the put_mmu_context for us */
+ 		goto out;
+ 	}
+ 
+Index: fs/nfs/read.c
+===================================================================
+RCS file: /blah-local/cvsroot/lin2.3/fs/nfs/read.c,v
+retrieving revision 1.1.1.5
+diff -u -u -r1.1.1.5 read.c
+--- read.c	1999/07/15 05:00:25	1.1.1.5
++++ read.c	1999/07/20 04:09:03
+@@ -152,7 +152,7 @@
+ 		fail++;
+ 		dprintk("NFS: %d successful reads, %d failures\n", succ, fail);
+ 	}
+-	page->owner = (int)current; // HACK, FIXME, will go away.
++	page->owner = current; // HACK, FIXME, will go away.
+ 	UnlockPage(page);
+ 	free_page(address);
+ 
+Index: include/asm-i386/mmu_context.h
+===================================================================
+RCS file: /blah-local/cvsroot/lin2.3/include/asm-i386/mmu_context.h,v
+retrieving revision 1.1.1.2
+diff -u -u -r1.1.1.2 mmu_context.h
+--- mmu_context.h	1999/07/15 05:08:14	1.1.1.2
++++ mmu_context.h	1999/07/20 04:18:17
+@@ -15,13 +15,15 @@
+  * a function call ...
+  */
+ #define get_mmu_context(prev, next) \
+-	do { if (next->flags & PF_LAZY_TLB) \
+-		{ mmget(prev->mm); next->mm = prev->mm; \
+-			next->thread.cr3 = prev->thread.cr3; } } while(0)
++	do { if (next->flags & PF_LAZY_TLB) { \
++		next->thread.cr3 = prev->thread.cr3; \
++		get_page(mem_map + MAP_NR(__va(next->thread.cr3))); \
++	} } while(0)
+ 
+ #define put_mmu_context(prev, next) \
+ 	do { if (prev->flags & PF_LAZY_TLB) \
+-			{ mmput(prev->mm); } } while(0)
++		pgd_free(__va(prev->thread.cr3)); \
++	} while(0)
+ 
+ #define init_new_context(mm)	do { } while(0)
+ /*
+Index: include/asm-i386/pgtable.h
+===================================================================
+RCS file: /blah-local/cvsroot/lin2.3/include/asm-i386/pgtable.h,v
+retrieving revision 1.1.1.3
+diff -u -u -r1.1.1.3 pgtable.h
+--- pgtable.h	1999/07/15 05:08:13	1.1.1.3
++++ pgtable.h	1999/07/20 04:19:31
+@@ -306,12 +306,16 @@
+ #define SET_PAGE_DIR(tsk,pgdir) \
+ do { \
+ 	unsigned long __pgdir = __pa(pgdir); \
+-	(tsk)->thread.cr3 = __pgdir; \
++	int was_lazy = ((tsk)->flags & PF_LAZY_TLB); \
+ 	/* do not inherit lazy-TLB after exec() */ \
+-	if ((pgdir != swapper_pg_dir) && ((tsk)->flags & PF_LAZY_TLB)) \
++	if ((pgdir != swapper_pg_dir) && was_lazy) \
+ 		(tsk)->flags &= ~PF_LAZY_TLB; \
+-	if ((tsk) == current) \
++	if ((tsk) == current) { \
+ 		__asm__ __volatile__("movl %0,%%cr3": :"r" (__pgdir)); \
++		if (was_lazy) \
++			pgd_free(__va((tsk)->thread.cr3)); \
++	} \
++	(tsk)->thread.cr3 = __pgdir; \
+ } while (0)
+ 
+ #define pte_none(x)	(!pte_val(x))
+Index: include/asm-i386/system.h
+===================================================================
+RCS file: /blah-local/cvsroot/lin2.3/include/asm-i386/system.h,v
+retrieving revision 1.1.1.3
+diff -u -u -r1.1.1.3 system.h
+--- system.h	1999/07/15 05:08:13	1.1.1.3
++++ system.h	1999/07/20 05:30:51
+@@ -7,7 +7,7 @@
+ #ifdef __KERNEL__
+ 
+ struct task_struct;	/* one of the stranger aspects of C forward declarations.. */
+-extern void FASTCALL(__switch_to(struct task_struct *prev, struct task_struct *next));
++extern struct task_struct * FASTCALL(__switch_to(struct task_struct *prev, struct task_struct *next));
+ 
+ #define switch_to(prev,next,last) do {					\
+ 	asm volatile("pushl %%esi\n\t"					\
+@@ -23,7 +23,7 @@
+ 		     "popl %%edi\n\t"					\
+ 		     "popl %%esi\n\t"					\
+ 		     :"=m" (prev->thread.esp),"=m" (prev->thread.eip),	\
+-		      "=b" (last)					\
++		      "=a" (last)					\
+ 		     :"m" (next->thread.esp),"m" (next->thread.eip),	\
+ 		      "a" (prev), "d" (next),				\
+ 		      "b" (prev));					\
+Index: kernel/exit.c
+===================================================================
+RCS file: /blah-local/cvsroot/lin2.3/kernel/exit.c,v
+retrieving revision 1.1.1.3
+diff -u -u -r1.1.1.3 exit.c
+--- exit.c	1999/07/15 05:07:53	1.1.1.3
++++ exit.c	1999/07/20 04:09:09
+@@ -237,10 +237,10 @@
+ 	if (mm != &init_mm) {
+ 		flush_cache_mm(mm);
+ 		flush_tlb_mm(mm);
++		SET_PAGE_DIR(tsk, swapper_pg_dir);	/* should go before destroy_context, right? -ben */
+ 		destroy_context(mm);
+ 		tsk->mm = &init_mm;
+ 		tsk->swappable = 0;
+-		SET_PAGE_DIR(tsk, swapper_pg_dir);
+ 		mm_release();
+ 		mmput(mm);
+ 	}
+Index: kernel/sched.c
+===================================================================
+RCS file: /blah-local/cvsroot/lin2.3/kernel/sched.c,v
+retrieving revision 1.1.1.3
+diff -u -u -r1.1.1.3 sched.c
+--- sched.c	1999/07/15 05:07:53	1.1.1.3
++++ sched.c	1999/07/20 04:10:52
+@@ -624,6 +624,7 @@
+  */
+ static inline void __schedule_tail (struct task_struct *prev)
+ {
++	put_mmu_context(prev, current);
+ #ifdef __SMP__
+ 	if ((prev->state == TASK_RUNNING) &&
+ 			(prev != idle_task(smp_processor_id())))
+@@ -633,6 +634,7 @@
+ #endif /* __SMP__ */
+ }
+ 
++FASTCALL(void schedule_tail (struct task_struct *prev));	/* keep in sync with entry.S */
+ void schedule_tail (struct task_struct *prev)
+ {
+ 	__schedule_tail(prev);
+@@ -783,7 +785,6 @@
+ 	 */
+ 	get_mmu_context(prev, next);
+ 	switch_to(prev, next, prev);
+-	put_mmu_context(prev, next);
+ 	__schedule_tail(prev);
+ 
+ same_process:
+@@ -2005,6 +2006,8 @@
+ 	t = get_cycles();
+ 	sched_data->curr = current;
+ 	sched_data->last_schedule = t;
++	if (!current->flags & PF_LAZY_TLB)
++		printk("idle doesn't have a lazy tlb!\n");
+ }
+ 
+ void __init sched_init(void)
+@@ -2028,7 +2031,7 @@
+ 	/*
+ 	 * The boot idle thread does lazy MMU switching as well:
+ 	 */
+-	mmget(&init_mm);
+ 	current->flags |= PF_LAZY_TLB;
++	get_mmu_context(current, current);
+ }
+ 
+Index: kernel/softirq.c
+===================================================================
+RCS file: /blah-local/cvsroot/lin2.3/kernel/softirq.c,v
+retrieving revision 1.1.1.1
+diff -u -u -r1.1.1.1 softirq.c
+--- softirq.c	1999/03/21 15:22:00	1.1.1.1
++++ softirq.c	1999/07/20 04:09:12
+@@ -26,45 +26,50 @@
+ void (*bh_base[32])(void);
+ 
+ /*
+- * This needs to make sure that only one bottom half handler
+- * is ever active at a time. We do this without locking by
+- * doing an atomic increment on the intr_count, and checking
+- * (nonatomically) against 1. Only if it's 1 do we schedule
+- * the bottom half.
+- *
+- * Note that the non-atomicity of the test (as opposed to the
+- * actual update) means that the test may fail, and _nobody_
+- * runs the handlers if there is a race that makes multiple
+- * CPU's get here at the same time. That's ok, we'll run them
+- * next time around.
++ * Repeatedly run over the bottom halves until there are no more, but only run
++ * each bottom half at most once.  If we don't loop, if one bottom half triggers
++ * another, it might get delayed a long time.  If we loop indefinately, then the
++ * system will lock completely under a heavy irq load. -bcrl
+  */
+-static inline void run_bottom_halves(void)
+-{
+-	unsigned long active;
+-	void (**bh)(void);
+-
+-	active = get_active_bhs();
+-	clear_active_bhs(active);
+-	bh = bh_base;
+-	do {
+-		if (active & 1)
+-			(*bh)();
+-		bh++;
+-		active >>= 1;
+-	} while (active);
+-}
+-
+ asmlinkage void do_bottom_half(void)
+ {
+ 	int cpu = smp_processor_id();
++	unsigned long left = ~0UL;
++	unsigned long active;
++	void (**bh)(void);
+ 
++again:
+ 	if (softirq_trylock(cpu)) {
+ 		if (hardirq_trylock(cpu)) {
+ 			__sti();
+-			run_bottom_halves();
++
++			while ((active = left & get_active_bhs())) {
++				left &= ~active;
++				clear_active_bhs(active);
++				bh = bh_base;
++				do {
++					if (active & 1)
++						(*bh)();
++					bh++;
++						active >>= 1;
++				} while (active);
++			}
++
+ 			__cli();
+ 			hardirq_endlock(cpu);
++			softirq_endlock(cpu);
++
++			/*
++			 * Avoid the race by checking if any bottom halves
++			 * are active after releasing all locks.  This is a
++			 * rare race, but should inexpensive to check.  -bcrl
++			 */
++			rmb();
++			if (get_active_bhs() & left)
++				goto again;
++			return;
+ 		}
+ 		softirq_endlock(cpu);
+ 	}
+ }
++
+Index: mm/page_alloc.c
+===================================================================
+RCS file: /blah-local/cvsroot/lin2.3/mm/page_alloc.c,v
+retrieving revision 1.1.1.5
+diff -u -u -r1.1.1.5 page_alloc.c
+--- page_alloc.c	1999/07/15 05:00:42	1.1.1.5
++++ page_alloc.c	1999/07/20 03:40:38
+@@ -89,6 +89,7 @@
+  * Hint: -mask = 1+~mask
+  */
+ spinlock_t page_alloc_lock = SPIN_LOCK_UNLOCKED;
++#define ADDRESS(x) (PAGE_OFFSET + ((x) << PAGE_SHIFT))
+ 
+ static inline void free_pages_ok(unsigned long map_nr, unsigned long order)
+ {
+@@ -97,6 +98,7 @@
+ 	unsigned long mask = (~0UL) << order;
+ 	unsigned long flags;
+ 
++	memset((void *)ADDRESS(map_nr), 0x5a, PAGE_SIZE << order);
+ 	spin_lock_irqsave(&page_alloc_lock, flags);
+ 
+ #define list(x) (mem_map+(x))
+@@ -159,7 +161,6 @@
+ #define MARK_USED(index, order, area) \
+ 	change_bit((index) >> (1+(order)), (area)->map)
+ #define CAN_DMA(x) (PageDMA(x))
+-#define ADDRESS(x) (PAGE_OFFSET + ((x) << PAGE_SHIFT))
+ #define RMQUEUE(order, gfp_mask) \
+ do { struct free_area_struct * area = free_area+order; \
+      unsigned long new_order = order; \

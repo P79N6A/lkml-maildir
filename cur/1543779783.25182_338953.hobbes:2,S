@@ -1,0 +1,130 @@
+Date: Wed, 3 Aug 2005 17:43:44 -0700
+From: 	zach@vmware ...
+Subject: [PATCH] 3/5 explicit-iopl
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2005/8/3/255
+
+The pushf/popf in switch_to are ONLY used to switch IOPL.  Making this
+explicit in C code is more clear.  This pushf/popf pair was added as a
+bugfix for leaking IOPL to unprivileged processes when using sysenter/sysexit
+based system calls (sysexit does not restore flags).
+When requesting an IOPL change in sys_iopl(), it is just as easy to
+change the current flags and the flags in the stack image (in case an IRET
+is required), but there is no reason to force an IRET if we came in from the
+SYSENTER path.
+This change is the minimal solution for supporting a paravirtualized Linux
+kernel that allows user processes to run with I/O privilege.  Other solutions
+require radical rewrites of part of the low level fault / system call handling
+code, or do not fully support sysenter based system calls.
+Unfortunately, this added one field to the thread_struct.  But as a bonus, on
+P4, the fastest time measured for switch_to() went from 312 to 260 cycles, a
+win of about 17% in the fast case through this performance critical path.
+Signed-off-by: Zachary Amsden <zach@vmware.com>
+Index: linux-2.6.13/arch/i386/kernel/ioport.c
+===================================================================
+--- linux-2.6.13.orig/arch/i386/kernel/ioport.c	2005-06-17 12:48:29.000000000 -0700
++++ linux-2.6.13/arch/i386/kernel/ioport.c	2005-08-02 17:11:01.000000000 -0700
+@@ -132,6 +132,7 @@
+ 	volatile struct pt_regs * regs = (struct pt_regs *) &unused;
+ 	unsigned int level = regs->ebx;
+ 	unsigned int old = (regs->eflags >> 12) & 3;
++	struct thread_struct * t = &current->thread;
+ 
+ 	if (level > 3)
+ 		return -EINVAL;
+@@ -140,8 +141,8 @@
+ 		if (!capable(CAP_SYS_RAWIO))
+ 			return -EPERM;
+ 	}
+-	regs->eflags = (regs->eflags &~ 0x3000UL) | (level << 12);
+-	/* Make sure we return the long way (not sysenter) */
+-	set_thread_flag(TIF_IRET);
++	t->iopl = level << 12;
++	regs->eflags = (regs->eflags & ~X86_EFLAGS_IOPL) | t->iopl;
++	set_iopl_mask(t->iopl);
+ 	return 0;
+ }
+Index: linux-2.6.13/arch/i386/kernel/process.c
+===================================================================
+--- linux-2.6.13.orig/arch/i386/kernel/process.c	2005-08-02 17:08:58.000000000 -0700
++++ linux-2.6.13/arch/i386/kernel/process.c	2005-08-02 17:11:01.000000000 -0700
+@@ -716,6 +716,13 @@
+ 		loadsegment(gs, next->gs);
+ 
+ 	/*
++	 * Restore IOPL if needed.
++	 */
++	if (unlikely(prev->iopl != next->iopl)) {
++		set_iopl_mask(next->iopl);
++	}
++
++	/*
+ 	 * Now maybe reload the debug registers
+ 	 */
+ 	if (unlikely(next->debugreg[7])) {
+Index: linux-2.6.13/include/asm-i386/processor.h
+===================================================================
+--- linux-2.6.13.orig/include/asm-i386/processor.h	2005-08-02 17:06:23.000000000 -0700
++++ linux-2.6.13/include/asm-i386/processor.h	2005-08-02 17:11:27.000000000 -0700
+@@ -457,6 +457,7 @@
+ 	unsigned long	*io_bitmap_ptr;
+ /* max allowed port in the bitmap, in bytes: */
+ 	unsigned long	io_bitmap_max;
++ 	unsigned long	iopl;
+ /* performance counters */
+ 	struct vperfctr *perfctr;
+ };
+@@ -514,6 +515,21 @@
+ 			: /* no output */			\
+ 			:"r" (value))
+ 
++/*
++ * Set IOPL bits in EFLAGS from given mask
++ */
++static inline void set_iopl_mask(unsigned mask)
++{
++	unsigned int reg;
++	__asm__ __volatile__ ("pushfl;"
++			      "popl %0;"
++			      "andl %1, %0;"
++			      "orl %2, %0;"
++			      "pushl %0;"
++			      "popfl"
++				: "=&r" (reg)
++				: "i" (~X86_EFLAGS_IOPL), "r" (mask));
++}
+ 
+ /* Forward declaration, a strange C thing */
+ struct task_struct;
+Index: linux-2.6.13/include/asm-i386/system.h
+===================================================================
+--- linux-2.6.13.orig/include/asm-i386/system.h	2005-08-02 17:06:23.000000000 -0700
++++ linux-2.6.13/include/asm-i386/system.h	2005-08-02 17:11:49.000000000 -0700
+@@ -15,8 +15,7 @@
+ #define switch_to(prev,next,last) do {					\
+ 	unsigned long esi,edi;						\
+  	perfctr_suspend_thread(&(prev)->thread);			\
+-	asm volatile("pushfl\n\t"					\
+-		     "pushl %%ebp\n\t"					\
++	asm volatile("pushl %%ebp\n\t"					\
+ 		     "movl %%esp,%0\n\t"	/* save ESP */		\
+ 		     "movl %5,%%esp\n\t"	/* restore ESP */	\
+ 		     "movl $1f,%1\n\t"		/* save EIP */		\
+@@ -24,7 +23,6 @@
+ 		     "jmp __switch_to\n"				\
+ 		     "1:\t"						\
+ 		     "popl %%ebp\n\t"					\
+-		     "popfl"						\
+ 		     :"=m" (prev->thread.esp),"=m" (prev->thread.eip),	\
+ 		      "=a" (last),"=S" (esi),"=D" (edi)			\
+ 		     :"m" (next->thread.esp),"m" (next->thread.eip),	\
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+More majordomo info at  
+http://vger.kernel.org/majordomo-info.html
+Please read the FAQ at  
+http://www.tux.org/lkml/

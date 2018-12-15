@@ -1,0 +1,146 @@
+Date: Tue, 28 Feb 2006 10:05:00 +0100
+From: Thomas Gleixner <>
+Subject: Re: + fix-next_timer_interrupt-for-hrtimer.patch added to -mm tree
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2006/2/28/30
+
+On Mon, 2006-02-27 at 19:29 -0800, Tony Lindgren wrote:
+> I've changed ARM xtime_lock to read lock, but now there's a slight
+> chance that an interrupt adds a timer after next_timer_interrupt() is
+> called and before timer is reprogrammed. I believe s390 also has this
+> problem.
+This needs a more generalized solution later, but I picked up your ARM
+change and simplified the hrtimer related bits.
+	tglx
+Index: 2.6.16-rc4-git/arch/arm/kernel/time.c
+===================================================================
+--- 2.6.16-rc4-git.orig/arch/arm/kernel/time.c
++++ 2.6.16-rc4-git/arch/arm/kernel/time.c
+@@ -422,12 +422,14 @@ static int timer_dyn_tick_disable(void)
+ void timer_dyn_reprogram(void)
+ {
+ 	struct dyn_tick_timer *dyn_tick = system_timer->dyn_tick;
++	unsigned long next, seq;
+ 
+-	if (dyn_tick) {
+-		write_seqlock(&xtime_lock);
+-		if (dyn_tick->state & DYN_TICK_ENABLED)
++	if (dyn_tick && (dyn_tick->state & DYN_TICK_ENABLED)) {
++		next = next_timer_interrupt();
++		do {
++			seq = read_seqbegin(&xtime_lock);
+ 			dyn_tick->reprogram(next_timer_interrupt() - jiffies);
+-		write_sequnlock(&xtime_lock);
++		} while (read_seqretry(&xtime_lock, seq));
+ 	}
+ }
+ 
+Index: 2.6.16-rc4-git/include/linux/hrtimer.h
+===================================================================
+--- 2.6.16-rc4-git.orig/include/linux/hrtimer.h
++++ 2.6.16-rc4-git/include/linux/hrtimer.h
+@@ -116,6 +116,10 @@ extern int hrtimer_try_to_cancel(struct 
+ extern ktime_t hrtimer_get_remaining(const struct hrtimer *timer);
+ extern int hrtimer_get_res(const clockid_t which_clock, struct timespec *tp);
+ 
++#ifdef CONFIG_NO_IDLE_HZ
++extern ktime_t hrtimer_get_next_event(void);
++#endif
++
+ static inline int hrtimer_active(const struct hrtimer *timer)
+ {
+ 	return timer->state == HRTIMER_PENDING;
+Index: 2.6.16-rc4-git/kernel/hrtimer.c
+===================================================================
+--- 2.6.16-rc4-git.orig/kernel/hrtimer.c
++++ 2.6.16-rc4-git/kernel/hrtimer.c
+@@ -505,6 +505,41 @@ ktime_t hrtimer_get_remaining(const stru
+ 	return rem;
+ }
+ 
++#ifdef CONFIG_NO_IDLE_HZ
++/**
++ * hrtimer_get_next_event - get the time until next expiry event
++ *
++ * Returns the delta to the next expiry event or KTIME_MAX if no timer
++ * is pending.
++ */
++ktime_t hrtimer_get_next_event(void)
++{
++	struct hrtimer_base *base = __get_cpu_var(hrtimer_bases);
++	ktime_t delta, mindelta = { .tv64 = KTIME_MAX };
++	unsigned long flags;
++	int i;
++
++	for (i = 0; i < MAX_HRTIMER_BASES; i++, base++) {
++		struct hrtimer *timer;
++
++		spin_lock_irqsave(&base->lock, flags);
++		if (!base->first) {
++			spin_unlock_irqrestore(&base->lock, flags);
++			continue;
++		}
++		timer = rb_entry(base->first, struct hrtimer, node);
++		delta.tv64 = timer->expires.tv64;
++		spin_unlock_irqrestore(&base->lock, flags);
++		delta = ktime_sub(delta, base->get_time());
++		if (delta.tv64 < mindelta.tv64)
++			mindelta.tv64 = delta.tv64;
++	}
++	if (mindelta.tv64 < 0)
++		mindelta.tv64 = 0;
++	return mindelta;
++}
++#endif
++
+ /**
+  * hrtimer_init - initialize a timer to the given clock
+  *
+Index: 2.6.16-rc4-git/kernel/timer.c
+===================================================================
+--- 2.6.16-rc4-git.orig/kernel/timer.c
++++ 2.6.16-rc4-git/kernel/timer.c
+@@ -488,10 +488,21 @@ unsigned long next_timer_interrupt(void)
+ 	tvec_base_t *base;
+ 	struct list_head *list;
+ 	struct timer_list *nte;
+-	unsigned long expires;
++	unsigned long expires, hr_expires = MAX_JIFFY_OFFSET;
++	ktime_t hr_delta;
+ 	tvec_t *varray[4];
+ 	int i, j;
+ 
++	hr_delta = hrtimer_get_next_event();
++	if (hr_delta.tv64 != KTIME_MAX) {
++		struct timespec tsdelta;
++		tsdelta = ktime_to_timespec(hr_delta);
++		hr_expires = timespec_to_jiffies(&tsdelta);
++		if (hr_expires < 3)
++			return hr_expires + jiffies;
++	}
++	hr_expires += jiffies;
++
+ 	base = &__get_cpu_var(tvec_bases);
+ 	spin_lock(&base->t_base.lock);
+ 	expires = base->timer_jiffies + (LONG_MAX >> 1);
+@@ -542,6 +553,10 @@ found:
+ 		}
+ 	}
+ 	spin_unlock(&base->t_base.lock);
++
++	if (time_before(hr_expires, expires))
++		return hr_expires;
++
+ 	return expires;
+ }
+ #endif
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+More majordomo info at  
+http://vger.kernel.org/majordomo-info.html
+Please read the FAQ at  
+http://www.tux.org/lkml/

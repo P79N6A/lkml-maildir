@@ -1,0 +1,217 @@
+Date: Thu, 15 Jul 2004 18:59:18 +0900
+From: IWAMOTO Toshihiro <>
+Subject: rebinding buffer_head to new(remapped) page
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2004/7/15/35
+
+In memory hotremoval, all pages in a removing region need to be freed.
+In my patch (
+http://people.valinux.co.jp/~iwamoto/mh.html
+), such pages
+are copied to other areas rather than to freed to avoid various
+issues.
+Until now, if a page has a buffer_head attached to it, the buffer_head
+are freed in advance.  This means a writeback is issued if a page is
+dirty.  Unfortunately, this approach is unaccetpably slow in some
+cases.
+To solve this issue, I'm implementing a mechanism to handle
+buffer_head without writeback.  The attached patch is applied over the
+patches found in the above URL and implements this mechanism for ext2.
+remap_move_buffer_ext2() says almost everything; buffer_head is locked
+and their pointers to a page is adjusted.  The locks are released when
+a page remapping(migrating) operation is done.
+The patch seems to work, but it isn't tested much and I'm not
+an expert of file systems.
+I've also tried with ext3 with trivial changes to the patch, and it
+also seems to work.  Quick look at jbd and ext3 found no problem, though.
+Any comments are appreciated.
+--- linux-2.6.7.ORG/mm/memhotplug.c	2004-06-30 16:15:02.000000000 +0900
++++ linux-2.6.7/mm/memhotplug.c	2004-07-09 17:23:09.000000000 +0900
+@@ -6,6 +6,7 @@
+  *  Support of memory hotplug, Iwamoto
+  */
+ 
++#include <linux/config.h>
+ #include <linux/mm.h>
+ #include <linux/module.h>
+ #include <linux/swap.h>
+@@ -67,11 +68,16 @@
+ #define	REMAPPREP_WB		1
+ #define	REMAPPREP_BUFFER	2
+ 
++#ifdef CONFIG_EXT2_FS
++extern struct address_space_operations ext2_aops;
++extern struct address_space_operations ext2_nobh_aops;
++#endif
++
+ /*
+  * Try to free buffers if "page" has them.
+  */
+ static int
+-remap_preparepage(struct page *page, int fastmode)
++remap_preparepage(struct page *page, struct page *newpage, int fastmode)
+ {
+ 	struct address_space *mapping;
+ 	int waitcnt = fastmode ? 0 : 100;
+@@ -95,6 +101,13 @@
+ 		__set_current_state(TASK_RUNNING);
+ 		waitcnt--;
+ 	}
++	if (PagePrivate(page) && PageDirty(page) && mapping != NULL) {
++		if (mapping->a_ops == &ext2_aops ||
++		    mapping->a_ops == &ext2_nobh_aops)
++			remap_move_buffer_ext2(page, newpage);
++		/* fallback writeback if unsupported fs type */
++	}
++
+ 	if (PagePrivate(page)) {
+ 		/* XXX copied from shrink_list() */
+ 		if (PageDirty(page) &&
+@@ -151,6 +164,36 @@
+ 	return 0;
+ }
+ 
++void
++remap_move_buffer_ext2(struct page *page, struct page *newpage)
++{
++	struct buffer_head *bh, *head;
++
++/*	printk("remap_move_buffer_ext2: %p -> %p\n", page, newpage); */
++	spin_lock(&page->mapping->private_lock);
++	bh = head = page_buffers(page);
++	do {
++		get_bh(bh);
++		lock_buffer(bh);
++	} while ((bh = bh->b_this_page) != head);
++
++	newpage->private = page->private;
++	page->private = 0;
++	page_cache_release(page);
++	page_cache_get(newpage);
++
++	/* XXX */
++	ClearPagePrivate(page);
++	SetPagePrivate(newpage);
++
++	bh = head;
++	do {
++		BUG_ON(bh->b_page != page);
++		set_bh_page(bh, newpage, (unsigned long)bh->b_data & (PAGE_SIZE - 1));
++	} while ((bh = bh->b_this_page) != head);
++	spin_unlock(&page->mapping->private_lock);
++	/* buffers are unlocked when remapping is complete */
++}
+ /*
+  * Just assign swap space to a anonymous page if it doesn't have yet,
+  * so that the page can be handled like a page in the page cache
+@@ -353,13 +396,29 @@
+ remap_exchange_pages(struct page *page, struct page *newpage,
+ 			 struct address_space *mapping)
+ {
+-	if (PageDirty(page))
++	struct buffer_head *bh, *head;
++
++	/* XXX this will make a whole page dirty (if it has buffers) */
++	if (PageDirty(page)) {
++		ClearPageDirty(newpage); /* to force radix tag set */
+ 		set_page_dirty(newpage);
++	}
+ 	page->mapping = NULL;
+ 	unlock_page(page);
+ 
+ 	__put_page(page);
+ 
++	if (PagePrivate(newpage)) {
++		BUG_ON(mapping != newpage->mapping);
++		spin_lock(&mapping->private_lock);
++		bh = head = page_buffers(newpage);
++		do {
++			put_bh(bh);
++			unlock_buffer(bh);
++		} while ((bh = bh->b_this_page) != head);
++		spin_unlock(&mapping->private_lock);
++	}
++
+ 	/* We are done.  Finish and let the waiters run. */
+ 	SetPageUptodate(newpage);
+ }
+@@ -488,6 +547,7 @@
+ {
+ 	struct page *newpage;
+ 	struct address_space *mapping;
++	unsigned long saved_pflags;
+ 	LIST_HEAD(vlist);
+ 	int truncated = 0;
+ 	int nretry = fastmode ? HZ/50: HZ*10; /* XXXX */
+@@ -496,9 +556,19 @@
+ 		return -ENOMEM;
+ 	if (TestSetPageLocked(newpage))
+ 		BUG();
++	{	/* XXX */
++		int *p;
++		int i;
++		p = kmap_atomic(newpage, KM_USER0);
++		for(i = 0; i < PAGE_SIZE / sizeof(int); i++)
++			p[i] = 0xdeadbeef;
++		kunmap_atomic(p, KM_USER0);
++	}
++		
+ 	lock_page(page);
++	saved_pflags = page->flags;
+ 
+-	if (ops->remap_prepare && ops->remap_prepare(page, fastmode))
++	if (ops->remap_prepare && ops->remap_prepare(page, newpage, fastmode))
+ 		goto radixfail;
+ 	page_map_lock(page);
+ 	if (PageAnon(page) && !PageSwapCache(page))
+@@ -543,6 +612,14 @@
+ 	BUG_ON(mapping != page_mapping(page));
+ 
+ 	ops->remap_copy_page(newpage, page);
++	if (((newpage->flags ^ saved_pflags) &
++	    (1 << PG_mappedtodisk)) ||
++	    ((!(newpage->flags & (1 << PG_dirty))) &&
++	    ((saved_pflags & (1 << PG_dirty))))) {
++		printk("flags: %lx -> %lx\n, %p, %p\n", saved_pflags,
++		    newpage->flags, page, newpage);
++		KDB_ENTER();
++	}
+ 	remap_exchange_pages(page, newpage, mapping);
+ 	if (ops->remap_lru_add_page)
+ 		ops->remap_lru_add_page(newpage, PageActive(page));
+@@ -571,6 +648,8 @@
+ 	return 1;
+ 
+ radixfail:
++	if (PagePrivate(newpage)) /* XXX */
++		BUG();
+ 	unlock_page(page);
+ 	unlock_page(newpage);
+ 	if (ops->remap_stick_page)
+@@ -676,13 +755,9 @@
+ 		page = list_entry(failedp.prev, struct page, lru);
+ 		list_del(&page->lru);
+ 		if (!TestSetPageLocked(page)) {
+-			if (remap_preparepage(page, 10 /* XXX */)) {
+-				unlock_page(page);
+-			} else {
+-				ClearPageLocked(page);	/* XXX */
+-				if (!remap_onepage(page, REMAP_ANYNODE, 0, &remap_ops))
+-					continue;
+-			}
++			ClearPageLocked(page);	/* XXX */
++			if (!remap_onepage(page, REMAP_ANYNODE, 10, &remap_ops))
++				continue;
+ 		}
+ 		spin_lock_irq(&zone->lru_lock);
+ 		if (PageActive(page)) {
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+More majordomo info at  
+http://vger.kernel.org/majordomo-info.html
+Please read the FAQ at  
+http://www.tux.org/lkml/

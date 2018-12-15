@@ -1,0 +1,465 @@
+Date: 05 Sep 2002 16:12:33 -0700
+From: Stephen Hemminger <>
+Subject: [PATCH][2.4.20-pre5] non syscall gettimeofday
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2002/9/5/316
+
+The following patch implements a shared memory interface to allow
+implementing gettimeofday (and other clock measurement) using the TSC
+counter on i386.  On a 1.6G Xeon this reduces gettimeofday from 1.2 us
+per call to .17 us per call.
+The interface is through a /proc/tscinfo that is mmap'd by the library.
+If the kernel doesn't have working TSC and/or has NUMA TSC problems then
+the /proc file will not exist and the library should fall back to a
+syscall.
+Attachments:
+	patch for 2.4.20-pre5
+	sample library routine
+diff -urN -X dontdiff linux-2.4/Documentation/magic-number.txt linux-2.4-vclock/Documentation/magic-number.txt
+--- linux-2.4/Documentation/magic-number.txt	Thu Aug 29 14:31:47 2002
++++ linux-2.4-vclock/Documentation/magic-number.txt	Fri Aug 30 13:37:35 2002
+@@ -97,3 +97,4 @@
+ SLAB_MAGIC_DESTROYED  0xb2f23c5a  kmem_slab_s       mm/slab.c
+ STLI_PORTMAGIC        0xe671c7a1  stliport          include/linux/istallion.h
+ CCB_MAGIC             0xf2691ad2  ccb               drivers/scsi/ncr53c8xx.c
++TSCINFO_MAGIC         0x203854e0  tscinfo           include/linux/tscinfo.h
+diff -urN -X dontdiff linux-2.4/arch/i386/kernel/Makefile linux-2.4-vclock/arch/i386/kernel/Makefile
+--- linux-2.4/arch/i386/kernel/Makefile	Thu Aug 29 14:31:49 2002
++++ linux-2.4-vclock/arch/i386/kernel/Makefile	Fri Aug 30 14:55:50 2002
+@@ -40,5 +40,6 @@
+ obj-$(CONFIG_X86_LOCAL_APIC)	+= mpparse.o apic.o nmi.o
+ obj-$(CONFIG_X86_IO_APIC)	+= io_apic.o acpitable.o
+ obj-$(CONFIG_X86_VISWS_APIC)	+= visws_apic.o
++obj-$(CONFIG_X86_HAS_TSC)	+= tscinfo.o
+ 
+ include $(TOPDIR)/Rules.make
+diff -urN -X dontdiff linux-2.4/arch/i386/kernel/time.c linux-2.4-vclock/arch/i386/kernel/time.c
+--- linux-2.4/arch/i386/kernel/time.c	Thu Aug 29 14:31:49 2002
++++ linux-2.4-vclock/arch/i386/kernel/time.c	Tue Sep  3 13:52:22 2002
+@@ -55,6 +55,7 @@
+ #include <linux/mc146818rtc.h>
+ #include <linux/timex.h>
+ #include <linux/config.h>
++#include <linux/tscinfo.h>
+ 
+ #include <asm/fixmap.h>
+ #include <asm/cobalt.h>
+@@ -70,7 +71,7 @@
+ /* Number of usecs that the last interrupt was delayed */
+ static int delay_at_last_interrupt;
+ 
+-static unsigned long last_tsc_low; /* lsb 32 bits of Time Stamp Counter */
++unsigned long last_tsc_low; /* lsb 32 bits of Time Stamp Counter */
+ 
+ /* Cached *multiplier* to convert TSC counts to microseconds.
+  * (see the equation below).
+@@ -84,6 +85,33 @@
+ 
+ spinlock_t rtc_lock = SPIN_LOCK_UNLOCKED;
+ 
++extern struct timezone sys_tz;
++int use_tsc;
++
++static inline void update_tscinfo(unsigned long usec_delay,
++				  unsigned long lost,
++				  const struct timezone *tz)
++{
++#ifdef CONFIG_X86_HAS_TSC
++	extern struct tsc_info *tscinfo;
++
++	if (use_tsc && tscinfo) {
++		if (lost)
++			usec_delay += lost * (1000000 / HZ);
++	
++		tscinfo->pre_sequence++; 
++		wmb();
++		tscinfo->last_tsc = last_tsc_low;
++		tscinfo->last_tv.tv_usec = usec_delay + xtime.tv_usec;
++		tscinfo->last_tv.tv_sec = xtime.tv_sec;
++		tscinfo->post_sequence++;
++		if (tz)
++			tscinfo->last_tz = *tz;
++		wmb();
++	}
++#endif
++}
++
+ static inline unsigned long do_fast_gettimeoffset(void)
+ {
+ 	register unsigned long eax, edx;
+@@ -309,6 +337,11 @@
+ 	}
+ 
+ 	xtime = *tv;
++
++	update_tscinfo(delay_at_last_interrupt,
++		       jiffies - wall_jiffies, &sys_tz);
++
++
+ 	time_adjust = 0;		/* stop active adjtime() */
+ 	time_status |= STA_UNSYNC;
+ 	time_maxerror = NTP_PHASE_LIMIT;
+@@ -461,7 +494,6 @@
+ #endif
+ }
+ 
+-static int use_tsc;
+ 
+ /*
+  * This is the same as the above, except we _also_ save the current
+@@ -508,10 +540,18 @@
+ 
+ 		count = ((LATCH-1) - count) * TICK_SIZE;
+ 		delay_at_last_interrupt = (count + LATCH/2) / LATCH;
++
++
+ 	}
+  
+ 	do_timer_interrupt(irq, NULL, regs);
+ 
++	/*
++	 * Copy current time sample out to the mmap window
++	 */
++	update_tscinfo(delay_at_last_interrupt,
++		       jiffies - wall_jiffies, NULL);
++
+ 	write_unlock(&xtime_lock);
+ 
+ }
+diff -urN -X dontdiff linux-2.4/arch/i386/kernel/tscinfo.c linux-2.4-vclock/arch/i386/kernel/tscinfo.c
+--- linux-2.4/arch/i386/kernel/tscinfo.c	Wed Dec 31 16:00:00 1969
++++ linux-2.4-vclock/arch/i386/kernel/tscinfo.c	Thu Sep  5 11:28:22 2002
+@@ -0,0 +1,113 @@
++/*
++ *  linux/arch/i386/kernel/tscinfo.c
++ *
++ *  Copyright (C) 2002  by Stephen Hemminger <shemminger@osdl.org>
++ *  based on ideas by Andrea Arcangeli, and Ingo Molnar
++ *
++ *  Propogate kernel time of day and TSC information to allow constructing
++ *  gettimeofday and equivalent functions in user space without
++ *  a system call.
++ *
++ * Changes:
++ */
++
++#include <linux/errno.h>
++#include <linux/module.h>
++#include <linux/sched.h>
++#include <linux/kernel.h>
++#include <linux/proc_fs.h>
++#include <linux/string.h>
++#include <linux/mm.h>
++#include <linux/interrupt.h>
++#include <linux/time.h>
++#include <linux/delay.h>
++#include <linux/init.h>
++#include <linux/smp.h>
++#include <linux/vmalloc.h>
++#include <linux/wrapper.h>
++
++#include <linux/tscinfo.h>
++
++struct tsc_info *tscinfo;
++
++extern unsigned long fast_gettimeoffset_quotient;
++extern unsigned long last_tsc_low;
++extern struct timezone sys_tz;
++extern rwlock_t xtime_lock;
++
++static inline unsigned long kvirt_to_pa(unsigned long adr)
++{
++	unsigned long kva, ret;
++
++	kva = (unsigned long) page_address(vmalloc_to_page((void *)adr));
++	kva |= adr & (PAGE_SIZE-1); /* restore the offset */
++	ret = __pa(kva);
++	return ret;
++}
++
++int tscinfo_mmap(struct file *file, struct vm_area_struct *vma)
++{
++	unsigned long offset = vma->vm_pgoff << PAGE_SHIFT;
++	unsigned long len = vma->vm_end - vma->vm_start;
++	unsigned long pos = (unsigned long) tscinfo + offset;
++
++	if (!tscinfo)
++		return -ENODEV;
++
++	if ((offset + len) > PAGE_ALIGN(sizeof(*tscinfo)))
++		return -ENXIO;
++
++	if ((vma->vm_flags & (VM_SHARED|VM_WRITE)) == (VM_SHARED|VM_WRITE)) {
++		printk("vsyscall: attempt to write to mapping\n");
++		return -EPERM;
++	}
++
++	if (remap_page_range(vma->vm_start, kvirt_to_pa(pos),
++			     len, vma->vm_page_prot))
++		return -EAGAIN;
++
++	return 0;
++}
++
++static struct file_operations tscinfo_operations = {
++	mmap:	tscinfo_mmap,
++};
++
++/* Initialize shared memory area and setup /proc entry  */
++void __init proc_tscinfo_init(void)
++{
++	struct proc_dir_entry *entry;
++	extern int use_tsc;
++	struct tsc_info *t;
++	unsigned long flags;
++	
++	/* not using tsc's for time so don't create entry */
++	if (!use_tsc)
++		return;
++	
++	/* NB: tsc_info will fit on single page */
++	t = (struct tsc_info *) vmalloc(sizeof(struct tsc_info));
++	if (!t)
++		return;
++	
++	/* initial value can be off at first but corrected
++	   on next timer interrupt */
++	read_lock_irqsave(&xtime_lock, flags);
++	t->version_magic = TSCINFO_MAGIC;
++	t->cpu_khz = cpu_khz;
++	t->offset_quotient = fast_gettimeoffset_quotient;
++	
++	t->last_tsc = last_tsc_low;
++	t->last_tv = xtime;
++	t->last_tz = sys_tz;
++	read_unlock_irqrestore(&xtime_lock, flags);
++
++	tscinfo = t;
++
++	entry = create_proc_entry("tscinfo", 0, NULL);
++	if (entry) {
++		entry->proc_fops = &tscinfo_operations;
++		entry->size = (size_t) sizeof(struct tsc_info);
++	}
++}
++
+diff -urN -X dontdiff linux-2.4/fs/proc/root.c linux-2.4-vclock/fs/proc/root.c
+--- linux-2.4/fs/proc/root.c	Thu Aug 29 14:32:08 2002
++++ linux-2.4-vclock/fs/proc/root.c	Fri Aug 30 14:59:10 2002
+@@ -67,6 +67,9 @@
+ #ifdef CONFIG_PPC_RTAS
+ 	proc_rtas_init();
+ #endif
++#ifdef CONFIG_X86_HAS_TSC
++	proc_tscinfo_init();
++#endif
+ 	proc_bus = proc_mkdir("bus", 0);
+ }
+ 
+diff -urN -X dontdiff linux-2.4/include/linux/proc_fs.h linux-2.4-vclock/include/linux/proc_fs.h
+--- linux-2.4/include/linux/proc_fs.h	Fri Aug 30 09:35:48 2002
++++ linux-2.4-vclock/include/linux/proc_fs.h	Tue Sep  3 12:19:20 2002
+@@ -133,6 +133,11 @@
+ extern void proc_rtas_init(void);
+ 
+ /*
++ * i386/tscinfo.c
++ */
++extern void proc_tscinfo_init(void);
++
++/*
+  * PPC64
+  */ 
+ extern void proc_ppc64_init(void);
+diff -urN -X dontdiff linux-2.4/include/linux/tscinfo.h linux-2.4-vclock/include/linux/tscinfo.h
+--- linux-2.4/include/linux/tscinfo.h	Wed Dec 31 16:00:00 1969
++++ linux-2.4-vclock/include/linux/tscinfo.h	Tue Sep  3 13:48:37 2002
+@@ -0,0 +1,23 @@
++#ifndef _LINUX_TSCINFO_H
++#define _LINUX_TSCINFO_H
++/*
++ * Export conversion information between current time and tsc values
++ */
++
++struct tsc_info {
++	unsigned long version_magic;	/* detect interface changes */
++	unsigned long pre_sequence;	/* detect changes while reading */
++	unsigned long post_sequence;
++
++	unsigned long cpu_khz;		/* for TSC calibration */
++	unsigned long offset_quotient;	/* conversion from tsc to usec */
++	
++	unsigned long last_tsc;		/* lsb of TSC at last clock tick */
++
++	struct timeval last_tv;		/* time of day at last clock tick */
++	struct timezone last_tz;	/* timezone */
++};
++
++#define TSCINFO_MAGIC	0x203854e0
++
++#endif /* ugettime.c -- userland alternative to gettimeofday
+   This file is part of "ugettime", a userland alternative to
+   gettimeofday and time system call.
+   This program is free software; you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation; either version 2 of the License, or (at
+   your option) any later version.
+   This program is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+   General Public License for more details.
+   You should have received a copy of the GNU General Public License
+   along with this program; see the file COPYING.  If not, write to the
+   Free Software Foundation, Inc., 59 Temple Place, Suite 330, Boston,
+   MA 02111-1307, USA.  
+*/
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/mman.h>
+#include <sys/time.h>
+#include <sys/fcntl.h>
+#include <sys/syscall.h>
+#include <linux/tscinfo.h>
+static void *mmap_base = NULL;
+struct __xchg_dummy { unsigned long a[100]; };
+#define __xg(x) ((struct __xchg_dummy *)(x))
+static inline unsigned long __cmpxchg(volatile void *ptr, unsigned long old,
+				      unsigned long new, int size)
+{
+	unsigned long prev;
+	switch (size) {
+	case 1:
+		__asm__ __volatile__("lock; cmpxchgb %b1,%2"
+				     : "=a"(prev)
+				     : "q"(new), "m"(*__xg(ptr)), "0"(old)
+				     : "memory");
+		return prev;
+	case 2:
+		__asm__ __volatile__("lock; cmpxchgw %w1,%2"
+				     : "=a"(prev)
+				     : "q"(new), "m"(*__xg(ptr)), "0"(old)
+				     : "memory");
+		return prev;
+	case 4:
+		__asm__ __volatile__("lock; cmpxchgl %1,%2"
+				     : "=a"(prev)
+				     : "q"(new), "m"(*__xg(ptr)), "0"(old)
+				     : "memory");
+		return prev;
+	}
+	return old;
+}
+#define cmpxchg(ptr,o,n)\
+		((__typeof__(*(ptr)))__cmpxchg((ptr),(unsigned long)(o),\
+					(unsigned long)(n),sizeof(*(ptr))))
+/*
+ * Setup shared read-only map of tsc_info data structure
+ * if kernel does not support it then leave mmap_base set to MAP_FAILED
+ */
+static void setup_mmap(void) {
+	int fd;
+	void *base;
+	const long pgsz = sysconf(_SC_PAGE_SIZE);
+	const long mapsz 
+		= (sizeof(struct tsc_info)+(pgsz-1)) &~ (pgsz-1);
+	if ((fd = open("/proc/tscinfo", O_RDONLY)) < 0) 
+		base = MAP_FAILED;
+	else {
+		base = mmap(NULL, mapsz, PROT_READ, MAP_SHARED, fd, 0);
+		close(fd);
+	}
+	/* Atomicaly update mmap,
+	 * so if two threads try to setup
+	 * at same time only one wins.
+	 */
+	if (cmpxchg(&mmap_base, 0, base) != 0) {
+		/* race detected, keep other threads map */
+		if (base != MAP_FAILED) 
+			munmap(base, mapsz);
+	}
+}
+static inline const struct tsc_info *get_mmap(void)
+{
+	if (!mmap_base) 
+		setup_mmap();
+	if (mmap_base == MAP_FAILED ||
+	    *(unsigned long *) mmap_base != TSCINFO_MAGIC) {
+		return NULL;
+	}
+	return (const struct tsc_info *) mmap_base;
+}
+/* Read TSC register */
+#define rdtsc(low,high) \
+     __asm__ __volatile__("rdtsc" : "=a" (low), "=d" (high))
+#define mb() 	__asm__ __volatile__ ("lock; addl $0,0(%%esp)": : :"memory")
+#define rmb()	mb()
+static inline unsigned long gettimeoffset(unsigned long last_tsc,
+					  unsigned long fast_quotient)
+{
+	register unsigned long tsc_lo, tsc_hi;
+	rdtsc(tsc_lo, tsc_hi);
+	tsc_lo -= last_tsc;
+	/*
+	 * Time offset = (tsc_low delta) * fast_gettimeoffset_quotient
+	 *             = (tsc_low delta) * (usecs_per_clock)
+	 *             = (tsc_low delta) * (usecs_per_jiffy / clocks_per_jiffy)
+	 *
+	 * Using a mull instead of a divl saves up to 31 clock cycles
+	 * in the critical path.
+	 */
+			
+	__asm__("mull %2"
+		:"=a" (tsc_lo), "=d" (tsc_hi)
+		:"rm" (fast_quotient),
+		"0" (tsc_lo));
+	return tsc_hi;
+}
+int
+gettimeofday (struct timeval *tv, struct timezone *tz)
+{
+	const struct tsc_info *	tsci = get_mmap();
+	
+	if (!tsci)
+		return syscall(SYS_gettimeofday,tv, tz);
+	if (tv) {
+		unsigned long seq, sec, usec;
+		/* must check to see if clock ticked */
+		do {
+			seq = tsci->pre_sequence;
+			usec = gettimeoffset(tsci->last_tsc, 
+					     tsci->offset_quotient);
+			sec = tsci->last_tv.tv_sec;
+			usec += tsci->last_tv.tv_usec;
+		
+			rmb();
+		} while (tsci->post_sequence != seq);
+		
+		while (usec >= 1000000) {
+			usec -= 1000000;
+			sec++;
+		}
+		tv->tv_usec = usec;
+		tv->tv_sec = sec;
+	}
+	if (tz) {
+		*tz = tsci->last_tz;
+	}
+		
+	return 0;
+}
+time_t
+time (time_t *t)
+{
+	const struct tsc_info *	tsci = get_mmap();
+	time_t now;
+	if (!tsci)
+		return syscall(SYS_time,t);
+	now = tsci->last_tv.tv_sec;
+	if (t)
+		*t = now;
+	return (time_t) now;
+}

@@ -1,0 +1,119 @@
+Date: Thu, 9 Mar 2000 12:21:50 +0100 (CET)
+From: Andrea Arcangeli <>
+Subject: Re: new IRQ scalability changes in 2.3.48
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/3/13/74
+
+On Mon, 13 Mar 2000 yodaiken@fsmlabs.com wrote:
+>> do have an assert in schedule() so it's plain impossible. The lowlatency
+>> patch simply works by increasing the effective frequency (occurance) of
+>> rescheduling (preemption) points [without actually rescheduling more
+>> often].
+>
+>This is too subtle for me. I don't know how you can make true 
+>the first 2 things without having the third be false.
+I think Ingo meant "without rescheduling more often than what we expected
+while looking the scheduler code".
+The lowlatency patch simply adds the equivalent of:
+	if (current->need_resched)
+		schedule();
+in places that are used to run for a long time without rescheduling
+in-between. This way the scheduler decisions gets effective immediatly
+and not after the lots of time.
+>> Having said this, i now do agree that doing a preemptible kernel (which
+>> the Linux SMP kernel could become with a small amount of work) is a
+>> superior solution to this, wrt. latencies.
+Ingo, how do you plan to handle the by-hand locks? You can trivially
+forbid rescheduling as soon as you have a spin_lock() held, but how do you
+handle code that uses a spinlock to serialize the accesses to a lock?
+Suppose this is the kernel code (it's silly code I know but it's just to
+give you the idea of what we'll get wrong):
+	static int lock;
+  again:
+	while (lock);
+	spin_lock(&serialize_me);
+	if (lock) {
+		spin_unlock(&serialize_me);
+		goto again;
+	}
+	lock = 1;
+	spin_unlock(&serialize_me);
+	mb();
+	do stuff
+	-------------------- rescheduled by preemptive kernel
+	mb();
+	lock = 0;
+Another task grabs the lock while the task that is holding the lock is
+been rescheduled, and so the other task hangs in while(lock); for
+200msec!! This means very bad performance. So there may be very bad
+performance side effects all over the place in making the kernel
+preemptable. The whole section should be marked as non preemptable or the
+first while(lock); should be replaced with while(lock) if
+(current->need_resched) schedule(). With a non preemptable kernel the
+schedule() wasn't necessary for good performance because the behaviour we
+wanted was not to reschedule and we known if somebody was helding the
+lock, that lock was going to be released very soon (faster than a
+reschedule). And running the critical section without reschedule in
+between is also the right thing to do for most fast locks to avoid
+wasting CPU in poing pongs in the scheduler.
+And since most of the stuff needs some kind of serialization it also mean
+for most of syscalls you are going to reschedule in the ret_from_syscall
+stage anyway as now.
+I think one of the only interesting places for the preemtable kernel is
+copy user stuff that will effectivly be rescheduled as soon as it's
+necessary.
+>Well, to start, it would violate Linus' rule, an old UNIX rule, and your
+>new IRQ scheme makes it more complex -- you have to make sure to not
+>switch out of tasks that are handling unacked interrupts. 
+The irq scheme is not involved at all (except we would have to forbid the
+try-to-reschedule in the case we got an interrupt nested in another irq as
+we now we are forbidding the reschedule if the irq happened on top of
+kernel code).
+>I don't know how to trade throughput for latency without losing throughput.
+With the fact we'll have to bloat the fast path (a fast lock like the
+above one and all the spinlocks will need an additional
+forbid_preempt(smp_processor_id()) the preemtable kernel it's not likely
+to be a win.
+The latency will decrease without drpping throughtput only in code that
+runs for long time with none lock held like the copy_user stuff. That
+stuff will run at the same speed as now but with zero scheduler latency.
+The _lose_ instead will happen in _all_ the code that grabs any kind of
+spinlock because spin_lock/spin_unlock will be slower and the latency
+won't decrease for that stuff.
+But now by thinking at that stuff I have an idea! Why instead of making
+the kernel preemtable we take the other way around? So why instead of
+having to forbid scheduling in locked regions, we don't simply allow
+rescheduling in some piece of code that we know that will benefit by the
+preemtable thing?
+The kernel won't be preemtable this way (so we'll keep throughtput in the
+locking fast path) but we could mark special section of kernel like the
+copy user as preemtable.
+It will be quite easy:
+static atomic_t cpu_preemtable[NR_CPUS] = { [0..NR_CPUS] = ATOMIC_INIT(0), };
+#define preemtable_copy_user(...) \
+do { \
+	atomic_inc(&cpu_preemtable[smp_processor_id()]); \
+	copy_user(...); \
+	atomic_dec(&cpu_preemtable[smp_processor_id()]); \
+} while (0)
+Then the only thing we'll have to change is the irq return path where we
+now are are doing:
+	if (we are _not_ running on top of the kernel)
+		reschedule();
+Now it will have to be:
+	if (we are _not_ running on top of the kernel ||
+						      ^^
+	    atomic_read(&cpu_preemtable[smp_processor_id()]))
+	    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+		reschedule();
+That's all. Then we'll have copu_user preemtable with a few lines of
+changes. I'll try that immediatly :).
+Andrea
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

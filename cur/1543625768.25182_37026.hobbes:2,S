@@ -1,0 +1,116 @@
+Date: Mon, 25 Mar 2002 15:46:23 +1100
+From: Rusty Russell <>
+Subject: Re: [PATCH] Futexes IV (Fast Lightweight Userspace Semaphores)
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2002/3/24/140
+
+On Mon, 25 Mar 2002 13:28:44 +1100
+Rusty Russell <rusty@rustcorp.com.au> wrote:
+> So the summary is: futexes not sufficient to implement pthreads
+> locking.
+So let's go back to the more generic "exporting waitqueues to userspace" idea,
+with a twist: we use a userspace address as the identifier on the waitq, which
+gives us a unique identifier, but the kernel never actually derefs the
+pointer.  (And in my prior kernel code I optimized it so that waking did an
+implicit remove; not sure it's a win, so assumed that was removed here).
+This gives code as below (Peter, Martin, please check):
+/* Assume we have the following operations:
+   uwaitq_add(void *uaddr);
+   uwaitq_remove(void *uaddr);
+   uwaitq_wake(void *uaddr, int wake_all_flag);
+   uwaitq_wait(relative timeout);
+*/
+typedef struct
+{
+	int counter;
+} pthread_mutex_t;
+typedef struct 
+{
+	int condition;
+} pthread_cond_t;
+typedef struct
+{
+	unsigned int num_left;
+	unsigned int initial_count;
+} pthread_barrier_t;
+#define PTHREAD_MUTEX_INITIALIZER { { 1 } }
+#define PTHREAD_COND_INITIALIZER { 0, { 0 }, { 0 } }
+int pthread_barrier_init(struct pthread_barrier_t *barrier,
+			 void *addr,
+			 unsigned int count)
+{
+	barrier->num_left = barrier->initial_count = count;
+}
+int pthread_barrier_wait(struct pthread_barrier_t *barrier)
+{
+	/* Use barrier address as uwaitq id. */
+	uwaitq_add(barrier);
+	if (atomic_dec_and_test(&barrier->num_left)) {
+		/* Restore barrier. */
+		barrier->num_left = barrier->initial_count;
+		/* Wake the other threads */
+		uwaitq_wake(barrier, 1 /* WAKE_ALL */);
+		uwaitq_remove(barrier);
+		return 0; /* PTHREAD_BARRIER_SERIAL_THREAD */
+	}
+	while (uwaitq_wait(NULL) == 0 || errno == EINTR);
+	uwaitq_remove(barrier);
+	return 1;
+}
+int pthread_cond_signal(pthread_cond_t *cond)
+{
+	return uwaitq_wake(cond, 0 /* WAKE_ONE */);
+}
+int pthread_cond_broadcast(pthread_cond_t *cond)
+{
+	return uwaitq_wake(cond, 1 /* WAKE_ALL */);
+}
+static int __pthread_cond_wait(pthread_cond_t *cond,
+			       pthread_mutex_t *mutex,
+			       const struct timespec *reltime)
+{
+	int ret;
+	uwaitq_add(cond);
+	futex_up(&mutex, 1);
+	while ((ret = uwaitq_wait(reltime)) == 0 || errno == EINTR);
+	uwaitq_remove(cond);
+	futex_down(&mutex, NULL);
+	return ret;
+}
+int pthread_cond_wait(pthread_cond_t *cond, pthread_mutex_t *mutex)
+{
+	return __pthread_cond_wait(cond, mutex, NULL);
+}
+int pthread_cond_timedwait(pthread_cond_t *cond,
+			   pthread_mutex_t *mutex,
+			   const struct timespec *abstime)
+{
+	struct timeval _now;
+	struct timespec now, rel;
+	/* Absolute to relative */
+	gettimeofday(&_now, NULL);
+	TIMEVAL_TO_TIMESPEC(&_now, &now);
+	if (now.tv_sec > abstime->tv_sec
+	    || (now.tv_sec == abstime->tv_sec
+		&& now.tv_nsec > abstime->tv_nsec))
+		return ETIMEDOUT;
+	rel.tv_sec = now.tv_sec - abstime->tv_sec;
+	rel.tv_nsec = now.tv_usec - abstime->tv_usec;
+	if (rel.tv_nsec < 0) {
+		--rel.tv_sec;
+		rel.tv_nsec += 1000000000;
+	}
+	return __pthread_cond_wait(cond, mutex, &rel);
+}
+-- 
+  Anyone who quotes me in their sig is an idiot. -- Rusty Russell.
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+More majordomo info at  
+http://vger.kernel.org/majordomo-info.html
+Please read the FAQ at  
+http://www.tux.org/lkml/

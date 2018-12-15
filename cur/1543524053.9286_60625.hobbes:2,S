@@ -1,0 +1,131 @@
+Date: Sun, 30 Jan 2000 19:09:00 +1100
+From: Keith Owens <>
+Subject: Please review all modules for unload races
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/1/30/27
+
+Would kernel developers and maintainers please review all of their code
+that can be loaded as a module.  There are two requirements for module
+code which AFAICT have never been explicitly documented, consider this
+mail to be that missing documentation.  Unfortunately some code is
+violating these requirements and is open to races which is why I need
+everybody to review and verify that their module code is correct.
+First the requirements for modules then the task list.
+Coding requirements for modules to avoid unload races.
+(1) All code and structures that are exported from a module must be
+    protected by the big kernel lock, either directly or indirectly.
+    The routines that load and unload modules run under the big kernel
+    lock and if the data they manipulate is not similarly protected
+    then modules can be unloaded because they appear to be not in use
+    even when they are being used.
+    (a) Code and structures can be explicitly exported via
+        EXPORT_SYMBOL.  Access to these symbols is controlled by the
+        sys_init_module() and sys_delete_module() routines, both of
+        which hold the big kernel lock while they adjust symbol
+        reference counts.  Anything accessed via EXPORT_SYMBOL is
+        automatically safe, provided that the higher level modules that
+        access those symbols are also safe.
+    (b) Code and structures can also be implicitly exported when they
+        are passed to a register_service() routine.  For these symbols,
+        there is no automatic guarantee of locking, instead we have to
+        rely on correct coding techniques to preserve code and data
+        integrity.
+        The big kernel lock protection can be direct or indirect.
+        Direct protection is when the code holds the kernel lock while
+        it runs.  For example, sys_open for foo does kernel_lock(),
+        foo_open(), kernel_unlock().  Anything that foo_open() does is
+        atomic wrt module loading and unloading, *** but only when
+        foo_open() is coded according to requirement 2 ***.
+        Some routines do not run under the kernel lock, usually because
+        it would cause too much contention.  Instead the code requires
+        a kernel token of some kind and that token can only be obtained
+        from code that was protected (directly or indirectly) by the
+        big kernel lock.  Indirect protection relies on the routine
+        that provides the token also doing MOD_INC_USE_COUNT for every
+        token it gives out.
+        For example, read and write do not get the kernel lock.  These
+        routines can only be called with a valid file descriptor, that
+        fd comes from open which runs under the big lock.  The open
+        routine does MOD_INC_USE_COUNT for every fd it assigns, the
+        close routine does MOD_DEC_USE_COUNT for each fd that is
+        retired.
+        Only when the module use count is zero can the module be
+        unloaded.  The module use count has the same effect wrt module
+        loading and unloading as the big kernel lock but it allows code
+        to run without incurring the contention that the big kernel
+        lock would generate.
+(2) The big kernel lock is automatically released when a process sleeps
+    in the kernel and is automatically reacquired on reschedule if the
+    process had the lock originally.  Any code that can be compiled as
+    a module and is entered with the big kernel lock held *MUST*
+    increment the use count to activate the indirect module protection
+    before doing anything that might sleep.
+    In practice, this means that all routines that live in modules and
+    are invoked under the big kernel lock should do MOD_INC_USE_COUNT
+    as their very first action.  And all failure paths from that
+    routine must do MOD_DEC_USE_COUNT before returning.
+    Many modules are violating this requirement by doing work that can
+    sleep before they issue MOD_INC_USE_COUNT, this code leaves itself
+    open to races.  For example, this code is wrong
+	static int open_foo(struct inode *inode, struct file *file)
+	{
+		if (request_irq(FOO_IRQ, foo_interrupt, 0, "FOO", NULL))
+			return -EBUSY;
+		MOD_INC_USE_COUNT;
+		return 0;
+	}
+    request_irq calls kmalloc(,GFP_KERNEL) which can sleep.  While it
+    is sleeping, open_foo loses the kernel lock, allowing other
+    routines such as delete_module to run.  The module use count has
+    not been incremented yet so as far as delete_module is concerned,
+    the foo module is not in use and can be removed.  But request_irq
+    will eventually return into the foo module after the module has
+    been deleted - Oops.  The code must be rewritten this way
+	static int open_foo(struct inode *inode, struct file *file)
+	{
+		MOD_INC_USE_COUNT;	/* must be first */
+		if (request_irq(FOO_IRQ, foo_interrupt, 0, "FOO", NULL)) {
+			MOD_DEC_USE_COUNT;	/* failure path */
+			return -EBUSY;
+		}
+		return 0;
+	}
+    This is the only way to ensure that the code is protected by the
+    big kernel lock all the way through and therefore cannot be removed
+    in mid flight.  This protection can be direct (holds the lock) or
+    indirect (module has a non-zero use count) but the indirect
+    protection (increment the use count) *MUST* be activated before
+    doing anything that can sleep.
+The task list.
+Find all the module routines that are
+  * called from outside the module and
+  * are accessed via register_xxx (ignore EXPORT_SYMBOLs) and
+  * do not require kernel tokens to run.
+Typical routines are open, statfs and socket, basically anything that
+takes a "name" instead of a "fd".
+(1) Make sure that all these routines are invoked under the big kernel
+    lock.  In most cases this is already being done, e.g. sys_open and
+    sys_statfs grab the lock before calling the module routine.
+    Unfortunately sys_socket does not get the big kernel lock which
+    means that any module routines called from socket are unsafe wrt
+    module unloading.  For example, sys_socket -> sock_create ->
+    inet6_create is unsafe when IPv6 is a module - yes, I know that v6
+    does not really work as a module but the attempt was made and there
+    are still bits of module code in af_inet6.c.  Other socket based
+    modules are also open to races in this area, is their any reason
+    that sock_create does not do lock_kernel() around the calls to the
+    network family create routine?
+(2) Make sure that the first thing these module routines do is
+    MOD_INC_USE_COUNT and that all failure paths do MOD_DEC_USE_COUNT.
+    This check is particularly important because many modules have been
+    incorrectly coded on the assumption that MOD_INC_USE_COUNT can be
+    delayed until the end of the routine.
+Keith Owens, modules maintainer
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

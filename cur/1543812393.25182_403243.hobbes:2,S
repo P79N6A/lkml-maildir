@@ -1,0 +1,143 @@
+Date: Fri, 3 Mar 2006 13:51:14 -0800
+From: Benjamin LaHaise <>
+Subject: Re: Memory barriers and spin_unlock safety
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2006/3/3/229
+
+On Fri, Mar 03, 2006 at 01:34:17PM -0800, Linus Torvalds wrote:
+> Indeed. I think smp_wmb() should be a compiler fence only on x86(-64), ie 
+> just compile to a "barrier()" (and not even that on UP, of course).
+Actually, no.  At least in testing an implementation of Dekker's and 
+Peterson's algorithms as a replacement for the locked operation in 
+our spinlocks, it is absolutely necessary to have an sfence in the lock 
+to ensure the lock is visible to the other CPU before proceeding.  I'd 
+use smp_wmb() as the fence is completely unnecessary on UP and is even 
+irq-safe.  Here's a copy of the Peterson's implementation to illustrate 
+(it works, it's just slower than the existing spinlocks).
+		-ben
+diff --git a/include/asm-x86_64/spinlock.h b/include/asm-x86_64/spinlock.h
+index fe484a6..45bd386 100644
+--- a/include/asm-x86_64/spinlock.h
++++ b/include/asm-x86_64/spinlock.h
+@@ -4,6 +4,8 @@
+ #include <asm/atomic.h>
+ #include <asm/rwlock.h>
+ #include <asm/page.h>
++#include <asm/pda.h>
++#include <asm/processor.h>
+ #include <linux/config.h>
+ 
+ /*
+@@ -18,50 +20,53 @@
+  */
+ 
+ #define __raw_spin_is_locked(x) \
+-		(*(volatile signed int *)(&(x)->slock) <= 0)
+-
+-#define __raw_spin_lock_string \
+-	"\n1:\t" \
+-	"lock ; decl %0\n\t" \
+-	"js 2f\n" \
+-	LOCK_SECTION_START("") \
+-	"2:\t" \
+-	"rep;nop\n\t" \
+-	"cmpl $0,%0\n\t" \
+-	"jle 2b\n\t" \
+-	"jmp 1b\n" \
+-	LOCK_SECTION_END
+-
+-#define __raw_spin_unlock_string \
+-	"movl $1,%0" \
+-		:"=m" (lock->slock) : : "memory"
++		((*(volatile signed int *)(x) & ~0xff) != 0)
+ 
+ static inline void __raw_spin_lock(raw_spinlock_t *lock)
+ {
+-	__asm__ __volatile__(
+-		__raw_spin_lock_string
+-		:"=m" (lock->slock) : : "memory");
++	int cpu = read_pda(cpunumber);
++
++	barrier();
++	lock->flags[cpu] = 1;
++	lock->turn = cpu ^ 1;
++	barrier();
++
++	asm volatile("sfence":::"memory");
++
++	while (lock->flags[cpu ^ 1] && (lock->turn != cpu)) {
++		cpu_relax();
++		barrier();
++	}
+ }
+ 
+ #define __raw_spin_lock_flags(lock, flags) __raw_spin_lock(lock)
+ 
+ static inline int __raw_spin_trylock(raw_spinlock_t *lock)
+ {
+-	int oldval;
+-
+-	__asm__ __volatile__(
+-		"xchgl %0,%1"
+-		:"=q" (oldval), "=m" (lock->slock)
+-		:"0" (0) : "memory");
+-
+-	return oldval > 0;
++	int cpu = read_pda(cpunumber);
++	barrier();
++	if (__raw_spin_is_locked(lock))
++		return 0;
++
++	lock->flags[cpu] = 1;
++	lock->turn = cpu ^ 1;
++	asm volatile("sfence":::"memory");
++
++	if (lock->flags[cpu ^ 1] && (lock->turn != cpu)) {
++		lock->flags[cpu] = 0;
++		barrier();
++		return 0;
++	}
++	return 1;
+ }
+ 
+ static inline void __raw_spin_unlock(raw_spinlock_t *lock)
+ {
+-	__asm__ __volatile__(
+-		__raw_spin_unlock_string
+-	);
++	int cpu;
++	//asm volatile("lfence":::"memory");
++	cpu = read_pda(cpunumber);
++	lock->flags[cpu] = 0;
++	barrier();
+ }
+ 
+ #define __raw_spin_unlock_wait(lock) \
+diff --git a/include/asm-x86_64/spinlock_types.h b/include/asm-x86_64/spinlock_types.h
+index 59efe84..a409cbf 100644
+--- a/include/asm-x86_64/spinlock_types.h
++++ b/include/asm-x86_64/spinlock_types.h
+@@ -6,10 +6,11 @@
+ #endif
+ 
+ typedef struct {
+-	volatile unsigned int slock;
++	volatile unsigned char turn;
++	volatile unsigned char flags[3];
+ } raw_spinlock_t;
+ 
+-#define __RAW_SPIN_LOCK_UNLOCKED	{ 1 }
++#define __RAW_SPIN_LOCK_UNLOCKED	{ 0, { 0, } }
+ 
+ typedef struct {
+ 	volatile unsigned int lock;
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+More majordomo info at  
+http://vger.kernel.org/majordomo-info.html
+Please read the FAQ at  
+http://www.tux.org/lkml/

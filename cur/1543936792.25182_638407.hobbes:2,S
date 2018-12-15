@@ -1,0 +1,142 @@
+Date: Tue, 15 Jan 2008 10:45:47 +0900
+From: KOSAKI Motohiro <>
+Subject: [RFC] mmaped copy too slow?
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2008/1/14/491
+
+Hi
+at one point, I found the large file copy speed was different depending on
+the copy method.
+I compared below method
+ - read(2) and write(2).
+ - mmap(2) x2 and memcpy.
+ - mmap(2) and write(2).
+in addition, effect of fadvice(2) and madvice(2) is checked.
+to a strange thing, 
+   - most faster method is read + write + fadvice.
+   - worst method is mmap + memcpy.
+some famous book(i.e. Advanced Programming in UNIX Environment 
+by W. Richard Stevens) written mmap copy x2 faster than read-write.
+but, linux doesn't.
+and, I found bottleneck is page reclaim.
+for comparision, I change page reclaim function a bit. and test again.
+test machine:
+   CPU:      Pentium4 with HT 2.8GHz
+   memory:   512M
+   Disk I/O: can about 20M/s transfer.
+             (in other word, 1GB transfer need 50s at ideal state)
+spent time of 1GB file copy.(unit is second)
+                 2.6.24-rc6    2.6.24-rc6       ratio
+                               +my patch        (small is faster)
+    ------------------------------------------------------------
+    rw_cp             59.32       58.60          98.79%
+    rw_fadv_cp        57.96       57.96          100.0%
+    mm_sync_cp        69.97       61.68          88.15%
+    mm_sync_madv_cp   69.41       62.54          90.10%
+    mw_cp             61.69       63.11         102.30%
+    mw_madv_cp        61.35       61.31          99.93%
+this patch is too premature and ugly.
+but I think that there is enough information to discuss to 
+page reclaim improvement. 
+the problem is when almost page is mapped and PTE access bit on,
+page reclaim process below steps.
+  1) page move to inactive list -> active list
+  2) page move to active list   -> inactive list
+  3) really pageout
+It is too roundabout and unnecessary memory pressure happend.
+if you don't mind, please discuss.
+Signed-off-by: KOSAKI Motohiro <kosaki.motohiro@jp.fujitsu.com>
+---
+ mm/vmscan.c |   46 +++++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 43 insertions(+), 3 deletions(-)
+Index: linux-2.6.24-rc6-cp3/mm/vmscan.c
+===================================================================
+--- linux-2.6.24-rc6-cp3.orig/mm/vmscan.c	2008-01-13 21:58:03.000000000 +0900
++++ linux-2.6.24-rc6-cp3/mm/vmscan.c	2008-01-13 22:30:27.000000000 +0900
+@@ -446,13 +446,18 @@ static unsigned long shrink_page_list(st
+ 	struct pagevec freed_pvec;
+ 	int pgactivate = 0;
+ 	unsigned long nr_reclaimed = 0;
++	unsigned long nr_scanned = 0;
++	LIST_HEAD(l_mapped_pages);
++	unsigned long nr_mapped_page_activate = 0;
++	struct page *page;
++	int reference_checked = 0;
+ 
+ 	cond_resched();
+ 
+ 	pagevec_init(&freed_pvec, 1);
++retry:
+ 	while (!list_empty(page_list)) {
+ 		struct address_space *mapping;
+-		struct page *page;
+ 		int may_enter_fs;
+ 		int referenced;
+ 
+@@ -466,6 +471,7 @@ static unsigned long shrink_page_list(st
+ 
+ 		VM_BUG_ON(PageActive(page));
+ 
++		nr_scanned++;
+ 		sc->nr_scanned++;
+ 
+ 		if (!sc->may_swap && page_mapped(page))
+@@ -493,11 +499,17 @@ static unsigned long shrink_page_list(st
+ 				goto keep_locked;
+ 		}
+ 
+-		referenced = page_referenced(page, 1);
+-		/* In active use or really unfreeable?  Activate it. */
+-		if (sc->order <= PAGE_ALLOC_COSTLY_ORDER &&
+-					referenced && page_mapping_inuse(page))
+-			goto activate_locked;
++		if (!reference_checked) {
++			referenced = page_referenced(page, 1);
++			/* In active use or really unfreeable?  Activate it. */
++			if (sc->order <= PAGE_ALLOC_COSTLY_ORDER &&
++			    referenced && page_mapping_inuse(page)) {
++				nr_mapped_page_activate++;
++				unlock_page(page);
++				list_add(&page->lru, &l_mapped_pages);
++				continue;
++			}
++		}
+ 
+ #ifdef CONFIG_SWAP
+ 		/*
+@@ -604,7 +616,31 @@ keep:
+ 		list_add(&page->lru, &ret_pages);
+ 		VM_BUG_ON(PageLRU(page));
+ 	}
++
++	if (nr_scanned == nr_mapped_page_activate) {
++		/* may be under copy by mmap.
++		   ignore reference flag. */
++		reference_checked = 1;
++		list_splice(&l_mapped_pages, page_list);
++		goto retry;
++	} else {
++		/* move active list just now */
++		while (!list_empty(&l_mapped_pages)) {
++			page = lru_to_page(&l_mapped_pages);
++			list_del(&page->lru);
++			prefetchw_prev_lru_page(page, &l_mapped_pages, flags);
++
++			if (!TestSetPageLocked(page)) {
++				SetPageActive(page);
++				pgactivate++;
++				unlock_page(page);
++			}
++			list_add(&page->lru, &ret_pages);
++		}
++	}
++
+ 	list_splice(&ret_pages, page_list);
++
+ 	if (pagevec_count(&freed_pvec))
+ 		__pagevec_release_nonlru(&freed_pvec);
+ 	count_vm_events(PGACTIVATE, pgactivate);
+[unhandled content-type:application/octet-stream][unhandled content-type:application/octet-stream][unhandled content-type:application/octet-stream][unhandled content-type:application/octet-stream][unhandled content-type:application/octet-stream]

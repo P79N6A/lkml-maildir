@@ -1,0 +1,93 @@
+Date: Fri, 27 Feb 2004 16:09:21 -0600 (CST)
+From:  olof@austin ...
+Subject: [PATCH] NULL pointer deref in tcp_do_twkill_work()
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2004/2/27/275
+
+This bug has been encountered before (ref 
+http://bugme.osdl.org/show_bug.cgi?id=1627
+),
+but that time it went away by itself. We're now seeing it again with
+another heavy network load on 2.6.3.
+Recap:
+We're crashing in tcp_do_twkill_work():
+        tw_for_each_inmate(tw, node, safe,
+                           &tcp_tw_death_row[slot]) {
+                __tw_del_dead_node(tw);
+                spin_unlock(&tw_death_lock);
+                tcp_timewait_kill(tw);
+                tcp_tw_put(tw);
+                killed++;
+                spin_lock(&tw_death_lock);
+                if (killed > quota) {
+                        ret = 1;
+                        break;
+                }
+        }
+The crash is in __tw_del_dead_node, where tw is taken off of the
+tw_death_node list. At the time of the crash, the pprev list pointer is
+NULL, which indicates that tw is no longer on the list.
+I'm suspicious of the fact that the tw_death_lock is released, and since
+it's released, the "safe" inmate could be descheduled on another CPU. Once
+the lock is reaquired and the loop is redone, the new tw (old safe) is
+now already taken off the list so we go astray.
+Shouldn't the loop always restart from the beginning instead of using the
+(not thread-)"safe" list iteration? Since it keeps taking the entries off
+the list, the behaviour should be identical but it wouldn't be racy.
+The alternative is to not drop the lock, but I'm guessing we need to do
+that to avoid deadlocks. I don't know the TCP code well enough to tell for
+sure.
+Proposed patch is attached. We've given it a bit of runtime here but the
+crashes happen randomly so it'll take a while to gain full confidence that
+it's fixed. But the above reasoning around the patch seems to make sense.
+Thanks,
+Olof
+Olof Johansson                                        Office: 4E002/905
+Linux on Power Development                            IBM Systems Group
+Email: olof@austin.ibm.com                          Phone: 512-838-9858
+All opinions are my own and not those of IBM
+--- net/ipv4/tcp_minisocks.c.orig	2004-02-27 13:43:11.000000000 -0600
++++ net/ipv4/tcp_minisocks.c	2004-02-27 15:21:18.318890672 -0600
+@@ -427,9 +427,7 @@ static u32 twkill_thread_slots;
+ static int tcp_do_twkill_work(int slot, unsigned int quota)
+ {
+ 	struct tcp_tw_bucket *tw;
+-	struct hlist_node *node, *safe;
+ 	unsigned int killed;
+-	int ret;
+ 
+ 	/* NOTE: compare this to previous version where lock
+ 	 * was released after detaching chain. It was racy,
+@@ -438,25 +436,21 @@ static int tcp_do_twkill_work(int slot, 
+ 	 * soft irqs are not sequenced.
+ 	 */
+ 	killed = 0;
+-	ret = 0;
+-	tw_for_each_inmate(tw, node, safe,
+-			   &tcp_tw_death_row[slot]) {
++	while (killed <= quota &&
++	       !hlist_empty(&tcp_tw_death_row[slot])) {
++		tw = hlist_entry(tcp_tw_death_row[slot].first, struct tcp_tw_bucket, tw_death_node);
+ 		__tw_del_dead_node(tw);
+ 		spin_unlock(&tw_death_lock);
+ 		tcp_timewait_kill(tw);
+ 		tcp_tw_put(tw);
+ 		killed++;
+ 		spin_lock(&tw_death_lock);
+-		if (killed > quota) {
+-			ret = 1;
+-			break;
+-		}
+ 	}
+ 
+ 	tcp_tw_count -= killed;
+ 	NET_ADD_STATS_BH(TimeWaited, killed);
+ 
+-	return ret;
++	return killed > quota;
+ }
+ 
+ static void tcp_twkill(unsigned long dummy)

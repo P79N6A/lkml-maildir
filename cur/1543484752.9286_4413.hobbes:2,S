@@ -1,0 +1,109 @@
+Date: Sat, 6 Feb 1999 17:57:45 -0800 (PST)
+From: Linus Torvalds <>
+Subject: Re: Linux-2.2.2-pre2..
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/2/6/115
+
+On Sat, 6 Feb 1999, Alexander Viro wrote:
+> 
+> It means that either you've got a struct file leak or something is playing
+> bad games with filp->private_data. In theory it may be any other subsystem
+> using the same field. IIRC tty code more or less blindly assumes that
+> meaningful value in private_data means that we have a tty-related struct
+> file. Potential candidates: AFFS, CODA(?), drivers/net/cosa.c(?), ISDN,
+> APM(?), MTRR(?). Do you have any of those beasts?
+No, I don't think he needs any of those beasts.
+My theory on why it happens (which is just a theory, mind you, but I feel
+better about having a theory, and I have a fairly simple patch to try out
+that I sent out just a moment ago) is as follows:
+ - CPU#1 closes the master side of a pty pair, and as a result does a
+   "tty_hangup()" on the slave side. "tty_hangup()" is really designed for
+   use of asynchronous events (ie called from interrupt handlers), and
+   as such won't actually do the hangup event itself, because an interrupt
+   handler cannot muck around with major kernel data structures. 
+   So what "tty_hangup()" does, is to just queue the hangup, along with
+   the tty pointer. The _actual_ hangup will be done the next time we do a
+   reschedule which forces the tq_immediate queue to be executed.
+ - CPU#1 closes the slave side on the pty pair, immediately after closing
+   the master.
+ - CPU#2 is in the scheduler, and happens to find the tq_immediate thing,
+   and starts executing it. However, the first thing the hangup thing will
+   do is to aquire the kernel lock (because now we're _really_ going to
+   hang up, we're not in a interrupt context any more, and we can do
+   whatever we want, including locking things down)
+   CPU#2 blocks, because CPU#1 is still busy doing the actual close thing. 
+ - in the meantime CPU#1 has (correctly) decided that both the master and
+   the slave have closed, and is going to do a "release_mem()" to actually
+   free up the memory for the tty data structures. Before it does the
+   relese_mem, though, it wants to flush all tty task queues, becuase it
+   doesn't want to leave any pending events on the tty's that are going
+   away: 
+        /*
+         * Make sure that the tty's task queue isn't activated.
+         */
+        run_task_queue(&tq_timer);
+        run_task_queue(&tq_scheduler);
+        /*
+         * The release_mem function takes care of the details of clearing
+         * the slots and preserving the termios structure.
+         */
+        release_mem(tty, idx);
+   The above works beautifully on an UP box, but on an SMP box there won't
+   be any task queues to be run, but there _is_ a pending (and now stale)
+   task queue sitting on the other CPU. That won't be found by the above
+   code, because it's no longer on the task queues itself - it has been
+   run, but is busy. 
+   So CPU#1 releases all tty information, and returns. As part of
+   returning from the system call, it releases the kernel lock.
+ - CPU#2 unblocks, and now tries to do a hangup() on a tty that has been
+   free'd. BOOM.
+Anyway, I think the above explains it, and it also explains why you get
+random corruption and strange behaviour - we're using a tty pointer that
+really doesn't exist any more. It also explains why this only happens on
+SMP, even though every single piece of code is protected by the kernel
+lock.
+(Lesson of the day: even having a kernel lock _everywhere_ is not
+necessarily good enough, if you pass data around from one lock to another
+without references or similar - there won't be any concurrency, but the
+data can be stale even so).
+The patch I sent out (and here it is appended again) is completely
+untested, and may not work at all (maybe the first time you close a pty
+pair the kernel will blow up), but I wanted to check the above theory by
+just making the pty case completely synchronous - which it should be
+anyway, because it's just silly to use the routine designed for
+asynchronous events for something synchronous like a pty that doesn't use
+interrupts at all.
+Anyway, that two-liner is good enough to essentially make the above case
+completely impossible to trigger on any normal machine, but I'll still
+have to do something else to make sure that _real_ asynchronous hangup
+events can't lead to problems. The easiest way to fix things is probably
+to do a simple reference count on the tty structures, but I want to
+validate the basic problem first.
+		Linus
+----
+--- v2.2.1/linux/drivers/char/pty.c	Mon Oct  5 13:13:39 1998
++++ linux/drivers/char/pty.c	Sat Feb  6 17:28:37 1999
+@@ -84,7 +84,6 @@
+ 	wake_up_interruptible(&tty->link->write_wait);
+ 	set_bit(TTY_OTHER_CLOSED, &tty->link->flags);
+ 	if (tty->driver.subtype == PTY_TYPE_MASTER) {
+-		tty_hangup(tty->link);
+ 		set_bit(TTY_OTHER_CLOSED, &tty->flags);
+ #ifdef CONFIG_UNIX98_PTYS
+ 		{
+@@ -95,6 +94,7 @@
+ 			}
+ 		}
+ #endif
++		tty_vhangup(tty->link);
+ 	}
+ }
+ 
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

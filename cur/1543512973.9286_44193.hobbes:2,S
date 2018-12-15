@@ -1,0 +1,473 @@
+Date: Fri, 15 Oct 1999 03:15:41 -0400 (EDT)
+From: Alexander Viro <>
+Subject: [RFC][CFT] Symlinks cleanup (2.3)
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/10/15/16
+
+	Folks, the patch below cleans up symlink handling. For now it's
+only done for minixfs, but it can be trivially extended to the rest of
+normal symlinks - I just wanted to get something that could be tested
+without frying the main filesystems. All infrastructure is there, so if it
+will work for minix it will work for ext2 and friends.
+	What had been done:
+1. New inode method (->getlink()) had been added.
+2. Symlink inodes that have a normal semantics (i.e. ->follow_link() is
+equivalent to lookup on ->readlink()) may use generic_readlink() and
+generic_follow_link() if the provide ->getlink(). 
+3. New data type (name_struct) had been added. ->getlink(dentry,name_struct)
+should either fill namestruct according to the contents of the link and
+return 0 or return an error.
+4. name_struct contains the pointer to the link contents (char *n_name),
+destructor (void (*n_free)(struct name_struct *)) and the void *n_data -
+opaque data that may be used by destructor. Example: for minixfs n_data is
+the pointer to bh containg the body, n_name points to the ->b_data of that
+bh and destructor just passes n_data to brelse().
+5. There are several helper functions - set_name_struct_bh, 
+set_name_struct_page, etc. that set the name_struct by the corresponding
+data. Example of usage:
+static int minix_getlink(struct dentry * dentry, struct name_struct *p)
+{
+       struct buffer_head * bh = minix_bread(dentry->d_inode, 0, 0);
+       if (!bh)
+               return -EIO;
+       set_name_struct_bh(p, bh);
+       return 0;
+}
+So for filesystems symlinks are really easy, they don't have to bother
+with setting the stuff up by hands.
+6. There are two inode flags that control caching of those animals. If you
+set S_VOLATILE_LINK - no caching at all, we assume that the thing becomes
+invalid immediately. Otherwise the result is cached (contents of the
+link, not the result of lookup, indeed). The second flag (S_LCACHE_LINK)
+determines the policy - if you set it results are considered valid until
+the final iput().
+So there... It kills code duplication between the foo_readlink() and
+foo_follow_link() and one between the methods for different filesystems.
+Filesystem should only know how to pick the link contents and be able to
+tell what did it get (bh/page/etc.). If you have something trickier (e.g.
+procfs symlinks) - just leave everything as is. It also cuts down the
+usage of stack space - it's not critical for ext2 and friends, but for
+coda it means that we are spending about 90 bytes for each level of
+symlink nesting (most of them in lookup_dentry() and do_follow_link())
+instead of about 1100 per level. With that patch we probably can raise the
+limit on nesting to 32 or so (instead of the current 5).
+In the current form it affects only minixfs, so it should be moderately
+safe for testing. That is, probably it will not eat your main filesystems,
+only crash the kernel and fry the power supply ;-)
+Linus, could you look it through and tell if you have objections to the
+thing?
+						Cheers,
+							Al
+diff -urN linux-2.3.22-pre2/fs/Makefile linux-bird.symlink/fs/Makefile
+--- linux-2.3.22-pre2/fs/Makefile	Sun Sep 12 13:36:16 1999
++++ linux-bird.symlink/fs/Makefile	Thu Oct 14 23:43:56 1999
+@@ -13,7 +13,8 @@
+ O_OBJS    = open.o read_write.o devices.o file_table.o buffer.o \
+ 		super.o  block_dev.o stat.o exec.o pipe.o namei.o fcntl.o \
+ 		ioctl.o readdir.o select.o fifo.o locks.o filesystems.o \
+-		dcache.o inode.o attr.o bad_inode.o file.o iobuf.o $(BINFMTS) 
++		dcache.o inode.o attr.o bad_inode.o file.o iobuf.o nameidata.o \
++		$(BINFMTS) 
+ 
+ MOD_LIST_NAME := FS_MODULES
+ ALL_SUB_DIRS = coda minix ext2 fat msdos vfat proc isofs nfs umsdos ntfs \
+diff -urN linux-2.3.22-pre2/fs/inode.c linux-bird.symlink/fs/inode.c
+--- linux-2.3.22-pre2/fs/inode.c	Sat Oct  9 16:10:12 1999
++++ linux-bird.symlink/fs/inode.c	Thu Oct 14 23:45:30 1999
+@@ -253,10 +253,17 @@
+ 	wait_on_inode(inode);
+ 	if (IS_QUOTAINIT(inode))
+ 		DQUOT_DROP(inode);
++	if (inode->i_link)
++		goto clear_link;	/* keep the main path clean */
++go_on:
+ 	if (inode->i_sb && inode->i_sb->s_op && inode->i_sb->s_op->clear_inode)
+ 		inode->i_sb->s_op->clear_inode(inode);
+ 
+ 	inode->i_state = 0;
++	return;
++clear_link:
++	put_name_struct(inode->i_link);
++	goto go_on;
+ }
+ 
+ /*
+@@ -461,6 +468,7 @@
+ {
+ 	memset(&inode->u, 0, sizeof(inode->u));
+ 	inode->i_sock = 0;
++	inode->i_link = NULL;
+ 	inode->i_op = NULL;
+ 	inode->i_nlink = 1;
+ 	atomic_set(&inode->i_writecount, 0);
+diff -urN linux-2.3.22-pre2/fs/minix/symlink.c linux-bird.symlink/fs/minix/symlink.c
+--- linux-2.3.22-pre2/fs/minix/symlink.c	Sun Sep 12 06:00:35 1999
++++ linux-bird.symlink/fs/minix/symlink.c	Fri Oct 15 00:25:09 1999
+@@ -7,15 +7,17 @@
+  */
+ 
+ #include <linux/errno.h>
+-#include <linux/sched.h>
+ #include <linux/fs.h>
+ #include <linux/minix_fs.h>
+-#include <linux/stat.h>
+ 
+-#include <asm/uaccess.h>
+-
+-static int minix_readlink(struct dentry *, char *, int);
+-static struct dentry *minix_follow_link(struct dentry *, struct dentry *, unsigned int);
++static int minix_getlink(struct dentry * dentry, struct name_struct *p)
++{
++	struct buffer_head * bh = minix_bread(dentry->d_inode, 0, 0);
++	if (!bh)
++		return -EIO;
++	set_name_struct_bh(p, bh);
++	return 0;
++}
+ 
+ /*
+  * symlinks can't do much...
+@@ -31,8 +33,8 @@
+ 	NULL,			/* rmdir */
+ 	NULL,			/* mknod */
+ 	NULL,			/* rename */
+-	minix_readlink,		/* readlink */
+-	minix_follow_link,	/* follow_link */
++	generic_readlink,	/* readlink */
++	generic_follow_link,	/* follow_link */
+ 	NULL,			/* get_block */
+ 	NULL,			/* readpage */
+ 	NULL,			/* writepage */
+@@ -40,43 +42,6 @@
+ 	NULL,			/* truncate */
+ 	NULL,			/* permission */
+ 	NULL,			/* smap */
+-	NULL			/* revalidate */
++	NULL,			/* revalidate */
++	minix_getlink		/* getlink */
+ };
+-
+-static struct dentry * minix_follow_link(struct dentry * dentry,
+-					struct dentry * base,
+-					unsigned int follow)
+-{
+-	struct inode *inode = dentry->d_inode;
+-	struct buffer_head * bh;
+-
+-	bh = minix_bread(inode, 0, 0);
+-	if (!bh) {
+-		dput(base);
+-		return ERR_PTR(-EIO);
+-	}
+-	UPDATE_ATIME(inode);
+-	base = lookup_dentry(bh->b_data, base, follow);
+-	brelse(bh);
+-	return base;
+-}
+-
+-static int minix_readlink(struct dentry * dentry, char * buffer, int buflen)
+-{
+-	struct buffer_head * bh;
+-	int i;
+-	char c;
+-
+-	if (buflen > 1023)
+-		buflen = 1023;
+-	bh = minix_bread(dentry->d_inode, 0, 0);
+-	if (!bh)
+-		return 0;
+-	i = 0;
+-	while (i<buflen && (c = bh->b_data[i])) {
+-		i++;
+-		put_user(c,buffer++);
+-	}
+-	brelse(bh);
+-	return i;
+-}
+diff -urN linux-2.3.22-pre2/fs/namei.c linux-bird.symlink/fs/namei.c
+--- linux-2.3.22-pre2/fs/namei.c	Thu Oct 14 20:04:17 1999
++++ linux-bird.symlink/fs/namei.c	Fri Oct 15 01:05:04 1999
+@@ -1419,3 +1419,39 @@
+ 	unlock_kernel();
+ 	return error;
+ }
++
++struct dentry *generic_follow_link(struct dentry *dentry, struct dentry *base,
++					int follow)
++{
++	struct inode *inode = dentry->d_inode;
++	struct name_struct *name = vfs_getlink(dentry);
++	if (!IS_ERR(name)) {
++		base = lookup_dentry(name->n_name,base,follow);
++		if (!IS_LCACHE_LINK(inode))
++			put_name_struct(name);
++		return base;
++	}
++	dput(base);
++	return (struct dentry *)name;
++}
++
++int generic_readlink(struct dentry *dentry, char *buf, int bufsiz)
++{
++	struct inode *inode = dentry->d_inode;
++	struct name_struct *name = vfs_getlink(dentry);
++	int error;
++	int i;
++
++	error = PTR_ERR(name);
++	if (IS_ERR(name))
++		goto out;
++	for (i = 0; i < bufsiz && name->n_name[i]; i++)
++		;
++	if (copy_to_user(buf, name->n_name, i))
++		i = -EFAULT;
++	error = i;
++	if (!IS_LCACHE_LINK(inode))
++		put_name_struct(name);
++out:
++	return error;
++}
+diff -urN linux-2.3.22-pre2/fs/nameidata.c linux-bird.symlink/fs/nameidata.c
+--- linux-2.3.22-pre2/fs/nameidata.c	Wed Dec 31 19:00:00 1969
++++ linux-bird.symlink/fs/nameidata.c	Fri Oct 15 01:30:51 1999
+@@ -0,0 +1,135 @@
++#include <linux/malloc.h>
++#include <linux/pagemap.h>
++#include <linux/fs.h>
++
++static spinlock_t name_struct_lock = SPIN_LOCK_UNLOCKED;
++/* Allocation - very rough and stupid; to be replaced with cache */
++
++struct name_struct *new_name_struct(void)
++{
++	struct name_struct *res;
++	res = kmalloc(sizeof(*res), GFP_KERNEL);
++	if (res) {
++		memset(res, 0, sizeof(*res));
++		res->n_count = 1;
++	}
++	return res;
++}
++
++void put_name_struct(struct name_struct *p)
++{
++	spin_lock(&name_struct_lock);
++	if (!--p->n_count) {
++		if (p->n_inode)
++			p->n_inode->i_link = NULL;
++		spin_unlock(&name_struct_lock);
++		if (p->n_free)
++			p->n_free(p);
++		kfree(p);
++		return;
++	}
++	spin_unlock(&name_struct_lock);
++}
++
++struct name_struct *get_name_struct(struct inode *i)
++{
++	struct name_struct *res;
++	spin_lock(&name_struct_lock);
++	res = i->i_link;
++	if (res && !IS_LCACHE_LINK(i))
++		res->n_count++;
++	spin_unlock(&name_struct_lock);
++	return res;
++}
++
++void bind_name_struct(struct inode *i, struct name_struct *p)
++{
++	spin_lock(&name_struct_lock);
++	i->i_link = p;
++	p->n_inode = i;
++	spin_unlock(&name_struct_lock);
++}
++
++/* common types - it should cover 99% of cases */
++static void ns_kfree(struct name_struct *p)
++{
++	kfree(p->n_data);
++}
++
++int set_name_struct_kmalloc(struct name_struct *p, int size)
++{
++	char *m = kmalloc(size, GFP_KERNEL);
++	if (!m)
++		return -ENOMEM;
++	p->n_data = m;
++	p->n_name = m;
++	p->n_free = ns_kfree;
++	return 0;
++}
++
++void set_name_struct_kmalloced(struct name_struct *p, char *m)
++{
++	p->n_data = m;
++	p->n_name = m;
++	p->n_free = ns_kfree;
++}
++
++static void ns_page(struct name_struct *p)
++{
++	free_page((unsigned long)p->n_data);
++}
++
++int set_name_struct_page(struct name_struct *p) {
++	char *m = (char *)__get_free_page(GFP_KERNEL);
++	if (!m)
++		return -ENOMEM;
++	p->n_data = m;
++	p->n_name = m;
++	p->n_free = ns_page;
++	return 0;
++}
++
++static void ns_pagecache(struct name_struct *p)
++{
++	page_cache_release((struct page*)p->n_data);
++}
++
++void set_name_struct_pagecache(struct name_struct *p, struct page *page) {
++	p->n_data = page;
++	p->n_name = (char*)page_address(page);
++	p->n_free = ns_pagecache;
++}
++
++static void ns_bh(struct name_struct *p)
++{
++	brelse((struct buffer_head *)p->n_data);
++}
++
++void set_name_struct_bh(struct name_struct *p, struct buffer_head *bh) {
++	p->n_data = bh;
++	p->n_name = bh->b_data;
++	p->n_free = ns_bh;
++}
++ 
++struct name_struct *vfs_getlink(struct dentry *dentry)
++{
++	struct inode *inode = dentry->d_inode;
++	struct name_struct *res;
++	down(&inode->i_sem);
++	res = get_name_struct(inode);
++	if (!res) {
++		res = new_name_struct();
++		if (res) {
++			int err = inode->i_op->getlink(dentry, res);
++			if (err) {
++				put_name_struct(res);
++				res = ERR_PTR(err);
++			} else if (!IS_VOLATILE_LINK(inode))
++				bind_name_struct(inode, res);
++		} else
++			res = ERR_PTR(-ENOMEM);
++	}
++	up(&inode->i_sem);
++	UPDATE_ATIME(inode);
++	return res;
++}
+diff -urN linux-2.3.22-pre2/include/linux/fs.h linux-bird.symlink/include/linux/fs.h
+--- linux-2.3.22-pre2/include/linux/fs.h	Thu Oct 14 20:04:18 1999
++++ linux-bird.symlink/include/linux/fs.h	Fri Oct 15 01:07:22 1999
+@@ -97,6 +97,8 @@
+ #define S_IMMUTABLE	512	/* Immutable file */
+ #define MS_NOATIME	1024	/* Do not update access times. */
+ #define MS_NODIRATIME	2048	/* Do not update directory access times */
++#define S_VOLATILE_LINK	4096	/* volatile symlink */
++#define S_LCACHE_LINK	8192	/* long-cache symlink */
+ 
+ #define MS_ODD_RENAME	32768	/* Temporary stuff; will go away as soon
+ 				  * as nfs_rename() will be cleaned up
+@@ -140,6 +142,8 @@
+ #define IS_QUOTAINIT(inode)	((inode)->i_flags & S_QUOTA)
+ #define IS_APPEND(inode)	((inode)->i_flags & S_APPEND)
+ #define IS_IMMUTABLE(inode)	((inode)->i_flags & S_IMMUTABLE)
++#define IS_VOLATILE_LINK(inode)	((inode)->i_flags & S_VOLATILE_LINK)
++#define IS_LCACHE_LINK(inode)	((inode)->i_flags & S_LCACHE_LINK)
+ #define IS_NOATIME(inode)	__IS_FLG(inode, MS_NOATIME)
+ #define IS_NODIRATIME(inode)	__IS_FLG(inode, MS_NODIRATIME)
+ 
+@@ -323,6 +327,14 @@
+ #include <linux/quota.h>
+ #include <linux/mount.h>
+ 
++struct name_struct {
++	struct inode *	n_inode;	/* our inode */
++	int		n_count;	/* reference counter */
++	char *		n_name;		/* name */
++	void (*n_free)(struct name_struct *);	/* destructor */
++	void *		n_data;		/* misc */
++};
++
+ struct inode {
+ 	struct list_head	i_hash;
+ 	struct list_head	i_list;
+@@ -363,6 +375,7 @@
+ 	atomic_t		i_writecount;
+ 	unsigned int		i_attr_flags;
+ 	__u32			i_generation;
++	struct name_struct *	i_link;
+ 	union {
+ 		struct minix_inode_info		minix_i;
+ 		struct ext2_inode_info		ext2_i;
+@@ -577,6 +590,9 @@
+ extern int vfs_unlink(struct inode *, struct dentry *);
+ extern int vfs_rename(struct inode *, struct dentry *, struct inode *, struct dentry *);
+ 
++int generic_readlink(struct dentry *, char *, int);
++struct dentry *generic_follow_link(struct dentry *, struct dentry *, int);
++
+ /*
+  * This is the "filldir" function type, used by readdir() to let
+  * the kernel specify what kind of dirent layout it wants to have.
+@@ -640,6 +656,7 @@
+ 	int (*permission) (struct inode *, int);
+ 	int (*smap) (struct inode *,int);
+ 	int (*revalidate) (struct dentry *);
++	int (*getlink) (struct dentry *, struct name_struct *);
+ };
+ 
+ struct super_operations {
+@@ -959,6 +976,17 @@
+ 
+ extern int inode_change_ok(struct inode *, struct iattr *);
+ extern void inode_setattr(struct inode *, struct iattr *);
++
++struct name_struct *new_name_struct(void);
++void put_name_struct(struct name_struct *);
++struct name_struct *get_name_struct(struct inode *);
++void bind_name_struct(struct inode *, struct name_struct *);
++int set_name_struct_kmalloc(struct name_struct *, int);
++void set_name_struct_kmalloced(struct name_struct *, char *);
++int set_name_struct_page(struct name_struct *);
++void set_name_struct_pagecache(struct name_struct *, struct page *);
++void set_name_struct_bh(struct name_struct *, struct buffer_head *);
++struct name_struct *vfs_getlink(struct dentry *);
+ 
+ #endif /* __KERNEL__ */
+ 
+diff -urN linux-2.3.22-pre2/kernel/ksyms.c linux-bird.symlink/kernel/ksyms.c
+--- linux-2.3.22-pre2/kernel/ksyms.c	Thu Oct 14 20:04:19 1999
++++ linux-bird.symlink/kernel/ksyms.c	Fri Oct 15 00:28:35 1999
+@@ -201,6 +201,13 @@
+ EXPORT_SYMBOL(add_to_page_cache_unique);
+ EXPORT_SYMBOL(__find_get_page);
+ EXPORT_SYMBOL(__find_lock_page);
++EXPORT_SYMBOL(set_name_struct_kmalloc);
++EXPORT_SYMBOL(set_name_struct_kmalloced);
++EXPORT_SYMBOL(set_name_struct_page);
++EXPORT_SYMBOL(set_name_struct_pagecache);
++EXPORT_SYMBOL(set_name_struct_bh);
++EXPORT_SYMBOL(generic_readlink);
++EXPORT_SYMBOL(generic_follow_link);
+                         
+ #if !defined(CONFIG_NFSD) && defined(CONFIG_NFSD_MODULE)
+ EXPORT_SYMBOL(do_nfsservctl);
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

@@ -1,0 +1,271 @@
+Date: Sun, 14 Mar 1999 10:53:23 +0100 (CET)
+From: Ingo Molnar <>
+Subject: Re: [patch] recover losed timer interrupt using the TSC [Re: [patch] kstat change to see how much Linux SMP really scale well]
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/3/14/12
+
+On Sun, 14 Mar 1999, Andrea Arcangeli wrote:
+> Infact people is starting to report that its machine clock is losing
+> time. 
+i think it is more correct to define this a bug and print out a warning if
+a too long delay happens. (patch against 2.2.3 attached) It's also a much
+shorter and less intrusive patch. (it actually removes 13 lines) The
+patch: 
+  - prints a warning if a too long delay happens, eg.:
+	bug: 000000001809cc03 cycles timer IRQ delay from c0107413
+    (the above message was triggered artificially) The EIP is
+    probably from the place where the long delay happened, but not
+    necessarily. It's at least a starting point. IRQ0 has the highest
+    priority, so we very likely will see some 'near' EIP.
+  - moves get_8254_timer_count() into irq.h, thus we have one unified way
+    of querying the timer counter.
+  - fixes APIC calibration so that it doesnt cause excessive delays. (the
+    patch popped up this one ;)
+instead of silently 'fixing up' long delays, we should rather fix the
+delays, not the effect. Also, a buggy TSC might cause 'delays', so we
+definitely want something in the syslog.
+(Buddha, Colin, does this patch detect your timer problems?) 
+-- mingo
+--- linux/arch/i386/kernel/time.c.orig3	Tue Mar  9 11:03:40 1999
++++ linux/arch/i386/kernel/time.c	Sun Mar 14 10:42:19 1999
+@@ -66,7 +66,8 @@
+ /* Number of usecs that the last interrupt was delayed */
+ static int delay_at_last_interrupt;
+ 
+-static unsigned long last_tsc_low; /* lsb 32 bits of Time Stamp Counter */
++static unsigned long last_tsc_low, /* lsb 32 bits of Time Stamp Counter */
++			last_tsc_high;
+ 
+ /* Cached *multiplier* to convert TSC counts to microseconds.
+  * (see the equation below).
+@@ -156,18 +157,10 @@
+ 	unsigned long jiffies_t;
+ 
+ 	/* timer count may underflow right here */
+-	outb_p(0x00, 0x43);	/* latch the count ASAP */
++	count = get_8254_timer_count();
+ 
+-	count = inb_p(0x40);	/* read the latched count */
+-
+-	/*
+-	 * We do this guaranteed double memory access instead of a _p 
+-	 * postfix in the previous port access. Wheee, hackady hack
+-	 */
+  	jiffies_t = jiffies;
+ 
+-	count |= inb_p(0x40) << 8;
+-
+ 	/*
+ 	 * avoiding timer inconsistencies (they are rare, but they happen)...
+ 	 * there are two kinds of problems that must be avoided here:
+@@ -431,28 +424,44 @@
+ 
+ 	if (use_tsc)
+ 	{
++		unsigned int prev_high, prev_low;
++		unsigned int delta_high, delta_low;
++
+ 		/*
+-		 * It is important that these two operations happen almost at
+-		 * the same time. We do the RDTSC stuff first, since it's
+-		 * faster. To avoid any inconsistencies, we need interrupts
+-		 * disabled locally.
++		 * We want to detect time inconsistencies
+ 		 */
++		prev_high = last_tsc_high;
++		prev_low = last_tsc_low;
+ 
+ 		/*
+-		 * Interrupts are just disabled locally since the timer irq
+-		 * has the SA_INTERRUPT flag set. -arca
++		 * It is important that these two operations happen almost at
++		 * the same time. We do the RDTSC stuff first, since it's
++		 * faster.
+ 		 */
+-	
+-		/* read Pentium cycle counter */
+-		__asm__("rdtsc" : "=a" (last_tsc_low) : : "edx");
+-
+-		outb_p(0x00, 0x43);     /* latch the count ASAP */
+-
+-		count = inb_p(0x40);    /* read the latched count */
+-		count |= inb(0x40) << 8;
++		__asm__("rdtsc" : "=a" (last_tsc_low), "=d" (last_tsc_high));
++		count = get_8254_timer_count();
+ 
+ 		count = ((LATCH-1) - count) * TICK_SIZE;
+ 		delay_at_last_interrupt = (count + LATCH/2) / LATCH;
++
++		delta_low = last_tsc_low - prev_low;
++		delta_high = last_tsc_high - prev_high;
++		if (last_tsc_low < prev_low)
++			delta_high--;
++
++		/*
++		 * did we have a too big timer IRQ delay? The limit is
++		 * 1.5*1/HZ. This detects big delays too, not just
++		 * max 4G*1cycle ones, but breaks together with cpu_hz
++		 * at the 4GHz barrier.
++		 */
++		if (delta_high || (delta_low > cpu_hz/HZ*3/2))
++			printk("bug: %08x%08x cycles timer IRQ delay from %p\n",
++				delta_high, delta_low, (void *)regs->eip);
++		/*
++		 * (we do not try to recover 'lost ticks', because lost
++		 * ticks are a bug on a TSC-capable system.)
++		 */
+ 	}
+  
+ 	do_timer_interrupt(irq, NULL, regs);
+@@ -574,6 +583,7 @@
+ 		} while ((inb(0x61) & 0x20) == 0);
+ 		__asm__ __volatile__("rdtsc":"=a" (endlow),"=d" (endhigh));
+ 
++		last_tsc_high = endhigh;
+ 		last_tsc_low = endlow;
+ 
+ 		/* Error: ECTCNEVERSET */
+--- linux/arch/i386/kernel/irq.h.orig3	Tue Mar  9 11:03:39 1999
++++ linux/arch/i386/kernel/irq.h	Sun Mar 14 10:18:32 1999
+@@ -251,4 +251,18 @@
+ 	}
+ }
+ 
++/*
++ * Get the timer chip's counter.
++ */
++extern inline unsigned int get_8254_timer_count(void)
++{
++	unsigned int count;
++
++	outb_p(0x00, 0x43);		/* latch the counter */
++	count = inb_p(0x40);		/* get counter LSB */
++	count |= inb_p(0x40) << 8;	/* get counter MSB */
++
++	return count;
++}
++
+ #endif
+--- linux/arch/i386/kernel/smp.c.orig3	Tue Mar  9 14:54:49 1999
++++ linux/arch/i386/kernel/smp.c	Sun Mar 14 10:51:16 1999
+@@ -847,10 +847,9 @@
+ 	/*
+ 	 * Set up our APIC timer.
+ 	 */
++ 	sti();
+ 	setup_APIC_clock();
+ 
+- 	__sti();
+-
+ #ifdef CONFIG_MTRR
+ 	/*  Must be done before calibration delay is computed  */
+ 	mtrr_init_secondary_cpu ();
+@@ -1831,22 +1830,6 @@
+  */
+ 
+ /*
+- * The timer chip is already set up at HZ interrupts per second here,
+- * but we do not accept timer interrupts yet. We only allow the BP
+- * to calibrate.
+- */
+-static unsigned int __init get_8254_timer_count(void)
+-{
+-	unsigned int count;
+-
+-	outb_p(0x00, 0x43);
+-	count = inb_p(0x40);
+-	count |= inb_p(0x40) << 8;
+-
+-	return count;
+-}
+-
+-/*
+  * This function sets up the local APIC timer, with a timeout of
+  * 'clocks' APIC bus clock. During calibration we actually call
+  * this function twice, once with a bogus timeout value, second
+@@ -1887,25 +1870,16 @@
+ 	apic_write(APIC_TMICT, clocks/APIC_DIVISOR);
+ }
+ 
++/*
++ * This is more exact than it looks like. Yep we have the timer IRQ's
++ * latency added, _but_ we have it always and it's a constant, thus
++ * it doesnt matter.
++ */
+ void __init wait_8254_wraparound(void)
+ {
+-	unsigned int curr_count, prev_count=~0;
+-	int delta;
+-
+-	curr_count = get_8254_timer_count();
+-
+-	do {
+-		prev_count = curr_count;
+-		curr_count = get_8254_timer_count();
+-		delta = curr_count-prev_count;
+-
+-	/*
+-	 * This limit for delta seems arbitrary, but it isn't, it's
+-	 * slightly above the level of error a buggy Mercury/Neptune
+-	 * chipset timer can cause.
+-	 */
++	unsigned long prev_jiffies = jiffies;
+ 
+-	} while (delta<300);
++	while (jiffies == prev_jiffies) mb();
+ }
+ 
+ /*
+@@ -1937,12 +1911,12 @@
+ 	 */
+ 	setup_APIC_timer(1000000000);
+ 
++	sti();
+ 	/*
+ 	 * The timer chip counts down to zero. Let's wait
+ 	 * for a wraparound to start exact measurement:
+ 	 * (the current tick might have been already half done)
+ 	 */
+-
+ 	wait_8254_wraparound ();
+ 
+ 	/*
+@@ -1994,13 +1968,8 @@
+ 
+ void __init setup_APIC_clock(void)
+ {
+-	unsigned long flags;
+-
+ 	static volatile int calibration_lock;
+ 
+-	__save_flags(flags);
+-	__cli();
+-
+ 	SMP_PRINTK(("setup_APIC_clock() called.\n"));
+ 
+ 	/*
+@@ -2028,16 +1997,7 @@
+ /*
+  * Now set up the timer for real.
+  */
+-
+ 	setup_APIC_timer (calibration_result);
+-
+-	/*
+-	 * We ACK the APIC, just in case there is something pending.
+-	 */
+-
+-	ack_APIC_irq ();
+-
+-	__restore_flags(flags);
+ }
+ 
+ /*
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

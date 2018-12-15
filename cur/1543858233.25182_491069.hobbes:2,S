@@ -1,0 +1,184 @@
+Date: Wed, 13 Dec 2006 11:43:55 +0000
+From: Richard Purdie <>
+Subject: Re: [PATCH, RFC/T] Fix handling of write failures to swap devices
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2006/12/13/75
+
+On Wed, 2006-11-01 at 16:26 +1100, Nick Piggin wrote:
+> The attached (very untested, in need of splitting up) patch attempts to
+> solve these problems. Note that it is probably not going to prevent your
+> SIGBUS, so that will have to be found and fixed individually.
+> 
+> In the meantime, I'll run this through some testing when I get half a
+> chance.
+> 
+> plain text document attachment (mm-swap-fail.patch)
+> Notice swap write errors during page reclaim, and deallocate the swap entry
+> which is backing the swapcache. This allows the page error to be cleared and
+> the page be allocated to a new entry, rather than the page to becoming pinned
+> forever.
+I finally got around to doing some debugging on this patch
+(
+http://lkml.org/lkml/2006/11/1/7
+). Firstly, I can't seem to reproduce
+the SIGBUS issues I was seeing so I'm assuming that was some bug I
+introduced somewhere along the line and/or something fixed in mainline.
+The patch below is a diff on top of the patch linked to above so you can
+see what I needed to change to make it work.
+The patch you proposed locked upon entry to try_to_unuse_entry() as
+shrink_page_list() already had the page locked. I therefore moved the
+locking to try_to_unuse() but this is complicated by the retry loop. The
+solution below handles this but is slightly ugly as it has the "magic"
+locking sequence in two places and I'm not sure where the associated
+comment should go. An alternative might be to return -EAGAIN and have
+the caller perform the loop for us but I'm not keen on having to
+replicate this to all call sites. We could also just check if the page
+was locked by the caller? Whats the best way to handle this?
+The refcounting was also broken which I solved by moving
+page_cache_release() to try_to_unuse() with the locking. Alternatively,
+should try_to_unuse_page_entry() increase some refcount?
+I added a sanity check to make sure that if we unused a page and it was
+no longer in swapcache, its dirty bit was cleared. I suspect this isn't
+actually needed but should be harmless.
+I also moved the pages with error check outside PageAnon(page) as
+otherwise you can see IO loops where it continually tries to swap out a
+page with errors.
+With these changes, the patch has coped fine with the testing I've
+exposed it to where entire swap devices sudden stopped accepting writes.
+It happily marked every page in the swap partition bad with no
+instabilities.
+If we can agree a way to handle the page locking, I think this patch
+might be ready for -mm? I'm happy to split it into a small series and
+submit it...
+Richard
+Index: linux-2.6.19/mm/swapfile.c
+===================================================================
+--- linux-2.6.19.orig/mm/swapfile.c	2006-12-13 11:23:34.000000000 +0000
++++ linux-2.6.19/mm/swapfile.c	2006-12-13 11:21:11.000000000 +0000
+@@ -669,9 +669,6 @@ static int try_to_unuse_entry(swp_entry_
+ 	 * tests, do_swap_page and try_to_unuse repeatedly compete.
+ 	 */
+ retry:
+-	wait_on_page_locked(page);
+-	wait_on_page_writeback(page);
+-	lock_page(page);
+ 	wait_on_page_writeback(page);
+ 
+ 	/*
+@@ -729,11 +726,8 @@ retry:
+ 		mmput(start_mm);
+ 		start_mm = new_start_mm;
+ 	}
+-	if (retval) {
+-		unlock_page(page);
+-		page_cache_release(page);
+-		goto out;
+-	}
++	if (retval)
++		return retval;
+ 
+ 	/*
+ 	 * How could swap count reach 0x7fff when the maximum pid is 0x7fff,
+@@ -778,6 +772,9 @@ retry:
+ 			};
+ 
+ 			swap_writepage(page, &wbc);
++			wait_on_page_locked(page);
++			wait_on_page_writeback(page);
++			lock_page(page);
+ 			goto retry;
+ 		}
+ 		if (!shmem) {
+@@ -801,15 +798,11 @@ retry:
+ 	 * will preserve it.
+ 	 */
+ 	SetPageDirty(page);
+-	unlock_page(page);
+-	page_cache_release(page);
+-
+ 	if (start_mm_p)
+ 		*start_mm_p = start_mm;
+ 	else
+ 		mmput(start_mm);
+ 
+-out:
+ 	return retval;
+ }
+ 
+@@ -836,6 +829,8 @@ void try_to_unuse_page_entry(struct page
+ 	BUG_ON(*swap_map == SWAP_MAP_BAD);
+ 
+ 	try_to_unuse_entry(entry, swap_map, page, NULL);
++	if (!PageSwapCache(page)) 
++		ClearPageDirty(page);
+ }
+ 
+ /*
+@@ -941,8 +936,16 @@ static int try_to_unuse(unsigned int typ
+ 			break;
+ 		}
+ 
++		wait_on_page_locked(page);
++		wait_on_page_writeback(page);
++		lock_page(page);
++
+ 		retval = try_to_unuse_entry(entry, swap_map, page,
+ 							&start_mm);
++
++		page_cache_release(page);
++		unlock_page(page);
++
+ 		if (retval)
+ 			break;
+ 
+Index: linux-2.6.19/mm/vmscan.c
+===================================================================
+--- linux-2.6.19.orig/mm/vmscan.c	2006-12-13 11:23:34.000000000 +0000
++++ linux-2.6.19/mm/vmscan.c	2006-12-13 11:18:28.000000000 +0000
+@@ -489,24 +489,22 @@ static unsigned long shrink_page_list(st
+ 
+ #ifdef CONFIG_SWAP
+ 		/*
++		 * Encountered an error last time? Try to remove the
++		 * page from its current position, which will notice
++		 * the error and mark that swap entry bad. Then we can
++		 * try allocating another swap entry.
++		 */
++		if (PageSwapCache(page) && unlikely(PageError(page)))
++			try_to_unuse_page_entry(page);
++
++		/*
+ 		 * Anonymous process memory has backing store?
+ 		 * Try to allocate it some swap space here.
+ 		 */
+-		if (PageAnon(page)) {
+-			/*
+-			 * Encountered an error last time? Try to remove the
+-			 * page from its current position, which will notice
+-			 * the error and mark that swap entry bad. Then we can
+-			 * try allocating another swap entry.
+-			 */
+-			if (PageSwapCache(page) && unlikely(PageError(page)))
+-				try_to_unuse_page_entry(page);
++		if (PageAnon(page) && !PageSwapCache(page) 
++				&& !add_to_swap(page, GFP_ATOMIC))
++			goto activate_locked;
+ 
+-			if (!PageSwapCache(page)) {
+-				if (!add_to_swap(page, GFP_ATOMIC))
+-					goto activate_locked;
+-			}
+-		}
+ #endif /* CONFIG_SWAP */
+ 
+ 		mapping = page_mapping(page);
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+More majordomo info at  
+http://vger.kernel.org/majordomo-info.html
+Please read the FAQ at  
+http://www.tux.org/lkml/

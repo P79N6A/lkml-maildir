@@ -1,0 +1,121 @@
+Date: Sun, 12 Dec 1999 17:41:52 +0100 (CET)
+From: Andrea Arcangeli <>
+Subject: Re: Possible 2.2.14pre12 bug: set_blocksize message on umount
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/12/12/61
+
+On Sat, 11 Dec 1999, Nate Eldredge wrote:
+>A rather odd thing that looks like it may indicate a bug.
+It can be as well harmless. The main difference between 2.2.13 and
+2.2.14pre12 is the printk, so if everything was fine for you in 2.2.13 you
+should expect 2.2.14pre12 to work fine too (with an additional printk).
+Anyway I'll examine all the details below.
+The 2.2.13 set_blocksize was handling the case of a buffer referenced on
+the re-sized blockdevice, by invalidating the buffer and removing it from
+the hash. Removing it from the hash make no sense because the
+hash is indexed in function of the size of the buffer. So there's no
+way a find_buffer can find the old buffer by mistake, thus there's no
+point to remove it from the hash. Removing it from the hash may lead to
+two buffers pointing the same block so it may lead to lose coherency after
+returning to the old blocksize in the worst case.
+I am also checking that the buffer is not dirty. If the buffer examined is
+dirty, by clearing the dirty bit as 2.2.13 is doing, we could corrupt more
+than doing two not coherent writes as 2.2.14pre12. We can return to the
+2.2.13 way but it won't make any real difference for safety because
+destroying dirty cache means fs corruption too.
+Another difference is that 2.2.13 is clearing the updated bit and I admit
+this is a bit more safe because only in the case of busy buffers that you
+got, when we'll return to the old size we'll make sure to reread from the
+potentially updated data from disk.
+>When I shut down my box just now, as it was unmounting filesystems, I
+>got this message (copied by hand and retyped but checked):
+>
+>set_blocksize: b_count 3, dev ide0(3,1), block 1686626
+>set_blocksize: b_count 1, dev ide0(3,1), block 1686628
+>set_blocksize: b_count 1, dev ide0(3,1), block 1686629
+>set_blocksize: b_count 1, dev ide0(3,1), block 1686627
+>set_blocksize: b_count 1, dev ide0(3,1), block 181674
+Could you tell me which filesystem are you using on /dev/hda1?
+If you was doing read-I/O on a blockdevice while mounting an fs the above
+is harmless.
+If it's instead a filesystem that is not relasing all buffers before
+calling set_blocksize, it would be better to fix the fs properly if
+possible. It could harmless also for a filesystem, but if the filesystem
+will continue to use the old-sized buffers for some time, it can lose
+coherency with the rest of the buffer cache and it can read obsolete data
+potentially causing fs corruption. The printk I added there wants to catch
+exactly this kind of issues that was silenty ignored by the old 2.2.13
+set_blocksize.
+So knowing which blockdevice was playing with /dev/hda1 on your system is
+the interesting information now.
+I changed a bit set_blocksize this way:
+o	convert the KERN_ERR to KERN_WARNING in the printk
+o	removed the `!'
+o	print also the caller address (help debugging)
+o	check the dirty bit atomically (after the last sleep) and issue it
+	as a warning (it maybe the user writing to the blockdevice while
+	mounting a fs that is generating the printk so it's not obvious it's
+	a kernel error but it's only a warning that the admin
+	definitely wants to see). (very minor issue)
+o	clear the dirty bit also if the buffer is still referenced
+	(no real difference as it may be worse or better)
+o	make sure to read old data after we'll return to the old
+	blocksize by clearing the updated bit. This is the only worty part
+	of the below patch. (2.2.13 way). Note that this change has
+	nothing to do with the _source_ of the printk. This only
+	changes how the kernel react _after_ the printk.
+--- 2.2.14pre12/fs/buffer.c	Thu Dec  9 03:20:59 1999
++++ /tmp/buffer.c	Sun Dec 12 17:21:21 1999
+@@ -678,21 +678,26 @@
+ 			bhnext = bh->b_next_free;
+ 			if (bh->b_dev != dev || bh->b_size == size)
+ 				continue;
+-			if (buffer_dirty(bh))
+-				printk(KERN_ERR "set_blocksize: dev %s buffer_dirty %lu size %lu\n", kdevname(dev), bh->b_blocknr, bh->b_size);
+ 			if (buffer_locked(bh))
+ 			{
+ 				slept = 1;
+ 				wait_on_buffer(bh);
+ 			}
++			if (buffer_dirty(bh))
++				printk(KERN_WARNING "set_blocksize: dev %s buffer_dirty %lu size %lu\n", kdevname(dev), bh->b_blocknr, bh->b_size);
+ 			if (!bh->b_count)
+ 				put_last_free(bh);
+ 			else
+-				printk(KERN_ERR
++			{
++				mark_buffer_clean(bh);
++				clear_bit(BH_Uptodate, &bh->b_state);
++				clear_bit(BH_Req, &bh->b_state);
++				printk(KERN_WARNING
+ 				       "set_blocksize: "
+-				       "b_count %d, dev %s, block %lu!\n",
++				       "b_count %d, dev %s, block %lu, from %p\n",
+ 				       bh->b_count, bdevname(bh->b_dev),
+-				       bh->b_blocknr);
++				       bh->b_blocknr, __builtin_return_address(0));
++			}
+ 			if (slept)
+ 				goto again;
+ 		}
+If you'll apply the above patch you'll get the information about which
+set_blocksize was going on, and that will help to discover if it's a
+filesystem bug or not. If it's not a filesystem bug you should ingore the
+message. I understand that some people could be annoyed but such a message
+if it's not generated by a kernel problem, but IMHO it's not good to
+remove such message just to avoid annoying people because the message may
+allow us to catch subtle bugs. BTW, I never reproduced such message here,
+so I believe that most of users won't be annoyed either ;).
+Alan I think it's a good idea to apply the above patch to the 2.2.14pre
+kernel for clearing the updated bit also if the buffer is referenced (and
+the Req bit too to avoid some part of the I/O subsystem to think it's not
+uptodate due a read error).
+Andrea
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

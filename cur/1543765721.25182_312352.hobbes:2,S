@@ -1,0 +1,1550 @@
+Date: Mon, 18 Apr 2005 12:19:54 +0900
+From: Takashi Ikebe <>
+Subject: [PATCH x86_64] Live Patching Function on 2.6.11.7
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2005/4/17/108
+
+The patch was over 50k, so I separate it to each architecture and in line..
+This patch add function called "Live patching" which is defined on
+OSDL's carrier grade linux requiremnt definition to linux 2.6.11.7 kernel.
+The live patching allows process to patch on-line (without restarting
+process) on i386 and x86_64 architectures, by overwriting jump assembly
+code on entry point of functions which you want to fix, to patched
+functions.
+The live patching function is very common on high-availability system
+such as carrier system, and this patch realize it also on linux.
+(Patch & process restart time is very critical on such high-availability
+system, live patch allows you to milliseconds order process stopping
+time to apply new patch.)
+The basis is below:
+1. Live patch command loads the patch modules to target process's memory
+area,
+2. Live patch command resolve patch symbol.
+3. Live patch command overwrite jump code to the entry point of function
+which you want to fix, to the patch module's symbol.
+Kernel patch and user mode tools are required, and both of them are
+available at 
+http://pannus.sourceforge.net
+Please take a look and give us comments!
+This patch add following system calls and function.
+o mmap3: maps patch to target process's memory area with security check.
+o accesspvm: access(read/write) target process's memory area.
+o init_pend: initialization of live patch sequence on target process.
+o rt_handlereturn: run initialize root of each patch (same as signal
+handler).
+o check_init: check that the initialization is finished or not.
+o munmap3: unmap patch from target process's memory area.
+-- 
+Takashi Ikebe
+NTT Network Service Systems Laboratories
+9-11, Midori-Cho 3-Chome Musashino-Shi,
+Tokyo 180-8585 Japan
+Tel : +81 422 59 4246, Fax : +81 422 60 4012
+e-mail : ikebe.takashi@lab.ntt.co.jp
+diff -urpN linux-2.6.11.7-vanilla/arch/x86_64/kernel/Makefile linux-2.6.11.7-pannus-x86_64/arch/x86_64/kernel/Makefile
+--- linux-2.6.11.7-vanilla/arch/x86_64/kernel/Makefile	2005-04-08 03:57:55.000000000 +0900
++++ linux-2.6.11.7-pannus-x86_64/arch/x86_64/kernel/Makefile	2005-04-18 10:45:47.000000000 +0900
+@@ -7,7 +7,8 @@ EXTRA_AFLAGS	:= -traditional
+ obj-y	:= process.o semaphore.o signal.o entry.o traps.o irq.o \
+ 		ptrace.o time.o ioport.o ldt.o setup.o i8259.o sys_x86_64.o \
+ 		x8664_ksyms.o i387.o syscall.o vsyscall.o \
+-		setup64.o bootflag.o e820.o reboot.o quirks.o
++		setup64.o bootflag.o e820.o reboot.o quirks.o \
++		accesspvm.o exechandle.o
+ 
+ obj-$(CONFIG_X86_MCE)         += mce.o
+ obj-$(CONFIG_X86_MCE_INTEL)	+= mce_intel.o
+diff -urpN linux-2.6.11.7-vanilla/arch/x86_64/kernel/accesspvm.c linux-2.6.11.7-pannus-x86_64/arch/x86_64/kernel/accesspvm.c
+--- linux-2.6.11.7-vanilla/arch/x86_64/kernel/accesspvm.c	1970-01-01 09:00:00.000000000 +0900
++++ linux-2.6.11.7-pannus-x86_64/arch/x86_64/kernel/accesspvm.c	2005-04-18 10:52:31.000000000 +0900
+@@ -0,0 +1,111 @@
++/* 
++ * accesspvm.c
++ * Copyright (C) 2004 NTT Corporation
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARICULAR PURPOSE. See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
++ */
++
++/*
++ * Provide the system call to read/write the specific data in the user process.
++ */
++
++#include <linux/kernel.h>
++#include <linux/sched.h>
++#include <linux/mm.h>
++#include <linux/smp.h>
++#include <linux/smp_lock.h>
++#include <linux/errno.h>
++#include <asm/uaccess.h>
++#include <linux/slab.h>
++#include <linux/vmalloc.h>
++
++asmlinkage int sys_accesspvm(long pid, unsigned long addr, long datap, int len, int flag)
++{
++       	struct task_struct *tsk;
++	int ret = -EPERM;
++	long *p = NULL;
++
++	read_lock(&tasklist_lock); // lock tasklist
++	tsk = find_task_by_pid(pid);
++	if (tsk)
++		get_task_struct(tsk); // get task_struct
++	read_unlock(&tasklist_lock); // unlock tasklist
++	if (!tsk) {
++		ret = -ESRCH;
++		goto out;
++	}
++
++	if (pid <= 1)		// you may not mess with kernel thread or init.
++		goto out_tsk;
++	
++	if(((current->uid != tsk->euid) ||
++	    (current->uid != tsk->suid) ||
++	    (current->uid != tsk->uid) ||
++	    (current->gid != tsk->egid) ||
++	    (current->gid != tsk->sgid) ||
++	    (current->gid != tsk->gid)) && !capable(CAP_SYS_PANNUS)) {
++                // invalid user in sys_accesspvm
++                return -EPERM;
++        }
++
++	p = vmalloc(len);
++	if(!p){
++		printk("accesspvm: Cannot allocate by vmalloc\n");
++		ret = -ENOMEM;
++		goto out_tsk;
++	}
++
++	if(flag == 0){
++		if(access_process_vm(tsk, addr, p, len, flag) != len) {
++			vfree(p);
++			ret = -EIO;
++			goto out_tsk;
++		}
++
++		if(copy_to_user((void *)datap,(const void *)p,len)){
++			printk("accesspvm: Copy_to_user error\n");
++			vfree(p);
++			ret = -EIO;
++			goto out_tsk;
++		}
++		ret = 0;
++		vfree(p);
++
++	} 
++	else if(flag == 1) {
++		if(copy_from_user(p,(void *)datap,len)){
++			printk("accesspvm: Copy_from_user error\n");
++			vfree(p);
++			ret = -EIO;
++			goto out_tsk;
++		}
++
++		if (access_process_vm(tsk, addr, p, len, flag) == len){
++			vfree(p);
++			ret = 0;
++			goto out_tsk;
++		}
++		ret = -EIO;
++		vfree(p);
++	}
++	 else {
++		vfree(p);
++	}
++
++out_tsk:
++	put_task_struct(tsk); // release the task_struct
++out:
++	return ret;
++}
+diff -urpN linux-2.6.11.7-vanilla/arch/x86_64/kernel/asm-offsets.c linux-2.6.11.7-pannus-x86_64/arch/x86_64/kernel/asm-offsets.c
+--- linux-2.6.11.7-vanilla/arch/x86_64/kernel/asm-offsets.c	2005-04-08 03:57:42.000000000 +0900
++++ linux-2.6.11.7-pannus-x86_64/arch/x86_64/kernel/asm-offsets.c	2005-04-18 10:45:47.000000000 +0900
+@@ -33,6 +33,7 @@ int main(void)
+ 	ENTRY(flags);
+ 	ENTRY(addr_limit);
+ 	ENTRY(preempt_count);
++	ENTRY(inipending);
+ 	BLANK();
+ #undef ENTRY
+ #define ENTRY(entry) DEFINE(pda_ ## entry, offsetof(struct x8664_pda, entry))
+diff -urpN linux-2.6.11.7-vanilla/arch/x86_64/kernel/entry.S linux-2.6.11.7-pannus-x86_64/arch/x86_64/kernel/entry.S
+--- linux-2.6.11.7-vanilla/arch/x86_64/kernel/entry.S	2005-04-08 03:57:30.000000000 +0900
++++ linux-2.6.11.7-pannus-x86_64/arch/x86_64/kernel/entry.S	2005-04-18 10:45:47.000000000 +0900
+@@ -214,6 +214,8 @@ sysret_check:		
+ 	/* Handle reschedules */
+ 	/* edx:	work, edi: workmask */	
+ sysret_careful:
++	cmpl $0,threadinfo_inipending(%rcx)
++	jne sysret_init
+ 	bt $TIF_NEED_RESCHED,%edx
+ 	jnc sysret_signal
+ 	sti
+@@ -237,6 +239,16 @@ sysret_signal:
+ 1:	movl $_TIF_NEED_RESCHED,%edi
+ 	jmp sysret_check
+ 	
++sysret_init:
++	movl $0,threadinfo_inipending(%rcx)
++	sti
++	xorl %esi,%esi          # oldset
++	leaq -ARGOFFSET(%rsp),%rdi      # regs
++	leaq do_init(%rip),%rax
++	call ptregscall_common
++	jmp sysret_check
++
++	
+ 	/* Do syscall tracing */
+ tracesys:			 
+ 	SAVE_REST
+@@ -395,6 +407,23 @@ ENTRY(stub_rt_sigreturn)
+ 	CFI_ENDPROC
+ 
+ /* 
++ * In the case restorer calls rt_handlereturn, collect and store registers,
++ * and call rt_handlereturn with stored register struct.
++ */
++ENTRY(stub_rt_handlereturn)
++	CFI_STARTPROC
++	addq $8, %rsp
++	SAVE_REST
++	movq %rsp,%rdi
++	FIXUP_TOP_OF_STACK %r11
++	call sys_rt_handlereturn
++	movq %rax,RAX(%rsp) # fixme, this could be done at the higher layer
++	RESTORE_REST
++	jmp int_ret_from_sys_call
++	CFI_ENDPROC
++
++
++/* 
+  * Interrupt entry/exit.
+  *
+  * Interrupt entry points save only callee clobbered registers in fast path.
+@@ -481,6 +510,8 @@ bad_iret:
+ 	
+ 	/* edi: workmask, edx: work */	
+ retint_careful:
++	cmpl $0,threadinfo_inipending(%rcx)
++	jne retint_init	
+ 	bt    $TIF_NEED_RESCHED,%edx
+ 	jnc   retint_signal
+ 	sti
+@@ -527,6 +558,21 @@ retint_kernel:	
+ #endif	
+ 	CFI_ENDPROC
+ 	
++retint_init:
++	CFI_STARTPROC
++	movl $0,threadinfo_inipending(%rcx)
++	sti
++	SAVE_REST
++	movq $-1,ORIG_RAX(%rsp)
++	xorq %rsi,%rsi          # oldset
++	movq %rsp,%rdi          # &pt_regs
++	call do_init
++	RESTORE_REST
++	cli
++	GET_THREAD_INFO(%rcx)
++	jmp retint_check
++	CFI_ENDPROC
++	
+ /*
+  * APIC interrupts.
+  */		
+diff -urpN linux-2.6.11.7-vanilla/arch/x86_64/kernel/exechandle.c linux-2.6.11.7-pannus-x86_64/arch/x86_64/kernel/exechandle.c
+--- linux-2.6.11.7-vanilla/arch/x86_64/kernel/exechandle.c	1970-01-01 09:00:00.000000000 +0900
++++ linux-2.6.11.7-pannus-x86_64/arch/x86_64/kernel/exechandle.c	2005-04-18 10:58:52.000000000 +0900
+@@ -0,0 +1,461 @@
++/*
++ * exechandle.c
++ * Copyright (C)  2004-2005 NTT Corporation
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARICULAR PURPOSE. See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
++ */
++
++/*
++ * Initalization module.
++ */
++
++#include <linux/sched.h>
++#include <linux/mm.h>
++#include <linux/smp.h>
++#include <linux/smp_lock.h>
++#include <linux/kernel.h>
++#include <linux/signal.h>
++#include <linux/errno.h>
++#include <linux/wait.h>
++#include <linux/ptrace.h>
++#include <linux/unistd.h>
++#include <linux/stddef.h>
++#include <linux/tty.h>
++#include <linux/personality.h>
++#include <linux/compiler.h>
++#include <linux/binfmts.h>
++#include <asm/ucontext.h>
++#include <asm/uaccess.h>
++#include <asm/i387.h>
++#include <asm/proto.h>
++#include <asm/exechandle.h>
++
++extern int exception_trace;
++
++void init_fault(struct pt_regs *regs, void *frame, struct task_struct *me, char *where);
++
++struct rt_initframe
++{
++	char *pretcode;       /* Return address after _init */
++	struct ucontext uc;   /* user mode context before execute _init */
++	struct siginfo info;  /* signal information before execute _init */
++};
++
++/*
++ * Restore the context before execute _init.
++ */
++static int
++restore_initcontext(struct pt_regs *regs, struct sigcontext *sc, unsigned long *prax)
++{
++	unsigned int err = 0;
++
++	/* Restore context from stored one before _init. */
++
++#define COPY(x)		err |= __get_user(regs->x, &sc->x)
++
++	COPY(rdi); COPY(rsi); COPY(rbp); COPY(rsp); COPY(rbx);
++	COPY(rdx); COPY(rcx); COPY(rip);
++	COPY(r8);
++	COPY(r9);
++	COPY(r10);
++	COPY(r11);
++	COPY(r12);
++	COPY(r13);
++	COPY(r14);
++	COPY(r15);
++
++	{
++		unsigned int tmpflags;
++		err |= __get_user(tmpflags, &sc->eflags);
++		regs->eflags = (regs->eflags & ~0x40DD5) | (tmpflags & 0x40DD5);
++		regs->orig_rax = -1;
++	}
++
++	/* Restore the floating register, if used. */
++	{
++		struct _fpstate * buf;
++		err |= __get_user(buf, &sc->fpstate);
++
++		if (buf) {
++			if (verify_area(VERIFY_READ, buf, sizeof(*buf)))
++				goto badframe;
++			err |= restore_i387(buf);
++		}
++	}
++
++	err |= __get_user(*prax, &sc->rax);
++	return err;
++
++badframe:
++	return 1;
++}
++
++/*
++ * Restart the process with restoring stack.
++ */
++asmlinkage long sys_rt_handlereturn(struct pt_regs regs)
++{
++	struct rt_initframe *frame = (struct rt_initframe *)(regs.rsp - 8);
++	stack_t st;
++	long eax;
++	struct task_struct *me = current;
++
++	/* Check frame pointer */
++	if (verify_area(VERIFY_READ, frame, sizeof(*frame))) {
++		goto badframe;
++	}
++
++	/* Restore hardware context */
++	if (restore_initcontext(&regs, &frame->uc.uc_mcontext, &eax)) {
++		goto badframe;
++	}
++
++	/* Shift stack pointer */
++	if (__copy_from_user(&st, &frame->uc.uc_stack, sizeof(st))) {
++		goto badframe;
++	}
++
++	/* Clear initalization flag */
++	me->thread_info->inifinish=0;
++	return eax;
++
++      badframe:
++	me->thread_info->inifinish=-1;
++	init_fault(&regs,frame,me,"handlereturn");
++	return 0;
++}
++
++/*
++ * Set up hardware context for initialization.
++ */
++static inline int
++setup_initcontext(struct sigcontext *sc, struct pt_regs *regs, unsigned long mask, struct task_struct *me)
++{
++        int err = 0;
++
++        err |= __put_user(0, &sc->gs);
++        err |= __put_user(0, &sc->fs);
++
++        err |= __put_user(regs->rdi, &sc->rdi);
++        err |= __put_user(regs->rsi, &sc->rsi);
++        err |= __put_user(regs->rbp, &sc->rbp);
++        err |= __put_user(regs->rsp, &sc->rsp);
++        err |= __put_user(regs->rbx, &sc->rbx);
++        err |= __put_user(regs->rdx, &sc->rdx);
++        err |= __put_user(regs->rcx, &sc->rcx);
++        err |= __put_user(regs->rax, &sc->rax);
++        err |= __put_user(regs->r8, &sc->r8);
++        err |= __put_user(regs->r9, &sc->r9);
++        err |= __put_user(regs->r10, &sc->r10);
++        err |= __put_user(regs->r11, &sc->r11);
++        err |= __put_user(regs->r12, &sc->r12);
++        err |= __put_user(regs->r13, &sc->r13);
++        err |= __put_user(regs->r14, &sc->r14);
++        err |= __put_user(regs->r15, &sc->r15);
++        err |= __put_user(me->thread.trap_no, &sc->trapno);
++        err |= __put_user(me->thread.error_code, &sc->err);
++        err |= __put_user(regs->rip, &sc->rip);
++        err |= __put_user(regs->eflags, &sc->eflags);
++        err |= __put_user(mask, &sc->oldmask);
++        err |= __put_user(me->thread.cr2, &sc->cr2);
++
++        return err;
++}
++
++/*
++ * Fix stack pointer.
++ */
++static void *
++get_stack(struct pt_regs *regs, unsigned long size)
++{
++	unsigned long rsp;
++
++	/* Shift stack pointer by stack size. */
++	rsp = regs->rsp - 128;
++
++	/* Align page size boudaries */
++	return (void *)round_down(rsp - size, 16);
++}
++
++/*
++ * Set initialization frame and register.
++ */
++static void setup_init_frame(struct k_initaction *ka, struct pt_regs * regs,
++                             sigset_t *set, struct task_struct *me)
++{
++	struct rt_initframe *frame;
++	struct _fpstate *fp = NULL;
++	int err = 0;
++
++	/* Store the floating point register, if used. */
++	if (tsk_used_math(me)!=0) {
++
++		fp = get_stack(regs, sizeof(struct _fpstate));
++		frame = (void *)round_down((u64)fp - sizeof(struct rt_initframe), 16) - 8;
++
++		if (!access_ok(VERIFY_WRITE, fp, sizeof(struct _fpstate))) {
++			goto give_sigsegv;
++		}
++
++		if (save_i387(fp) < 0)
++		  err |= -1;
++	} else {
++		frame = get_stack(regs, sizeof(struct rt_initframe)) - 8;
++	}
++
++	/* Check accessibility of stack */
++	if (!access_ok(VERIFY_WRITE, frame, sizeof(*frame))) {
++		goto give_sigsegv;
++	}
++
++	/* Create the ucontext.  */
++	err |= __put_user(0, &frame->uc.uc_flags);
++	err |= __put_user(0, &frame->uc.uc_link);
++	err |= __put_user(me->sas_ss_sp, &frame->uc.uc_stack.ss_sp);
++	err |= __put_user(sas_ss_flags(regs->rsp),
++			  &frame->uc.uc_stack.ss_flags);
++	err |= __put_user(me->sas_ss_size, &frame->uc.uc_stack.ss_size);
++	err |= setup_initcontext(&frame->uc.uc_mcontext, regs, set->sig[0], me);
++	err |= __put_user(fp, &frame->uc.uc_mcontext.fpstate);
++
++	/* Set the resotrer address as return address from inialization*/
++	err |= __put_user(ka->ia.restorer, &frame->pretcode);
++
++	if (err) {
++		goto give_sigsegv;
++	}
++
++	/* Set handler execution to register */
++	/* Set rax to 0 because _init has no prototype declaration.*/
++	regs->rax = 0;
++
++		
++	/*
++	 * Take over previous signal information in rsi and user context in uc,
++	 * set stack pointer(rsp) to the start address of initialization frame,
++	 * set instruction pointer(rip) to _init address, and switchover
++	 * user_mode segment by setting cs and rs.
++	 */
++	regs->rsi = (unsigned long)&frame->info; 
++	regs->rdx = (unsigned long)&frame->uc; 
++	regs->rsp = (unsigned long) frame;
++	regs->rip = (unsigned long) ka->ia.inithandler;
++	regs->cs = __USER_CS;
++	regs->ss = __USER_DS; 
++
++	set_fs(USER_DS);
++	regs->eflags &= ~TF_MASK;
++
++	return;
++
++give_sigsegv:
++	me->thread_info->inipending=0;
++	me->thread_info->inifinish=-1;
++	init_fault(regs,frame,me,"handle deliver");
++	return;
++}
++
++/*
++ * Check caller and invoke setup_init_frame.
++ * param:regs   register struct
++ * param:ka     information for initialization
++ * param:oldset signal set
++ * return:none
++ */
++void
++handle_init(struct pt_regs *regs, struct k_initaction *ka, sigset_t *oldset)
++{
++
++
++	/* Check the caller is kernel or not */
++	if ((long)regs->orig_rax >= 0) {
++		/* Return EINTER, if the caller is during systemcall. */
++		switch (regs->rax) {
++			case -ERESTART_RESTARTBLOCK:
++		      case -ERESTARTNOHAND:
++			regs->rax = -EINTR;
++			break;
++
++		      case -ERESTARTSYS:
++			regs->rax = -EINTR;
++			break;
++			/* Skip if the value in rax is error from the beginning.*/
++		      case -ERESTARTNOINTR:
++			regs->rax = regs->orig_rax;
++			regs->rip -= 2;
++			break;
++
++			default:
++
++			break;
++		}
++	}
++
++	setup_init_frame(ka, regs, oldset, current);
++
++}
++
++
++/*
++ * Check the register and invoke handle_init.
++ */
++void do_init(struct pt_regs *regs, sigset_t *oldset)
++{
++
++	struct k_initaction *ka=&current->k_ia;
++
++	/* Exit if the third flag of CS register is not 3. */
++	if ((regs->cs & 3) != 3) {
++		current->thread_info->inifinish=-1;
++		return;
++	}
++
++	/* Block if there is signal set.*/
++	if (!oldset){
++		oldset = &current->blocked;
++	}
++
++	/*  Clear debug watch point register.*/
++	if (current->thread.debugreg7){
++		asm volatile("movq %0,%%db7" :: "r" (current->thread.debugreg7));
++	}
++
++	handle_init(regs,ka,oldset);
++
++	return;
++}
++
++/*
++ * Output error in case of illegal.
++ */
++void init_fault(struct pt_regs *regs, void *frame, struct task_struct *me, char *where)
++{
++
++	/* Output messages if it is illegal.*/
++	if (exception_trace)
++                printk("%s[%d] bad frame in %s frame:%p rip:%lx rsp:%lx orax:%lx\n",
++                       me->comm,me->pid,where,frame,regs->rip,regs->rsp,regs->orig_rax);
++
++} 
++
++/*
++ * Set inipending flag.
++ */
++asmlinkage int sys_init_pend(pid_t pid, struct k_initaction *user_k_ia)
++{
++	struct k_initaction ka;
++	struct task_struct *tsk;
++	int error;
++
++	/* Copy initialization information from user area to kernel area. */
++	error = -EFAULT;
++	if(copy_from_user(&ka,user_k_ia,sizeof(ka)))
++		goto out;
++
++	/* if pid <= 1, parameter error */
++	error = -EPERM;
++	if (pid <= 1)
++		goto out;
++
++	/*  Get task struct from PID. */
++	error = -ESRCH;
++	read_lock(&tasklist_lock);
++	tsk = find_task_by_pid((pid_t)pid);
++	if(tsk)
++		get_task_struct(tsk);
++	read_unlock(&tasklist_lock);
++	if(!tsk)
++		goto out;
++
++	/* capability check. */
++	if(((current->uid != tsk->euid) ||
++	    (current->uid != tsk->suid) ||
++	    (current->uid != tsk->uid) ||
++	    (current->gid != tsk->egid) ||
++	    (current->gid != tsk->sgid) ||
++	    (current->gid != tsk->gid)) && !capable(CAP_SYS_PANNUS)) {
++		/* Invalid user */
++		error = -EPERM;
++		return error;
++	}
++
++	error=-EPERM;
++	/* flag pending */
++	tsk->thread_info->inipending=1;
++	tsk->thread_info->inifinish=1;
++
++	/* set k_ia */
++	tsk->k_ia = ka;
++
++	smp_mb();
++
++	return 0;
++out:
++	return error;
++}
++
++/*
++ * Check inifinish.
++ */
++asmlinkage int sys_check_init(pid_t pid)
++{
++	struct task_struct *tsk;
++	int error;
++
++	/* if pid <= 1, parameter error */
++	error = -EPERM;
++	if (pid <= 1) 
++		goto out;
++
++	/* Get task struct from pid.*/
++	error = -ESRCH;
++	read_lock(&tasklist_lock);
++	tsk = find_task_by_pid((pid_t)pid);
++	if(tsk)
++		get_task_struct(tsk);
++	read_unlock(&tasklist_lock);
++	if(!tsk)
++		goto out;
++
++	/* capability check. */
++	error = -EPERM;
++        if(((current->uid != tsk->euid) ||
++            (current->uid != tsk->suid) ||
++            (current->uid != tsk->uid) ||
++            (current->gid != tsk->egid) ||
++            (current->gid != tsk->sgid) ||
++            (current->gid != tsk->gid)) && !capable(CAP_SYS_PANNUS)) {
++            /* Invalid user */
++		goto out;
++        }
++
++	/* 
++	 * Check inifinish in task struct.
++	 * If it is 0, return 0, if it is  -1, return -1, else return EAGAIN.
++	 */
++	if(tsk->thread_info->inifinish==0){
++		return 0;
++	}else if(tsk->thread_info->inifinish==-1){
++		error = -EINVAL;
++		goto out;
++	}else{
++		error = -EAGAIN;
++		goto out;
++	}
++
++out:
++	return error;
++}
++
+diff -urpN linux-2.6.11.7-vanilla/arch/x86_64/kernel/sys_x86_64.c linux-2.6.11.7-pannus-x86_64/arch/x86_64/kernel/sys_x86_64.c
+--- linux-2.6.11.7-vanilla/arch/x86_64/kernel/sys_x86_64.c	2005-04-08 03:57:47.000000000 +0900
++++ linux-2.6.11.7-pannus-x86_64/arch/x86_64/kernel/sys_x86_64.c	2005-04-18 11:05:42.000000000 +0900
+@@ -16,6 +16,7 @@
+ #include <linux/file.h>
+ #include <linux/utsname.h>
+ #include <linux/personality.h>
++#include <linux/sched.h>
+ 
+ #include <asm/uaccess.h>
+ #include <asm/ipc.h>
+@@ -66,6 +67,57 @@ out:
+ 	return error;
+ }
+ 
++/*
++ * Provide the mmap3 system call which maps the file to the specified process's memory.
++ */
++long sys_mmap3(void *arg)
++{
++      long error;
++      struct file * file;
++      mmap3_arg_struct_t a;
++      struct task_struct *tsk; // task_struct of process where plug will be loaded
++      // copy the struct in user space to kernel space
++      error = -EFAULT;
++      if (copy_from_user(&a, arg, sizeof(a)))
++              goto out;
++       error = -EINVAL;
++      if (a.pgoff & ~PAGE_MASK)
++              goto out;
++      error = -EBADF;
++      file = NULL;
++      a.flags &= ~(MAP_EXECUTABLE | MAP_DENYWRITE);
++      if (!(a.flags & MAP_ANONYMOUS)) {
++              file = fget(a.fd);
++              if (!file)
++                      goto out;
++      }
++      error = -ESRCH;
++      read_lock(&tasklist_lock); // lock tasklist
++      tsk = find_task_by_pid((pid_t)a.pid);
++      if (tsk)
++              get_task_struct(tsk);
++      read_unlock(&tasklist_lock); // unlock tasklist
++      if (!tsk)
++              goto out;
++      if(((current->uid != tsk->euid) ||
++      (current->uid != tsk->suid) ||
++      (current->uid != tsk->uid) ||
++      (current->gid != tsk->egid) ||
++      (current->gid != tsk->sgid) ||
++      (current->gid != tsk->gid)) && !capable(CAP_SYS_PANNUS)) {
++              // invalid user in sys_accesspvm
++              return -EPERM;
++      }
++      // map the file to memory
++      down_write(&tsk->mm->mmap_sem);
++      error = (long)do_mmap_pgoff2(file, a.addr, a.len, a.prot, a.flags, a.pgoff >> PAGE_SHIFT, tsk);
++      up_write(&tsk->mm->mmap_sem);
++      if (file)
++              fput(file);
++out:
++      return error;
++}
++
+ static void find_start_end(unsigned long flags, unsigned long *begin,
+ 			   unsigned long *end)
+ {
+@@ -142,6 +194,52 @@ full_search:
+ 	}
+ }
+ 
++unsigned long
++arch_get_unmapped_area2(struct file *filp, unsigned long addr,
++		unsigned long len, unsigned long pgoff, 
++		unsigned long flags, struct task_struct *tsk)
++{
++	struct mm_struct *mm = tsk->mm;
++	struct vm_area_struct *vma;
++	unsigned long start_addr;
++	unsigned long begin, end;
++	
++	find_start_end(flags, &begin, &end); 
++
++	if (len > end)
++		return -ENOMEM;
++
++	if (addr) {
++		addr = PAGE_ALIGN(addr);
++		vma = find_vma(mm, addr);
++		if (end - len >= addr &&
++		    (!vma || addr + len <= vma->vm_start))
++			return addr;
++	}
++	addr = mm->free_area_cache;
++	if (addr < begin) 
++		addr = begin; 
++	start_addr = addr;
++
++full_search:
++	for (vma = find_vma(mm, addr); ; vma = vma->vm_next) {
++		if (end - len < addr) {
++			if (start_addr != begin) {
++				start_addr = addr = begin;
++				goto full_search;
++			}
++			return -ENOMEM;
++		}
++		if (!vma || addr + len <= vma->vm_start) {
++			mm->free_area_cache = addr + len;
++			return addr;
++		}
++		addr = vma->vm_end;
++	}
++}
++
++
++
+ asmlinkage long sys_uname(struct new_utsname __user * name)
+ {
+ 	int err;
+diff -urpN linux-2.6.11.7-vanilla/include/asm-x86_64/exechandle.h linux-2.6.11.7-pannus-x86_64/include/asm-x86_64/exechandle.h
+--- linux-2.6.11.7-vanilla/include/asm-x86_64/exechandle.h	1970-01-01 09:00:00.000000000 +0900
++++ linux-2.6.11.7-pannus-x86_64/include/asm-x86_64/exechandle.h	2005-04-18 10:45:47.000000000 +0900
+@@ -0,0 +1,21 @@
++#ifndef _ASM_X86_64_EXECHANDLE_H
++#define _ASM_X86_64_EXECHANDLE_H
++
++#include <asm/types.h>
++#include <asm/signal.h>
++
++
++struct initaction
++{
++	void (*inithandler)(int);
++	void (*restorer)(void);
++};
++
++struct k_initaction
++{
++        struct initaction ia;
++};
++
++void do_init(struct pt_regs *regs, sigset_t *oldset);
++
++#endif
+diff -urpN linux-2.6.11.7-vanilla/include/asm-x86_64/thread_info.h linux-2.6.11.7-pannus-x86_64/include/asm-x86_64/thread_info.h
+--- linux-2.6.11.7-vanilla/include/asm-x86_64/thread_info.h	2005-04-08 03:57:52.000000000 +0900
++++ linux-2.6.11.7-pannus-x86_64/include/asm-x86_64/thread_info.h	2005-04-18 10:45:47.000000000 +0900
+@@ -33,6 +33,9 @@ struct thread_info {
+ 
+ 	mm_segment_t		addr_limit;	
+ 	struct restart_block    restart_block;
++
++	__u32			inipending;	/* pending flags for live patch */
++	__u32			inifinish;	/* finish flags for live patch */
+ };
+ #endif
+ 
+diff -urpN linux-2.6.11.7-vanilla/include/asm-x86_64/unistd.h linux-2.6.11.7-pannus-x86_64/include/asm-x86_64/unistd.h
+--- linux-2.6.11.7-vanilla/include/asm-x86_64/unistd.h	2005-04-08 03:57:51.000000000 +0900
++++ linux-2.6.11.7-pannus-x86_64/include/asm-x86_64/unistd.h	2005-04-18 10:45:47.000000000 +0900
+@@ -563,8 +563,21 @@ __SYSCALL(__NR_add_key, sys_add_key)
+ __SYSCALL(__NR_request_key, sys_request_key)
+ #define __NR_keyctl		250
+ __SYSCALL(__NR_keyctl, sys_keyctl)
++#define __NR_mmap3	251
++__SYSCALL(__NR_mmap3, sys_mmap3)
++#define __NR_accesspvm	252
++__SYSCALL(__NR_accesspvm, sys_accesspvm)
++#define __NR_init_pend	253
++__SYSCALL(__NR_init_pend, sys_init_pend)
++#define __NR_rt_handlereturn	254
++__SYSCALL(__NR_rt_handlereturn, stub_rt_handlereturn)
++#define __NR_check_init	255
++__SYSCALL(__NR_check_init, sys_check_init)
++#define __NR_munmap3	256
++__SYSCALL(__NR_munmap3, sys_munmap3)
+ 
+-#define __NR_syscall_max __NR_keyctl
++
++#define __NR_syscall_max __NR_munmap3
+ #ifndef __NO_STUBS
+ 
+ /* user-visible error numbers are in the range -1 - -4095 */
+@@ -751,6 +764,7 @@ static inline pid_t waitpid(int pid, int
+ extern long sys_mmap(unsigned long addr, unsigned long len,
+ 			unsigned long prot, unsigned long flags,
+ 			unsigned long fd, unsigned long off);
++extern long sys_mmap3(void *);
+ 
+ extern int sys_modify_ldt(int func, void *ptr, unsigned long bytecount);
+ 
+diff -urpN linux-2.6.11.7-vanilla/include/linux/capability.h linux-2.6.11.7-pannus-x86_64/include/linux/capability.h
+--- linux-2.6.11.7-vanilla/include/linux/capability.h	2005-04-08 03:57:26.000000000 +0900
++++ linux-2.6.11.7-pannus-x86_64/include/linux/capability.h	2005-04-18 10:45:47.000000000 +0900
+@@ -288,6 +288,10 @@ typedef __u32 kernel_cap_t;
+ 
+ #define CAP_AUDIT_CONTROL    30
+ 
++/* Allow use of memory access system calls for Live Patching */
++
++#define CAP_SYS_PANNUS       31
++
+ #ifdef __KERNEL__
+ /* 
+  * Bounding set
+diff -urpN linux-2.6.11.7-vanilla/include/linux/mm.h linux-2.6.11.7-pannus-x86_64/include/linux/mm.h
+--- linux-2.6.11.7-vanilla/include/linux/mm.h	2005-04-08 03:57:09.000000000 +0900
++++ linux-2.6.11.7-pannus-x86_64/include/linux/mm.h	2005-04-18 10:45:47.000000000 +0900
+@@ -614,6 +614,7 @@ extern int install_page(struct mm_struct
+ extern int install_file_pte(struct mm_struct *mm, struct vm_area_struct *vma, unsigned long addr, unsigned long pgoff, pgprot_t prot);
+ extern int handle_mm_fault(struct mm_struct *mm,struct vm_area_struct *vma, unsigned long address, int write_access);
+ extern int make_pages_present(unsigned long addr, unsigned long end);
++extern int make_pages_present2(unsigned long addr, unsigned long end, struct task_struct *tsk);
+ extern int access_process_vm(struct task_struct *tsk, unsigned long addr, void *buf, int len, int write);
+ void install_arg_page(struct vm_area_struct *, struct page *, unsigned long);
+ 
+@@ -730,10 +731,16 @@ extern void exit_mmap(struct mm_struct *
+ 
+ extern unsigned long get_unmapped_area(struct file *, unsigned long, unsigned long, unsigned long, unsigned long);
+ 
++extern unsigned long get_unmapped_area2(struct file *, unsigned long, unsigned long, unsigned long, unsigned long, struct task_struct *);
++
+ extern unsigned long do_mmap_pgoff(struct file *file, unsigned long addr,
+ 	unsigned long len, unsigned long prot,
+ 	unsigned long flag, unsigned long pgoff);
+ 
++extern unsigned long do_mmap_pgoff2(struct file *file, unsigned long addr,
++	unsigned long len, unsigned long prot,
++	unsigned long flag, unsigned long pgoff, struct task_struct *);
++
+ static inline unsigned long do_mmap(struct file *file, unsigned long addr,
+ 	unsigned long len, unsigned long prot,
+ 	unsigned long flag, unsigned long offset)
+diff -urpN linux-2.6.11.7-vanilla/include/linux/mman.h linux-2.6.11.7-pannus-x86_64/include/linux/mman.h
+--- linux-2.6.11.7-vanilla/include/linux/mman.h	2005-04-08 03:57:13.000000000 +0900
++++ linux-2.6.11.7-pannus-x86_64/include/linux/mman.h	2005-04-18 10:45:47.000000000 +0900
+@@ -64,4 +64,17 @@ calc_vm_flag_bits(unsigned long flags)
+ 	       _calc_vm_trans(flags, MAP_LOCKED,     VM_LOCKED    );
+ }
+ 
++/*
++ * Struct of argument to pass the mmap3 system call.
++ */ 
++typedef struct _mmap3_arg_struct {
++	unsigned long addr; /* address where file is loaded */
++	unsigned long len; /* length of data to be maped */
++	unsigned long prot; /* permission of the memory where the file is mapped */
++	unsigned long flags; /* flag of mapped memory */
++	unsigned long fd; /* file descriptor of data to be mapped */
++	unsigned long pgoff; /* page offset of data to be mapped */
++	unsigned long pid; /* process ID */
++} mmap3_arg_struct_t;
++
+ #endif /* _LINUX_MMAN_H */
+diff -urpN linux-2.6.11.7-vanilla/include/linux/sched.h linux-2.6.11.7-pannus-x86_64/include/linux/sched.h
+--- linux-2.6.11.7-vanilla/include/linux/sched.h	2005-04-08 03:57:12.000000000 +0900
++++ linux-2.6.11.7-pannus-x86_64/include/linux/sched.h	2005-04-18 10:45:47.000000000 +0900
+@@ -21,6 +21,7 @@
+ #include <asm/ptrace.h>
+ #include <asm/mmu.h>
+ #include <asm/cputime.h>
++#include <asm/exechandle.h>
+ 
+ #include <linux/smp.h>
+ #include <linux/sem.h>
+@@ -197,9 +198,19 @@ extern unsigned long
+ arch_get_unmapped_area(struct file *, unsigned long, unsigned long,
+ 		       unsigned long, unsigned long);
+ extern unsigned long
++arch_get_unmapped_area2(struct file *, unsigned long, unsigned long,
++		       unsigned long, unsigned long, struct task_struct *);
++
++extern unsigned long
+ arch_get_unmapped_area_topdown(struct file *filp, unsigned long addr,
+ 			  unsigned long len, unsigned long pgoff,
+ 			  unsigned long flags);
++
++extern unsigned long
++arch_get_unmapped_area_topdown2(struct file *filp, unsigned long addr,
++			  unsigned long len, unsigned long pgoff,
++			  unsigned long flags, struct task_struct *);
++
+ extern void arch_unmap_area(struct vm_area_struct *area);
+ extern void arch_unmap_area_topdown(struct vm_area_struct *area);
+ 
+@@ -211,6 +222,11 @@ struct mm_struct {
+ 	unsigned long (*get_unmapped_area) (struct file *filp,
+ 				unsigned long addr, unsigned long len,
+ 				unsigned long pgoff, unsigned long flags);
++	unsigned long (*get_unmapped_area2) (struct file *filp,
++				unsigned long addr, unsigned long len,
++				unsigned long pgoff, unsigned long flags, 
++				struct task_struct * tsk);
++
+ 	void (*unmap_area) (struct vm_area_struct *area);
+ 	unsigned long mmap_base;		/* base of mmap area */
+ 	unsigned long free_area_cache;		/* first hole */
+@@ -685,6 +701,7 @@ struct task_struct {
+   	struct mempolicy *mempolicy;
+ 	short il_next;
+ #endif
++	struct k_initaction k_ia; /*Inialization info for live patch */
+ };
+ 
+ static inline pid_t process_group(struct task_struct *tsk)
+@@ -1173,6 +1190,7 @@ static inline void arch_pick_mmap_layout
+ {
+ 	mm->mmap_base = TASK_UNMAPPED_BASE;
+ 	mm->get_unmapped_area = arch_get_unmapped_area;
++	mm->get_unmapped_area2 = arch_get_unmapped_area2;
+ 	mm->unmap_area = arch_unmap_area;
+ }
+ #endif
+diff -urpN linux-2.6.11.7-vanilla/kernel/fork.c linux-2.6.11.7-pannus-x86_64/kernel/fork.c
+--- linux-2.6.11.7-vanilla/kernel/fork.c	2005-04-08 03:57:12.000000000 +0900
++++ linux-2.6.11.7-pannus-x86_64/kernel/fork.c	2005-04-18 10:45:47.000000000 +0900
+@@ -2,6 +2,7 @@
+  *  linux/kernel/fork.c
+  *
+  *  Copyright (C) 1991, 1992  Linus Torvalds
++ *  Copyright (C)  2004-2005 NTT Corporation
+  */
+ 
+ /*
+@@ -412,6 +413,12 @@ void mm_release(struct task_struct *tsk,
+ 		u32 __user * tidptr = tsk->clear_child_tid;
+ 		tsk->clear_child_tid = NULL;
+ 
++		/* initialize flag and information for live patch */
++		tsk->thread_info->inipending=0;
++		tsk->thread_info->inifinish=0;
++		tsk->k_ia.ia.inithandler=NULL;
++		tsk->k_ia.ia.restorer=NULL;
++
+ 		/*
+ 		 * We don't check the error code - if userspace has
+ 		 * not set up a proper pointer then tough luck.
+diff -urpN linux-2.6.11.7-vanilla/mm/memory.c linux-2.6.11.7-pannus-x86_64/mm/memory.c
+--- linux-2.6.11.7-vanilla/mm/memory.c	2005-04-08 03:57:36.000000000 +0900
++++ linux-2.6.11.7-pannus-x86_64/mm/memory.c	2005-04-18 10:45:47.000000000 +0900
+@@ -2209,6 +2209,27 @@ int make_pages_present(unsigned long add
+ 	return ret == len ? 0 : -1;
+ }
+ 
++int make_pages_present2(unsigned long addr, unsigned long end, struct task_struct *tsk)
++{
++	int ret, len, write;
++	struct vm_area_struct * vma;
++
++	vma = find_vma(tsk->mm, addr);
++	if (!vma)
++		return -1;
++	write = (vma->vm_flags & VM_WRITE) != 0;
++	if (addr >= end)
++		BUG();
++	if (end > vma->vm_end)
++		BUG();
++	len = (end+PAGE_SIZE-1)/PAGE_SIZE-addr/PAGE_SIZE;
++	ret = get_user_pages(tsk, tsk->mm, addr,
++			len, write, 0, NULL, NULL);
++	if (ret < 0)
++		return ret;
++	return ret == len ? 0 : -1;
++}
++
+ /* 
+  * Map a vmalloc()-space virtual address to the physical page.
+  */
+diff -urpN linux-2.6.11.7-vanilla/mm/mmap.c linux-2.6.11.7-pannus-x86_64/mm/mmap.c
+--- linux-2.6.11.7-vanilla/mm/mmap.c	2005-04-08 03:57:45.000000000 +0900
++++ linux-2.6.11.7-pannus-x86_64/mm/mmap.c	2005-04-18 11:04:40.000000000 +0900
+@@ -1143,6 +1143,239 @@ unacct_error:
+ 
+ EXPORT_SYMBOL(do_mmap_pgoff);
+ 
++/*
++ * map the data which have the length specified in the file to the memory of
++ * the specified task.(clone of do_mmap_pgoff)
++ */
++
++unsigned long do_mmap_pgoff2(struct file * file, unsigned long addr,
++			unsigned long len, unsigned long prot,
++			unsigned long flags, unsigned long pgoff, struct task_struct *tsk)
++{
++	struct mm_struct * mm = tsk->mm;
++	struct vm_area_struct * vma, * prev;
++	struct inode *inode;
++	unsigned int vm_flags;
++	int correct_wcount = 0;
++	int error;
++	struct rb_node ** rb_link, * rb_parent;
++	int accountable = 1;
++	unsigned long charged = 0;
++
++	if (file) {
++		if (is_file_hugepages(file))
++			accountable = 0;
++
++		if (!file->f_op || !file->f_op->mmap)
++			return -ENODEV;
++
++		if ((prot & PROT_EXEC) &&
++		    (file->f_vfsmnt->mnt_flags & MNT_NOEXEC))
++			return -EPERM;
++	}
++
++	if ((prot & PROT_READ) && (tsk->personality & READ_IMPLIES_EXEC))
++		if (!(file && (file->f_vfsmnt->mnt_flags & MNT_NOEXEC)))
++			prot |= PROT_EXEC;
++	if (!len)
++		return addr;
++
++	len = PAGE_ALIGN(len);
++	if (!len || len > TASK_SIZE)
++		return -EINVAL;
++
++	if ((pgoff + (len >> PAGE_SHIFT)) < pgoff)
++		return -EINVAL;
++
++	if (mm->map_count > sysctl_max_map_count)
++		return -ENOMEM;
++
++	addr = get_unmapped_area2(file, addr, len, pgoff, flags, tsk);
++	if (addr & ~PAGE_MASK)
++		return addr;
++
++	vm_flags = calc_vm_prot_bits(prot) | calc_vm_flag_bits(flags) |
++			mm->def_flags | VM_MAYREAD | VM_MAYWRITE | VM_MAYEXEC;
++
++	if (flags & MAP_LOCKED) {
++		if (!can_do_mlock())
++			return -EPERM;
++		vm_flags |= VM_LOCKED;
++	}
++	if (vm_flags & VM_LOCKED) {
++		unsigned long locked, lock_limit;
++		locked = mm->locked_vm << PAGE_SHIFT;
++		lock_limit = tsk->signal->rlim[RLIMIT_MEMLOCK].rlim_cur;
++		locked += len;
++		if (locked > lock_limit && !capable(CAP_IPC_LOCK))
++			return -EAGAIN;
++	}
++
++	inode = file ? file->f_dentry->d_inode : NULL;
++
++	if (file) {
++		switch (flags & MAP_TYPE) {
++		case MAP_SHARED:
++			if ((prot&PROT_WRITE) && !(file->f_mode&FMODE_WRITE))
++				return -EACCES;
++
++			if (IS_APPEND(inode) && (file->f_mode & FMODE_WRITE))
++				return -EACCES;
++
++			if (locks_verify_locked(inode))
++				return -EAGAIN;
++
++			vm_flags |= VM_SHARED | VM_MAYSHARE;
++			if (!(file->f_mode & FMODE_WRITE))
++				vm_flags &= ~(VM_MAYWRITE | VM_SHARED);
++
++		case MAP_PRIVATE:
++			if (!(file->f_mode & FMODE_READ))
++				return -EACCES;
++			break;
++
++		default:
++			return -EINVAL;
++		}
++	} else {
++		switch (flags & MAP_TYPE) {
++		case MAP_SHARED:
++			vm_flags |= VM_SHARED | VM_MAYSHARE;
++			break;
++		case MAP_PRIVATE:
++			pgoff = addr >> PAGE_SHIFT;
++			break;
++		default:
++			return -EINVAL;
++		}
++	}
++
++	error = security_file_mmap(file, prot, flags);
++	if (error)
++		return error;
++		
++	error = -ENOMEM;
++munmap_back:
++	vma = find_vma_prepare(mm, addr, &prev, &rb_link, &rb_parent);
++	if (vma && vma->vm_start < addr + len) {
++		if (do_munmap(mm, addr, len))
++			return -ENOMEM;
++		goto munmap_back;
++	}
++	if ((mm->total_vm << PAGE_SHIFT) + len
++	    > tsk->signal->rlim[RLIMIT_AS].rlim_cur)
++		return -ENOMEM;
++
++	if (accountable && (!(flags & MAP_NORESERVE) ||
++			    sysctl_overcommit_memory == OVERCOMMIT_NEVER)) {
++		if (vm_flags & VM_SHARED) {
++			vm_flags |= VM_ACCOUNT;
++		} else if (vm_flags & VM_WRITE) {
++			charged = len >> PAGE_SHIFT;
++			if (security_vm_enough_memory(charged))
++				return -ENOMEM;
++			vm_flags |= VM_ACCOUNT;
++		}
++	}
++
++	if (!file && !(vm_flags & VM_SHARED) &&
++	    vma_merge(mm, prev, addr, addr + len, vm_flags,
++					NULL, NULL, pgoff, NULL))
++		goto out;
++
++	vma = kmem_cache_alloc(vm_area_cachep, SLAB_KERNEL);
++	if (!vma) {
++		error = -ENOMEM;
++		goto unacct_error;
++	}
++	memset(vma, 0, sizeof(*vma));
++
++	vma->vm_mm = mm;
++	vma->vm_start = addr;
++	vma->vm_end = addr + len;
++	vma->vm_flags = vm_flags;
++	vma->vm_page_prot = protection_map[vm_flags & 0x0f];
++	vma->vm_pgoff = pgoff;
++
++	if (file) {
++		error = -EINVAL;
++		if (vm_flags & (VM_GROWSDOWN|VM_GROWSUP))
++			goto free_vma;
++		if (vm_flags & VM_DENYWRITE) {
++			error = deny_write_access(file);
++			if (error)
++				goto free_vma;
++			correct_wcount = 1;
++		}
++		vma->vm_file = file;
++		get_file(file);
++		error = file->f_op->mmap(file, vma);
++		if (error)
++			goto unmap_and_free_vma;
++	} else if (vm_flags & VM_SHARED) {
++		error = shmem_zero_setup(vma);
++		if (error)
++			goto free_vma;
++	}
++
++	if ((vm_flags & (VM_SHARED|VM_ACCOUNT)) == (VM_SHARED|VM_ACCOUNT))
++		vma->vm_flags &= ~VM_ACCOUNT;
++
++
++	addr = vma->vm_start;
++	pgoff = vma->vm_pgoff;
++	vm_flags = vma->vm_flags;
++
++	if (!file || !vma_merge(mm, prev, addr, vma->vm_end,
++			vma->vm_flags, NULL, file, pgoff, vma_policy(vma))) {
++		file = vma->vm_file;
++		vma_link(mm, vma, prev, rb_link, rb_parent);
++		if (correct_wcount)
++			atomic_inc(&inode->i_writecount);
++	} else {
++		if (file) {
++			if (correct_wcount)
++				atomic_inc(&inode->i_writecount);
++			fput(file);
++		}
++		mpol_free(vma_policy(vma));
++		kmem_cache_free(vm_area_cachep, vma);
++	}
++
++out:
++	mm->total_vm += len >> PAGE_SHIFT;
++	__vm_stat_account(mm, vm_flags, file, len >> PAGE_SHIFT);
++	if (vm_flags & VM_LOCKED) {
++		mm->locked_vm += len >> PAGE_SHIFT;
++		make_pages_present2(addr, addr + len, tsk);
++	}
++	if (flags & MAP_POPULATE) {
++		up_write(&mm->mmap_sem);
++		sys_remap_file_pages(addr, len, 0,
++					pgoff, flags & MAP_NONBLOCK);
++		down_write(&mm->mmap_sem);
++	}
++	acct_update_integrals();
++	update_mem_hiwater();
++	return addr;
++
++unmap_and_free_vma:
++	if (correct_wcount)
++		atomic_inc(&inode->i_writecount);
++	vma->vm_file = NULL;
++	fput(file);
++
++	zap_page_range(vma, vma->vm_start, vma->vm_end - vma->vm_start, NULL);
++free_vma:
++	kmem_cache_free(vm_area_cachep, vma);
++unacct_error:
++	if (charged)
++		vm_unacct_memory(charged);
++	return error;
++}
++EXPORT_SYMBOL(do_mmap_pgoff2);
++
++
+ /* Get an address range which is currently unmapped.
+  * For shmat() with addr=0.
+  *
+@@ -1199,6 +1432,48 @@ full_search:
+ 		addr = vma->vm_end;
+ 	}
+ }
++
++/*
++ * Get the area in the specific process where nothing is mapped.
++ * (clone of arch_get_unmapped_area)
++ */
++unsigned long
++arch_get_unmapped_area2(struct file *filp, unsigned long addr,
++		unsigned long len, unsigned long pgoff, unsigned long flags, struct task_struct *tsk)
++{
++ 
++	struct mm_struct *mm = tsk->mm;
++	struct vm_area_struct *vma;
++	unsigned long start_addr;
++	if (len > TASK_SIZE)
++		return -ENOMEM;
++
++	if (addr) {
++		addr = PAGE_ALIGN(addr);
++		vma = find_vma(mm, addr);
++		if (TASK_SIZE - len >= addr &&
++		    (!vma || addr + len <= vma->vm_start))
++			return addr;
++	}
++	start_addr = addr = mm->free_area_cache;
++
++full_search:
++	for (vma = find_vma(mm, addr); ; vma = vma->vm_next) {
++		if (TASK_SIZE - len < addr) {
++			if (start_addr != TASK_UNMAPPED_BASE) {
++				start_addr = addr = TASK_UNMAPPED_BASE;
++				goto full_search;
++			}
++			return -ENOMEM;
++		}
++		if (!vma || addr + len <= vma->vm_start) {
++			mm->free_area_cache = addr + len;
++			return addr;
++		}
++		addr = vma->vm_end;
++	}
++}
++
+ #endif	
+ 
+ void arch_unmap_area(struct vm_area_struct *area)
+@@ -1300,6 +1575,66 @@ fail:
+ 
+ 	return addr;
+ }
++
++/*
++ * Get the area in the specific process where nothing is mapped.
++ * (clone of arch_get_unmapped_area_topdown)
++ */
++unsigned long
++arch_get_unmapped_area_topdown2(struct file *filp, const unsigned long addr0,
++			  const unsigned long len, const unsigned long pgoff,
++			  const unsigned long flags, struct task_struct *tsk)
++{
++	struct vm_area_struct *vma, *prev_vma;
++	struct mm_struct *mm = tsk->mm;
++	unsigned long base = mm->mmap_base, addr = addr0;
++	int first_time = 1;
++
++	if (len > TASK_SIZE)
++		return -ENOMEM;
++
++	if (mm->free_area_cache > base)
++		mm->free_area_cache = base;
++
++	if (addr) {
++		addr = PAGE_ALIGN(addr);
++		vma = find_vma(mm, addr);
++		if (TASK_SIZE - len >= addr &&
++		    (!vma || addr + len <= vma->vm_start))
++			return addr;
++	}
++
++try_again:
++	if (mm->free_area_cache < len)
++		goto fail;
++
++	addr = (mm->free_area_cache - len) & PAGE_MASK;
++	do {
++	  if (!(vma = find_vma_prev(mm, addr, &prev_vma)))
++			return addr;
++
++		if (addr+len <= vma->vm_start &&
++				(!prev_vma || (addr >= prev_vma->vm_end)))
++			return (mm->free_area_cache = addr);
++		else
++			if (mm->free_area_cache == vma->vm_end)
++				mm->free_area_cache = vma->vm_start;
++
++		addr = vma->vm_start-len;
++	} while (len <= vma->vm_start);
++
++fail:
++	if (first_time) {
++		mm->free_area_cache = base;
++		first_time = 0;
++		goto try_again;
++	}
++	mm->free_area_cache = TASK_UNMAPPED_BASE;
++	addr = arch_get_unmapped_area2(filp, addr0, len, pgoff, flags, tsk);
++	mm->free_area_cache = base;
++	return addr;
++}
++
+ #endif
+ 
+ void arch_unmap_area_topdown(struct vm_area_struct *area)
+@@ -1350,6 +1685,35 @@ get_unmapped_area(struct file *file, uns
+ 
+ EXPORT_SYMBOL(get_unmapped_area);
+ 
++/*
++ * Get the area in the specific process where nothing is mapped.
++ * (clone of get_unmapped_area)
++ */
++unsigned long
++get_unmapped_area2(struct file *file, unsigned long addr, unsigned long len,
++		unsigned long pgoff, unsigned long flags, struct task_struct *tsk)
++{
++	if (flags & MAP_FIXED) {
++		unsigned long ret;
++
++		if (addr > TASK_SIZE - len)
++			return -ENOMEM;
++		if (addr & ~PAGE_MASK)
++			return -EINVAL;
++		if (file && is_file_hugepages(file))  {
++			ret = prepare_hugepage_range(addr, len);
++		} else {
++			ret = is_hugepage_only_range(addr, len);
++		}
++		if (ret)
++			return -EINVAL;
++		return addr;
++	}
++	return tsk->mm->get_unmapped_area2(file, addr, len, pgoff, flags, tsk);
++}
++
++EXPORT_SYMBOL(get_unmapped_area2);
++
+ /* Look up the first VMA which satisfies  addr < vm_end,  NULL if none. */
+ struct vm_area_struct * find_vma(struct mm_struct * mm, unsigned long addr)
+ {
+@@ -1878,6 +2242,49 @@ static inline void verify_mm_writelocked
+ #endif
+ }
+ 
++
++
++/*
++ * Clear the specified mapped area in specified process.
++ * Provide the system call munmap3.
++ * Send memory map information struct to do_munmap.
++ */
++asmlinkage long sys_munmap3(unsigned long addr, size_t len, pid_t pid)
++{
++	int ret;
++	struct mm_struct *mm;
++
++	/* target process task struct */
++	struct task_struct *tsk;
++
++	/* get specified process task struct from pid.*/          
++	read_lock(&tasklist_lock);
++	tsk = find_task_by_pid(pid);
++	read_unlock(&tasklist_lock);
++
++	if (!tsk)
++		return -ESRCH;
++
++	// capability check	
++	if(((current->uid != tsk->euid) ||
++	(current->uid != tsk->suid) ||
++	(current->uid != tsk->uid) ||
++	(current->gid != tsk->egid) ||
++	(current->gid != tsk->sgid) ||
++	(current->gid != tsk->gid)) && !capable(CAP_SYS_PANNUS)) {
++		// invalid user in munamp3
++		// EPERM:1 Operation not permitted
++		return -EPERM;
++	}
++        
++                                                                        
++	mm = tsk->mm;
++	down_write(&mm->mmap_sem);
++	ret = do_munmap(mm, addr, len);
++	up_write(&mm->mmap_sem);
++	return ret;
++}
++
+ /*
+  *  this is really a simplified "do_mmap".  it only handles
+  *  anonymous maps.  eventually we may be able to do some

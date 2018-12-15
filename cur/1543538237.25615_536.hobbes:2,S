@@ -1,0 +1,234 @@
+Date: Wed, 05 Jul 2000 14:08:49 +0200
+From: Olaf Titz <>
+Subject: [RFC] solution for the inet_ntoa problem, buffer allocator
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/7/5/26
+
+Ideally, we would be able to do something like:
+  printk(KERN_DEBUG "foo: src=%s dst=%s\n", inet_ntoa(src), inet_ntoa(dst));
+but the inet_ntoa() API doesn't work that way. Providing a buffer to
+that function needs additional code over and over again, and that is
+exactly what such library functions should eliminate.
+The NIPQUAD solution is (a) cumbersome to handle, (b) conceptually
+wrong since an IP address is _one_ item to print, not four, and (c)
+even worse when dealing with IPv6 addresses.
+Some kind of dynamic allocation of buffers would be in order.
+Unfortunately, alloca() can not be used in this context.
+I'm presenting a simple routine to dynamically allocate buffers and
+implementations of
+ char *kinet_ntoa(__u32 a) and
+ char *kinet6_ntoa(const struct in6_addr *a)
+which use this allocation. With those routines, it is possible to call
+printk() in the natural way. For the IPv6 case, the address is
+displayed in compressed format. It is easy to add any other
+"foo-to-string" conversion routine.
+The buffer allocation works as follows: every conversion routine has
+its own chain (salloc_t) of buffers (scope_buf_t). Whenever a buffer
+is needed, it looks for a free one in the chain. Each buffer is tagged
+with the return address of the caller (here called "scope"). A buffer
+is considered free when its scope doesn't match the current one.
+Additionally, since one buffer can be used several times in a row by
+one caller, a buffer is considered free if it is older than an hour.
+When no free buffer is found, a new one is allocated. A routine to
+free the whole chain is provided too.
+Each chain is protected by its own spinlock and the whole thing is
+(assumed to be) SMP-safe.
+I assume that using __builtin_frame_address(0) as scope instead of
+__builtin_return_address(0) would lead to less collisions, but this is
+not tested and using __builtin_frame_address in a function seems to
+automatically turn on -fno-omit-frame-pointer for that function, so
+this is prone to hurt more than it helps.
+The central salloc() routine is non-reentrant wrt. one chain and the
+buffers it returns are assumed to be short-lived. It is constructed
+precisely for the printk("%s", foo(bar)) or strcpy(dest, foo(bar))
+situation where foo() calls salloc() to get its buffer and probably
+unsuited for other uses.
+The buffer chains are like micro-slabs but using a kmem_cache for each
+one of them, which is assumed to hold only 3-4 objects of size 16
+bytes (for kinet_ntoa), would probably be overkill.
+I currently use this module in CIPE and it works. (The IPv6 part is
+more a demo by now, since CIPE doesn't use IPv6, but it is tested.)
+Olaf
+#ifndef SALLOC_H
+#define SALLOC_H
+#define SALLOC_DEBUG
+#define SALLOC_TIMEOUT (3600*HZ)
+#include <linux/types.h>
+#include <linux/socket.h>
+#include <linux/in.h>
+#include <linux/in6.h>
+#include <linux/malloc.h>
+#include <asm/spinlock.h>
+typedef struct scope_buf_s {
+    struct scope_buf_s *next;
+    void *scope;
+#ifdef SALLOC_TIMEOUT
+    unsigned long timeout;
+#endif
+    char buf[0];
+} scope_buf_t;
+typedef struct salloc_s {
+    scope_buf_t *buflist;
+    int size;
+    spinlock_t lock;
+#ifdef SALLOC_DEBUG
+    int nbufs;
+#endif
+} salloc_t;
+#ifdef SALLOC_DEBUG
+#define SALLOC_INIT(size) (salloc_t) { NULL, size, SPIN_LOCK_UNLOCKED, 0 }
+#else
+#define SALLOC_INIT(size) (salloc_t) { NULL, size, SPIN_LOCK_UNLOCKED }
+#endif
+extern void *salloc(salloc_t *bufs, void *scope);
+extern void sunalloc(salloc_t *bufs);
+/* These routines use salloc() and can be seen as a prototype. */
+extern char *__kinet_ntoa(__u32 a, void *s);
+#define kinet_ntoa(a) __kinet_ntoa((a), __builtin_return_address(0))
+extern char *__kinet6_ntoa(const struct in6_addr *a, void *s);
+#define kinet6_ntoa(a) __kinet6_ntoa((a), __builtin_return_address(0))
+extern void ntoa_unalloc(void);
+#endif
+#include "salloc.h"
+#include <linux/kernel.h>
+#define IN6_COMPRESS
+void *salloc(salloc_t *bufs, void *scope)
+{
+    unsigned long flags;
+    scope_buf_t *q;
+    spin_lock_irqsave(&bufs->lock, flags);
+    q = bufs->buflist;
+    while (q) {
+	if (q->scope != scope)
+	    goto out;
+#ifdef SALLOC_TIMEOUT
+	if (time_after(jiffies, q->timeout)) {
+	    printk(KERN_INFO "salloc: timeout buf=%p scope=%p\n",
+		   q, q->scope);
+	    /* Break this because it _should_ be dead */
+	    goto out;
+	}
+#endif
+	q = q->next;
+    }
+#ifdef SALLOC_DEBUG
+    ++bufs->nbufs;
+    printk(KERN_DEBUG "salloc: alloc %d n=%d scope=%p\n",
+	   bufs->size, bufs->nbufs, scope);
+#endif
+    q = kmalloc(sizeof(scope_buf_t)+bufs->size, GFP_ATOMIC);
+    q->next = bufs->buflist;
+    bufs->buflist = q;
+ out:
+    q->scope = scope;
+#ifdef SALLOC_TIMEOUT
+    q->timeout = jiffies + SALLOC_TIMEOUT;
+#endif
+    spin_unlock_irqrestore(&bufs->lock, flags);
+    return q->buf;
+}
+void sunalloc(salloc_t *bufs)
+{
+    unsigned long flags;
+    scope_buf_t *q, *q0;
+    spin_lock_irqsave(&bufs->lock, flags);
+    for (q = bufs->buflist; q; q = q0) {
+	q0 = q->next;
+	kfree(q);
+    }
+    bufs->buflist = NULL;
+#ifdef SALLOC_DEBUG
+    bufs->nbufs = 0;
+#endif
+    spin_unlock_irqrestore(&bufs->lock, flags);
+}
+/* IPv4 address conversion */
+static salloc_t sa_ntoa = SALLOC_INIT(16);
+static inline void ___kinet_ntoa(const __u32 a, char *b)
+{
+    char *p = b;
+    const unsigned char *x=(const unsigned char *)&a;
+    int i;
+    for (i=0; i<4; ++i, ++x) {
+        int k=*x/100;
+        if (k)
+            *p++=k+'0';
+        k=(*x/10)%10;
+        if (k)
+            *p++=k+'0';
+        *p++=(*x%10)+'0';
+        if (i<3)
+            *p++='.';
+    }
+    *p='\0';
+}
+char *__kinet_ntoa(const __u32 a, void *s)
+{
+    char *b = salloc(&sa_ntoa, s);
+    ___kinet_ntoa(a, b);
+    return b;
+}
+/* IPv6 address conversion */
+static salloc_t sa_ntoa6 = SALLOC_INIT(40);
+#ifdef IN6_COMPRESS
+/* Find longest zero run of 16bit words */
+static inline void flzr(const struct in6_addr *a, int *l, int *r)
+{
+    int i=0, j;
+    while (i<8) {
+	if (!a->s6_addr16[i]) {
+	    j = i;
+	    while (j<7 && !a->s6_addr16[j+1])
+		++j;
+	    if (j-i > *r-*l) {
+		*l = i;
+		*r = j;
+	    }
+	    i = j+1;
+	} else {
+	    ++i;
+	}
+    }
+}
+#endif
+static inline void ___kinet6_ntoa(const struct in6_addr *a, char *b)
+{
+    char *p = b;
+    int i, j;
+    int l = -1, r = -2;
+    static const char hex[16] = "0123456789ABCDEF";
+    static const __u16 mask[4] = { 0xF000, 0xFF00, 0xFFF0, 0xFFFF };
+    static const __u16 shft[4] = { 12, 8, 4, 0 };
+#ifdef IN6_COMPRESS
+    flzr(a, &l, &r);
+#endif
+    if (l==0)
+	*p++ = ':';
+    for (i=0; i<8; ++i) {
+	if (i<l || i>r) {
+	    __u16 k=ntohs(a->s6_addr16[i]);
+	    for (j=0; j<4; ++j)
+		if (j==3 || (k & mask[j]))
+		    *p++ = hex[(k>>shft[j]) & 15];
+	    if (i<7)
+		*p++ = ':';
+	}
+	if (i==r)
+	    *p++ = ':';
+    }
+    *p = '\0';
+}
+char *__kinet6_ntoa(const struct in6_addr *a, void *s)
+{
+    char *b = salloc(&sa_ntoa6, s);
+    ___kinet6_ntoa(a, b);
+    return b;
+}
+void ntoa_unalloc(void)
+{
+    sunalloc(&sa_ntoa);
+    sunalloc(&sa_ntoa6);
+}

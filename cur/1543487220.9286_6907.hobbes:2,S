@@ -1,0 +1,246 @@
+Date: Wed, 24 Feb 1999 16:31:19 +0000 (GMT)
+From: Tim Waugh <>
+Subject: Poll semantics for lp
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/2/24/62
+
+Hi,
+I sent this to linux-parport, but didn't get an answer.  Does anyone here
+have anything to say about it?
+Thanks,
+Tim.
+*/
+---------- Forwarded message ----------
+Date: Sun, 21 Feb 1999 18:46:07 +0000 (GMT)
+From: Tim Waugh <tim@cyberelk.demon.co.uk>
+To: linux-parport@torque.net
+Subject: [PARPORT] Poll semantics for lp
+Hi guys,
+I'm given to believe that the LPRng filter 'ifhp' uses select() to figure
+out if the printer has any status to send.  Currently, that's not
+implemented.
+Here's an illustration of a fairly easy way of implementing it for lp, but
+I'd like to hear people's opinions.
+The idea is that we keep the printer in reverse nibble mode whenever it's
+idle, and then just watch nDataAvail.  If the peripheral signals that it's
+got data available, we tell the application to read.
+I'm reasonably certain that this is semantically wrong, and that select()
+returning a readfd means that read() will return without blocking,
+something which we cannot guarantee with this method.
+I had a go in implementing asynchronous I/O in lp, but it ended in
+disaster.
+So - opinions?
+Thanks,
+Tim.
+*/
+--- linux-2.2.1-1284/include/linux/lp.h	Thu Feb 11 20:31:06 1999
++++ linux/include/linux/lp.h	Thu Feb 11 19:48:30 1999
+@@ -28,6 +28,11 @@
+ #define LP_CAREFUL 0x0080 /* obsoleted -arca */
+ #define LP_ABORTOPEN 0x0100
+ 
++#define LP_NO_REVERSE  0x0200 /* No reverse mode available. */
++#define LP_DATA_AVAIL  0x0400 /* Data is available. */
++#define LP_HAVE_PORT_BIT   11 /* (0x0800) Port is claimed. */
++#define LP_PORT_BUSY   (2<<12) /* Reading or writing. */
++
+ /* timeout for each character.  This is relative to bus cycles -- it
+  * is the count in a busy loop.  THIS IS THE VALUE TO CHANGE if you
+  * have extremely slow printing, or if the machine seems to slow down
+@@ -124,6 +129,7 @@
+ 	struct wait_queue *err_waitq;
+ 	unsigned int last_error;
+ 	struct semaphore port_mutex;
++	struct wait_queue *dataq;
+ };
+ 
+ /*
+--- linux-2.2.1-1284/drivers/char/lp.c	Thu Feb 11 20:31:06 1999
++++ linux/drivers/char/lp.c	Thu Feb 11 20:35:00 1999
+@@ -117,10 +117,11 @@
+ #include <linux/major.h>
+ #include <linux/sched.h>
+ #include <linux/malloc.h>
+ #include <linux/fcntl.h>
+ #include <linux/delay.h>
++#include <linux/poll.h>
+ 
+ #include <linux/parport.h>
+ #undef LP_STATS
+ #include <linux/lp.h>
+ 
+@@ -136,11 +137,11 @@
+ 	[0 ... LP_NO-1] = {NULL, 0, LP_INIT_CHAR, LP_INIT_TIME, LP_INIT_WAIT,
+ 			   NULL,
+ #ifdef LP_STATS
+ 			   0, 0, {0},
+ #endif
+-			   NULL, 0, MUTEX, }
++			   NULL, 0, MUTEX, NULL, }
+ };
+ 
+ /* Test if printer is ready */
+ #define	LP_READY(status)	((status) & LP_PBUSY)
+ /* Test if the printer is not acking the strobe */
+@@ -160,16 +161,56 @@
+        struct lp_struct *lps = (struct lp_struct *)handle;
+ 
+        if (waitqueue_active (&lps->err_waitq))
+                wake_up_interruptible(&lps->err_waitq);
+ 
++       if (!(lps->flags & LP_PORT_BUSY)) {
++	       /* Let the port go. */
++	       clear_bit (LP_HAVE_PORT_BIT, &lps->flags);
++	       return 0;
++       }
++
+        /* Don't actually release the port now */
+        return 1;
+ }
+ 
+-#define lp_parport_release(x)	do { parport_release(lp_table[(x)].dev); } while (0);
+-#define lp_parport_claim(x)	do { parport_claim_or_block(lp_table[(x)].dev); } while (0);
++static void lp_check_data (struct lp_struct *lp)
++{
++	struct pardevice *dev = lp->dev;
++	if (!(lp->flags & LP_NO_REVERSE)) {
++		int err = parport_negotiate (dev->port, IEEE1284_MODE_NIBBLE);
++		if (err)
++			lp->flags |= LP_NO_REVERSE;
++		else {
++			unsigned char s = parport_read_status (dev->port);
++			if (s & PARPORT_STATUS_ERROR)
++				lp->flags &= ~LP_DATA_AVAIL;
++			else {
++				lp->flags |= LP_DATA_AVAIL;
++				if (waitqueue_active (&lp->dataq))
++					wake_up_interruptible (&lp->dataq);
++			}
++		}
++	}
++}
++
++static void lp_parport_release (int minor)
++{
++	if (test_and_clear_bit (LP_HAVE_PORT_BIT, &lp_table[minor].flags))
++		parport_release (lp_table[minor].dev);
++
++	lp_check_data (&lp_table[minor]);
++	lp_table[minor].flags &= ~LP_PORT_BUSY;
++}
++
++static void lp_parport_claim (int minor)
++{
++	if (!test_and_set_bit (LP_HAVE_PORT_BIT, &lp_table[minor].flags))
++		parport_claim_or_block (lp_table[minor].dev);
++
++	lp_table[minor].flags |= LP_PORT_BUSY;
++}
+ 
+ /* --- low-level port access ----------------------------------- */
+ 
+ #define r_dtr(x)	(parport_read_data(lp_table[(x)].dev->port))
+ #define r_str(x)	(parport_read_status(lp_table[(x)].dev->port))
+@@ -190,14 +231,31 @@
+ 
+ static void lp_interrupt(int irq, void *dev_id, struct pt_regs *regs)
+ {
+ 	struct lp_struct *lp_dev = (struct lp_struct *) dev_id;
+ 	parport_ieee1284_interrupt (irq, lp_dev->dev->port, regs);
++	if (!(lp_dev->flags & LP_PORT_BUSY))
++		lp_check_data (lp_dev);
+ 	if (waitqueue_active (&lp_dev->err_waitq))
+ 		wake_up_interruptible (&lp_dev->err_waitq);
+ }
+ 
++static void lp_wakeup (void *handle)
++{
++	struct lp_struct *lp_dev = handle;
++
++	if (lp_dev->flags & LP_PORT_BUSY)
++		return;
++
++	/* Grab the port if it can help (i.e. reverse mode is possible). */
++	if (!(lp_dev->flags & LP_NO_REVERSE)) {
++		parport_claim (lp_dev->dev);
++		set_bit (LP_HAVE_PORT_BIT, &lp_dev->flags);
++		lp_check_data (lp_dev);
++	}
++}
++
+ static void lp_error (int minor)
+ {
+ 	int polling;
+ 
+ 	if (LP_F(minor) & LP_ABORT)
+@@ -205,11 +263,11 @@
+ 
+ 	polling = lp_table[minor].dev->port->irq == PARPORT_IRQ_NONE;
+ 	if (polling) lp_parport_release (minor);
+ 	interruptible_sleep_on_timeout (&lp_table[minor].err_waitq,
+ 					LP_TIMEOUT_POLLED);
+-	if (polling) lp_parport_claim (minor)
++	if (polling) lp_parport_claim (minor);
+ 	else parport_yield_blocking (lp_table[minor].dev);
+ }
+ 
+ static int lp_check_status(int minor)
+ {
+@@ -474,20 +532,33 @@
+ 			retval = -EINVAL;
+ 	}
+ 	return retval;
+ }
+ 
++static unsigned int lp_poll (struct file *filp, struct poll_table_struct *wait)
++{
++	unsigned int minor = MINOR(filp->f_dentry->d_inode->i_rdev);
++	unsigned int mask = POLLOUT | POLLWRNORM; /* always writable */
++
++	poll_wait (filp, &lp_table[minor].dataq, wait);
++
++	if (lp_table[minor].flags & LP_DATA_AVAIL)
++		mask |= POLLIN | POLLRDNORM;
++
++	return mask;
++}
++
+ static struct file_operations lp_fops = {
+ 	lp_lseek,
+ #ifdef CONFIG_PRINTER_READBACK
+ 	lp_read,
+ #else
+ 	NULL,
+ #endif
+ 	lp_write,
+ 	NULL,		/* lp_readdir */
+-	NULL,		/* lp_poll */
++	lp_poll,
+ 	lp_ioctl,
+ 	NULL,		/* lp_mmap */
+ 	lp_open,
+ 	NULL,		/* flush */
+ 	lp_release
+@@ -539,11 +610,11 @@
+ #endif
+ 
+ int lp_register(int nr, struct parport *port)
+ {
+ 	lp_table[nr].dev = parport_register_device(port, "lp", 
+-						   lp_preempt, NULL,
++						   lp_preempt, lp_wakeup,
+ 						   lp_interrupt, 
+ 						   0,
+ 						   (void *) &lp_table[nr]);
+ 	if (lp_table[nr].dev == NULL)
+ 		return 1;
+--  To unsubscribe, send mail to: linux-parport-request@torque.net --
+--  with the single word "unsubscribe" in the body of the message. --
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

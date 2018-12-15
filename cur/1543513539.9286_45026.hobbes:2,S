@@ -1,0 +1,372 @@
+Date: Wed, 20 Oct 1999 19:32:19 -0400 (EDT)
+From: "Benjamin C.R. LaHaise" <>
+Subject: [PATCH] 2.3.23pre4 - DMA fix, boot failure on ABIT BP6 and page_alloc.c improvements
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/10/20/127
+
+Hello everyone,
+Below are three patches.  The first to setup.c fixes a problem my BP6 was
+triggering in the new E820/bootmem code -- one of the memory regions was a
+paltry 1KB in size, and it wasn't being skipped properly.
+The second to bootmem.c fixes the problem with all memory being marked as
+DMA.
+The third to page_alloc.c is not an essential fix, but rather a forward
+port of a patch in 2.2.13 that splits GFP_DMA pages into a separate list
+from non-DMA pages.  This helps keep the system's DMA pool at a higher
+steady state since the last of the DMAable pages will only be consumed by
+atomic allocations.  Personally, I think it makes the high memory stuff
+look a bit more tidy =)
+This patch is against 2.3.23pre4 plus Ingo's highmem-2.3.23-D3 patch.
+		-ben
+diff -ur clean/2.3.23pre4+highmem-D3/arch/i386/kernel/setup.c 2.3.23pre4/arch/i386/kernel/setup.c
+--- clean/2.3.23pre4+highmem-D3/arch/i386/kernel/setup.c	Wed Oct 20 16:28:02 1999
++++ 2.3.23pre4/arch/i386/kernel/setup.c	Wed Oct 20 19:00:17 1999
+@@ -594,6 +594,11 @@
+ 		if (e820.map[i].type != E820_RAM)
+ 			continue;
+ 		curr_pfn = PFN_DOWN(e820.map[i].addr + e820.map[i].size);
++
++		/* skip regions that don't give us a complete page */
++		if (curr_pfn <= PFN_UP(e820.map[i].addr))
++			continue;
++
+ 		if (curr_pfn > max_pfn)
+ 			max_pfn = curr_pfn;
+ 	}
+@@ -644,6 +649,10 @@
+ 		 * ... and at the end of the usable range downwards:
+ 		 */
+ 		last_pfn = PFN_DOWN(e820.map[i].addr + e820.map[i].size);
++
++		/* skip if it's not a usable range */
++		if (last_pfn <= curr_pfn)
++			continue;
+ 
+ 		if (last_pfn > max_low_pfn)
+ 			last_pfn = max_low_pfn;
+diff -ur clean/2.3.23pre4+highmem-D3/mm/bootmem.c 2.3.23pre4/mm/bootmem.c
+--- clean/2.3.23pre4+highmem-D3/mm/bootmem.c	Wed Oct 20 19:18:46 1999
++++ 2.3.23pre4/mm/bootmem.c	Wed Oct 20 19:14:49 1999
+@@ -212,7 +212,7 @@
+ 			ClearPageReserved(page);
+ 			set_page_count(page, 1);
+ 			if (i >= (__pa(MAX_DMA_ADDRESS) >> PAGE_SHIFT))
+-				clear_bit(PG_DMA, page);
++				clear_bit(PG_DMA, &page->flags);
+ 			__free_page(page);
+ 		}
+ 	}
+diff -ur clean/2.3.23pre4+highmem-D3/mm/page_alloc.c 2.3.23pre4/mm/page_alloc.c
+--- clean/2.3.23pre4+highmem-D3/mm/page_alloc.c	Wed Oct 20 16:28:04 1999
++++ 2.3.23pre4/mm/page_alloc.c	Wed Oct 20 18:45:34 1999
+@@ -44,15 +44,23 @@
+ struct free_area_struct {
+ 	struct list_head free_list;
+ 	unsigned int * map;
++	unsigned long count;
+ };
+ 
++#define MEM_TYPE_DMA		0
++#define MEM_TYPE_NORMAL		1
++#define MEM_TYPE_HIGH		2
++
++static const char *mem_type_strs[] = {"DMA", "Normal", "High"};
++
+ #ifdef CONFIG_HIGHMEM
+-#define HIGHMEM_LISTS_OFFSET	NR_MEM_LISTS
+-static struct free_area_struct free_area[NR_MEM_LISTS*2];
++#define NR_MEM_TYPES		3
+ #else
+-static struct free_area_struct free_area[NR_MEM_LISTS];
++#define NR_MEM_TYPES		2
+ #endif
+ 
++static struct free_area_struct free_area[NR_MEM_TYPES][NR_MEM_LISTS];
++
+ /*
+  * Free_page() adds the page to the free lists. This is optimized for
+  * fast normal cases (no error jumps taken normally).
+@@ -80,13 +88,13 @@
+ #define memlist_next(x) ((x)->next)
+ #define memlist_prev(x) ((x)->prev)
+ 
+-static inline void free_pages_ok(unsigned long map_nr, unsigned long order)
++static inline void free_pages_ok(struct page *page, unsigned long map_nr, unsigned long order)
+ {
+-	struct free_area_struct *area = free_area + order;
++	struct free_area_struct *area;
+ 	unsigned long index = map_nr >> (1 + order);
+ 	unsigned long mask = (~0UL) << order;
+ 	unsigned long flags;
+-	struct page *page, *buddy;
++	struct page *buddy;
+ 
+ 	spin_lock_irqsave(&page_alloc_lock, flags);
+ 
+@@ -94,10 +102,17 @@
+ 
+ #ifdef CONFIG_HIGHMEM
+ 	if (map_nr >= highmem_mapnr) {
+-		area += HIGHMEM_LISTS_OFFSET;
++		area = free_area[MEM_TYPE_HIGH];
+ 		nr_free_highpages -= mask;
+-	}
++	} else
+ #endif
++	if (PageDMA(page))
++		area = free_area[MEM_TYPE_DMA];
++	else
++		area = free_area[MEM_TYPE_NORMAL];
++
++	area += order;
++
+ 	map_nr &= mask;
+ 	nr_free_pages -= mask;
+ 
+@@ -113,12 +128,14 @@
+ 		buddy = list(map_nr ^ -mask);
+ 		page = list(map_nr);
+ 
++		area->count--;
+ 		memlist_del(&buddy->list);
+ 		mask <<= 1;
+ 		area++;
+ 		index >>= 1;
+ 		map_nr &= mask;
+ 	}
++	area->count++;
+ 	memlist_add_head(&(list(map_nr))->list, &area->free_list);
+ #undef list
+ 
+@@ -141,7 +158,7 @@
+ 		if (PageLocked(page))
+ 			PAGE_BUG(page);
+ 
+-		free_pages_ok(page-mem_map, 0);
++		free_pages_ok(page, page-mem_map, 0);
+ 		return 1;
+ 	}
+ 	return 0;
+@@ -158,7 +175,7 @@
+ 				PAGE_BUG(map);
+ 			if (PageLocked(map))
+ 				PAGE_BUG(map);
+-			free_pages_ok(map_nr, order);
++			free_pages_ok(map, map_nr, order);
+ 			return 1;
+ 		}
+ 	}
+@@ -174,6 +191,7 @@
+ 		area--;
+ 		high--;
+ 		size >>= 1;
++		area->count++;
+ 		memlist_add_head(&(map)->list, &(area)->free_list);
+ 		MARK_USED(index, high, area);
+ 		index += size;
+@@ -183,9 +201,9 @@
+ 	return index;
+ }
+ 
+-static inline struct page * rmqueue (int order, int gfp_mask, int offset)
++static inline struct page * rmqueue (int order, unsigned type)
+ {
+-	struct free_area_struct * area = free_area+order+offset;
++	struct free_area_struct * area = free_area[type]+order;
+ 	unsigned long curr_order = order, map_nr;
+ 	struct page *page;
+ 	struct list_head *head, *curr;
+@@ -194,18 +212,16 @@
+ 		head = &area->free_list;
+ 		curr = memlist_next(head);
+ 
+-		while (curr != head) {
++		if (curr != head) {
+ 			page = memlist_entry(curr, struct page, list);
+-			if (!(gfp_mask & __GFP_DMA) || CAN_DMA(page)) {
+-				memlist_del(curr);
+-				map_nr = page - mem_map;	
+-				MARK_USED(map_nr, curr_order, area);
+-				nr_free_pages -= 1 << order;
+-				map_nr = EXPAND(page, map_nr, order, curr_order, area);
+-				page = mem_map + map_nr;
+-				return page;	
+-			}
+-			curr = memlist_next(curr);
++			memlist_del(curr);
++			area->count--;
++			map_nr = page - mem_map;	
++			MARK_USED(map_nr, curr_order, area);
++			nr_free_pages -= 1 << order;
++			map_nr = EXPAND(page, map_nr, order, curr_order, area);
++			page = mem_map + map_nr;
++			return page;	
+ 		}
+ 		curr_order++;
+ 		area++;
+@@ -271,6 +287,7 @@
+ {
+ 	unsigned long flags;
+ 	struct page *page;
++	unsigned type;
+ 
+ 	if (order >= NR_MEM_LISTS)
+ 		goto nopage;
+@@ -289,22 +306,25 @@
+ 		goto lowmemory;
+ 
+ ok_to_allocate:
+-	spin_lock_irqsave(&page_alloc_lock, flags);
+-
+ #ifdef CONFIG_HIGHMEM
+-	if (gfp_mask & __GFP_HIGHMEM) {
+-		page = rmqueue(order, gfp_mask, HIGHMEM_LISTS_OFFSET);
++	if (gfp_mask & __GFP_HIGHMEM)
++		type = MEM_TYPE_HIGH;
++	else
++#endif
++	if (gfp_mask & __GFP_DMA)
++		type = MEM_TYPE_DMA;
++	else
++		type = MEM_TYPE_NORMAL;
++
++	spin_lock_irqsave(&page_alloc_lock, flags);
++	do {
++		page = rmqueue(order, type);
+ 		if (page) {
+-			nr_free_highpages -= 1 << order;
+ 			spin_unlock_irqrestore(&page_alloc_lock, flags);
+-			goto ret;
++			return page;
+ 		}
+-	}
+-#endif
+-	page = rmqueue(order, gfp_mask, 0);
++	} while (type-- > 0) ;
+ 	spin_unlock_irqrestore(&page_alloc_lock, flags);
+-	if (page)
+-		goto ret;
+ 
+ 	/*
+ 	 * If we can schedule, do so, and make sure to yield.
+@@ -323,8 +343,6 @@
+ 	if (balance_lowmemory(gfp_mask))
+ 		goto ok_to_allocate;
+ 	goto nopage;
+-ret:
+-	return page;
+ }
+ 
+ unsigned long __get_free_pages(int gfp_mask, unsigned long order)
+@@ -349,40 +367,32 @@
+ void show_free_areas(void)
+ {
+  	unsigned long order, flags;
+- 	unsigned long total = 0;
++	unsigned type;
+ 
+-	printk("Free pages:      %6dkB (%6ldkB HighMem)\n ( ",
++	spin_lock_irqsave(&page_alloc_lock, flags);
++	printk("Free pages:      %6dkB (%6ldkB HighMem)\n",
+ 		nr_free_pages<<(PAGE_SHIFT-10),
+ 		nr_free_highpages<<(PAGE_SHIFT-10));
+-	printk("Free: %d, lru_cache: %d (%d %d %d)\n",
++	printk("( Free: %d, lru_cache: %d (%d %d %d) )\n",
+ 		nr_free_pages,
+ 		nr_lru_pages,
+ 		freepages.min,
+ 		freepages.low,
+ 		freepages.high);
+ 
+-	spin_lock_irqsave(&page_alloc_lock, flags);
+- 	for (order = 0; order < NR_MEM_LISTS; order++) {
+-		unsigned long nr = 0;
+-		struct list_head *head, *curr;
+-		struct page *page;
++	for (type = 0; type < NR_MEM_TYPES; type++) {
++ 		unsigned long total = 0;
++		printk("  %s: ", mem_type_strs[type]);
++	 	for (order = 0; order < NR_MEM_LISTS; order++) {
++			unsigned long nr = free_area[type][order].count;
+ 
+-		head = &free_area[order].free_list;
+-		for (curr = memlist_next(head); curr != head; curr = memlist_next(curr)) {
+-			page = memlist_entry(curr, struct page, list);
+-			nr++;
++			total += nr * ((PAGE_SIZE>>10) << order);
++			printk("%lu*%lukB ", nr, (unsigned long)((PAGE_SIZE>>10) << order));
+ 		}
+-#ifdef CONFIG_HIGHMEM
+-		head = &free_area[order+HIGHMEM_LISTS_OFFSET].free_list;
+-		for (curr = memlist_next(head); curr != head; curr = memlist_next(curr))
+-			nr++;
+-#endif
+-		total += nr * ((PAGE_SIZE>>10) << order);
+-		printk("%lu*%lukB ", nr, (unsigned long)((PAGE_SIZE>>10) << order));
++		printk("= %lukB)\n", total);
+ 	}
+ 	spin_unlock_irqrestore(&page_alloc_lock, flags);
+ 
+-	printk("= %lukB)\n", total);
+ #ifdef SWAP_CACHE_INFO
+ 	show_swap_cache_info();
+ #endif	
+@@ -400,8 +410,7 @@
+ void __init free_area_init(unsigned long end_mem_pages)
+ {
+ 	mem_map_t * p;
+-	unsigned long mask = -1;
+-	unsigned long i;
++	unsigned long i, j;
+ 	unsigned long map_size;
+ 
+ 	/*
+@@ -442,25 +451,20 @@
+ 		memlist_init(&p->list);
+ 	}
+ 	
+-	for (i = 0 ; i < NR_MEM_LISTS ; i++) {
+-		unsigned long bitmap_size;
+-		unsigned int * map;
+-		memlist_init(&(free_area+i)->free_list);
+-#ifdef CONFIG_HIGHMEM
+-		memlist_init(&(free_area+HIGHMEM_LISTS_OFFSET+i)->free_list);
+-#endif
+-		mask += mask;
+-		end_mem_pages = (end_mem_pages + ~mask) & mask;
+-		bitmap_size = end_mem_pages >> i;
+-		bitmap_size = (bitmap_size + 7) >> 3;
+-		bitmap_size = LONG_ALIGN(bitmap_size);
+-		map = (unsigned int *) alloc_bootmem(bitmap_size);
+-		free_area[i].map = map;
+-		memset((void *) map, 0, bitmap_size);
+-#ifdef CONFIG_HIGHMEM
+-		map = (unsigned int *) alloc_bootmem(bitmap_size);
+-		free_area[HIGHMEM_LISTS_OFFSET+i].map = map;
+-		memset((void *) map, 0, bitmap_size);
+-#endif
++	for (j = 0 ; j < NR_MEM_TYPES ; j++) {
++		unsigned long mask = -1;
++		for (i = 0 ; i < NR_MEM_LISTS ; i++) {
++			unsigned long bitmap_size;
++			unsigned int * map;
++			memlist_init(&free_area[j][i].free_list);
++			mask += mask;
++			end_mem_pages = (end_mem_pages + ~mask) & mask;
++			bitmap_size = end_mem_pages >> i;
++			bitmap_size = (bitmap_size + 7) >> 3;
++			bitmap_size = LONG_ALIGN(bitmap_size);
++			map = (unsigned int *) alloc_bootmem(bitmap_size);
++			free_area[j][i].map = map;
++			memset((void *) map, 0, bitmap_size);
++		}
+ 	}
+ }
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

@@ -1,0 +1,191 @@
+Date: Thu, 26 Oct 2000 09:17:38 +1100
+From: Stephen Rothwell <>
+Subject: Re: [PATCH] make my life easier ...
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/10/25/166
+
+Hi Andre,
+Andre Hedrick <andre@linux-ide.org> writes:
+> 
+> You want to get ATA/PI APM fixed?
+Absolutely :-)
+> "The Linux 'original' IDE guy' Mark Lord showed Alan what was trying to
+> bang over everyone's head, without success.
+> 
+> Here is his sample code for cs5530 chipset.
+> 
+> Look at this and comment.  I have part of the space setup to complete the
+> APM extenstion calls.  This will get you and me out of a jam with laptops.
+OK, I include below a more or less translation for 2.4.  I have not even
+compiled this, and have not got the hardware to test it anyway.
+However, on the bus this morning, I though about this again and wondered
+that this may not the correct way to do this.  What we actually want to
+power manage is the PCI device as a whole not each interface independantly,
+which I would assume is impossible anyway.
+2.4 provides another power management interface for PCI drivers - the
+suspend and resume elements of the pci_driver struct.  These have
+the advantage of the driver being called in the correct order with
+respect to power being removed/resumed to the bus that the device
+is actually hanging off.  Unfortunately, the IDE code does not use
+the "new" (quoted from Documentation/pci.txt) pci_register_driver
+interface.
+Also, the suspend/resume logic should include code to actually turn
+the device off and on.
+Where do we go from here?
+Cheers,
+Stephen
+-- 
+Stephen Rothwell, Open Source Researcher, Linuxcare, Inc.
++61-2-62628990 tel, +61-2-62628991 fax 
+sfr@linuxcare.com, 
+http://www.linuxcare.com/
+ 
+Linuxcare. Support for the revolution.
+diff -ruN 2.4.0-test10pre5/drivers/ide/cs5530.c 2.4.0-test10pre5-ide/drivers/ide/cs5530.c
+--- 2.4.0-test10pre5/drivers/ide/cs5530.c	Wed Oct  4 10:35:09 2000
++++ 2.4.0-test10pre5-ide/drivers/ide/cs5530.c	Thu Oct 26 01:09:05 2000
+@@ -31,6 +31,23 @@
+ 
+ #define DISPLAY_CS5530_TIMINGS
+ 
++#if defined(CONFIG_PM)
++#include <linux/pm.h>
++/*
++ * This driver now supports APM SUSPEND/RESUME actions,
++ * for which it saves/restores chipset/drive timings.
++ *
++ * BUT.. this code may be slightly unsafe to use since
++ * there is no knowlege of APM in the higher level IDE code.
++ *
++ * The risk is that there may be I/O in progress when
++ * our RESUME function is invoked.. and we'll basically toast it.
++ * The high level code will eventually time out on its IRQ wait,
++ * and likely report a "lost interrupt" after assuming the
++ * operation completed successfully.  Ugh.
++ */
++#endif
++
+ #if defined(DISPLAY_CS5530_TIMINGS) && defined(CONFIG_PROC_FS)
+ #include <linux/stat.h>
+ #include <linux/proc_fs.h>
+@@ -251,7 +268,7 @@
+ /*
+  * Initialize the cs5530 bridge for reliable IDE DMA operation.
+  */
+-unsigned int __init pci_init_cs5530 (struct pci_dev *dev, const char *name)
++unsigned int pci_init_cs5530 (struct pci_dev *dev, const char *name)
+ {
+ 	struct pci_dev *master_0 = NULL, *cs5530_0 = NULL;
+ 	unsigned short pcicmd = 0;
+@@ -338,12 +355,108 @@
+ 	return 0;
+ }
+ 
++#if defined(CONFIG_PM)
++static int cs5530_pm_callback(struct pm_dev *pm_dev, pm_request_t rqst,
++		void *data)
++{
++	static unsigned int saved_regs[2][4];
++	static int saved_state[2];
++	static int already_restored = 1;
++	int h, d, r;
++	unsigned int basereg;
++	unsigned int format;
++	ide_hwif_t *hwif = pm_dev->data;
++	ide_drive_t *drive;
++
++	switch(rqst) {
++	case PM_SUSPEND: 
++		if (hwif == NULL)
++			break;
++
++		basereg = CS5530_BASEREG(hwif);
++		h = hwif->index;
++		for (r = 0; r < 4; ++r)
++			saved_regs[h][r] = inl(basereg + (r<<2));
++		saved_state[h] = 1;
++		printk("%s: saved chipset timings\n", hwif->name);
++		already_restored = 0;
++		break;
++
++	case PM_RESUME: 
++		if (hwif == NULL)
++			break;
++		h = hwif->index;
++		if (saved_state[h] == 0)
++			break;
++
++		/*
++		 * Restore chipset registers:
++		 */
++		basereg = CS5530_BASEREG(hwif);
++		if (!already_restored++)
++			(void) pci_init_cs5530 (hwif->pci_dev, "CS5530");
++		for (r = 0; r < 4; ++r)
++			outl(saved_regs[h][r], basereg + (r<<2));
++		printk("%s: restored chipset timings\n", hwif->name);
++		/*
++		 * Re-program drive PIO modes
++		 */
++		format = (saved_regs[h][1] >> 31) & 1;
++		for (d = 0; d < MAX_DRIVES; ++d) {
++			drive = &(hwif->drives[d]);
++			if (drive->present) {
++				unsigned int pio, timings;
++				timings = saved_regs[h][d<<1];
++				for (pio = 0; pio <= 4; ++pio)
++					if (cs5530_pio_timings[format][pio] == timings)
++						break;
++				if (pio > 4)
++					pio = 255; /* autotune */
++				(void)cs5530_tuneproc(drive, pio);
++			}
++		}
++		/*
++		 * Re-program drive DMA modes
++		 */
++		if (hwif->dmaproc != NULL) {
++			for (d = 0; d < MAX_DRIVES; ++d) {
++				drive = &(hwif->drives[d]);
++				if (drive->present) {
++					int was_using_dma = drive->using_dma;
++					(void)cs5530_dmaproc(ide_dma_off_quietly, drive);
++					(void)cs5530_dmaproc(ide_dma_check, drive); 
++					if (!was_using_dma && drive->using_dma)
++						(void)cs5530_dmaproc(ide_dma_off_quietly, drive);
++				}
++			}
++		}
++		saved_state[h] = 0;
++		break;
++
++	default:
++		break;
++	}
++	return 0;
++}
++#endif
++
+ /*
+  * This gets invoked by the IDE driver once for each channel,
+  * and performs channel-specific pre-initialization before drive probing.
+  */
+ void __init ide_init_cs5530 (ide_hwif_t *hwif)
+ {
++#if defined(CONFIG_PM)
++	struct pm_dev *pm_dev;
++
++	pm_dev = pm_register(PM_PCI_DEV, PM_PCI_ID(hwif->pci_dev),
++			cs5530_pm_callback);
++	if (pm_dev == NULL)
++		printk(KERN_WARNING "%s: apm suspend/resume might not work\n",
++			hwif->name);
++	else
++		pm_dev->data = hwif;
++#endif
+ 	if (hwif->mate)
+ 		hwif->serialized = hwif->mate->serialized = 1;
+ 	if (!hwif->dma_base) {

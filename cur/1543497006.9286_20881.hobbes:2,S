@@ -1,0 +1,145 @@
+Date: Fri, 28 May 1999 05:06:36 -0400
+From: Joseph Malicki <>
+Subject: MAJOR NTFS BUG - DO NOT USE WRITE!
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/5/29/114
+
+If you're using the writing code in the NTFS driver, you should STOP NOW!
+:)  Any writes that extend a file (beyond the first write() call on creation,
+ANY writes beyond the end otherwise) will overwrite a malloc'd buffer and
+corrupt arbitrary memory from the kernel heap, up to the length it's extended.
+So writing to NTFS can not only corrupt the NTFS filesystem, it can corrupt
+ANYTHING.... your ext2 partitions and network packets are at risk too...
+Not malloc'ing additional memory is also the reason why NTFS does not use the
+astronomical amounts of memory I assumed it did :)  I'm working on a patch to
+fix it the RIGHT way, but it could potentially break read.  Included is a
+horrible kludge patch which tries to fix this in a temporary manner until the
+real fix is done.
+Once it overwrites the arbitrary kernel memory, it will then read it back on
+subsequent reads, reporting any changes to userspace.... this could be a
+security hole.
+I'm working on a patch, it should be done by the end of this weekend if it's at
+the difficulty level I think it is, but will result in much new untested code
+in NTFS....  For now it would be a good idea to stop using CONFIG_NTFS_RW,
+probably disable it in Config.in.....
+You've been warned.
+Joseph Malicki
+Techinical details:
+When a file is written to beyond its end, ntfs_readwrite_attr (inode.c) calls
+ntfs_resize_attr (attr.c). If the attribute is resident (i.e. the file has 0
+length and no blocks are allocated on disk so far), ntfs_resize_attr will
+initialize attr->d.data with a new pointer that is the size of the first write.
+This is why the first write will succeed.  However, if blocks have already
+been allocated, it will call ntfs_extend_attr (attr.c).  This will call
+ntfs_insert_run (attr.c), which does allocate new memory for the new runlist
+(i.e. extents list) for its increased size.  However, attr->d.data will never
+be changed.  So any writes past the end will overflow this buffer and walk all
+over the kernel heap.
+I've been contemplating rewriting NTFS to not use attr->d.data like it does
+now, but instead to read/write files a block at a time from the buffer cache as
+they're requested....  but this looks like it will be needed.  An ntfs_malloc
+and a memcpy in ntfs_extend_attr would do for now, but would eat up a lot of
+memory.  I've been wanting to write large (up to 50MB) files back and forth,
+and kmalloc'ing 100MB from the kernel heap just isn't going to work well :).
+Joseph Malicki
+Here's the kludge patch that should work for now....
+please comment
+--- linux/fs/ntfs/attr.c~	Mon Apr 12 13:05:58 1999
++++ linux/fs/ntfs/attr.c	Fri May 28 06:56:35 1999
+@@ -135,15 +135,18 @@
+ 	if(attr->compressed)return EOPNOTSUPP;
+ 	if(ino->record_count>1)return EOPNOTSUPP;
+ 
++	if( *len <= attr->allocated )
++	{
++		ntfs_error("NTFS: Something truely stupid is happening\n");
++		return 0;	/* truely stupid things do sometimes happen */
++	}
++
+ 	if(attr->resident) {
+ 		error = ntfs_make_attr_nonresident(ino,attr);
+ 		if(error)
+ 			return error;
+ 	}
+ 
+-	if( *len <= attr->allocated )
+-		return 0;	/* truely stupid things do sometimes happen */
+-
+ 	rl=attr->d.r.runlist;
+ 	rlen=attr->d.r.len-1;
+ 
+@@ -232,6 +235,8 @@
+ 		return EOPNOTSUPP;
+ 	if(attr->resident){
+ 		void *v;
++		/* JMM: So that clusters will be properly allocated.. */
++		attr->size=newsize;
+ 		if(newsize>ino->vol->mft_recordsize){
+ 			error=ntfs_make_attr_nonresident(ino,attr);
+ 			if(error)return error;
+@@ -251,7 +256,6 @@
+ 		}else
+ 			attr->d.data=0;
+ 		ntfs_free(v);
+-		attr->size=newsize;
+ 		return 0;
+ 	}
+ 	/* non-resident attribute */
+@@ -284,14 +288,31 @@
+ 			}
+ 		/* FIXME? free space for extra runs in memory */
+ 		attr->d.r.len=newlen;
++		attr->allocated = newcount * clustersize;
+ 	}else{
++		void *v;
++
+ 		newlen=newsize;
+ 		error=ntfs_extend_attr(ino,attr,&newlen,ALLOC_REQUIRE_SIZE);
+ 		if(error)return error; /* FIXME: incomplete */
+ 		newcount=newlen/clustersize;
++		attr->allocated = newcount * clustersize;
++
++		/* JMM: Oops! we need to extend the memory block */
++		v=attr->d.data;
++		attr->d.data=ntfs_malloc(attr->allocated);
++
++		if(!attr->d.data)return ENOMEM;
++
++		if (v)
++		{
++			ntfs_memcpy(attr->d.data, v, oldsize);
++			ntfs_free(v);
++		}
++		ntfs_bzero((char*)attr->d.data+oldsize,
++			   attr->allocated-oldsize);
+ 	}
+ 	/* fill in new sizes */
+-	attr->allocated = newcount*clustersize;
+ 	attr->size = newsize;
+ 	/* attr->initialized does not change. */
+ 	if(!newsize)
+--- linux/fs/ntfs/inode.c~	Sat Apr 24 20:51:48 1999
++++ linux/fs/ntfs/inode.c	Fri May 28 06:56:35 1999
+@@ -149,9 +149,9 @@
+ 	ntfs_fill_mft_header(buf,vol->mft_recordsize,vol->blocksize,0);
+ 	ntfs_insert_fixups(buf,vol->blocksize);
+ 	io.param=buf;
+-	io.size=vol->mft_recordsize;
+ 	io.fn_put = ntfs_put;
+ 	io.fn_get = ntfs_get;
++	io.size=vol->mft_recordsize;
+ 	error=ntfs_write_attr(vol->mft_ino,vol->at_data,0,
+ 			      (rcount-1)*vol->mft_recordsize,&io);
+ 	if(error)return error;
+@@ -555,7 +555,7 @@
+ 		{
+ 			ntfs_error("Read error\n");
+ 			dest->size=copied;
+-			return 0;
++			return error;
+ 		}
+ 		l-=chunk;
+ 		copied+=chunk;

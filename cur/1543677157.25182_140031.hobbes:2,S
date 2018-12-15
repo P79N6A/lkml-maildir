@@ -1,0 +1,121 @@
+Date: Thu, 12 Jun 2003 15:16:01 -0500
+From: Dave McCracken <>
+Subject: [PATCH] Fix vmtruncate race and distributed filesystem race
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2003/6/12/223
+
+Paul McKenney and I sat down today and hashed out just what the races are
+for both  vmtruncate and the distributed filesystems.  We took Andrea's
+idea of using seqlocks and came up with a simple solution that definitely
+fixes the race in vmtruncate, as well as most likely the invalidate race in
+distributed filesystems.  Paul is going to discuss it with the DFS folks to
+verify that it's a complete fix for them, but neither of us can see a hole.
+Anyway, here's the patch.
+Dave McCracken
+======================================================================
+Dave McCracken          IBM Linux Base Kernel Team      1-512-838-3059
+dmccr@us.ibm.com                                        T/L   678-3059
+--- 2.5.70-mm8/./drivers/mtd/devices/blkmtd.c	2003-05-26 20:00:21.000000000 -0500
++++ 2.5.70-mm8-trunc/./drivers/mtd/devices/blkmtd.c	2003-06-12 13:45:48.000000000 -0500
+@@ -1189,6 +1189,7 @@ static int __init init_blkmtd(void)
+   INIT_LIST_HEAD(&mtd_rawdevice->as.locked_pages);
+   mtd_rawdevice->as.host = NULL;
+   init_MUTEX(&(mtd_rawdevice->as.i_shared_sem));
++  seqlock_init(&(mtd_rawdevice->as.truncate_lock));
+ 
+   mtd_rawdevice->as.a_ops = &blkmtd_aops;
+   INIT_LIST_HEAD(&mtd_rawdevice->as.i_mmap);
+--- 2.5.70-mm8/./include/linux/fs.h	2003-06-12 13:37:28.000000000 -0500
++++ 2.5.70-mm8-trunc/./include/linux/fs.h	2003-06-12 13:42:51.000000000 -0500
+@@ -19,6 +19,7 @@
+ #include <linux/cache.h>
+ #include <linux/radix-tree.h>
+ #include <linux/kobject.h>
++#include <linux/seqlock.h>
+ #include <asm/atomic.h>
+ 
+ struct iovec;
+@@ -323,6 +324,7 @@ struct address_space {
+ 	struct list_head	i_mmap;		/* list of private mappings */
+ 	struct list_head	i_mmap_shared;	/* list of shared mappings */
+ 	struct semaphore	i_shared_sem;	/* protect both above lists */
++	seqlock_t		truncate_lock;	/* Cover race condition with truncate */
+ 	unsigned long		dirtied_when;	/* jiffies of first page dirtying */
+ 	int			gfp_mask;	/* how to allocate the pages */
+ 	struct backing_dev_info *backing_dev_info; /* device readahead, etc */
+--- 2.5.70-mm8/./fs/inode.c	2003-06-12 13:37:22.000000000 -0500
++++ 2.5.70-mm8-trunc/./fs/inode.c	2003-06-12 13:43:29.000000000 -0500
+@@ -185,6 +185,7 @@ void inode_init_once(struct inode *inode
+ 	INIT_RADIX_TREE(&inode->i_data.page_tree, GFP_ATOMIC);
+ 	spin_lock_init(&inode->i_data.page_lock);
+ 	init_MUTEX(&inode->i_data.i_shared_sem);
++	seqlock_init(&inode->i_data.truncate_lock);
+ 	INIT_LIST_HEAD(&inode->i_data.private_list);
+ 	spin_lock_init(&inode->i_data.private_lock);
+ 	INIT_LIST_HEAD(&inode->i_data.i_mmap);
+--- 2.5.70-mm8/./mm/swap_state.c	2003-05-26 20:00:39.000000000 -0500
++++ 2.5.70-mm8-trunc/./mm/swap_state.c	2003-06-12 13:40:54.000000000 -0500
+@@ -44,6 +44,7 @@ struct address_space swapper_space = {
+ 	.i_mmap		= LIST_HEAD_INIT(swapper_space.i_mmap),
+ 	.i_mmap_shared	= LIST_HEAD_INIT(swapper_space.i_mmap_shared),
+ 	.i_shared_sem	= __MUTEX_INITIALIZER(swapper_space.i_shared_sem),
++	.truncate_lock  = SEQLOCK_UNLOCKED,
+ 	.private_lock	= SPIN_LOCK_UNLOCKED,
+ 	.private_list	= LIST_HEAD_INIT(swapper_space.private_list),
+ };
+--- 2.5.70-mm8/./mm/memory.c	2003-06-12 13:37:31.000000000 -0500
++++ 2.5.70-mm8-trunc/./mm/memory.c	2003-06-12 13:40:54.000000000 -0500
+@@ -1138,6 +1138,9 @@ invalidate_mmap_range(struct address_spa
+ 			hlen = ULONG_MAX - hba + 1;
+ 	}
+ 	down(&mapping->i_shared_sem);
++	/* Protect against page fault */
++	write_seqlock(&mapping->truncate_lock);
++	write_sequnlock(&mapping->truncate_lock);
+ 	if (unlikely(!list_empty(&mapping->i_mmap)))
+ 		invalidate_mmap_range_list(&mapping->i_mmap, hba, hlen);
+ 	if (unlikely(!list_empty(&mapping->i_mmap_shared)))
+@@ -1390,8 +1393,11 @@ do_no_page(struct mm_struct *mm, struct 
+ 	unsigned long address, int write_access, pte_t *page_table, pmd_t *pmd)
+ {
+ 	struct page * new_page;
++	struct inode *inode;
++	struct address_space *mapping;
+ 	pte_t entry;
+ 	struct pte_chain *pte_chain;
++	unsigned sequence;
+ 	int ret;
+ 
+ 	if (!vma->vm_ops || !vma->vm_ops->nopage)
+@@ -1400,6 +1406,10 @@ do_no_page(struct mm_struct *mm, struct 
+ 	pte_unmap(page_table);
+ 	spin_unlock(&mm->page_table_lock);
+ 
++	inode = vma->vm_file->f_dentry->d_inode;
++	mapping = inode->i_mapping;
++retry:
++	sequence = read_seqbegin(&mapping->truncate_lock);
+ 	new_page = vma->vm_ops->nopage(vma, address & PAGE_MASK, 0);
+ 
+ 	/* no page was available -- either SIGBUS or OOM */
+@@ -1428,6 +1438,17 @@ do_no_page(struct mm_struct *mm, struct 
+ 	}
+ 
+ 	spin_lock(&mm->page_table_lock);
++	/*
++	 * If someone invalidated the page, serialize against the inode,
++	 * then go try again.
++	 */
++	if (unlikely(read_seqretry(&mapping->truncate_lock, sequence))) {
++		spin_unlock(&mm->page_table_lock);
++		down(&inode->i_sem);
++		up(&inode->i_sem);
++		goto retry;
++	}
++
+ 	page_table = pte_offset_map(pmd, address);
+ 
+ 	/*

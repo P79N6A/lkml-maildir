@@ -1,0 +1,766 @@
+Date: Thu, 10 Feb 2000 18:05:17 +0100
+From: Jakub Jelinek <>
+Subject: [PATCH] Userland virtual address space hole fixes
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/2/10/131
+
+Hi!
+sparc64 has for 64bit userland virtual address space
+0-0x80000000000 and 0xfffff80000000000-0xfffffffc00000000 (this is mostly
+hardware issue) but it is mapped int pgd into pgds 0-511 and 512-1022
+respectively (because it would be dumb to have huge pgds).
+Vast majority of kernel code works with this pretty well, but free_pgtables
+is still broken: it just shifts the virtual addresses down by PGDIR_SHIFT
+and assumes the result is correct offset into pgd, which it is not on
+sparc64. This causes e.g. random crashes of 64bit statically linked apps
+(which only trigger free_pgtables with common programs on sparc64).
+The patch below fixes this by masking the offsets into pgd by its size.
+I couldn't use (PTRS_PER_PGD-1) as a mask since alpha and sparc64 use the
+last pgd for virtual PTE and thus PTRS_PER_PGD is not a power of two there,
+so I introduced a new arch define. Alternatively it could be done by
+((PTRS_PER_PGD-1)|1) if you wish (but it is not sure whether that would will
+work with future archs).
+Another issue is that some syscalls (brk, mremap, munmap, mmap) can be used
+by evil application to allocate things in the virtual address hole and
+confuse kernel by that quite a lot. sparc_mmap was trying to solve this a
+little bit, but did not fully, while other syscalls did not bother much.
+This patch should fix all this by:
+- allowing arch specific get_unmapped_area, which can handle all the arch
+specific details like where in virtual address space it is possible to
+allocate things and where it is not.
+- hacking sparc64 and sparc32 syscall stubs to these syscalls to make sure
+they have proper arguments before calling generic routines (to do this, I
+had unfortunately to separate sys_mremap do do_mremap and sys_mremap but I
+see no other easy way how to do it without copying most of mremap.c into
+sparc files which would be ugly and unmaintainable - I have to call
+get_unmapped_area in some cases before calling do_mremap and thus have to
+hold mm semaphore around).
+sun4c and sun4 has similar issues like sparc64 has (there the VA hole is
+from 0x20000000 to 0xdfffffff and perhaps some other architectures will have
+something similar, so it is not sparc64 specific issue).
+Please apply.
+Cheers,
+    Jakub
+___________________________________________________________________
+Jakub Jelinek | jakub@redhat.com | 
+http://sunsite.mff.cuni.cz/~jj
+Linux version 2.3.43 on a sparc64 machine (1343.49 BogoMips)
+___________________________________________________________________
+--- linux/arch/sparc/kernel/sys_sparc.c.jj	Thu Feb 10 17:06:18 2000
++++ linux/arch/sparc/kernel/sys_sparc.c	Thu Feb 10 17:28:54 2000
+@@ -34,12 +34,39 @@ asmlinkage unsigned long sys_getpagesize
+ 	return PAGE_SIZE; /* Possibly older binaries want 8192 on sun4's? */
+ }
+ 
++unsigned long get_unmapped_area(unsigned long addr, unsigned long len)
++{
++	struct vm_area_struct * vmm;
++
++	/* See asm-sparc/uaccess.h */
++	if (len > TASK_SIZE - PAGE_SIZE)
++		return 0;
++	if (ARCH_SUN4C_SUN4 && len > 0x20000000)
++		return 0;
++	if (!addr)
++		addr = TASK_UNMAPPED_BASE;
++	addr = PAGE_ALIGN(addr);
++
++	for (vmm = find_vma(current->mm, addr); ; vmm = vmm->vm_next) {
++		/* At this point:  (!vmm || addr < vmm->vm_end). */
++		if (ARCH_SUN4C_SUN4 && addr < 0xe0000000 && 0x20000000 - len < addr) {
++			addr = PAGE_OFFSET;
++			vmm = find_vma(current->mm, PAGE_OFFSET);
++		}
++		if (TASK_SIZE - PAGE_SIZE - len < addr)
++			return 0;
++		if (!vmm || addr + len <= vmm->vm_start)
++			return addr;
++		addr = vmm->vm_end;
++	}
++}
++
+ extern asmlinkage unsigned long sys_brk(unsigned long brk);
+ 
+ asmlinkage unsigned long sparc_brk(unsigned long brk)
+ {
+ 	if(ARCH_SUN4C_SUN4) {
+-		if(brk >= 0x20000000 && brk < 0xe0000000)
++		if ((brk & 0xe0000000) != (current->mm->brk & 0xe0000000))
+ 			return current->mm->brk;
+ 	}
+ 	return sys_brk(brk);
+@@ -190,24 +217,16 @@ static unsigned long do_mmap2(unsigned l
+ 
+ 	down(&current->mm->mmap_sem);
+ 	lock_kernel();
+-	retval = -ENOMEM;
++	retval = -EINVAL;
+ 	len = PAGE_ALIGN(len);
+-	if(!(flags & MAP_FIXED) &&
+-	   (!addr || (ARCH_SUN4C_SUN4 &&
+-		      (addr >= 0x20000000 && addr < 0xe0000000)))) {
+-		addr = get_unmapped_area(0, len);
+-		if(!addr)
+-			goto out_putf;
+-		if (ARCH_SUN4C_SUN4 &&
+-		    (addr >= 0x20000000 && addr < 0xe0000000)) {
+-			retval = -EINVAL;
+-			goto out_putf;
+-		}
+-	}
++	if (ARCH_SUN4C_SUN4 &&
++	    (len > 0x20000000 ||
++	     ((flags & MAP_FIXED) &&
++	      addr < 0xe0000000 && addr + len > 0x20000000)))
++		goto out_putf;
+ 
+ 	/* See asm-sparc/uaccess.h */
+-	retval = -EINVAL;
+-	if((len > (TASK_SIZE - PAGE_SIZE)) || (addr > (TASK_SIZE-len-PAGE_SIZE)))
++	if (len > TASK_SIZE - PAGE_SIZE || addr + len > TASK_SIZE - PAGE_SIZE)
+ 		goto out_putf;
+ 
+ 	flags &= ~(MAP_EXECUTABLE | MAP_DENYWRITE);
+@@ -236,6 +255,50 @@ asmlinkage unsigned long sys_mmap(unsign
+ 	unsigned long off)
+ {
+ 	return do_mmap2(addr, len, prot, flags, fd, off >> PAGE_SHIFT);
++}
++
++extern unsigned long do_mremap(unsigned long addr,
++	unsigned long old_len, unsigned long new_len,
++	unsigned long flags, unsigned long new_addr);
++                
++asmlinkage unsigned long sparc_mremap(unsigned long addr,
++	unsigned long old_len, unsigned long new_len,
++	unsigned long flags, unsigned long new_addr)
++{
++	unsigned long ret = -EINVAL;
++	if (ARCH_SUN4C_SUN4) {
++		if (old_len > 0x20000000 || new_len > 0x20000000)
++			goto out;
++		if (addr < 0xe0000000 && addr + old_len > 0x20000000)
++			goto out;
++	}
++	if (old_len > TASK_SIZE - PAGE_SIZE ||
++	    new_len > TASK_SIZE - PAGE_SIZE)
++		goto out;
++	down(&current->mm->mmap_sem);
++	if (flags & MREMAP_FIXED) {
++		if (ARCH_SUN4C_SUN4 &&
++		    new_addr < 0xe0000000 &&
++		    new_addr + new_len > 0x20000000)
++			goto out_sem;
++		if (new_addr + new_len > TASK_SIZE - PAGE_SIZE)
++			goto out_sem;
++	} else if ((ARCH_SUN4C_SUN4 && addr < 0xe0000000 &&
++		    addr + new_len > 0x20000000) ||
++		   addr + new_len > TASK_SIZE - PAGE_SIZE) {
++		ret = -ENOMEM;
++		if (!(flags & MREMAP_MAYMOVE))
++			goto out_sem;
++		new_addr = get_unmapped_area (addr, new_len);
++		if (!new_addr)
++			goto out_sem;
++		flags |= MREMAP_FIXED;
++	}
++	ret = do_mremap(addr, old_len, new_len, flags, new_addr);
++out_sem:
++	up(&current->mm->mmap_sem);
++out:
++	return ret;       
+ }
+ 
+ /* we come to here via sys_nis_syscall so it can setup the regs argument */
+--- linux/arch/sparc/kernel/systbls.S.jj	Sat Jan 29 17:41:18 2000
++++ linux/arch/sparc/kernel/systbls.S	Thu Feb 10 17:28:54 2000
+@@ -69,7 +69,7 @@ sys_call_table:
+ /*235*/	.long sys_nis_syscall, sys_llseek, sys_mlock, sys_munlock, sys_mlockall
+ /*240*/	.long sys_munlockall, sys_sched_setparam, sys_sched_getparam, sys_sched_setscheduler, sys_sched_getscheduler
+ /*245*/	.long sys_sched_yield, sys_sched_get_priority_max, sys_sched_get_priority_min, sys_sched_rr_get_interval, sys_nanosleep
+-/*250*/	.long sys_mremap, sys_sysctl, sys_getsid, sys_fdatasync, sys_nfsservctl
++/*250*/	.long sparc_mremap, sys_sysctl, sys_getsid, sys_fdatasync, sys_nfsservctl
+ /*255*/	.long sys_nis_syscall, sys_nis_syscall
+ 
+ #ifdef CONFIG_SUNOS_EMUL
+--- linux/arch/sparc/kernel/sys_sunos.c.jj	Sat Jan 29 21:16:24 2000
++++ linux/arch/sparc/kernel/sys_sunos.c	Thu Feb 10 17:28:54 2000
+@@ -71,8 +71,10 @@ asmlinkage unsigned long sunos_mmap(unsi
+ 	lock_kernel();
+ 	current->personality |= PER_BSD;
+ 	if(flags & MAP_NORESERVE) {
+-		printk("%s: unimplemented SunOS MAP_NORESERVE mmap() flag\n",
+-		       current->comm);
++		static int cnt;
++		if (cnt++ < 10)
++			printk("%s: unimplemented SunOS MAP_NORESERVE mmap() flag\n",
++			       current->comm);
+ 		flags &= ~MAP_NORESERVE;
+ 	}
+ 	retval = -EBADF;
+@@ -84,19 +86,7 @@ asmlinkage unsigned long sunos_mmap(unsi
+ 			goto out;
+ 	}
+ 
+-	retval = -ENOMEM;
+-	if(!(flags & MAP_FIXED) &&
+-	   (!addr || (ARCH_SUN4C_SUN4 &&
+-		      (addr >= 0x20000000 && addr < 0xe0000000)))) {
+-		addr = get_unmapped_area(0, len);
+-		if(!addr)
+-			goto out_putf;
+-		if (ARCH_SUN4C_SUN4 &&
+-		    (addr >= 0x20000000 && addr < 0xe0000000)) {
+-			retval = -EINVAL;
+-			goto out_putf;
+-		}
+-	}
++	retval = -EINVAL;
+ 	/* If this is ld.so or a shared library doing an mmap
+ 	 * of /dev/zero, transform it into an anonymous mapping.
+ 	 * SunOS is so stupid some times... hmph!
+@@ -105,18 +95,27 @@ asmlinkage unsigned long sunos_mmap(unsi
+ 		if(MAJOR(file->f_dentry->d_inode->i_rdev) == MEM_MAJOR &&
+ 		   MINOR(file->f_dentry->d_inode->i_rdev) == 5) {
+ 			flags |= MAP_ANONYMOUS;
++			fput(file);
+ 			file = 0;
+ 		}
+ 	}
+-	if(!(flags & MAP_FIXED))
+-		addr = 0;
+ 	ret_type = flags & _MAP_NEW;
+ 	flags &= ~_MAP_NEW;
+ 
+-	/* See asm-sparc/uaccess.h */
+-	retval = -EINVAL;
+-	if((len > (TASK_SIZE - PAGE_SIZE)) || (addr > (TASK_SIZE-len-PAGE_SIZE)))
+-		goto out_putf;
++	if(!(flags & MAP_FIXED))
++		addr = 0;
++	else {
++		if (ARCH_SUN4C_SUN4 &&
++		    (len > 0x20000000 ||
++		     ((flags & MAP_FIXED) &&
++		      addr < 0xe0000000 && addr + len > 0x20000000)))
++			goto out_putf;
++
++		/* See asm-sparc/uaccess.h */
++		if (len > TASK_SIZE - PAGE_SIZE ||
++		    addr + len > TASK_SIZE - PAGE_SIZE)
++			goto out_putf;
++	}
+ 
+ 	flags &= ~(MAP_EXECUTABLE | MAP_DENYWRITE);
+ 	retval = do_mmap(file, addr, len, prot, flags, off);
+--- linux/arch/sparc64/kernel/systbls.S.jj	Sat Jan 29 17:41:21 2000
++++ linux/arch/sparc64/kernel/systbls.S	Thu Feb 10 17:28:54 2000
+@@ -69,7 +69,7 @@ sys_call_table32:
+ 	.word sys_nis_syscall, sys_llseek, sys_mlock, sys_munlock, sys_mlockall
+ /*240*/	.word sys_munlockall, sys_sched_setparam, sys_sched_getparam, sys_sched_setscheduler, sys_sched_getscheduler
+ 	.word sys_sched_yield, sys_sched_get_priority_max, sys_sched_get_priority_min, sys32_sched_rr_get_interval, sys32_nanosleep
+-/*250*/	.word sys_mremap, sys_sysctl, sys_getsid, sys_fdatasync, sys32_nfsservctl
++/*250*/	.word sys32_mremap, sys_sysctl, sys_getsid, sys_fdatasync, sys32_nfsservctl
+ 	.word sys_aplib
+ 
+ 	/* Now the 64-bit native Linux syscall table. */
+@@ -92,7 +92,7 @@ sys_call_table:
+ 	.word sys_reboot, sys_nis_syscall, sys_symlink, sys_readlink, sys_execve
+ /*60*/	.word sys_umask, sys_chroot, sys_newfstat, sys_nis_syscall, sys_getpagesize
+ 	.word sys_msync, sys_vfork, sys_pread, sys_pwrite, sys_nis_syscall
+-/*70*/	.word sys_nis_syscall, sys_mmap, sys_nis_syscall, sys_munmap, sys_mprotect
++/*70*/	.word sys_nis_syscall, sys_mmap, sys_nis_syscall, sys64_munmap, sys_mprotect
+ 	.word sys_nis_syscall, sys_vhangup, sys_nis_syscall, sys_nis_syscall, sys_getgroups
+ /*80*/	.word sys_setgroups, sys_getpgrp, sys_nis_syscall, sys_setitimer, sys_nis_syscall
+ 	.word sys_swapon, sys_getitimer, sys_nis_syscall, sys_sethostname, sys_nis_syscall
+@@ -128,7 +128,7 @@ sys_call_table:
+ 	.word sys_nis_syscall, sys_llseek, sys_mlock, sys_munlock, sys_mlockall
+ /*240*/	.word sys_munlockall, sys_sched_setparam, sys_sched_getparam, sys_sched_setscheduler, sys_sched_getscheduler
+ 	.word sys_sched_yield, sys_sched_get_priority_max, sys_sched_get_priority_min, sys_sched_rr_get_interval, sys_nanosleep
+-/*250*/	.word sys_mremap, sys_sysctl, sys_getsid, sys_fdatasync, sys_nfsservctl
++/*250*/	.word sys64_mremap, sys_sysctl, sys_getsid, sys_fdatasync, sys_nfsservctl
+ 	.word sys_aplib
+ 
+ #if defined(CONFIG_SUNOS_EMUL) || defined(CONFIG_SOLARIS_EMUL) || \
+--- linux/arch/sparc64/kernel/sys_sparc.c.jj	Sat Jan 29 21:16:25 2000
++++ linux/arch/sparc64/kernel/sys_sparc.c	Thu Feb 10 17:28:54 2000
+@@ -39,17 +39,49 @@ asmlinkage unsigned long sys_getpagesize
+ 	return PAGE_SIZE;
+ }
+ 
++unsigned long get_unmapped_area(unsigned long addr, unsigned long len)
++{
++	struct vm_area_struct * vmm;
++	unsigned long task_size = TASK_SIZE;
++
++	if (current->thread.flags & SPARC_FLAG_32BIT)
++		task_size = 0xf0000000UL;
++	if (len > task_size || len > -PAGE_OFFSET)
++		return 0;
++	if (!addr)
++		addr = TASK_UNMAPPED_BASE;
++	addr = PAGE_ALIGN(addr);
++
++	task_size -= len;
++
++	for (vmm = find_vma(current->mm, addr); ; vmm = vmm->vm_next) {
++		/* At this point:  (!vmm || addr < vmm->vm_end). */
++		if (addr < PAGE_OFFSET && -PAGE_OFFSET - len < addr) {
++			addr = PAGE_OFFSET;
++			vmm = find_vma(current->mm, PAGE_OFFSET);
++		}
++		if (task_size < addr)
++			return 0;
++		if (!vmm || addr + len <= vmm->vm_start)
++			return addr;
++		addr = vmm->vm_end;
++	}
++}
++
+ extern asmlinkage unsigned long sys_brk(unsigned long brk);
+ 
+ asmlinkage unsigned long sparc_brk(unsigned long brk)
+ {
+-	if((brk >= 0x80000000000UL && brk < PAGE_OFFSET) ||
+-	   (brk - current->mm->brk > 0x80000000000UL &&
+-	    brk - current->mm->brk < PAGE_OFFSET)) /* VM hole */
++	/* People could try to be nasty and use ta 0x6d in 32bit programs */
++	if ((current->thread.flags & SPARC_FLAG_32BIT) &&
++	    brk >= 0xf0000000UL)
++		return current->mm->brk;
++
++	if ((current->mm->brk & PAGE_OFFSET) != (brk & PAGE_OFFSET))
+ 		return current->mm->brk;
+ 	return sys_brk(brk);
+ }
+-
++                                                                
+ /*
+  * sys_pipe() is the normal C calling standard for creating
+  * a pipe. It's not the way unix traditionally does this, though.
+@@ -164,30 +196,21 @@ asmlinkage unsigned long sys_mmap(unsign
+ 			goto out;
+ 	}
+ 	flags &= ~(MAP_EXECUTABLE | MAP_DENYWRITE);
+-	retval = -ENOMEM;
+ 	len = PAGE_ALIGN(len);
++	retval = -EINVAL;
++
+ 	down(&current->mm->mmap_sem);
+ 	lock_kernel();
+-	if(!(flags & MAP_FIXED) && !addr) {
+-		addr = get_unmapped_area(addr, len);
+-		if(!addr)
+-			goto out_putf;
+-	}
+ 
+-	retval = -EINVAL;
+ 	if (current->thread.flags & SPARC_FLAG_32BIT) {
+-		if (len > 0xf0000000UL || addr > 0xf0000000UL - len)
++		if (len > 0xf0000000UL ||
++		    ((flags & MAP_FIXED) && addr > 0xf0000000UL - len))
+ 			goto out_putf;
+ 	} else {
+-		if (len >= 0x80000000000UL || 
+-		    (addr < 0x80000000000UL &&
+-		     addr > 0x80000000000UL-len))
++		if (len > -PAGE_OFFSET ||
++		    ((flags & MAP_FIXED) &&
++		     addr < PAGE_OFFSET && addr + len > -PAGE_OFFSET))
+ 			goto out_putf;
+-		if (addr >= 0x80000000000UL && addr < PAGE_OFFSET) {
+-			/* VM hole */
+-			retval = current->mm->brk;
+-			goto out_putf;
+-		}
+ 	}
+ 
+ 	retval = do_mmap(file, addr, len, prot, flags, off);
+@@ -199,6 +222,55 @@ out_putf:
+ 		fput(file);
+ out:
+ 	return retval;
++}
++
++asmlinkage long sys64_munmap(unsigned long addr, size_t len)
++{
++	long ret;
++
++	if (len > -PAGE_OFFSET ||
++	    (addr < PAGE_OFFSET && addr + len > -PAGE_OFFSET))
++		return -EINVAL;
++	down(&current->mm->mmap_sem);
++	ret = do_munmap(addr, len);
++	up(&current->mm->mmap_sem);
++	return ret;
++}
++
++extern unsigned long do_mremap(unsigned long addr,
++	unsigned long old_len, unsigned long new_len,
++	unsigned long flags, unsigned long new_addr);
++                
++asmlinkage unsigned long sys64_mremap(unsigned long addr,
++	unsigned long old_len, unsigned long new_len,
++	unsigned long flags, unsigned long new_addr)
++{
++	unsigned long ret = -EINVAL;
++	if (current->thread.flags & SPARC_FLAG_32BIT)
++		goto out;
++	if (old_len > -PAGE_OFFSET || new_len > -PAGE_OFFSET)
++		goto out;
++	if (addr < PAGE_OFFSET && addr + old_len > -PAGE_OFFSET)
++		goto out;
++	down(&current->mm->mmap_sem);
++	if (flags & MREMAP_FIXED) {
++		if (new_addr < PAGE_OFFSET &&
++		    new_addr + new_len > -PAGE_OFFSET)
++			goto out_sem;
++	} else if (addr < PAGE_OFFSET && addr + new_len > -PAGE_OFFSET) {
++		ret = -ENOMEM;
++		if (!(flags & MREMAP_MAYMOVE))
++			goto out_sem;
++		new_addr = get_unmapped_area (addr, new_len);
++		if (!new_addr)
++			goto out_sem;
++		flags |= MREMAP_FIXED;
++	}
++	ret = do_mremap(addr, old_len, new_len, flags, new_addr);
++out_sem:
++	up(&current->mm->mmap_sem);
++out:
++	return ret;       
+ }
+ 
+ /* we come to here via sys_nis_syscall so it can setup the regs argument */
+--- linux/arch/sparc64/kernel/sys_sunos32.c.jj	Sat Jan 29 21:16:25 2000
++++ linux/arch/sparc64/kernel/sys_sunos32.c	Thu Feb 10 17:28:54 2000
+@@ -71,8 +71,10 @@ asmlinkage u32 sunos_mmap(u32 addr, u32 
+ 	lock_kernel();
+ 	current->personality |= PER_BSD;
+ 	if(flags & MAP_NORESERVE) {
+-		printk("%s:  unimplemented SunOS MAP_NORESERVE mmap() flag\n",
+-		       current->comm);
++		static int cnt;
++		if (cnt++ < 10)
++			printk("%s:  unimplemented SunOS MAP_NORESERVE mmap() flag\n",
++			       current->comm);
+ 		flags &= ~MAP_NORESERVE;
+ 	}
+ 	retval = -EBADF;
+@@ -93,15 +95,11 @@ asmlinkage u32 sunos_mmap(u32 addr, u32 
+ 		}
+ 	}
+ 
+-	retval = -ENOMEM;
+-	if(!(flags & MAP_FIXED) && !addr) {
+-		unsigned long attempt = get_unmapped_area(addr, len);
+-		if(!attempt || (attempt >= 0xf0000000UL))
+-			goto out_putf;
+-		addr = (u32) attempt;
+-	}
++	retval = -EINVAL;
+ 	if(!(flags & MAP_FIXED))
+ 		addr = 0;
++	else if (len > 0xf0000000 || addr > 0xf0000000 - len)
++		goto out_putf;
+ 	ret_type = flags & _MAP_NEW;
+ 	flags &= ~_MAP_NEW;
+ 
+--- linux/arch/sparc64/kernel/sys_sparc32.c.jj	Fri Jan 21 12:38:54 2000
++++ linux/arch/sparc64/kernel/sys_sparc32.c	Thu Feb 10 17:28:54 2000
+@@ -44,6 +44,7 @@
+ #include <linux/filter.h>
+ #include <linux/highmem.h>
+ #include <linux/highuid.h>
++#include <linux/mman.h>
+ 
+ #include <asm/types.h>
+ #include <asm/ipc.h>
+@@ -4189,4 +4190,39 @@ out_error:
+ 	put_unused_fd(fd);
+ 	fd = error;
+ 	goto out;
++}
++
++extern unsigned long do_mremap(unsigned long addr,
++	unsigned long old_len, unsigned long new_len,
++	unsigned long flags, unsigned long new_addr);
++                
++asmlinkage unsigned long sys32_mremap(unsigned long addr,
++	unsigned long old_len, unsigned long new_len,
++	unsigned long flags, u32 __new_addr)
++{
++	unsigned long ret = -EINVAL;
++	unsigned long new_addr = AA(__new_addr);
++
++	if (old_len > 0xf0000000UL || new_len > 0xf0000000UL)
++		goto out;
++	if (addr > 0xf0000000UL - old_len)
++		goto out;
++	down(&current->mm->mmap_sem);
++	if (flags & MREMAP_FIXED) {
++		if (new_addr > 0xf0000000UL - new_len)
++			goto out_sem;
++	} else if (addr > 0xf0000000UL - new_len) {
++		ret = -ENOMEM;
++		if (!(flags & MREMAP_MAYMOVE))
++			goto out_sem;
++		new_addr = get_unmapped_area (addr, new_len);
++		if (!new_addr)
++			goto out_sem;
++		flags |= MREMAP_FIXED;
++	}
++	ret = do_mremap(addr, old_len, new_len, flags, new_addr);
++out_sem:
++	up(&current->mm->mmap_sem);
++out:
++	return ret;       
+ }
+--- linux/arch/sparc64/solaris/misc.c.jj	Sat Jan 29 21:16:25 2000
++++ linux/arch/sparc64/solaris/misc.c	Thu Feb 10 17:28:54 2000
+@@ -83,27 +83,25 @@ static u32 do_solaris_mmap(u32 addr, u32
+ 		}
+ 	}
+ 
+-	down(&current->mm->mmap_sem);
+-	retval = -ENOMEM;
+-	if(!(flags & MAP_FIXED) && !addr) {
+-		unsigned long attempt = get_unmapped_area(addr, len);
+-		if(!attempt || (attempt >= 0xf0000000UL))
+-			goto out_putf;
+-		addr = (u32) attempt;
+-	}
++	retval = -EINVAL;
++	len = PAGE_ALIGN(len);
+ 	if(!(flags & MAP_FIXED))
+ 		addr = 0;
++	else if (len > 0xf0000000UL || addr > 0xf0000000UL - len)
++		goto out_putf;
+ 	ret_type = flags & _MAP_NEW;
+ 	flags &= ~_MAP_NEW;
+ 
++	down(&current->mm->mmap_sem);
+ 	flags &= ~(MAP_EXECUTABLE | MAP_DENYWRITE);
+ 	retval = do_mmap(file,
+ 			 (unsigned long) addr, (unsigned long) len,
+ 			 (unsigned long) prot, (unsigned long) flags, off);
++	up(&current->mm->mmap_sem);
+ 	if(!ret_type)
+ 		retval = ((retval < 0xf0000000) ? 0 : retval);
++	                        
+ out_putf:
+-	up(&current->mm->mmap_sem);
+ 	if (file)
+ 		fput(file);
+ out:
+--- linux/fs/binfmt_elf.c.jj	Tue Feb  8 14:25:57 2000
++++ linux/fs/binfmt_elf.c	Thu Feb 10 17:28:54 2000
+@@ -269,14 +269,8 @@ static unsigned long load_elf_interp(str
+ 	    if (eppnt->p_flags & PF_W) elf_prot |= PROT_WRITE;
+ 	    if (eppnt->p_flags & PF_X) elf_prot |= PROT_EXEC;
+ 	    vaddr = eppnt->p_vaddr;
+-	    if (interp_elf_ex->e_type == ET_EXEC || load_addr_set) {
++	    if (interp_elf_ex->e_type == ET_EXEC || load_addr_set)
+ 	    	elf_type |= MAP_FIXED;
+-#ifdef __sparc__
+-	    } else {
+-		load_addr = get_unmapped_area(0, eppnt->p_filesz +
+-					ELF_PAGEOFFSET(vaddr));
+-#endif
+-	    }
+ 
+ 	    map_addr = do_mmap(file,
+ 			    load_addr + ELF_PAGESTART(vaddr),
+--- linux/include/asm-alpha/pgtable.h.jj	Tue Dec 21 11:17:36 1999
++++ linux/include/asm-alpha/pgtable.h	Thu Feb 10 17:28:54 2000
+@@ -40,6 +40,7 @@
+ #define PTRS_PER_PMD	(1UL << (PAGE_SHIFT-3))
+ #define PTRS_PER_PGD	((1UL << (PAGE_SHIFT-3))-1)
+ #define USER_PTRS_PER_PGD	(TASK_SIZE / PGDIR_SIZE)
++#define PGD_TABLE_MASK	PTRS_PER_PGD
+ 
+ /* Number of pointers that fit on a page:  this will go away. */
+ #define PTRS_PER_PAGE	(1UL << (PAGE_SHIFT-3))
+--- linux/include/asm-arm/pgtable.h.jj	Mon Dec 20 09:28:39 1999
++++ linux/include/asm-arm/pgtable.h	Thu Feb 10 17:28:54 2000
+@@ -33,6 +33,7 @@ extern void __pgd_error(const char *file
+ #define PGDIR_MASK		(~(PGDIR_SIZE-1))
+ 
+ #define USER_PTRS_PER_PGD	(TASK_SIZE/PGDIR_SIZE)
++#define PGD_TABLE_MASK		(PTRS_PER_PGD-1)
+ 
+ /*
+  * The table below defines the page protection levels that we insert into our
+--- linux/include/asm-i386/pgtable.h.jj	Thu Feb 10 17:12:53 2000
++++ linux/include/asm-i386/pgtable.h	Thu Feb 10 17:28:54 2000
+@@ -111,6 +111,7 @@ extern unsigned long empty_zero_page[102
+ #define PGDIR_MASK	(~(PGDIR_SIZE-1))
+ 
+ #define USER_PTRS_PER_PGD	(TASK_SIZE/PGDIR_SIZE)
++#define PGD_TABLE_MASK	(PTRS_PER_PGD-1)
+ 
+ #define USER_PGD_PTRS (PAGE_OFFSET >> PGDIR_SHIFT)
+ #define KERNEL_PGD_PTRS (PTRS_PER_PGD-USER_PGD_PTRS)
+--- linux/include/asm-m68k/pgtable.h.jj	Sat Jan 29 21:21:04 2000
++++ linux/include/asm-m68k/pgtable.h	Thu Feb 10 17:28:54 2000
+@@ -43,6 +43,7 @@
+ #define PTRS_PER_PMD	8
+ #define PTRS_PER_PGD	128
+ #define USER_PTRS_PER_PGD	(TASK_SIZE/PGDIR_SIZE)
++#define PGD_TABLE_MASK	(PTRS_PER_PGD-1)
+ 
+ /* Virtual address region for use by kernel_map() */
+ #define	KMAP_START	0xd0000000
+--- linux/include/asm-mips/pgtable.h.jj	Wed Feb  2 13:35:27 2000
++++ linux/include/asm-mips/pgtable.h	Thu Feb 10 17:28:54 2000
+@@ -84,6 +84,7 @@ extern void (*add_wired_entry)(unsigned 
+ #define PTRS_PER_PMD	1
+ #define PTRS_PER_PGD	1024
+ #define USER_PTRS_PER_PGD	(TASK_SIZE/PGDIR_SIZE)
++#define PGD_TABLE_MASK	(PTRS_PER_PGD-1)
+ 
+ #define VMALLOC_START     KSEG2
+ #define VMALLOC_VMADDR(x) ((unsigned long)(x))
+--- linux/include/asm-ppc/pgtable.h.jj	Thu Feb 10 17:12:53 2000
++++ linux/include/asm-ppc/pgtable.h	Thu Feb 10 17:28:54 2000
+@@ -136,6 +136,7 @@ extern unsigned long ioremap_bot, iorema
+ #define PTRS_PER_PMD	1
+ #define PTRS_PER_PGD	1024
+ #define USER_PTRS_PER_PGD	(TASK_SIZE / PGDIR_SIZE)
++#define PGD_TABLE_MASK	(PTRS_PER_PGD-1)
+ 
+ #define USER_PGD_PTRS (PAGE_OFFSET >> PGDIR_SHIFT)
+ #define KERNEL_PGD_PTRS (PTRS_PER_PGD-USER_PGD_PTRS)
+--- linux/include/asm-sh/pgtable.h.jj	Wed Feb  2 13:49:30 2000
++++ linux/include/asm-sh/pgtable.h	Thu Feb 10 17:28:54 2000
+@@ -91,6 +91,7 @@ extern inline void flush_tlb_pgtables(st
+ #define PGDIR_MASK	(~(PGDIR_SIZE-1))
+ 
+ #define USER_PTRS_PER_PGD	(TASK_SIZE/PGDIR_SIZE)
++#define PGD_TABLE_MASK	(PTRS_PER_PGD-1)
+ 
+ #define USER_PGD_PTRS (PAGE_OFFSET >> PGDIR_SHIFT)
+ #define KERNEL_PGD_PTRS (PTRS_PER_PGD-USER_PGD_PTRS)
+--- linux/include/asm-sparc/pgtable.h.jj	Tue Feb  8 09:24:57 2000
++++ linux/include/asm-sparc/pgtable.h	Thu Feb 10 17:32:43 2000
+@@ -118,6 +118,7 @@ BTFIXUPDEF_INT(page_kernel)
+ #define PTRS_PER_PMD    	BTFIXUP_SIMM13(ptrs_per_pmd)
+ #define PTRS_PER_PGD    	BTFIXUP_SIMM13(ptrs_per_pgd)
+ #define USER_PTRS_PER_PGD	BTFIXUP_SIMM13(user_ptrs_per_pgd)
++#define PGD_TABLE_MASK		(PTRS_PER_PGD-1)
+ 
+ #define PAGE_NONE      __pgprot(BTFIXUP_INT(page_none))
+ #define PAGE_SHARED    __pgprot(BTFIXUP_INT(page_shared))
+@@ -447,5 +448,8 @@ extern int io_remap_page_range(unsigned 
+ 			       unsigned long size, pgprot_t prot, int space);
+ 
+ #endif /* !(__ASSEMBLY__) */
++
++/* We provide our own get_unmapped_area to cope with VA holes for userland */
++#define HAVE_ARCH_GET_UNMAPPED_AREA
+ 
+ #endif /* !(_SPARC_PGTABLE_H) */
+--- linux/include/asm-sparc64/pgtable.h.jj	Tue Feb  8 15:20:51 2000
++++ linux/include/asm-sparc64/pgtable.h	Thu Feb 10 17:32:28 2000
+@@ -47,6 +47,7 @@
+ 
+ /* We cannot use the top 16G because VPTE table lives there. */
+ #define PTRS_PER_PGD		((1UL << (PAGE_SHIFT-3))-1)
++#define PGD_TABLE_MASK		PTRS_PER_PGD
+ 
+ /* Kernel has a separate 44bit address space. */
+ #define USER_PTRS_PER_PGD	((const int)((current->thread.flags & SPARC_FLAG_32BIT) ? \
+@@ -349,5 +350,8 @@ extern int io_remap_page_range(unsigned 
+ 			       unsigned long size, pgprot_t prot, int space);
+ 
+ #endif /* !(__ASSEMBLY__) */
++
++/* We provide our own get_unmapped_area to cope with VA holes for userland */
++#define HAVE_ARCH_GET_UNMAPPED_AREA
+ 
+ #endif /* !(_SPARC64_PGTABLE_H) */
+--- linux/include/asm-ia64/pgtable.h.jj	Mon Feb  7 21:58:02 2000
++++ linux/include/asm-ia64/pgtable.h	Thu Feb 10 17:28:54 2000
+@@ -87,6 +87,7 @@
+ #define PGDIR_MASK		(~(PGDIR_SIZE-1))
+ #define PTRS_PER_PGD		(__IA64_UL(1) << (PAGE_SHIFT-3))
+ #define USER_PTRS_PER_PGD	PTRS_PER_PGD
++#define PGD_TABLE_MASK		(PTRS_PER_PGD-1)
+ 
+ /*
+  * Definitions for second level:
+--- linux/mm/mmap.c.jj	Wed Feb  9 12:06:29 2000
++++ linux/mm/mmap.c	Thu Feb 10 17:30:05 2000
+@@ -346,6 +346,7 @@ free_vma:
+  * For mmap() without MAP_FIXED and shmat() with addr=0.
+  * Return value 0 means ENOMEM.
+  */
++#ifndef HAVE_ARCH_GET_UNMAPPED_AREA
+ unsigned long get_unmapped_area(unsigned long addr, unsigned long len)
+ {
+ 	struct vm_area_struct * vmm;
+@@ -365,6 +366,7 @@ unsigned long get_unmapped_area(unsigned
+ 		addr = vmm->vm_end;
+ 	}
+ }
++#endif
+ 
+ #define vm_avl_empty	(struct vm_area_struct *) NULL
+ 
+@@ -610,7 +612,10 @@ no_mmaps:
+ 	first = first >> PGDIR_SHIFT;
+ 	last = last >> PGDIR_SHIFT;
+ 	if (last > first) {
+-		clear_page_tables(mm, first, last-first);
++		/* For architectures with non-contiguous user virtual address space
++		 * we need to mask starting index into pgd table to pgd table size. -jj
++		 */
++		clear_page_tables(mm, first & PGD_TABLE_MASK, (last-first) & PGD_TABLE_MASK);
+ 		flush_tlb_pgtables(mm, first << PGDIR_SHIFT, last << PGDIR_SHIFT);
+ 	}
+ }
+--- linux/mm/mremap.c.jj	Mon Dec 20 09:35:05 1999
++++ linux/mm/mremap.c	Thu Feb 10 17:28:54 2000
+@@ -165,19 +165,14 @@ static inline unsigned long move_vma(str
+  *
+  * MREMAP_FIXED option added 5-Dec-1999 by Benjamin LaHaise
+  * This option implies MREMAP_MAYMOVE.
+- *
+- * "__new_addr" toying in order to not change the saved stack layout
+- * for old x86 binaries that don't want %edi to change..
+  */
+-asmlinkage unsigned long sys_mremap(unsigned long addr,
++unsigned long do_mremap(unsigned long addr,
+ 	unsigned long old_len, unsigned long new_len,
+-	unsigned long flags, unsigned long __new_addr)
++	unsigned long flags, unsigned long new_addr)
+ {
+-	unsigned long new_addr = __new_addr;
+ 	struct vm_area_struct *vma;
+ 	unsigned long ret = -EINVAL;
+ 
+-	down(&current->mm->mmap_sem);
+ 	if (flags & ~(MREMAP_FIXED | MREMAP_MAYMOVE))
+ 		goto out;
+ 
+@@ -287,6 +282,17 @@ asmlinkage unsigned long sys_mremap(unsi
+ 		ret = move_vma(vma, addr, old_len, new_len, new_addr);
+ 	}
+ out:
++	return ret;
++}
++
++asmlinkage unsigned long sys_mremap(unsigned long addr,
++	unsigned long old_len, unsigned long new_len,
++	unsigned long flags, unsigned long new_addr)
++{
++	unsigned long ret;
++
++	down(&current->mm->mmap_sem);
++	ret = do_mremap(addr, old_len, new_len, flags, new_addr);
+ 	up(&current->mm->mmap_sem);
+ 	return ret;
+ }

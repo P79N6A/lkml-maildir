@@ -1,0 +1,148 @@
+Date: Fri, 18 Feb 2000 20:51:48 +0100
+From: Martin Schenk <>
+Subject: small optimization for SMP scheduling
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/2/18/215
+
+This patch uses a bitfield "idle_cpus" to keep track of idle cpus.
+This can be used to
+- speed up reschedule_idle when there is no idle cpu
+- eliminate a call to reschedule_idle (and retaking the runqueue_lock)
+  in __schedule_tail, when there is no chance of replacing a running
+process
+The bitfield is changed only in cpu_idle, so on a busy system there
+should be no problem with invalidating cache lines all the time. 
+On my 2 CPU system, the patch speeds up scheduling by a few percent and
+decreases contention for the runqueue_lock.
+The attached patch is for the i386 architecture only (it should be
+trivial
+to add the necessary code for other architectures that support SMP)--- linuxelf-2.3.orig/arch/i386/kernel/process.c	Fri Feb 11 20:01:48 2000
++++ linuxelf-2.3/arch/i386/kernel/process.c	Fri Feb 18 20:27:45 2000
+@@ -86,6 +86,9 @@
+  */
+ void cpu_idle(void)
+ {
++#ifdef __SMP__
++	int this_cpu=smp_processor_id();
++#endif
+ 	/* endless idle loop with no priority at all */
+ 	init_idle();
+ 	current->priority = 0;
+@@ -93,10 +96,17 @@
+ 
+ 	while (1) {
+ 		void (*idle)(void) = pm_idle;
++#ifdef __SMP__
++        	extern volatile unsigned long idle_cpus;
++        	set_bit(this_cpu, &idle_cpus);
++#endif
+ 		if (!idle)
+ 			idle = default_idle;
+ 		while (!current->need_resched)
+ 			idle();
++#ifdef __SMP__
++        	clear_bit(this_cpu, &idle_cpus);
++#endif
+ 		schedule();
+ 		check_pgt_cache();
+ 	}
+--- linuxelf-2.3.orig/kernel/sched.c	Fri Feb 11 20:02:12 2000
++++ linuxelf-2.3/kernel/sched.c	Fri Feb 18 20:26:23 2000
+@@ -81,6 +81,8 @@
+ struct kernel_stat kstat = { 0 };
+ 
+ #ifdef __SMP__
++unsigned long idle_cpus=0UL;    /* assumes NR_CPUS = 32, just a hint for
++                                   reschedule_idle and __schedule_tail */
+ 
+ #define idle_task(cpu) (init_tasks[cpu_number_map(cpu)])
+ #define can_schedule(p)	(!(p)->has_cpu)
+@@ -189,34 +191,35 @@
+ 	struct task_struct *tsk;
+ 	int cpu, best_cpu, i;
+ 
+-	/*
+-	 * shortcut if the woken up task's last CPU is
+-	 * idle now.
+-	 */
+ 	best_cpu = p->processor;
+-	tsk = idle_task(best_cpu);
+-	if (cpu_curr(best_cpu) == tsk)
+-		goto send_now;
+-
+-	/*
+-	 * We know that the preferred CPU has a cache-affine current
+-	 * process, lets try to find a new idle CPU for the woken-up
+-	 * process:
+-	 */
+-	for (i = smp_num_cpus - 1; i >= 0; i--) {
+-		cpu = cpu_logical_map(i);
+-		if (cpu == best_cpu)
+-			continue;
+-		tsk = cpu_curr(cpu);
+-		/*
+-		 * We use the last available idle CPU. This creates
+-		 * a priority list between idle CPUs, but this is not
+-		 * a problem.
+-		 */
+-		if (tsk == idle_task(cpu))
+-			goto send_now;
+-	}
+ 
++        if (idle_cpus) {    /* some cpus are idle */
++                /*
++                 * shortcut if the woken up task's last CPU is
++                 * idle now.
++                 */
++                if (idle_cpus & (1<<best_cpu)) {
++                        tsk=cpu_curr(best_cpu);
++                        goto send_now;
++                }
++                /*
++                 * We know that the preferred CPU has a cache-affine current
++                 * process, lets try to find a new idle CPU for the woken-up
++                 * process:
++                 */
++                for (i = smp_num_cpus - 1; i >= 0; i--) {
++                        cpu = cpu_logical_map(i);
++                        if (idle_cpus & (1<<cpu)) {
++                        /*
++                         * We use the last available idle CPU. This creates
++                         * a priority list between idle CPUs, but this is not
++                         * a problem.
++                         */
++                                tsk=cpu_curr(cpu);
++                                goto send_now;
++                        }
++                }
++        }
+ 	/*
+ 	 * No CPU is idle, but maybe this process has enough priority
+ 	 * to preempt it's preferred CPU.
+@@ -408,12 +411,18 @@
+ static inline void __schedule_tail(struct task_struct *prev)
+ {
+ #ifdef __SMP__
++        int this_cpu=smp_processor_id();
+ 	if ((prev->state == TASK_RUNNING) &&
+-			(prev != idle_task(smp_processor_id()))) {
+-		unsigned long flags;
+-
+-		spin_lock_irqsave(&runqueue_lock, flags);
+-		reschedule_idle(prev, flags); // spin_unlocks runqueue
++			(prev != idle_task(this_cpu))) {
++		/* only try to reschedule if there is a chance of success */
++		if (idle_cpus || prev->policy != SCHED_OTHER ||
++		 	(prev->avg_slice < cacheflush_time &&
++		  	cpu_curr(this_cpu)->avg_slice > cacheflush_time))
++		{
++		        unsigned long flags;
++		        spin_lock_irqsave(&runqueue_lock, flags);
++		        reschedule_idle(prev, flags); // spin_unlocks runqueue
++		}
+ 	}
+ 	wmb();
+ 	prev->has_cpu = 0;

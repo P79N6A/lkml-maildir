@@ -1,0 +1,156 @@
+Date: Fri, 9 Jan 2009 23:09:46 +0100
+From: Willy Tarreau <>
+Subject: Re: [PATCH] tcp: splice as many packets as possible at once
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2009/1/9/381
+
+On Fri, Jan 09, 2009 at 11:02:06PM +0100, Eric Dumazet wrote:
+> Willy Tarreau a écrit :
+> > On Fri, Jan 09, 2009 at 09:51:17PM +0100, Eric Dumazet wrote:
+> > (...)
+> >>> Also, in your second mail, you're saying that your change
+> >>> might return more data than requested by the user. I can't
+> >>> find why, could you please explain to me, as I'm still quite
+> >>> ignorant in this area ?
+> >> Well, I just tested various user programs and indeed got this
+> >> strange result :
+> >>
+> >> Here I call splice() with len=1000 (0x3e8), and you can see
+> >> it gives a result of 1460 at the second call.
+> > 
+> > huh, not nice indeed!
+> > 
+> > While looking at the code to see how this could be possible, I
+> > came across this minor thing (unrelated IMHO) :
+> > 
+> > 	if (__skb_splice_bits(skb, &offset, &tlen, &spd))
+> > 		goto done;
+> >>>>>>> 	else if (!tlen)    <<<<<<
+> > 		goto done;
+> > 
+> > 	/*
+> > 	 * now see if we have a frag_list to map
+> > 	 */
+> > 	if (skb_shinfo(skb)->frag_list) {
+> > 		struct sk_buff *list = skb_shinfo(skb)->frag_list;
+> > 
+> > 		for (; list && tlen; list = list->next) {
+> > 			if (__skb_splice_bits(list, &offset, &tlen, &spd))
+> > 				break;
+> > 		}
+> > 	}
+> > 
+> >     done:
+> > 
+> > Above on the enlighted line, we'd better remove the else and leave a plain
+> > "if (!tlen)". Otherwise, when the first call to __skb_splice_bits() zeroes
+> > tlen, we still enter the if and evaluate the for condition for nothing. But
+> > let's leave that for later.
+> > 
+> >> I suspect a bug in splice code, that my patch just exposed.
+> > 
+> > I've checked in skb_splice_bits() and below and can't see how we can move
+> > more than the requested len.
+> > 
+> > However, with your change, I don't clearly see how we break out of
+> > the loop in tcp_read_sock(). Maybe we first read 1000 then loop again
+> > and read remaining data ? I suspect that we should at least exit when
+> > ((struct tcp_splice_state *)desc->arg.data)->len = 0.
+> > 
+> > At least that's something easy to add just before or after !desc->count
+> > for a test.
+> > 
+> 
+> I believe the bug is in tcp_splice_data_recv()
+yes, see my other mail.
+> I am going to test a new patch, but here is the thing I found:
+> 
+> diff --git a/net/ipv4/tcp.c b/net/ipv4/tcp.c
+> index bd6ff90..fbbddf4 100644
+> --- a/net/ipv4/tcp.c
+> +++ b/net/ipv4/tcp.c
+> @@ -523,7 +523,7 @@ static int tcp_splice_data_recv(read_descriptor_t *rd_desc, struct sk_buff *skb,
+>  {
+>         struct tcp_splice_state *tss = rd_desc->arg.data;
+> 
+> -       return skb_splice_bits(skb, offset, tss->pipe, tss->len, tss->flags);
+> +       return skb_splice_bits(skb, offset, tss->pipe, len, tss->flags);
+>  }
+it will not work, len is always 1000 in your case, for every call,
+as I had in my logs :
+kernel :
+tcp_splice_data_recv: skb=ed3d3480 offset=0 len=1460 tss->pipe=ed1cbc00 tss->len=1000 tss->flags=3
+tcp_sendpage: going through do_tcp_sendpages
+tcp_splice_data_recv: skb=ed3d3480 offset=1000 len=460 tss->pipe=ed1cbc00 tss->len=1000 tss->flags=3
+tcp_splice_data_recv: skb=ed3d3540 offset=0 len=1460 tss->pipe=ed1cbc00 tss->len=1000 tss->flags=3
+tcp_sendpage: going through do_tcp_sendpages
+tcp_sendpage: going through do_tcp_sendpages
+tcp_splice_data_recv: skb=ed3d3540 offset=1000 len=460 tss->pipe=ed1cbc00 tss->len=1000 tss->flags=3
+tcp_splice_data_recv: skb=ed3d3600 offset=0 len=1176 tss->pipe=ed1cbc00 tss->len=1000 tss->flags=3
+tcp_sendpage: going through do_tcp_sendpages
+tcp_sendpage: going through do_tcp_sendpages
+tcp_splice_data_recv: skb=ed3d3600 offset=1000 len=176 tss->pipe=ed1cbc00 tss->len=1000 tss->flags=3
+tcp_sendpage: going through do_tcp_sendpages
+program :
+accept(3, 0, NULL)                      = 4
+socket(PF_INET, SOCK_STREAM, IPPROTO_TCP) = 5
+connect(5, {sa_family=AF_INET, sin_port=htons(4001), sin_addr=inet_addr("10.0.3.1")}, 16) = 0
+fcntl64(4, F_SETFL, O_RDONLY|O_NONBLOCK) = 0
+fcntl64(5, F_SETFL, O_RDONLY|O_NONBLOCK) = 0
+pipe([6, 7])                            = 0
+select(6, [5], [], NULL, NULL)          = 1 (in [5])
+splice(0x5, 0, 0x7, 0, 0x3e8, 0x3)      = 1000
+select(6, [5], [4], NULL, NULL)         = 2 (in [5], out [4])
+splice(0x6, 0, 0x4, 0, 0x3e8, 0x3)      = 1000
+splice(0x5, 0, 0x7, 0, 0x3e8, 0x3)      = 1460
+select(6, [5], [4], NULL, NULL)         = 2 (in [5], out [4])
+splice(0x6, 0, 0x4, 0, 0x5b4, 0x3)      = 1460
+splice(0x5, 0, 0x7, 0, 0x3e8, 0x3)      = 1460
+select(6, [5], [4], NULL, NULL)         = 2 (in [5], out [4])
+splice(0x6, 0, 0x4, 0, 0x5b4, 0x3)      = 1460
+splice(0x5, 0, 0x7, 0, 0x3e8, 0x3)      = 176
+select(6, [5], [4], NULL, NULL)         = 2 (in [5], out [4])
+splice(0x6, 0, 0x4, 0, 0xb0, 0x3)       = 176
+splice(0x5, 0, 0x7, 0, 0x3e8, 0x3)      = -1 EAGAIN (Resource temporarily unavailable)
+close(5)                                = 0
+close(4)                                = 0
+exit_group(0)                           = ?
+Now with the fix :
+accept(3, 0, NULL)                      = 4
+socket(PF_INET, SOCK_STREAM, IPPROTO_TCP) = 5
+connect(5, {sa_family=AF_INET, sin_port=htons(4001), sin_addr=inet_addr("10.0.3.1")}, 16) = 0
+fcntl64(4, F_SETFL, O_RDONLY|O_NONBLOCK) = 0
+fcntl64(5, F_SETFL, O_RDONLY|O_NONBLOCK) = 0
+pipe([6, 7])                            = 0
+select(6, [5], [], NULL, NULL)          = 1 (in [5])
+splice(0x5, 0, 0x7, 0, 0x3e8, 0x3)      = 1000
+select(6, [5], [4], NULL, NULL)         = 2 (in [5], out [4])
+splice(0x6, 0, 0x4, 0, 0x3e8, 0x3)      = 1000
+splice(0x5, 0, 0x7, 0, 0x3e8, 0x3)      = 1000
+select(6, [5], [4], NULL, NULL)         = 2 (in [5], out [4])
+splice(0x6, 0, 0x4, 0, 0x3e8, 0x3)      = 1000
+splice(0x5, 0, 0x7, 0, 0x3e8, 0x3)      = 1000
+select(6, [5], [4], NULL, NULL)         = 2 (in [5], out [4])
+splice(0x6, 0, 0x4, 0, 0x3e8, 0x3)      = 1000
+splice(0x5, 0, 0x7, 0, 0x3e8, 0x3)      = 1000
+select(6, [5], [4], NULL, NULL)         = 2 (in [5], out [4])
+splice(0x6, 0, 0x4, 0, 0x3e8, 0x3)      = 1000
+splice(0x5, 0, 0x7, 0, 0x3e8, 0x3)      = 96
+select(6, [5], [4], NULL, NULL)         = 2 (in [5], out [4])
+splice(0x6, 0, 0x4, 0, 0x60, 0x3)       = 96
+splice(0x5, 0, 0x7, 0, 0x3e8, 0x3)      = -1 EAGAIN (Resource temporarily unavailable)
+close(5)                                = 0
+close(4)                                = 0
+exit_group(0)                           = ?
+Regards,
+Willy
+--
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+More majordomo info at  
+http://vger.kernel.org/majordomo-info.html
+Please read the FAQ at  
+http://www.tux.org/lkml/

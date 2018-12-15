@@ -1,0 +1,156 @@
+Date: Thu, 6 May 1999 01:58:00 +0200 (CEST)
+From: Andrea Arcangeli <>
+Subject: Re: [patch] SMP race fix [was Re: SMP lockup & 3c509 on 2.2.x [aka. the Deadly 'ping -f']]
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/5/5/253
+
+On Wed, 5 May 1999, Linus Torvalds wrote:
+>On Wed, 5 May 1999, Andrea Arcangeli wrote:
+>> 
+>> So far so good. But my argument is that the kenrel set the inprogress bit
+>> also if IRQ_DISABLED _was_ set.
+>
+>Yes. 
+>
+>So if you want to fix synchronize_irq(), maybe the proper change would
+>have been just something really simple like
+>
+>	/* Disabled? Nothing to synchronize.. */
+>	if (irq->status & IRQ_DISABLED)
+>		return;
+It's not clear to me where do you want to put the check. I suppose not in
+the end of disable_irq() otherwise the check would be a nono, and
+returning without wait and then doing an enable_irq() (with the current
+enable_irq() that clear the inprogress bit) would increase the door for
+the popular irq-SMP race.
+>	if (irq->status & IRQ_INPROGRESS)
+>		wait_for_irq_to_finish()
+I thought the current semantic of synchronize_irq() is that
+synchronize_irq() simply flush the _running_ _irqhandler_ (not the
+raw-irq) and so is _far_ from making sure that there won't be a new irq
+after the call.
+If somebody want to protect itself against a particular irq (thing that
+make tons of sense) he should use _disable_irq()_ __alone__ and _nothing_
+more. If he can accpet the last irq running but on a different cpu he can
+use my new disable_irq_nosync() to get better performances and SMP
+scalability (like in our case).
+I think it's _only_ disable_irq() that must make sure that no other irqX
+will run after the call. synchronize_irq() has not such semantic (at least
+according to me) and I don't consider it buggy (so it's not obvious that
+we want to make it bloated -> irqinprogress/irqdisabled aware). This also
+considering that cli() instead is perfectly safe for the underlined line:
+static inline void irq_enter(int cpu, unsigned int irq)
+{
+	hardirq_enter(cpu);
+	while (test_bit(0,&global_irq_lock)) {
+	       ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+		/* nothing */;
+	}
+}
+But if you then issue a sti() (as synchronize_irq() does) the pending irq
+will unblock (and it will be allowed to race in the disable_irq case)
+then.
+>instead of messing with the IRQ_INPROGRESS logic that is used by the IRQ
+>probing logic.
+I don't consider it a messing but a _fixage_. And btw inprogress made me
+to think that something is running for real, right now it would be better
+to call it `irqhappened' ;).
+My _main_ point against the current logic (and I hope to convince you ;)  
+is that the inprogress bit is the bit that has to make sure that the irq
+won't reenter itself. So in turn I think that a clean design imply that
+the inprogress bit has to be touched __only__ by irqhandlers and not from
+a foregin function (and doing that infact was causing the irq to reenter
+in itself). If the inprogress bit is touched only by irq handlers it's
+trivial to verify that there are no races. That's why I claim it a more
+robust/cleaner design.
+Really in this case it's been _far_ better that it harmed since due it I
+noticed also the synchronize_irq nono ;) but...
+>Did you even notice and/or verify that your changes may have broken IRQ
+>probing, which depends on the INPROGRESS behaviour?
+Yes in both my `second' patch and in the latest one I just updated the
+probing logic to the new behaviour.
+I had to clear the IRQ_DISABLE bit and then to reenable it after the probe
+(just before the ->shutdown) in order to get the INPROGRESS bit set while
+doing the probe (see the last lines of the irq.c part of my patch).
+The reason that irqprobing works with my code is that we probe _only_ irqs
+that have no action queued. And if the action is NULL all raw-irq handler
+are leaving IRQ_INPROGRESS enabled. Then when you'll register an action
+the request_irq call will automagically clear both irqinprogress and
+disableirq bits. When you'll free an irq then irqdisabled will be set. My
+changes seems fine to me (and they definitely works for my hardware that
+uses for sure irq probe because before updating the probing code to the
+new behaviour (I described above) I noticed some more not happy printk at
+boot ;).
+Last but not the least: my irqinprogress changes should make no
+performance difference (if something it should improve the unlikely case).
+>> >And "disable_irq()" will synchronously wait for the irq handler to have
+>> >exited (it has to - otherwise you'd see the case where somebody calls
+>> 
+>> No. That's my whole point and the cause of the race.
+>
+>Right. I believe you. I can see your _first_ patch making sense.
+I am very happy to hear that ;)). It would be nice also to get some report
+from people that was experiencing lockups though... ;)
+>I cannot see the second patch being all that worthwhile, while possibly
+>breaking autodetection and certainly modifying behaviour without any real
+>reason to.
+According to me it's still strictly needed to know for sure _when_ the
+last irq expired. And with the removal of the clear_bit(inprogress) from
+enable_irq now I am not forced to wait that the irq will expire before
+returning from disable_irq(). Now able to use a disable_irq_nosync(`N')
+function. This function will make sure that there won't be irq `N' running
+on the CPU that called the disable_irq(), but it may allow to go ahead
+even if the last irq `N' is still running in some remote CPU (and that
+it's the thing we want in the network card code). This will obviously
+improve SMP scalability (maybe only a bit but we got it for free with my
+cleaner irqinprogress logic...).
+You can't do that instead with the current IRQINPROGRESS exactly because
+enable_irq is doing dirty things with the irqinprogress bit.
+>Notice how my answer was to your _second_ patch, which I think is just
+>completely broken.
+Maybe I am on the wrong track but quite frankly I still think my last
+patch (the merging of the previous ones plus the
+s/synchronize_irq/barrier/) is the proper/right fix.
+Andrea Arcangeli
+-- start minor offtopic --
+For curiosity I taken a look to the first two usages of synchronize_irq()
+that a recursive grep picked up in the device drivers directory.
+drivers/net/de4x5.c:
+de4x5_interrupt(int irq, void *dev_id, struct pt_regs *regs)
+{
+    struct device *dev = (struct device *)dev_id;
+    struct de4x5_private *lp;
+    s32 imr, omr, sts, limit;
+    u_long iobase;
+    
+    if (dev == NULL) {
+	printk ("de4x5_interrupt(): irq %d for unknown device.\n", irq);
+	return;
+    }
+    lp = (struct de4x5_private *)dev->priv;
+    spin_lock(&lp->lock);
+    iobase = dev->base_addr;
+	
+    DISABLE_IRQs;                        /* Ensure non re-entrancy */
+    if (test_and_set_bit(MASK_INTERRUPTS, (void*) &lp->interrupt))
+	printk("%s: Re-entering the interrupt handler.\n", dev->name);
+    synchronize_irq();
+    ^^^^^^^^^^^^^^^^^
+a cli() inside an irq handler will be a nono so synchronize_irq would be
+a nono too.
+Here from plip.c:
+	if (error == HS_TIMEOUT) {
+		DISABLE(dev->irq);
+		synchronize_irq();
+	}
+here it's harming performances (there are many like this one in plip.c
+as there was some in 8390.c).
+-- end minor offtopic --
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

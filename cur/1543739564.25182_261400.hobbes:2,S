@@ -1,0 +1,385 @@
+Date: Sun, 17 Oct 2004 23:29:16 +0100
+From: Alexander Clouter <>
+Subject: [PATCH] cpufreq_ondemand
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2004/10/17/156
+
+Hi all,
+After playing with the cpufreq_ondemand governor (many thanks to those whom 
+made it) I made a number of alterations which suit me at least.  Really 
+looking for feedback and of course once people have fixed any bugs they find 
+and made the code look neater, possible inclusion?
+The improvements (well I think they are) I have made:
+1. I have replaced the algoritm it used to one which calculates the number of
+	cpu idle cycles that have passed and compares it to the number of cpu
+	cycles it would have expected to pass (for, the defaults, 20%/80%)
+	this means a couple of divisions have been removed, which is always 
+	nice and it lead to clearer code (for me at least), that was 
+	until I added the handful of 'if' conditionals though.... :-/
+2. controllable through 
+	/sys/.../ondemand/ignore_nice, you can tell it to consider 'nice' 
+	time as also idle cpu cycles.  Set it to '1' to treat 'nice' as cpu 
+	in an active state.
+3. (major) the scaling up and down of the cpufreq is now smoother.  I found 
+	it really nasty that if it tripped < 20% idle time that the freq was 
+	set to 100%.  This code smoothly increases the cpufreq as well as 
+	doing a better job of decreasing it too
+4. (minor) I changed DEF_SAMPLING_RATE_LATENCY_MULTIPLIER to 50000 and
+	DEF_SAMPLING_DOWN_FACTOR to 5 as I found the defaults a bit annoying 
+	on my system and resulted in the cpufreq constantly jumping.
+	For my patch it works far better if the sampling rate is much lower 
+	anyway, which can only be good for cpu efficiency in the long run
+5. the grainity of how much cpufreq is increased or decreased is controlled 
+	with sending a percentage to /sys/.../ondemand/freq_step_percent
+6. debugging (with 'watch -n1 cat /sys/.../ondemand/requested_freq') and 
+	backwards 'compatibility' to act like the 'userspace' governor is 
+	avaliable with /sys/.../ondemand/requested_freq if 
+	'freq_step_percent' is set to zero
+7. there are extra checks to not bother to try increasing/decreasing the 
+	cpufreq if there is nothing to do, or even can be done as it might 
+	already be at min/max (or freq_step_percent is zero)
+The code seems to work for me fine.  This is my first patch and the first 
+thing I have really posted here so be gentle with me :)
+Comments and improvements are of course more than welcome.
+Of course full thanks go to all the original authors, my C coding is naff and 
+I would of not been able to do this if it was not for the pretty much 
+complete (for my needs) cpufreq_ondemand module; Venkatesh did say we could 
+rip out the core algorithm and replace it with our own easily, he was right 
+:)
+Cheers
+Alex
+-- 
+ ___________________________________ 
+< Two is company, three is an orgy. >
+ ----------------------------------- 
+        \   ^__^
+         \  (oo)\_______
+            (__)\       )\/\
+                ||----w |
+                ||     ||
+diff -u -U 2 -r -N -d linux-2.6.9-rc4.orig/drivers/cpufreq/cpufreq_ondemand.c linux-2.6.9-rc4/drivers/cpufreq/cpufreq_ondemand.c
+--- linux-2.6.9-rc4.orig/drivers/cpufreq/cpufreq_ondemand.c	2004-10-11 03:58:49.000000000 +0100
++++ linux-2.6.9-rc4/drivers/cpufreq/cpufreq_ondemand.c	2004-10-17 18:32:28.000000000 +0100
+@@ -56,8 +56,8 @@
+ static unsigned int 				def_sampling_rate;
+ #define MIN_SAMPLING_RATE			(def_sampling_rate / 2)
+ #define MAX_SAMPLING_RATE			(500 * def_sampling_rate)
+-#define DEF_SAMPLING_RATE_LATENCY_MULTIPLIER	(1000)
+-#define DEF_SAMPLING_DOWN_FACTOR		(10)
++#define DEF_SAMPLING_RATE_LATENCY_MULTIPLIER	(50000)
++#define DEF_SAMPLING_DOWN_FACTOR		(5)
+ #define TRANSITION_LATENCY_LIMIT		(10 * 1000)
+ #define sampling_rate_in_HZ(x)			(((x * HZ) < (1000 * 1000))?1:((x * HZ) / (1000 * 1000)))
+ 
+@@ -65,8 +65,8 @@
+ 
+ struct cpu_dbs_info_s {
+ 	struct cpufreq_policy 	*cur_policy;
+-	unsigned int 		prev_cpu_idle_up;
+-	unsigned int 		prev_cpu_idle_down;
++	unsigned int 		prev_cpu_ticks;
++	unsigned int		prev_cpu_idle_ticks;
+ 	unsigned int 		enable;
+ };
+ static DEFINE_PER_CPU(struct cpu_dbs_info_s, cpu_dbs_info);
+@@ -81,6 +81,9 @@
+ 	unsigned int		sampling_down_factor;
+ 	unsigned int		up_threshold;
+ 	unsigned int		down_threshold;
++	unsigned int		requested_freq;
++	unsigned int		freq_step_percent;
++	unsigned int		ignore_nice;
+ };
+ 
+ struct dbs_tuners dbs_tuners_ins = {
+@@ -116,6 +119,22 @@
+ {									\
+ 	return sprintf(buf, "%u\n", dbs_tuners_ins.object);		\
+ }
++
++static ssize_t show_requested_freq(struct cpufreq_policy *policy, char *buf)
++{
++	return sprintf (buf, "%u\n", dbs_tuners_ins.requested_freq);
++}
++
++static ssize_t show_freq_step_percent(struct cpufreq_policy *policy, char *buf)
++{
++	return sprintf (buf, "%u\n", dbs_tuners_ins.freq_step_percent);
++}
++
++static ssize_t show_ignore_nice(struct cpufreq_policy *policy, char *buf)
++{
++	return sprintf (buf, "%u\n", dbs_tuners_ins.ignore_nice);
++}
++
+ show_one(sampling_rate, sampling_rate);
+ show_one(sampling_down_factor, sampling_down_factor);
+ show_one(up_threshold, up_threshold);
+@@ -189,6 +208,63 @@
+ 	return count;
+ }
+ 
++static ssize_t store_ignore_nice(struct cpufreq_policy *unused,
++		const char *buf, size_t count)
++{
++	unsigned int input;
++	int ret;
++	ret = sscanf (buf, "%u", &input);
++	down(&dbs_sem);
++	if ( ret == 1 ) {
++		if ( input > 1 )
++			input = 1;
++		dbs_tuners_ins.ignore_nice = input;
++	}
++	up(&dbs_sem);
++	return count;
++}
++
++static ssize_t store_freq_step_percent(struct cpufreq_policy *unused,
++		const char *buf, size_t count)
++{
++	unsigned int input;
++	int ret;
++	ret = sscanf (buf, "%u", &input);
++	down(&dbs_sem);
++	if ( ret == 1 ) {
++		/* someone might find 'freq_step_percent = 0' useful so this is
++		 * why I have added support to manually set the freq also; I
++		 * guess this would then permit a userland tool to jump in
++		 * without rmmod/insmod'ing.  show/store_requested_freq is also
++		 * darn handy for debugging
++		 */
++		if ( input > 100 )
++			input = 100;
++		dbs_tuners_ins.freq_step_percent = input;
++	}
++	up(&dbs_sem);
++	return count;
++}
++
++static ssize_t store_requested_freq(struct cpufreq_policy *policy,
++		const char *buf, size_t count)
++{
++	unsigned int input;
++	int ret;
++	ret = sscanf (buf, "%u", &input);
++	down(&dbs_sem);
++	if ( ret == 1 ) {
++		if ( input < policy->min )
++			input = policy->min;
++		if ( input > policy->max )
++			input = policy->max;
++		dbs_tuners_ins.requested_freq = input;
++		__cpufreq_driver_target(policy, input, CPUFREQ_RELATION_H);
++	}
++	up(&dbs_sem);
++	return count;
++}
++
+ #define define_one_rw(_name) 					\
+ static struct freq_attr _name = { 				\
+ 	.attr = { .name = __stringify(_name), .mode = 0644 }, 	\
+@@ -200,6 +276,9 @@
+ define_one_rw(sampling_down_factor);
+ define_one_rw(up_threshold);
+ define_one_rw(down_threshold);
++define_one_rw(requested_freq);
++define_one_rw(freq_step_percent);
++define_one_rw(ignore_nice);
+ 
+ static struct attribute * dbs_attributes[] = {
+ 	&sampling_rate_max.attr,
+@@ -208,6 +287,9 @@
+ 	&sampling_down_factor.attr,
+ 	&up_threshold.attr,
+ 	&down_threshold.attr,
++	&requested_freq.attr,
++	&freq_step_percent.attr,
++	&ignore_nice.attr,
+ 	NULL
+ };
+ 
+@@ -220,10 +302,9 @@
+ 
+ static void dbs_check_cpu(int cpu)
+ {
+-	unsigned int idle_ticks, up_idle_ticks, down_idle_ticks;
+-	unsigned int total_idle_ticks;
+-	unsigned int freq_down_step;
+-	unsigned int freq_down_sampling_rate;
++	unsigned int total_ticks, total_idle_ticks;
++	unsigned int ticks, idle_ticks;
++	unsigned int freq_step;
+ 	static int down_skip[NR_CPUS];
+ 	struct cpu_dbs_info_s *this_dbs_info;
+ 
+@@ -242,26 +323,82 @@
+ 	 *
+ 	 * Any frequency increase takes it to the maximum frequency. 
+ 	 * Frequency reduction happens at minimum steps of 
+-	 * 5% of max_frequency 
++	 * 5% (default) of max_frequency 
++	 *
++	 * My modified routine compares the number of idle ticks with the
++	 * expected number of idle ticks for the boundaries and acts accordingly
++	 * - Alexander Clouter <alex-kernel@digriz.org.uk>
+ 	 */
+-	/* Check for frequency increase */
+-	total_idle_ticks = kstat_cpu(cpu).cpustat.idle +
++
++	/* get various cpu stats */
++	total_ticks =
++		kstat_cpu(cpu).cpustat.user +
++		kstat_cpu(cpu).cpustat.nice +
++		kstat_cpu(cpu).cpustat.system +
++		kstat_cpu(cpu).cpustat.softirq +
++		kstat_cpu(cpu).cpustat.irq +
++		kstat_cpu(cpu).cpustat.idle +
++		kstat_cpu(cpu).cpustat.iowait;
++	total_idle_ticks =
++		kstat_cpu(cpu).cpustat.idle +
+ 		kstat_cpu(cpu).cpustat.iowait;
+-	idle_ticks = total_idle_ticks -
+-		this_dbs_info->prev_cpu_idle_up;
+-	this_dbs_info->prev_cpu_idle_up = total_idle_ticks;
+ 
+-	/* Scale idle ticks by 100 and compare with up and down ticks */
+-	idle_ticks *= 100;
+-	up_idle_ticks = (100 - dbs_tuners_ins.up_threshold) *
+-			sampling_rate_in_HZ(dbs_tuners_ins.sampling_rate);
++	/* if the /sys says we need to consider nice tasks as 'idle' time too */
++	if (dbs_tuners_ins.ignore_nice == 0)
++		total_idle_ticks += kstat_cpu(cpu).cpustat.nice;
++	
++	ticks = (total_ticks -
++		this_dbs_info->prev_cpu_ticks) * 100;
++	idle_ticks = (total_idle_ticks -
++		this_dbs_info->prev_cpu_idle_ticks) * 100;
++	
++	this_dbs_info->prev_cpu_ticks = total_ticks;
++	this_dbs_info->prev_cpu_idle_ticks = total_idle_ticks;
++	
++	/* nothing to do if we cannot shift the frequency */
++	if (dbs_tuners_ins.freq_step_percent == 0)
++		return;
++	
++	/* checks to see if we have anything to do or can do and breaks out if:
++	 *  - we are within the 20% <-> 80% region
++	 *  - if the cpu freq needs increasing we are not already at max
++	 *  - if the cpu freq needs decreasing we are not already at min
++	 *
++	 *  you have to love those parentheses.... :)
++	 */
++	if (!( ( (ticks-idle_ticks) > (dbs_tuners_ins.up_threshold*idle_ticks)
++			&& dbs_tuners_ins.requested_freq
++				!= this_dbs_info->cur_policy->max
++	       )
++  	    || ( (ticks-idle_ticks) < (dbs_tuners_ins.down_threshold*idle_ticks)
++			&& dbs_tuners_ins.requested_freq
++				!= this_dbs_info->cur_policy->min
++	       ) ) )
++		return;
+ 
+-	if (idle_ticks < up_idle_ticks) {
++	/* max freq cannot be less than 100. But who knows.... */
++	if (unlikely(this_dbs_info->cur_policy->max < 100)) {
++		freq_step = dbs_tuners_ins.freq_step_percent;
++	} else {
++		freq_step = (dbs_tuners_ins.freq_step_percent *
++				this_dbs_info->cur_policy->max) / 100;
++	}
++
++	/* Check for frequency increase */
++	if ( (ticks-idle_ticks) > (dbs_tuners_ins.up_threshold*idle_ticks) ) {
++		dbs_tuners_ins.requested_freq += freq_step;
++		if (dbs_tuners_ins.requested_freq >
++				this_dbs_info->cur_policy->max)
++			dbs_tuners_ins.requested_freq =
++				this_dbs_info->cur_policy->max;
++
++		/* printk("up: %u->%u\n",
++				this_dbs_info->cur_policy->cur,
++				dbs_tuners_ins.requested_freq); */
+ 		__cpufreq_driver_target(this_dbs_info->cur_policy,
+-			this_dbs_info->cur_policy->max, 
+-			CPUFREQ_RELATION_H);
++        	       	dbs_tuners_ins.requested_freq,
++        	       	CPUFREQ_RELATION_H);
+ 		down_skip[cpu] = 0;
+-		this_dbs_info->prev_cpu_idle_down = total_idle_ticks;
+ 		return;
+ 	}
+ 
+@@ -270,27 +407,19 @@
+ 	if (down_skip[cpu] < dbs_tuners_ins.sampling_down_factor)
+ 		return;
+ 
+-	idle_ticks = total_idle_ticks -
+-		this_dbs_info->prev_cpu_idle_down;
+-	/* Scale idle ticks by 100 and compare with up and down ticks */
+-	idle_ticks *= 100;
+ 	down_skip[cpu] = 0;
+-	this_dbs_info->prev_cpu_idle_down = total_idle_ticks;
+-
+-	freq_down_sampling_rate = dbs_tuners_ins.sampling_rate *
+-		dbs_tuners_ins.sampling_down_factor;
+-	down_idle_ticks = (100 - dbs_tuners_ins.down_threshold) *
+-			sampling_rate_in_HZ(freq_down_sampling_rate);
+-
+-	if (idle_ticks > down_idle_ticks ) {
+-		freq_down_step = (5 * this_dbs_info->cur_policy->max) / 100;
+-
+-		/* max freq cannot be less than 100. But who knows.... */
+-		if (unlikely(freq_down_step == 0))
+-			freq_down_step = 5;
+-
++	if ( (ticks-idle_ticks) < (dbs_tuners_ins.down_threshold*idle_ticks) ) {
++		dbs_tuners_ins.requested_freq -= freq_step;
++		if (dbs_tuners_ins.requested_freq <
++				this_dbs_info->cur_policy->min)
++			dbs_tuners_ins.requested_freq =
++				this_dbs_info->cur_policy->min;
++		
++		/* printk("down: %u->%u\n",
++				this_dbs_info->cur_policy->cur,
++				dbs_tuners_ins.requested_freq); */
+ 		__cpufreq_driver_target(this_dbs_info->cur_policy,
+-			this_dbs_info->cur_policy->cur - freq_down_step, 
++			dbs_tuners_ins.requested_freq, 
+ 			CPUFREQ_RELATION_H);
+ 		return;
+ 	}
+@@ -344,10 +473,16 @@
+ 		down(&dbs_sem);
+ 		this_dbs_info->cur_policy = policy;
+ 		
+-		this_dbs_info->prev_cpu_idle_up = 
++		this_dbs_info->prev_cpu_ticks =
++				kstat_cpu(cpu).cpustat.user +
++				kstat_cpu(cpu).cpustat.nice +
++				kstat_cpu(cpu).cpustat.system +
++				kstat_cpu(cpu).cpustat.softirq +
++				kstat_cpu(cpu).cpustat.irq +
+ 				kstat_cpu(cpu).cpustat.idle +
+ 				kstat_cpu(cpu).cpustat.iowait;
+-		this_dbs_info->prev_cpu_idle_down = 
++		this_dbs_info->prev_cpu_idle_ticks = 
++				kstat_cpu(cpu).cpustat.nice +
+ 				kstat_cpu(cpu).cpustat.idle +
+ 				kstat_cpu(cpu).cpustat.iowait;
+ 		this_dbs_info->enable = 1;
+@@ -368,7 +503,10 @@
+ 			def_sampling_rate = (latency / 1000) *
+ 					DEF_SAMPLING_RATE_LATENCY_MULTIPLIER;
+ 			dbs_tuners_ins.sampling_rate = def_sampling_rate;
+-
++			dbs_tuners_ins.requested_freq
++				= this_dbs_info->cur_policy->cur;
++			dbs_tuners_ins.freq_step_percent = 5;
++			dbs_tuners_ins.ignore_nice = 0;
+ 			dbs_timer_init();
+ 		}
+ 		[unhandled content-type:application/pgp-signature]

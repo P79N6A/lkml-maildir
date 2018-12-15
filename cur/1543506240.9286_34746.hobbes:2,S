@@ -1,0 +1,878 @@
+Date: Wed, 18 Aug 1999 12:11:31 +0100 (GMT/BST)
+From: Mike Jagdis <>
+Subject: [PATCH] Select speed ups
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/8/18/62
+
+Apparently select() is too slow. So I made it faster :-).
+  Firstly I rewrote the stuff in fs/select.c. This speeds up
+the set up and non-blocking cases. Secondly I removed the
+scans of the fd sets after blocking and only recheck the
+descriptors that have been woken. The bigger your fd sets,
+the more you gain. In the 1024 bits with one or two fds waking
+at once case you can be looking towards an order of magnitude
+less time in select!
+  The way this is done is to extend wait queue slightly (and
+hopefully acceptably) so that when a wake up happens the queue
+entry can optionally be placed on a specified "event" queue
+(or even just flagged as triggered). The select code uses this
+to find out which wait queue entries have been woken.
+  I originally conceived the wait queue change as a way of
+allowing the synchronous wait-sleep-wake to be used for
+asynchronous wait-do something else-handle event with a view
+to using it for lightweight, thread free AIO but then I saw
+some of the proposals for select speed ups that involved lots
+of driver changes, back reference lists etc...
+  I had hoped to put pretty graphs etc. on the web but haven't
+had chance yet. However, since Linus is pushing for a pre-2.4
+freeze I'd like this to at least have a chance of making the
+next kernel release. Please play with it. Especially if you
+have a non-Intel machine or processes that do a lot of selecting.
+  Constructive criticism to mike@roan.co.uk (or, if that is
+broken *again*, jaggy@purplet.demon.co.uk). Yes, I think the
+event queue manipulation should be macroized too... :-)
+				Mike
+-- 
+    A train stops at a train station, a bus stops at a bus station.
+    On my desk I have a work station...
+.----------------------------------------------------------------------.
+|  Mike Jagdis                  |  Internet:  mailto:mike@roan.co.uk   |
+|  Roan Technology Ltd.         |                                      |
+|  2 Markham Mews, Broad Street |  Telephone:  +44 118 989 0403        |
+|  Wokingham ENGLAND            |  Fax:        +44 118 989 1195        |
+`----------------------------------------------------------------------'
+diff -ur --exclude=.depend --exclude=.hdepend --exclude=*.flags --exclude=*.[oa] linux-2.3.13.old/fs/select.c linux-2.3.13+/fs/select.c
+--- linux-2.3.13.old/fs/select.c	Thu Aug  5 10:07:14 1999
++++ linux-2.3.13+/fs/select.c	Wed Aug 18 09:47:14 1999
+@@ -8,6 +8,13 @@
+  *     COFF/ELF binary emulation. If the process has the STICKY_TIMEOUTS
+  *     flag set in its personality we do *not* modify the given timeout
+  *     parameter to reflect time remaining.
++ *
++ *  August 1999
++ *     Rewritten to use event queues to limit overhead on wake up
++ *     after sleeping, plus general performance enhancements.
++ *     N.B. I believe the lock_kernel() is only needed because drivers'
++ *     poll routines might expect it. One day...?
++ *     -- Mike Jagdis <jaggy@purplet.demon.co.uk>
+  */
+ 
+ #include <linux/malloc.h>
+@@ -17,6 +24,13 @@
+ 
+ #include <asm/uaccess.h>
+ 
++/* Claim the file_lock semaphore around the whole fdset scan loop
++ * rather than when looking at an fdset bit within the loop (this
++ * is done by fget()/fput()). This holds a read lock on the decsriptor
++ * table for longer but reduces overhead in the loop.
++ */
++#define WIDE_FILE_LOCK
++
+ #define ROUND_UP(x,y) (((x)+(y)-1)/(y))
+ #define DEFAULT_POLLMASK (POLLIN | POLLOUT | POLLRDNORM | POLLWRNORM)
+ 
+@@ -39,184 +53,265 @@
+  * Linus noticed.  -- jrs
+  */
+ 
+-static void free_wait(poll_table * p)
++static void free_wait(poll_table * ptab)
+ {
+-	struct poll_table_entry * entry;
+-	poll_table *old;
++	struct poll_table_head *p;
+ 
++	/* Remove from the wait queues first. Having done that we
++	 * know the event queue can no longer change so we can ignore
++	 * it and just free the pages.
++	 */
++	p = ptab->head;
+ 	while (p) {
+-		entry = p->entry + p->nr;
+-		while (p->nr > 0) {
+-			p->nr--;
+-			entry--;
+-			remove_wait_queue(entry->wait_address,&entry->wait);
++		struct poll_table_entry *entry;
++		entry = (struct poll_table_entry *)(p + 1);
++		while (entry < p->entry) {
++			remove_wait_queue(entry->wait_address, &entry->wait);
+ 			fput(entry->filp);
++			entry++;
+ 		}
+-		old = p;
+ 		p = p->next;
+-		free_page((unsigned long) old);
+ 	}
+-}
+-
+-void __pollwait(struct file * filp, wait_queue_head_t * wait_address, poll_table *p)
+-{
+-	for (;;) {
+-		if (p->nr < __MAX_POLL_TABLE_ENTRIES) {
+-			struct poll_table_entry * entry;
+-ok_table:
+-		 	entry = p->entry + p->nr;
+-		 	get_file(filp);
+-		 	entry->filp = filp;
+-			entry->wait_address = wait_address;
+-			init_waitqueue_entry(&entry->wait, current);
+-			add_wait_queue(wait_address,&entry->wait);
+-			p->nr++;
+-			return;
+-		}
+-		if (p->next == NULL) {
+-			poll_table *tmp = (poll_table *) __get_free_page(GFP_KERNEL);
+-			if (!tmp)
+-				return;
+-			tmp->nr = 0;
+-			tmp->entry = (struct poll_table_entry *)(tmp + 1);
+-			tmp->next = NULL;
+-			p->next = tmp;
+-			p = tmp;
+-			goto ok_table;
+-		}
++	p = ptab->head;
++	while (p) {
++		struct poll_table_head *old = p;
+ 		p = p->next;
++		free_page((unsigned long) old);
+ 	}
+ }
+ 
+-#define __IN(fds, n)		(fds->in + n)
+-#define __OUT(fds, n)		(fds->out + n)
+-#define __EX(fds, n)		(fds->ex + n)
+-#define __RES_IN(fds, n)	(fds->res_in + n)
+-#define __RES_OUT(fds, n)	(fds->res_out + n)
+-#define __RES_EX(fds, n)	(fds->res_ex + n)
+-
+-#define BITS(fds, n)		(*__IN(fds, n)|*__OUT(fds, n)|*__EX(fds, n))
+-
+-static int max_select_fd(unsigned long n, fd_set_bits *fds)
++void __pollwait(struct file * filp, wait_queue_head_t * wait_address, poll_table *ptab)
+ {
+-	unsigned long *open_fds;
+-	unsigned long set;
+-	int max;
++	struct poll_table_head * tmp, * p = ptab->last;
++	struct poll_table_entry *last_entry;
+ 
+-	/* handle last in-complete long-word first */
+-	set = ~(~0UL << (n & (__NFDBITS-1)));
+-	n /= __NFDBITS;
+-	open_fds = current->files->open_fds->fds_bits+n;
+-	max = 0;
+-	if (set) {
+-		set &= BITS(fds, n);
+-		if (set) {
+-			if (!(set & ~*open_fds))
+-				goto get_max;
+-			return -EBADF;
+-		}
+-	}
+-	while (n) {
+-		open_fds--;
+-		n--;
+-		set = BITS(fds, n);
+-		if (!set)
+-			continue;
+-		if (set & ~*open_fds)
+-			return -EBADF;
+-		if (max)
+-			continue;
+-get_max:
+-		do {
+-			max++;
+-			set >>= 1;
+-		} while (set);
+-		max += n * __NFDBITS;
+-	}
+-
+-	return max;
++	last_entry = (void *)p + PAGE_SIZE - sizeof(struct poll_table_entry);
++	if (p->entry <= last_entry) {
++		struct poll_table_entry *entry;
++ok_table:
++		entry = p->entry++;
++	 	get_file(filp);
++		entry->n = ptab->n;
++	 	entry->filp = filp;
++		entry->wait_address = wait_address;
++		init_waitqueue_entry(&entry->wait, current);
++		entry->wait.ev_queue = &ptab->ev_queue;
++		add_wait_queue(wait_address, &entry->wait);
++		return;
++	}
++
++	tmp = (void *) __get_free_page(GFP_KERNEL);
++	if (tmp) {
++		tmp->entry = (struct poll_table_entry *)(tmp + 1);
++		tmp->next = NULL;
++		p->next = tmp;
++		ptab->last = p = tmp;
++		goto ok_table;
++	}
++	/* All the existing drivers expect this to succeed. If we are
++	 * out of memory we may just block until timeout (if there is
++	 * one) because we failed to wait.
++	 */
++	/* return -ENOMEM; */
+ }
+ 
++
+ #define BIT(i)		(1UL << ((i)&(__NFDBITS-1)))
+-#define MEM(i,m)	((m)+(unsigned)(i)/__NFDBITS)
+-#define ISSET(i,m)	(((i)&*(m)) != 0)
+-#define SET(i,m)	(*(m) |= (i))
+ 
+ #define POLLIN_SET (POLLRDNORM | POLLRDBAND | POLLIN | POLLHUP | POLLERR)
+ #define POLLOUT_SET (POLLWRBAND | POLLWRNORM | POLLOUT | POLLERR)
+ #define POLLEX_SET (POLLPRI)
+ 
+-int do_select(int n, fd_set_bits *fds, long *timeout)
++int do_select(int n, unsigned long *bits, const int size, long *timeout)
+ {
+-	poll_table *wait_table, *wait;
+-	int retval, i, off;
+-	long __timeout = *timeout;
++	poll_table wait_table, *wait;
++	int retval;
++	long __timeout;
++	unsigned long bit;
++	unsigned long fds, *fdl;
++	unsigned long mask;
++	struct file *file;
+ 
+-	wait = wait_table = NULL;
++	wait = NULL;
++	__timeout = *timeout;
+ 	if (__timeout) {
+-		wait_table = (poll_table *) __get_free_page(GFP_KERNEL);
+-		if (!wait_table)
++		wait_table.head = (void *) __get_free_page(GFP_KERNEL);
++		if (!wait_table.head)
+ 			return -ENOMEM;
+ 
+-		wait_table->nr = 0;
+-		wait_table->entry = (struct poll_table_entry *)(wait_table + 1);
+-		wait_table->next = NULL;
+-		wait = wait_table;
++		init_eventqueue(&wait_table.ev_queue);
++		wait_table.head->entry = (struct poll_table_entry *)(wait_table.head + 1);
++		wait_table.head->next = NULL;
++		wait_table.last = wait_table.head;
++		wait = &wait_table;
+ 	}
+ 
++	retval = 0;
++	lock_kernel();
++
++	if (!n)
++		goto no_setup;
++
++	mask = ~(~0UL << (n & (__NFDBITS-1)));
++	if (!mask)
++		mask = ~0UL;
++	n--;
++	current->state = TASK_INTERRUPTIBLE;
++	wait_table.n = n;
++	n /= __NFDBITS;
++	fdl = bits + n;
++
++	fds = (*fdl | fdl[size] | fdl[2*size]) & mask;
++
++#ifdef WIDE_FILE_LOCK
+ 	read_lock(&current->files->file_lock);
+-	retval = max_select_fd(n, fds);
+-	read_unlock(&current->files->file_lock);
++#endif
++	if (fds) {
++		bit = BIT(wait_table.n);
++		goto first_long;
++	}
+ 
+-	lock_kernel();
+-	if (retval < 0)
+-		goto out;
+-	n = retval;
+-	retval = 0;
+-	for (;;) {
+-		current->state = TASK_INTERRUPTIBLE;
+-		for (i = 0 ; i < n; i++) {
+-			unsigned long bit = BIT(i);
+-			unsigned long mask;
+-			struct file *file;
++	wait_table.n |= 31; /* Round up */
++
++	while (wait_table.n >= 0) {
++		/* Long runs of zero bits tend to be common, especially
++		 * at the end of over large sets so we use a tight loop
++		 * to skip them.
++		 */
++		do {
++			fdl--;
++			fds = *fdl | fdl[size] | fdl[2*size];
++		} while (!fds && fdl > bits);
++		if (!fds)
++			break;
++		wait_table.n = (fdl - bits) * 8*sizeof(unsigned long)
++				+ 8*sizeof(unsigned long) - 1;
+ 
+-			off = i / __NFDBITS;
+-			if (!(bit & BITS(fds, off)))
++		bit = 1UL << ((8*sizeof(unsigned long)) - 1);
++first_long:
++		for (; bit && wait_table.n >= 0; wait_table.n--, bit >>= 1) {
++			if (!(fds & bit))
+ 				continue;
+-			file = fget(i);
+-			mask = POLLNVAL;
+-			if (file) {
+-				mask = DEFAULT_POLLMASK;
+-				if (file->f_op && file->f_op->poll)
+-					mask = file->f_op->poll(file, wait);
+-				fput(file);
+-			}
+-			if ((mask & POLLIN_SET) && ISSET(bit, __IN(fds,off))) {
+-				SET(bit, __RES_IN(fds,off));
++
++#ifdef WIDE_FILE_LOCK
++			file = fcheck(wait_table.n);
++#else
++			file = fget(wait_table.n);
++#endif
++			if (!file)
++				goto out_badf;
++			mask = DEFAULT_POLLMASK;
++			if (file->f_op && file->f_op->poll)
++				mask = file->f_op->poll(file, wait);
++#ifndef WIDE_FILE_LOCK
++			fput(file);
++#endif
++			/* In general most of the bits will be unset
++			 * and branch prediction says that forward
++			 * conditional branches are not taken. So...
++			 */
++			if (!(*fdl & bit))
++				goto no_in_check;
++			if ((mask & POLLIN_SET)) {
++				fdl[3*size] |= bit;
+ 				retval++;
+ 				wait = NULL;
+ 			}
+-			if ((mask & POLLOUT_SET) && ISSET(bit, __OUT(fds,off))) {
+-				SET(bit, __RES_OUT(fds,off));
++no_in_check:
++			if (!(fdl[size] & bit))
++				goto no_out_check;
++			if ((mask & POLLOUT_SET)) {
++				fdl[4*size] |= bit;
+ 				retval++;
+ 				wait = NULL;
+ 			}
+-			if ((mask & POLLEX_SET) && ISSET(bit, __EX(fds,off))) {
+-				SET(bit, __RES_EX(fds,off));
++no_out_check:
++			if (!(fdl[2*size] & bit))
++				goto no_ex_check;
++			if ((mask & POLLEX_SET)) {
++				fdl[5*size] |= bit;
+ 				retval++;
+ 				wait = NULL;
+ 			}
++no_ex_check:
+ 		}
+-		wait = NULL;
+-		if (retval || !__timeout || signal_pending(current))
+-			break;
++	}
++
++#ifdef WIDE_FILE_LOCK
++	read_unlock(&current->files->file_lock);
++#endif
++
++no_setup:
++	while (!retval && __timeout && !signal_pending(current)) {
++		unsigned long flags;
++		wait_queue_t *w, *next;
++
+ 		__timeout = schedule_timeout(__timeout);
++		current->state = TASK_INTERRUPTIBLE;
++
++		/* Lift the queued events and reset the queue ready
++		 * for anything that happens while we "think".
++		 */
++		spin_lock_irqsave(&wait_table.ev_queue.lock, flags);
++		w = wait_table.ev_queue.head;
++		wait_table.ev_queue.head = NULL;
++		wait_table.ev_queue.tail = &wait_table.ev_queue.head;
++		spin_unlock_irqrestore(&wait_table.ev_queue.lock, flags);
++
++		for (; w; w=next) {
++			struct poll_table_entry * p;
++
++			/* Reset the wait_queue's event pointer before
++			 * checking in case it is triggered again.
++			 */
++			next = w->ev_next;
++			w->ev_queue = &wait_table.ev_queue;
++			mb();
++
++			p = (void *)w - offsetof(struct poll_table_entry, wait);
++			file = p->filp;
++#if 0
++			/* This has to be true or we would never have
++			 * done a wait on the file!
++			 */
++			if (file->f_op && file->f_op->poll)
++#endif
++				mask = file->f_op->poll(file, NULL);
++
++			fdl = bits + (p->n / __NFDBITS);
++			bit = BIT(p->n);
++
++			/* In general most of the bits will be unset
++			 * and branch prediction says that forward
++			 * conditional branches are not taken. So...
++			 */
++			if (!(*fdl & bit))
++				goto ev_no_in_check;
++			if ((mask & POLLIN_SET)) {
++				fdl[3*size] |= bit;
++				retval++;
++			}
++ev_no_in_check:
++			if (!(fdl[size] & bit))
++				goto ev_no_out_check;
++			if ((mask & POLLOUT_SET)) {
++				fdl[4*size] |= bit;
++				retval++;
++			}
++ev_no_out_check:
++			if (!(fdl[2*size] & bit))
++				goto ev_no_ex_check;
++			if ((mask & POLLEX_SET)) {
++				fdl[5*size] |= bit;
++				retval++;
++			}
++ev_no_ex_check:
++		}
+ 	}
+ 	current->state = TASK_RUNNING;
+-
+ out:
+ 	if (*timeout)
+-		free_wait(wait_table);
++		free_wait(&wait_table);
+ 
+ 	/*
+ 	 * Up-to-date the caller timeout.
+@@ -224,6 +319,10 @@
+ 	*timeout = __timeout;
+ 	unlock_kernel();
+ 	return retval;
++out_badf:
++	read_unlock(&current->files->file_lock);
++	retval = -EBADF;
++	goto out;
+ }
+ 
+ /*
+@@ -240,8 +339,7 @@
+ asmlinkage int
+ sys_select(int n, fd_set *inp, fd_set *outp, fd_set *exp, struct timeval *tvp)
+ {
+-	fd_set_bits fds;
+-	char *bits;
++	unsigned long *bits;
+ 	long timeout;
+ 	int ret, size;
+ 
+@@ -277,26 +375,17 @@
+ 	 * long-words. 
+ 	 */
+ 	ret = -ENOMEM;
+-	size = FDS_BYTES(n);
+-	bits = kmalloc(6 * size, GFP_KERNEL);
++	size = FDS_LONGS(n);
++	bits = kmalloc(6 * size * sizeof(unsigned long), GFP_KERNEL);
+ 	if (!bits)
+ 		goto out_nofds;
+-	fds.in      = (unsigned long *)  bits;
+-	fds.out     = (unsigned long *) (bits +   size);
+-	fds.ex      = (unsigned long *) (bits + 2*size);
+-	fds.res_in  = (unsigned long *) (bits + 3*size);
+-	fds.res_out = (unsigned long *) (bits + 4*size);
+-	fds.res_ex  = (unsigned long *) (bits + 5*size);
+-
+-	if ((ret = get_fd_set(n, inp, fds.in)) ||
+-	    (ret = get_fd_set(n, outp, fds.out)) ||
+-	    (ret = get_fd_set(n, exp, fds.ex)))
++	if ((ret = get_fd_set(n, inp, bits)) ||
++	    (ret = get_fd_set(n, outp, bits+size)) ||
++	    (ret = get_fd_set(n, exp, bits+2*size)))
+ 		goto out;
+-	zero_fd_set(n, fds.res_in);
+-	zero_fd_set(n, fds.res_out);
+-	zero_fd_set(n, fds.res_ex);
++	memset(bits+3*size, 0, 3*size*sizeof(unsigned long));
+ 
+-	ret = do_select(n, &fds, &timeout);
++	ret = do_select(n, bits, size, &timeout);
+ 
+ 	if (tvp && !(current->personality & STICKY_TIMEOUTS)) {
+ 		time_t sec = 0, usec = 0;
+@@ -318,9 +407,12 @@
+ 		ret = 0;
+ 	}
+ 
+-	set_fd_set(n, inp, fds.res_in);
+-	set_fd_set(n, outp, fds.res_out);
+-	set_fd_set(n, exp, fds.res_ex);
++	if (inp)
++		__copy_to_user(inp, bits+3*size, size*sizeof(unsigned long));
++	if (outp)
++		__copy_to_user(outp, bits+4*size, size*sizeof(unsigned long));
++	if (exp)
++		__copy_to_user(exp, bits+5*size, size*sizeof(unsigned long));
+ 
+ out:
+ 	kfree(bits);
+@@ -328,46 +420,99 @@
+ 	return ret;
+ }
+ 
+-static int do_poll(unsigned int nfds, struct pollfd *fds, poll_table *wait,
+-		   long timeout)
++static int do_poll(unsigned int nfds, struct pollfd *fds, long timeout)
+ {
++	poll_table wait_table, *wait;
++	struct pollfd * fdpnt;
+ 	int count = 0;
+ 
+-	for (;;) {
+-		unsigned int j;
+-		struct pollfd * fdpnt;
++	wait = NULL;
++	if (timeout) {
++		wait_table.head = (void *) __get_free_page(GFP_KERNEL);
++		if (!wait_table.head)
++			return -ENOMEM;
+ 
+-		current->state = TASK_INTERRUPTIBLE;
+-		for (fdpnt = fds, j = 0; j < nfds; j++, fdpnt++) {
+-			int fd;
+-			unsigned int mask;
+-
+-			mask = 0;
+-			fd = fdpnt->fd;
+-			if (fd >= 0) {
+-				struct file * file = fget(fd);
+-				mask = POLLNVAL;
+-				if (file != NULL) {
+-					mask = DEFAULT_POLLMASK;
+-					if (file->f_op && file->f_op->poll)
+-						mask = file->f_op->poll(file, wait);
+-					mask &= fdpnt->events | POLLERR | POLLHUP;
+-					fput(file);
+-				}
+-				if (mask) {
+-					wait = NULL;
+-					count++;
+-				}
++		init_eventqueue(&wait_table.ev_queue);
++		wait_table.head->entry = (struct poll_table_entry *)(wait_table.head + 1);
++		wait_table.head->next = NULL;
++		wait_table.last = wait_table.head;
++		wait = &wait_table;
++	}
++
++	current->state = TASK_INTERRUPTIBLE;
++	for (fdpnt = fds, wait_table.n = 0; wait_table.n < nfds; wait_table.n++, fdpnt++) {
++		int fd;
++		unsigned int mask;
++
++		mask = 0;
++		fd = fdpnt->fd;
++		if (fd >= 0) {
++			struct file * file = fget(fd);
++			mask = POLLNVAL;
++			if (file != NULL) {
++				mask = DEFAULT_POLLMASK;
++				if (file->f_op && file->f_op->poll)
++					mask = file->f_op->poll(file, wait);
++				mask &= fdpnt->events | POLLERR | POLLHUP;
++				fput(file);
++			}
++			if (mask) {
++				wait = NULL;
++				count++;
+ 			}
+-			fdpnt->revents = mask;
+ 		}
++		fdpnt->revents = mask;
++	}
++
++	while (!count && timeout && !signal_pending(current)) {
++		unsigned long flags;
++		wait_queue_t *w, *next;
+ 
+-		wait = NULL;
+-		if (count || !timeout || signal_pending(current))
+-			break;
+ 		timeout = schedule_timeout(timeout);
++		current->state = TASK_INTERRUPTIBLE;
++
++		/* Lift the queued events and reset the queue ready
++		 * for anything that happens while we "think".
++		 */
++		spin_lock_irqsave(&wait_table.ev_queue.lock, flags);
++		w = wait_table.ev_queue.head;
++		wait_table.ev_queue.head = NULL;
++		wait_table.ev_queue.tail = &wait_table.ev_queue.head;
++		spin_unlock_irqrestore(&wait_table.ev_queue.lock, flags);
++
++		for (; w; w=next) {
++			struct poll_table_entry * p;
++			unsigned long mask;
++			struct file * file;
++
++			/* Reset the wait_queue's event pointer before
++			 * checking in case it is triggered again.
++			 */
++			next = w->ev_next;
++			w->ev_queue = &wait_table.ev_queue;
++			mb();
++
++			p = (void *)w - offsetof(struct poll_table_entry, wait);
++			file = p->filp;
++			fdpnt = fds + p->n;
++#if 0
++			/* This has to be true or we would never have
++			 * done a wait on the file!
++			 */
++			if (file->f_op && file->f_op->poll)
++#endif
++				mask = file->f_op->poll(file, NULL);
++			mask &= fdpnt->events | POLLERR | POLLHUP;
++			if (mask) {
++				count++;
++				fdpnt->revents = mask;
++			}
++		}
+ 	}
+ 	current->state = TASK_RUNNING;
++
++	if (timeout)
++		free_wait(&wait_table);
+ 	return count;
+ }
+ 
+@@ -375,7 +520,6 @@
+ {
+ 	int i, fdcount, err, size;
+ 	struct pollfd * fds, *fds1;
+-	poll_table *wait_table = NULL, *wait = NULL;
+ 
+ 	lock_kernel();
+ 	/* Do a sanity check on nfds ... */
+@@ -384,7 +528,7 @@
+ 		goto out;
+ 
+ 	if (timeout) {
+-		/* Carefula about overflow in the intermediate values */
++		/* Careful about overflow in the intermediate values */
+ 		if ((unsigned long) timeout < MAX_SCHEDULE_TIMEOUT / HZ)
+ 			timeout = (unsigned long)(timeout*HZ+999)/1000+1;
+ 		else /* Negative or overflow */
+@@ -392,16 +536,6 @@
+ 	}
+ 
+ 	err = -ENOMEM;
+-	if (timeout) {
+-		wait_table = (poll_table *) __get_free_page(GFP_KERNEL);
+-		if (!wait_table)
+-			goto out;
+-		wait_table->nr = 0;
+-		wait_table->entry = (struct poll_table_entry *)(wait_table + 1);
+-		wait_table->next = NULL;
+-		wait = wait_table;
+-	}
+-
+ 	size = nfds * sizeof(struct pollfd);
+ 	fds = (struct pollfd *) kmalloc(size, GFP_KERNEL);
+ 	if (!fds)
+@@ -411,7 +545,7 @@
+ 	if (copy_from_user(fds, ufds, size))
+ 		goto out_fds;
+ 
+-	fdcount = do_poll(nfds, fds, wait, timeout);
++	fdcount = do_poll(nfds, fds, timeout);
+ 
+ 	/* OK, now copy the revents fields back to user space. */
+ 	fds1 = fds;
+@@ -426,8 +560,6 @@
+ out_fds:
+ 	kfree(fds);
+ out:
+-	if (wait)
+-		free_wait(wait_table);
+ 	unlock_kernel();
+ 	return err;
+ }
+diff -ur --exclude=.depend --exclude=.hdepend --exclude=*.flags --exclude=*.[oa] linux-2.3.13.old/include/linux/poll.h linux-2.3.13+/include/linux/poll.h
+--- linux-2.3.13.old/include/linux/poll.h	Thu Aug 12 10:36:44 1999
++++ linux-2.3.13+/include/linux/poll.h	Tue Aug 17 11:21:46 1999
+@@ -12,15 +12,21 @@
+ 
+ 
+ struct poll_table_entry {
++	int n;
+ 	struct file * filp;
+ 	wait_queue_t wait;
+ 	wait_queue_head_t * wait_address;
+ };
+ 
+-typedef struct poll_table_struct {
+-	struct poll_table_struct * next;
+-	unsigned int nr;
++struct poll_table_head {
++	struct poll_table_head * next;
+ 	struct poll_table_entry * entry;
++};
++
++typedef struct poll_table_struct {
++	int n;
++	event_queue_t ev_queue;
++	struct poll_table_head * head, * last;
+ } poll_table;
+ 
+ #define __MAX_POLL_TABLE_ENTRIES ((PAGE_SIZE - sizeof (poll_table)) / sizeof (struct poll_table_entry))
+@@ -51,15 +57,6 @@
+ typedef unsigned long kernel_fd_set[KFDS_NR/__NFDBITS];
+ 
+ /*
+- * Scaleable version of the fd_set.
+- */
+-
+-typedef struct {
+-	unsigned long *in, *out, *ex;
+-	unsigned long *res_in, *res_out, *res_ex;
+-} fd_set_bits;
+-
+-/*
+  * How many longwords for "nr" bits?
+  */
+ #define FDS_BITPERLONG	(8*sizeof(long))
+@@ -86,21 +83,6 @@
+ 	memset(fdset, 0, nr);
+ 	return 0;
+ }
+-
+-static inline
+-void set_fd_set(unsigned long nr, void *ufdset, unsigned long *fdset)
+-{
+-	if (ufdset)
+-		__copy_to_user(ufdset, fdset, FDS_BYTES(nr));
+-}
+-
+-static inline
+-void zero_fd_set(unsigned long nr, unsigned long *fdset)
+-{
+-	memset(fdset, 0, FDS_BYTES(nr));
+-}
+-
+-extern int do_select(int n, fd_set_bits *fds, long *timeout);
+ 
+ #endif /* KERNEL */
+ 
+diff -ur --exclude=.depend --exclude=.hdepend --exclude=*.flags --exclude=*.[oa] linux-2.3.13.old/include/linux/wait.h linux-2.3.13+/include/linux/wait.h
+--- linux-2.3.13.old/include/linux/wait.h	Thu Aug 12 10:36:42 1999
++++ linux-2.3.13+/include/linux/wait.h	Tue Aug 17 11:21:44 1999
+@@ -41,10 +41,19 @@
+ } while (0)
+ #endif
+ 
++struct __event_queue {
++	spinlock_t lock;
++	struct __wait_queue *head;
++	struct __wait_queue **tail;
++};
++typedef struct __event_queue event_queue_t;
++
+ struct __wait_queue {
+ 	unsigned int compiler_warning;
+ 	struct task_struct * task;
+ 	struct list_head task_list;
++	struct __event_queue *ev_queue;
++	struct __wait_queue *ev_next;
+ #if WAITQUEUE_DEBUG
+ 	long __magic;
+ 	long __waker;
+@@ -107,7 +116,7 @@
+ #endif
+ 
+ #define __WAITQUEUE_INITIALIZER(name,task) \
+-	{ 0x1234567, task, { NULL, NULL } __WAITQUEUE_DEBUG_INIT(name)}
++	{ 0x1234567, task, { NULL, NULL }, NULL, NULL __WAITQUEUE_DEBUG_INIT(name)}
+ #define DECLARE_WAITQUEUE(name,task) \
+ 	wait_queue_t name = __WAITQUEUE_INITIALIZER(name,task)
+ 
+@@ -140,6 +149,7 @@
+ 		WQ_BUG();
+ #endif
+ 	q->task = p;
++	q->ev_queue = NULL;
+ #if WAITQUEUE_DEBUG
+ 	q->__magic = (long)&q->__magic;
+ #endif
+@@ -195,6 +205,17 @@
+ 	CHECK_MAGIC(old->__magic);
+ #endif
+ 	list_del(&old->task_list);
++}
++
++
++#define DECLARE_EVENTQUEUE(name) \
++	event_queue_t name = { SPIN_LOCK_UNLOCKED, NULL, &name.head }
++
++static inline void init_eventqueue(event_queue_t *q)
++{
++	spin_lock_init(&q->lock);
++	q->head = NULL;
++	q->tail = &q->head;
+ }
+ 
+ #endif /* __KERNEL__ */
+diff -ur --exclude=.depend --exclude=.hdepend --exclude=*.flags --exclude=*.[oa] linux-2.3.13.old/kernel/sched.c linux-2.3.13+/kernel/sched.c
+--- linux-2.3.13.old/kernel/sched.c	Thu Aug 12 09:59:05 1999
++++ linux-2.3.13+/kernel/sched.c	Tue Aug 17 10:53:12 1999
+@@ -871,12 +871,23 @@
+ 	while (tmp != head) {
+ 		unsigned int state;
+                 wait_queue_t *curr = list_entry(tmp, wait_queue_t, task_list);
++		event_queue_t *ev = curr->ev_queue;
+ 
+ 		tmp = tmp->next;
+ 
+ #if WAITQUEUE_DEBUG
+ 		CHECK_MAGIC(curr->__magic);
+ #endif
++		if (ev) {
++			if (ev != (void *) -1) {
++				curr->ev_next = NULL;
++				spin_lock(&ev->lock);
++				*(ev->tail) = curr;
++				ev->tail = &curr->ev_next;
++				spin_unlock(&ev_lock);
++			}
++			curr->ev_queue = NULL;
++		}
+ 		p = curr->task;
+ 		state = p->state;
+ 		if (state & mode) {

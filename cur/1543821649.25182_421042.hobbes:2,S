@@ -1,0 +1,279 @@
+Date: Wed, 03 May 2006 21:54:18 +0100
+From: Peter Wainwright <>
+Subject: [RFC] [PATCH 1/2] Multi-threaded execution of ACPI control methods
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2006/5/3/193
+
+This patch enables multi-threaded execution of ACPI control methods.
+Certain machines (e.g. the HP nx6125) require the concurrent execution
+of several ACPI control methods.  Without multithreading, processing
+of ACPI events will be blocked, causing the machine to overheat and
+possible damage.
+This patch enables, optionally, the multithreaded execution of control
+methods and fixes 
+http://bugzilla.kernel.org/show_bug.cgi?id=5534.
+The required code is compiled into the kernel unconditionally (whenever
+ACPI is enabled in the kernel config). However, it is only activated
+by the boot option acpi_pool_size=<positive integer> or echoing
+a positive integer to /proc/acpi/pool_size.
+I would appreciate a review of this code. I have provided a boot time
+option and a /proc entry to configure this behaviour as an option,
+because
+it surely needs testing before it becomes the default.
+I believe it should become default behaviour for the kernel on all
+platforms,
+however, since a careful reading of the ACPI
+spec suggests that the behaviour of the nx6125 DSDT is in compliance
+with
+this spec and that any BIOS may potentially require this feature.
+Peter
+Signed-off-by: Peter Wainwright <prw@ceiriog.eclipse.co.uk>
+diff -u -r linux-2.6.16.11-prw2-old/Documentation/kernel-parameters.txt linux-2.6.16.11-prw2/Documentation/kernel-parameters.txt
+--- linux-2.6.16.11-prw2-old/Documentation/kernel-parameters.txt	2006-04-27 19:57:00.000000000 +0100
++++ linux-2.6.16.11-prw2/Documentation/kernel-parameters.txt	2006-05-03 21:23:00.000000000 +0100
+@@ -168,6 +168,13 @@
+ 			override platform specific driver.
+ 			See also Documentation/acpi-hotkey.txt.
+ 
++	acpi_pool_size=	[HW,ACPI]
++			Format: <int>
++			Determines the maximum size of the pool of
++			kernel threads which execute ACPI control
++			methods.  After system has booted up, it can
++			be set via /proc/acpi/pool_size.
++
+ 	enable_timer_pin_1 [i386,x86-64]
+ 			Enable PIN 1 of APIC timer
+ 			Can be useful to work around chipset bugs
+diff -u -r linux-2.6.16.11-prw2-old/drivers/acpi/bus.c linux-2.6.16.11-prw2/drivers/acpi/bus.c
+--- linux-2.6.16.11-prw2-old/drivers/acpi/bus.c	2006-05-03 21:18:38.000000000 +0100
++++ linux-2.6.16.11-prw2/drivers/acpi/bus.c	2006-05-03 21:19:23.000000000 +0100
+@@ -664,6 +664,7 @@
+ 	int result = 0;
+ 	acpi_status status = AE_OK;
+ 	extern acpi_status acpi_os_initialize1(void);
++	extern acpi_status acpi_os_initialize2(void);
+ 
+ 	ACPI_FUNCTION_TRACE("acpi_bus_init");
+ 
+@@ -727,6 +728,8 @@
+ 	 */
+ 	acpi_root_dir = proc_mkdir(ACPI_BUS_FILE_ROOT, NULL);
+ 
++	status = acpi_os_initialize2();
++
+ 	return_VALUE(0);
+ 
+ 	/* Mimic structured exception handling */
+diff -u -r linux-2.6.16.11-prw2-old/drivers/acpi/osl.c linux-2.6.16.11-prw2/drivers/acpi/osl.c
+--- linux-2.6.16.11-prw2-old/drivers/acpi/osl.c	2006-05-03 21:18:38.000000000 +0100
++++ linux-2.6.16.11-prw2/drivers/acpi/osl.c	2006-05-03 21:19:23.000000000 +0100
+@@ -46,6 +46,8 @@
+ 
+ #include <linux/efi.h>
+ 
++#include <linux/kthread.h>
++
+ #define _COMPONENT		ACPI_OS_SERVICES
+ ACPI_MODULE_NAME("osl")
+ #define PREFIX		"ACPI: "
+@@ -75,6 +77,151 @@
+ static acpi_osd_handler acpi_irq_handler;
+ static void *acpi_irq_context;
+ static struct workqueue_struct *kacpid_wq;
++struct timer_list acpi_reap_timer;
++
++#define REAP_INTERVAL 5
++#define REAP_TIMEOUT 10
++
++/*
++ * This parameter may be configured at boot-time by the command-line
++ * option acpi_pool_size=X
++ */
++static int max_pool_size = 0;
++static int __init acpi_set_pool_size(char *str)
++{
++	get_option(&str, &max_pool_size);
++	return 0;
++}
++__setup("acpi_pool_size=", acpi_set_pool_size);
++
++static int current_pool_size = 0;
++static struct list_head thread_pool = LIST_HEAD_INIT(thread_pool);
++
++struct thread_pool_entry {
++	struct task_struct *thread;
++	int id;
++	int active;
++	acpi_osd_exec_callback function;
++	void *context;
++	unsigned long jiffies;
++	wait_queue_head_t more_work;
++	wait_queue_head_t work_done;
++	struct list_head list;
++};
++
++/* This is based on the workqueue worker_thread */
++static int acpi_os_execute_worker(void *context)
++{
++	struct thread_pool_entry *e = (struct thread_pool_entry *)context;
++	DECLARE_WAITQUEUE(wait, current);
++
++	set_user_nice(current, -5);
++
++	set_current_state(TASK_INTERRUPTIBLE);
++
++	ACPI_DEBUG_PRINT((ACPI_DB_INFO, "[%d:%p] before loop\n", e->id, e));
++	while (!kthread_should_stop()) {
++		/* Wait until there is work to do in this thread */
++		add_wait_queue(&e->more_work, &wait);
++		if (!e->function) {
++			ACPI_DEBUG_PRINT((ACPI_DB_INFO, "[%d:%p] sleeping\n", e->id, e));
++			schedule();
++		}
++		else {
++			__set_current_state(TASK_RUNNING);
++		}
++		try_to_freeze();
++		remove_wait_queue(&e->more_work, &wait);
++		if (e->function) {
++			ACPI_DEBUG_PRINT((ACPI_DB_INFO, "[%d:%p] executing function=%p context=%p\n",
++					  e->id, e, e->function, e->context));
++			e->function(e->context);
++			e->jiffies = jiffies;
++			ACPI_DEBUG_PRINT((ACPI_DB_INFO, "[%d:%p] exit function=%p context=%p at %lx\n",
++					  e->id, e, e->function, e->context, e->jiffies));
++			e->function = NULL;
++			e->context = NULL;
++			e->active = 0;
++		}
++		set_current_state(TASK_INTERRUPTIBLE);
++	}
++	ACPI_DEBUG_PRINT((ACPI_DB_INFO, "[%d:%p] stopped\n", e->id, e));
++
++	return 0;
++}
++
++static struct work_struct acpi_reap_task;
++
++static void acpi_queue_reap_threads(unsigned long data);
++
++static void acpi_reap_threads(void *data)
++{
++	struct list_head *l, *n;
++
++	list_for_each_safe(l, n, &thread_pool) {
++		struct thread_pool_entry *e = list_entry(l, struct thread_pool_entry, list);
++		if (!e->active && (jiffies - e->jiffies) > HZ*REAP_TIMEOUT) {
++			int status;
++			ACPI_DEBUG_PRINT((ACPI_DB_INFO, "acpi_reap_threads REAP [%d:%p]\n", e->id, e));
++			list_del(l);
++			current_pool_size--;
++			status = kthread_stop(e->thread);
++			ACPI_DEBUG_PRINT((ACPI_DB_INFO, "acpi_reap_threads kthread_stop returned %d\n", status));
++			kfree(e);
++		}
++	}
++	if (!timer_pending(&acpi_reap_timer)) {
++		acpi_reap_timer.function = acpi_queue_reap_threads;
++		acpi_reap_timer.data = 0;
++		acpi_reap_timer.expires = jiffies + HZ*REAP_INTERVAL;
++		add_timer(&(acpi_reap_timer));
++	}
++}
++
++static void acpi_queue_reap_threads(unsigned long data)
++{
++	queue_work(kacpid_wq, &acpi_reap_task);
++}
++
++static struct thread_pool_entry *get_pool_thread(void)
++{
++	struct list_head *l;
++	list_for_each(l, &thread_pool) {
++		struct thread_pool_entry *e = list_entry(l, struct thread_pool_entry, list);
++		if (!e->active) {
++			e->active = 1;
++			return e;
++		}
++	}
++	/*
++	 * For the time being we have a user-configurable limit on the
++	 * current_pool_size.  We don't want a bad BIOS to create
++	 * unlimited kthreads.
++	 */
++	if (current_pool_size < max_pool_size) {
++		struct thread_pool_entry *e;
++		e = kmalloc(sizeof(struct thread_pool_entry), GFP_KERNEL);
++		list_add_tail(&e->list, &thread_pool);
++		e->id = current_pool_size;
++		init_waitqueue_head(&e->more_work);
++		init_waitqueue_head(&e->work_done);
++		e->function = NULL;
++		e->context = NULL;
++		e->active = 1;
++		/* kthread_run does kthread_create and wake_up_process */
++		e->thread = kthread_run(acpi_os_execute_worker, e, "kacpid-work-%d",
++					current_pool_size);
++		current_pool_size++;
++		if (!timer_pending(&acpi_reap_timer)) {
++			acpi_reap_timer.function = acpi_queue_reap_threads;
++			acpi_reap_timer.data = 0;
++			acpi_reap_timer.expires = jiffies + HZ*REAP_INTERVAL;
++			add_timer(&(acpi_reap_timer));
++		}
++		return e;
++	}
++	return NULL;
++}
+ 
+ acpi_status acpi_os_initialize(void)
+ {
+@@ -98,6 +245,16 @@
+ 	return AE_OK;
+ }
+ 
++/*
++ * Enable reaping of unused threads.
++ */
++acpi_status acpi_os_initialize2(void)
++{
++	INIT_WORK(&acpi_reap_task, acpi_reap_threads, NULL);
++	init_timer(&acpi_reap_timer);
++	return AE_OK;
++}
++
+ acpi_status acpi_os_terminate(void)
+ {
+ 	if (acpi_irq_handler) {
+@@ -661,6 +818,7 @@
+ static void acpi_os_execute_deferred(void *context)
+ {
+ 	struct acpi_os_dpc *dpc = NULL;
++	struct thread_pool_entry *e = NULL;
+ 
+ 	ACPI_FUNCTION_TRACE("os_execute_deferred");
+ 
+@@ -670,8 +828,17 @@
+ 		return_VOID;
+ 	}
+ 
+-	dpc->function(dpc->context);
+-
++	if (max_pool_size > 0 && (e = get_pool_thread())) {
++		ACPI_DEBUG_PRINT((ACPI_DB_INFO, "[%d:%p] function=%p context=%p\n",
++				  e->id, e, dpc->function, dpc->context));
++		e->context = dpc->context;
++		e->function = dpc->function;
++		wake_up(&e->more_work);
++	}
++	else {
++		ACPI_DEBUG_PRINT((ACPI_DB_INFO, "[inline] function=%p context=%p\n", dpc->function, dpc->context));
++		dpc->function(dpc->context);
++	}
+ 	kfree(dpc);
+ 
+ 	return_VOID;[unhandled content-type:application/pgp-signature]

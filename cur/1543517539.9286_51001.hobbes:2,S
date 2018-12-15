@@ -1,0 +1,166 @@
+Date: Wed, 1 Dec 1999 10:19:54 -0800 (PST)
+From: Pete Zaitcev <>
+Subject: Re: DMA and Cache coherency on machines without hardware enforced
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/12/1/88
+
+>> I have to write a device driver for a machine which does not have
+>> hardware enforced cache coherency between bus master devices and the
+>> CPU caches. Is there a way to allocate certain buffers in uncached
+>> memory. I know this would lower performance, but it would also solve
+>> certain problems which seem to be cropping up.
+>
+>ioremap_nocache(). You can also use ioremap_nocache() on allocated pages
+>(it's a page granularity thing) via doing something like:
+>
+>page = __get_free_pages(whatever, order);
+>ptr = ioremap_nocache(virt_to_phys(page), 1 << (order+PAGE_SHIFT));
+When was ioremap_nocache() introduced and was it sprinked with
+a penguin pee?
+Also note that if one wants to produce the bus address to
+program a DMA master he/she must use virt_to_bus(page), and NOT
+virt_to_bus(ptr).
+--Pete
+P.S. The approach that mingo suggests is known. This is what
+I use in my private tree for a kernel running on my home server:
+Index: drivers/net/3c59x.c
+===================================================================
+RCS file: /cvs/linux/linux/drivers/net/3c59x.c,v
+retrieving revision 1.39
+diff -u -r1.39 3c59x.c
+--- drivers/net/3c59x.c	1999/09/06 01:17:39	1.39
++++ drivers/net/3c59x.c	1999/11/27 05:52:26
+@@ -33,6 +33,9 @@
+ #else
+ static int vortex_debug = 1;
+ #endif
++#ifdef __sparc__	/* P3: 3c59x.c works on sparc64 without this */
++#define CACHE_KLUDGE  1
++#endif
+ 
+ /* Some values here only for performance evaluation and path-coverage
+    debugging. */
+@@ -366,10 +369,23 @@
+ union wn3_config {
+ 	int i;
+ 	struct w3_config_fields {
++#if defined(__sparc__)
++		int pad25:7;
++		unsigned int autoselect:1;
++		unsigned int xcvr:4;
++		int pad18:2;
++		unsigned int ram_split:2;
++		int pad8:8;
++		unsigned int rom_size:2;
++		unsigned int ram_speed:2;
++		unsigned int ram_width:1;
++		unsigned int ram_size:3;
++#else
+ 		unsigned int ram_size:3, ram_width:1, ram_speed:2, rom_size:2;
+ 		int pad8:8;
+ 		unsigned int ram_split:2, pad18:2, xcvr:4, autoselect:1;
+ 		int pad24:7;
++#endif
+ 	} u;
+ };
+ 
+@@ -435,6 +451,9 @@
+ 	struct sk_buff* tx_skbuff[TX_RING_SIZE];
+ 	struct net_device *next_module;
+ 	void *priv_addr;
++#ifdef CACHE_KLUDGE
++	volatile struct boom_rx_desc *rx_ring_unc;
++#endif
+ 	unsigned int cur_rx, cur_tx;		/* The next free ring entry */
+ 	unsigned int dirty_rx, dirty_tx;	/* The ring entries to be free()ed. */
+ 	struct net_device_stats stats;
+@@ -798,6 +817,22 @@
+ 		vp->priv_addr = mem;
+ 	}
+ 	memset(vp, 0, sizeof(*vp));
++#ifdef CACHE_KLUDGE
++	/*
++	 * Generally speaking ioremap is not supposed to
++	 * remap CPU memory located on the our side of host bridge.
++	 * In our case it only touches MMU which can map CPU memory of course.
++	 *
++	 * Result of ioremap cannot be given to virt_to_bus().
++	 */
++	{
++		unsigned long va;
++		va = (unsigned long) &vp->rx_ring[0];
++		vp->rx_ring_unc = (void *)((unsigned long) ioremap(
++		    virt_to_phys(va & PAGE_MASK), PAGE_SIZE)
++		    | (va & (PAGE_SIZE-1)));
++	}
++#endif
+ 	dev->priv = vp;
+ 
+ 	vp->next_module = root_vortex_dev;
+@@ -862,15 +897,12 @@
+ 		((u16 *)dev->dev_addr)[i] = htons(eeprom[i + 10]);
+ 	for (i = 0; i < 6; i++)
+ 		printk("%c%2.2x", i ? ':' : ' ', dev->dev_addr[i]);
+-#ifdef __sparc__
+-	printk(", IRQ %s\n", __irq_itoa(dev->irq));
+-#else
++	/* No need to __irq_itoa on sparc here, it's not empty for sun4d only */
+ 	printk(", IRQ %d\n", dev->irq);
+ 	/* Tell them about an invalid IRQ. */
+ 	if (vortex_debug && (dev->irq <= 0 || dev->irq >= NR_IRQS))
+ 		printk(KERN_WARNING " *** Warning: IRQ %d is unlikely to work! ***\n",
+ 			   dev->irq);
+-#endif
+ 
+ 	if (pci_tbl[vp->chip_id].drv_flags & HAS_CB_FNS) {
+ 		u32 fn_st_addr;			/* Cardbus function status space */
+@@ -1193,7 +1225,7 @@
+ 			printk(KERN_DEBUG "%s: Media %s has link beat, %x.\n",
+ 				   dev->name, media_tbl[dev->if_port].name, media_status);
+ 		} else if (vortex_debug > 1)
+-		  printk(KERN_DEBUG "%s: Media %s is has no link beat, %x.\n",
++		  printk(KERN_DEBUG "%s: Media %s has no link beat, %x.\n",
+ 				   dev->name, media_tbl[dev->if_port].name, media_status);
+ 		break;
+ 	  case XCVR_MII: case XCVR_NWAY:
+@@ -1577,7 +1609,6 @@
+ 		printk(KERN_ERR "%s: Re-entering the interrupt handler.\n", dev->name);
+ 		return;
+ 	}
+-	dev->interrupt = 1;
+ #endif
+ 
+ 	dev->interrupt = 1;
+@@ -1768,7 +1799,13 @@
+ 		printk(KERN_DEBUG "  In boomerang_rx(), status %4.4x, rx_status "
+ 			   "%4.4x.\n",
+ 			   inw(ioaddr+EL3_STATUS), inw(ioaddr+RxStatus));
+-	while ((rx_status = le32_to_cpu(vp->rx_ring[entry].status)) & RxDComplete){
++	for (;;) {
++#ifdef CACHE_KLUDGE
++		rx_status = le32_to_cpu(vp->rx_ring_unc[entry].status);
++#else
++		rx_status = le32_to_cpu(vp->rx_ring[entry].status);
++#endif
++		if ((rx_status & RxDComplete) == 0) break;
+ 		if (--rx_work_limit < 0)
+ 			break;
+ 		if (rx_status & RxDError) { /* Error, update stats. */
+@@ -2122,6 +2159,9 @@
+ 		release_region(root_vortex_dev->base_addr,
+ 					   pci_tbl[vp->chip_id].io_size);
+ 		kfree(root_vortex_dev);
++#ifdef CACHE_KLUDGE
++		iounmap((void *)((unsigned long)vp->rx_ring_unc & PAGE_MASK));
++#endif
+ 		kfree(vp->priv_addr);
+ 		root_vortex_dev = next_dev;
+ 	}
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

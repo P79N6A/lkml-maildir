@@ -1,0 +1,856 @@
+Date: Tue, 28 Feb 2006 12:29:12 +0100
+From: Michael Buesch <>
+Subject: [PATCH] Generic hardware RNG support
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2006/2/28/60
+
+Andrew, consider inclusion of the following patch into -mm
+for further testing, please.
+---
+This patch adds support for generic Hardware Random Number Generator
+drivers. This makes the usage of the bcm43xx internal RNG through
+/dev/hwrandom possible.
+A patch against bcm43xx for your testing pleasure can be found at:
+ftp://ftp.bu3sch.de/misc/bcm43xx-d80211-hwrng.patch
+diff -urNX 2.6.16-rc4-mm2/Documentation/dontdiff 2.6.16-rc4-mm2.orig/drivers/char/hw_random.c 2.6.16-rc4-mm2/drivers/char/hw_random.c
+--- 2.6.16-rc4-mm2.orig/drivers/char/hw_random.c	2006-02-28 11:54:50.000000000 +0100
++++ 2.6.16-rc4-mm2/drivers/char/hw_random.c	2006-02-28 12:07:56.000000000 +0100
+@@ -18,6 +18,9 @@
+ 	Copyright 2000,2001 Jeff Garzik <jgarzik@pobox.com>
+ 	Copyright 2000,2001 Philipp Rumpf <prumpf@mandrakesoft.com>
+ 
++	Added generic RNG API
++	Copyright 2006 Michael Buesch <mbuesch@freenet.de>
++
+ 	Please read Documentation/hw_random.txt for details on use.
+ 
+ 	----------------------------------------------------------
+@@ -27,11 +30,12 @@
+  */
+ 
+ 
++#include <linux/hw_random.h>
++#include <linux/pci.h>
+ #include <linux/module.h>
+ #include <linux/kernel.h>
+ #include <linux/fs.h>
+ #include <linux/init.h>
+-#include <linux/pci.h>
+ #include <linux/interrupt.h>
+ #include <linux/spinlock.h>
+ #include <linux/random.h>
+@@ -49,13 +53,9 @@
+ #include <asm/uaccess.h>
+ 
+ 
+-/*
+- * core module and version information
+- */
+-#define RNG_VERSION "1.0.0"
+-#define RNG_MODULE_NAME "hw_random"
+-#define RNG_DRIVER_NAME   RNG_MODULE_NAME " hardware driver " RNG_VERSION
+-#define PFX RNG_MODULE_NAME ": "
++#define RNG_MODULE_NAME		"hw_random"
++#define RNG_DRIVER_NAME		RNG_MODULE_NAME " hardware driver"
++#define PFX RNG_MODULE_NAME	": "
+ 
+ 
+ /*
+@@ -83,36 +83,31 @@
+ static ssize_t rng_dev_read (struct file *filp, char __user *buf, size_t size,
+ 				loff_t * offp);
+ 
+-static int __init intel_init (struct pci_dev *dev);
+-static void intel_cleanup(void);
+-static unsigned int intel_data_present (void);
+-static u32 intel_data_read (void);
+-
+-static int __init amd_init (struct pci_dev *dev);
+-static void amd_cleanup(void);
+-static unsigned int amd_data_present (void);
+-static u32 amd_data_read (void);
++static int __init intel_init (struct hwrng *rng);
++static void intel_cleanup(struct hwrng *rng);
++static unsigned int intel_data_present (struct hwrng *rng);
++static u32 intel_data_read (struct hwrng *rng);
++
++static int __init amd_init (struct hwrng *rng);
++static void amd_cleanup(struct hwrng *rng);
++static unsigned int amd_data_present (struct hwrng *rng);
++static u32 amd_data_read (struct hwrng *rng);
+ 
+ #ifdef __i386__
+-static int __init via_init(struct pci_dev *dev);
+-static void via_cleanup(void);
+-static unsigned int via_data_present (void);
+-static u32 via_data_read (void);
++static int __init via_init(struct hwrng *rng);
++static void via_cleanup(struct hwrng *rng);
++static unsigned int via_data_present (struct hwrng *rng);
++static u32 via_data_read (struct hwrng *rng);
+ #endif
+ 
+-static int __init geode_init(struct pci_dev *dev);
+-static void geode_cleanup(void);
+-static unsigned int geode_data_present (void);
+-static u32 geode_data_read (void);
+-
+-struct rng_operations {
+-	int (*init) (struct pci_dev *dev);
+-	void (*cleanup) (void);
+-	unsigned int (*data_present) (void);
+-	u32 (*data_read) (void);
+-	unsigned int n_bytes; /* number of bytes per ->data_read */
+-};
+-static struct rng_operations *rng_ops;
++static int __init geode_init(struct hwrng *rng);
++static void geode_cleanup(struct hwrng *rng);
++static unsigned int geode_data_present (struct hwrng *rng);
++static u32 geode_data_read (struct hwrng *rng);
++
++static struct hwrng *current_rng;
++static LIST_HEAD(rng_list);
++static DEFINE_MUTEX(rng_mutex);
+ 
+ static struct file_operations rng_chrdev_ops = {
+ 	.owner		= THIS_MODULE,
+@@ -122,9 +117,9 @@
+ 
+ 
+ static struct miscdevice rng_miscdev = {
+-	RNG_MISCDEV_MINOR,
+-	RNG_MODULE_NAME,
+-	&rng_chrdev_ops,
++	.minor		= RNG_MISCDEV_MINOR,
++	.name		= RNG_MODULE_NAME,
++	.fops		= &rng_chrdev_ops,
+ };
+ 
+ enum {
+@@ -135,24 +130,41 @@
+ 	rng_hw_geode,
+ };
+ 
+-static struct rng_operations rng_vendor_ops[] = {
+-	/* rng_hw_none */
+-	{ },
+-
+-	/* rng_hw_intel */
+-	{ intel_init, intel_cleanup, intel_data_present,
+-	  intel_data_read, 1 },
+-
+-	/* rng_hw_amd */
+-	{ amd_init, amd_cleanup, amd_data_present, amd_data_read, 4 },
+-
++static struct hwrng rng_vendor_ops[] = {
++	{ /* rng_hw_none */
++	}, { /* rng_hw_intel */
++		.name		= "intel",
++		.init		= intel_init,
++		.cleanup	= intel_cleanup,
++		.data_present	= intel_data_present,
++		.data_read	= intel_data_read,
++		.n_bytes	= 1,
++	}, { /* rng_hw_amd */
++		.name		= "amd",
++		.init		= amd_init,
++		.cleanup	= amd_cleanup,
++		.data_present	= amd_data_present,
++		.data_read	= amd_data_read,
++		.n_bytes	= 4,
++	},
+ #ifdef __i386__
+-	/* rng_hw_via */
+-	{ via_init, via_cleanup, via_data_present, via_data_read, 1 },
++	{ /* rng_hw_via */
++		.name		= "via",
++		.init		= via_init,
++		.cleanup	= via_cleanup,
++		.data_present	= via_data_present,
++		.data_read	= via_data_read,
++		.n_bytes	= 1,
++	},
+ #endif
+-
+-	/* rng_hw_geode */
+-	{ geode_init, geode_cleanup, geode_data_present, geode_data_read, 4 }
++	{ /* rng_hw_geode */
++		.name		= "geode",
++		.init		= geode_init,
++		.cleanup	= geode_cleanup,
++		.data_present	= geode_data_present,
++		.data_read	= geode_data_read,
++		.n_bytes	= 4,
++	},
+ };
+ 
+ /*
+@@ -204,39 +216,39 @@
+ #define INTEL_RNG_ADDR				0xFFBC015F
+ #define INTEL_RNG_ADDR_LEN			3
+ 
+-/* token to our ioremap'd RNG register area */
+-static void __iomem *rng_mem;
+-
+-static inline u8 intel_hwstatus (void)
++static inline u8 intel_hwstatus (void __iomem *rng_mem)
+ {
+ 	assert (rng_mem != NULL);
+ 	return readb (rng_mem + INTEL_RNG_HW_STATUS);
+ }
+ 
+-static inline u8 intel_hwstatus_set (u8 hw_status)
++static inline u8 intel_hwstatus_set (void __iomem *rng_mem, u8 hw_status)
+ {
+ 	assert (rng_mem != NULL);
+ 	writeb (hw_status, rng_mem + INTEL_RNG_HW_STATUS);
+-	return intel_hwstatus ();
++	return intel_hwstatus (rng_mem);
+ }
+ 
+-static unsigned int intel_data_present(void)
++static unsigned int intel_data_present(struct hwrng *rng)
+ {
+-	assert (rng_mem != NULL);
++	void __iomem *rng_mem = (void __iomem *)rng->priv;
+ 
++	assert (rng_mem != NULL);
+ 	return (readb (rng_mem + INTEL_RNG_STATUS) & INTEL_RNG_DATA_PRESENT) ?
+ 		1 : 0;
+ }
+ 
+-static u32 intel_data_read(void)
++static u32 intel_data_read(struct hwrng *rng)
+ {
+-	assert (rng_mem != NULL);
++	void __iomem *rng_mem = (void __iomem *)rng->priv;
+ 
++	assert (rng_mem != NULL);
+ 	return readb (rng_mem + INTEL_RNG_DATA);
+ }
+ 
+-static int __init intel_init (struct pci_dev *dev)
++static int __init intel_init(struct hwrng *rng)
+ {
++	void __iomem *rng_mem;
+ 	int rc;
+ 	u8 hw_status;
+ 
+@@ -248,9 +260,10 @@
+ 		rc = -EBUSY;
+ 		goto err_out;
+ 	}
++	rng->priv = (unsigned long)rng_mem;
+ 
+ 	/* Check for Intel 82802 */
+-	hw_status = intel_hwstatus ();
++	hw_status = intel_hwstatus (rng_mem);
+ 	if ((hw_status & INTEL_RNG_PRESENT) == 0) {
+ 		printk (KERN_ERR PFX "RNG not detected\n");
+ 		rc = -ENODEV;
+@@ -259,7 +272,7 @@
+ 
+ 	/* turn RNG h/w on, if it's off */
+ 	if ((hw_status & INTEL_RNG_ENABLED) == 0)
+-		hw_status = intel_hwstatus_set (hw_status | INTEL_RNG_ENABLED);
++		hw_status = intel_hwstatus_set (rng_mem, hw_status | INTEL_RNG_ENABLED);
+ 	if ((hw_status & INTEL_RNG_ENABLED) == 0) {
+ 		printk (KERN_ERR PFX "cannot enable RNG, aborting\n");
+ 		rc = -EIO;
+@@ -271,23 +284,22 @@
+ 
+ err_out_free_map:
+ 	iounmap (rng_mem);
+-	rng_mem = NULL;
+ err_out:
+ 	DPRINTK ("EXIT, returning %d\n", rc);
+ 	return rc;
+ }
+ 
+-static void intel_cleanup(void)
++static void intel_cleanup(struct hwrng *rng)
+ {
++	void __iomem *rng_mem = (void __iomem *)rng->priv;
+ 	u8 hw_status;
+ 
+-	hw_status = intel_hwstatus ();
++	hw_status = intel_hwstatus (rng_mem);
+ 	if (hw_status & INTEL_RNG_ENABLED)
+-		intel_hwstatus_set (hw_status & ~INTEL_RNG_ENABLED);
++		intel_hwstatus_set (rng_mem, hw_status & ~INTEL_RNG_ENABLED);
+ 	else
+ 		printk(KERN_WARNING PFX "unusual: RNG already disabled\n");
+ 	iounmap(rng_mem);
+-	rng_mem = NULL;
+ }
+ 
+ /***********************************************************************
+@@ -296,22 +308,25 @@
+  *
+  */
+ 
+-static u32 pmbase;			/* PMxx I/O base */
+-static struct pci_dev *amd_dev;
+-
+-static unsigned int amd_data_present (void)
++static unsigned int amd_data_present (struct hwrng *rng)
+ {
++	u32 pmbase = (u32)rng->priv;
++
+       	return inl(pmbase + 0xF4) & 1;
+ }
+ 
+ 
+-static u32 amd_data_read (void)
++static u32 amd_data_read (struct hwrng *rng)
+ {
++	u32 pmbase = (u32)rng->priv;
++
+ 	return inl(pmbase + 0xF0);
+ }
+ 
+-static int __init amd_init (struct pci_dev *dev)
++static int __init amd_init(struct hwrng *rng)
+ {
++	u32 pmbase;
++	struct pci_dev *dev = rng->dev;
+ 	int rc;
+ 	u8 rnen;
+ 
+@@ -327,6 +342,7 @@
+ 		rc = -EIO;
+ 		goto err_out;
+ 	}
++	rng->priv = (unsigned long)pmbase;
+ 
+ 	pci_read_config_byte(dev, 0x40, &rnen);
+ 	rnen |= (1 << 7);	/* RNG on */
+@@ -339,8 +355,6 @@
+ 	pr_info( PFX "AMD768 system management I/O registers at 0x%X.\n",
+ 			pmbase);
+ 
+-	amd_dev = dev;
+-
+ 	DPRINTK ("EXIT, returning 0\n");
+ 	return 0;
+ 
+@@ -349,13 +363,13 @@
+ 	return rc;
+ }
+ 
+-static void amd_cleanup(void)
++static void amd_cleanup(struct hwrng *rng)
+ {
+ 	u8 rnen;
+ 
+-	pci_read_config_byte(amd_dev, 0x40, &rnen);
++	pci_read_config_byte(rng->dev, 0x40, &rnen);
+ 	rnen &= ~(1 << 7);	/* RNG off */
+-	pci_write_config_byte(amd_dev, 0x40, rnen);
++	pci_write_config_byte(rng->dev, 0x40, rnen);
+ 
+ 	/* FIXME: twiddle pmio, also? */
+ }
+@@ -384,8 +398,6 @@
+ 	VIA_RNG_CHUNK_1_MASK	= 0xFF,
+ };
+ 
+-static u32 via_rng_datum;
+-
+ /*
+  * Investigate using the 'rep' prefix to obtain 32 bits of random data
+  * in one insn.  The upside is potentially better performance.  The
+@@ -411,9 +423,10 @@
+ 	return eax_out;
+ }
+ 
+-static unsigned int via_data_present(void)
++static unsigned int via_data_present(struct hwrng *rng)
+ {
+ 	u32 bytes_out;
++	u32 *via_rng_datum = (u32 *)(&rng->priv);
+ 
+ 	/* We choose the recommended 1-byte-per-instruction RNG rate,
+ 	 * for greater randomness at the expense of speed.  Larger
+@@ -427,20 +440,23 @@
+ 	 * A copy of MSR_VIA_RNG is placed in eax_out when xstore
+ 	 * completes.
+ 	 */
+-	via_rng_datum = 0; /* paranoia, not really necessary */
+-	bytes_out = xstore(&via_rng_datum, VIA_RNG_CHUNK_1) & VIA_XSTORE_CNT_MASK;
++
++	*via_rng_datum = 0; /* paranoia, not really necessary */
++	bytes_out = xstore(via_rng_datum, VIA_RNG_CHUNK_1) & VIA_XSTORE_CNT_MASK;
+ 	if (bytes_out == 0)
+ 		return 0;
+ 
+ 	return 1;
+ }
+ 
+-static u32 via_data_read(void)
++static u32 via_data_read(struct hwrng *rng)
+ {
++	u32 via_rng_datum = (u32)rng->priv;
++
+ 	return via_rng_datum;
+ }
+ 
+-static int __init via_init(struct pci_dev *dev)
++static int __init via_init(struct hwrng *rng)
+ {
+ 	u32 lo, hi, old_lo;
+ 
+@@ -472,7 +488,7 @@
+ 	return 0;
+ }
+ 
+-static void via_cleanup(void)
++static void via_cleanup(struct hwrng *rng)
+ {
+ 	/* do nothing */
+ }
+@@ -484,13 +500,12 @@
+  *
+  */
+ 
+-static void __iomem *geode_rng_base = NULL;
+-
+ #define GEODE_RNG_DATA_REG   0x50
+ #define GEODE_RNG_STATUS_REG 0x54
+ 
+-static u32 geode_data_read(void)
++static u32 geode_data_read(struct hwrng *rng)
+ {
++	void __iomem *geode_rng_base = (void __iomem *)rng->priv;
+ 	u32 val;
+ 
+ 	assert(geode_rng_base != NULL);
+@@ -498,8 +513,9 @@
+ 	return val;
+ }
+ 
+-static unsigned int geode_data_present(void)
++static unsigned int geode_data_present(struct hwrng *rng)
+ {
++	void __iomem *geode_rng_base = (void __iomem *)rng->priv;
+ 	u32 val;
+ 
+ 	assert(geode_rng_base != NULL);
+@@ -507,14 +523,18 @@
+ 	return val;
+ }
+ 
+-static void geode_cleanup(void)
++static void geode_cleanup(struct hwrng *rng)
+ {
++	void __iomem *geode_rng_base = (void __iomem *)rng->priv;
++
+ 	iounmap(geode_rng_base);
+   	geode_rng_base = NULL;
+ }
+ 
+-static int geode_init(struct pci_dev *dev)
++static int geode_init(struct hwrng *rng)
+ {
++	void __iomem *geode_rng_base;
++	struct pci_dev *dev = rng->dev;
+ 	unsigned long rng_base = pci_resource_start(dev, 0);
+ 
+ 	if (rng_base == 0)
+@@ -526,6 +546,7 @@
+ 		printk(KERN_ERR PFX "Cannot ioremap RNG memory\n");
+ 		return -EBUSY;
+ 	}
++	rng->priv = (unsigned long)geode_rng_base;
+ 
+ 	return 0;
+ }
+@@ -543,7 +564,6 @@
+ 		return -EINVAL;
+ 	if (filp->f_mode & FMODE_WRITE)
+ 		return -EINVAL;
+-
+ 	return 0;
+ }
+ 
+@@ -551,21 +571,26 @@
+ static ssize_t rng_dev_read (struct file *filp, char __user *buf, size_t size,
+ 				loff_t * offp)
+ {
+-	static DEFINE_SPINLOCK(rng_lock);
+ 	unsigned int have_data;
+ 	u32 data = 0;
+ 	ssize_t ret = 0;
++	int err;
+ 
+ 	while (size) {
+-		spin_lock(&rng_lock);
+-
++		err = mutex_lock_interruptible(&rng_mutex);
++		if (err)
++			return err;
++		if (!current_rng) {
++			mutex_unlock(&rng_mutex);
++			return -ENODEV;
++		}
+ 		have_data = 0;
+-		if (rng_ops->data_present()) {
+-			data = rng_ops->data_read();
+-			have_data = rng_ops->n_bytes;
++		if (current_rng->data_present == NULL ||
++		    current_rng->data_present(current_rng)) {
++			data = current_rng->data_read(current_rng);
++			have_data = current_rng->n_bytes;
+ 		}
+-
+-		spin_unlock (&rng_lock);
++		mutex_unlock(&rng_mutex);
+ 
+ 		while (have_data && size) {
+ 			if (put_user((u8)data, buf++)) {
+@@ -593,38 +618,186 @@
+ }
+ 
+ 
++static ssize_t hwrng_attr_current_store(struct class_device *class,
++					const char *buf, size_t len)
++{
++	int err = -ENODEV;
++	struct hwrng *rng;
++
++	if (!capable(CAP_SYS_ADMIN))
++		return -EPERM;
++	err = mutex_lock_interruptible(&rng_mutex);
++	if (err)
++		return err;
++	err = -ENODEV;
++	list_for_each_entry(rng, &rng_list, list) {
++		if (strncmp(rng->name, buf, len) == 0) {
++			if (rng->init) {
++				err = rng->init(rng);
++				if (err)
++					break;
++			}
++			if (current_rng && current_rng->cleanup)
++				current_rng->cleanup(current_rng);
++			current_rng = rng;
++			err = 0;
++			break;
++		}
++	}
++	mutex_unlock(&rng_mutex);
+ 
+-/*
+- * rng_init_one - look for and attempt to init a single RNG
+- */
+-static int __init rng_init_one (struct pci_dev *dev)
++	return err ? err : len;
++}
++
++static ssize_t hwrng_attr_current_show(struct class_device *class,
++				       char *buf)
+ {
+-	int rc;
++	int err;
++	ssize_t ret;
++	const char *name;
+ 
+-	DPRINTK ("ENTER\n");
++	err = mutex_lock_interruptible(&rng_mutex);
++	if (err)
++		return err;
++	if (current_rng)
++		name = current_rng->name;
++	else
++		name = "none";
++	ret = sprintf(buf, "%s\n", name);
++	mutex_unlock(&rng_mutex);
+ 
+-	assert(rng_ops != NULL);
++	return ret;
++}
+ 
+-	rc = rng_ops->init(dev);
+-	if (rc)
+-		goto err_out;
++static ssize_t hwrng_attr_available_show(struct class_device *class,
++					 char *buf)
++{
++	int err;
++	ssize_t ret = 0;
++	struct hwrng *rng;
+ 
+-	rc = misc_register (&rng_miscdev);
+-	if (rc) {
+-		printk (KERN_ERR PFX "misc device register failed\n");
+-		goto err_out_cleanup_hw;
++	err = mutex_lock_interruptible(&rng_mutex);
++	if (err)
++		return err;
++	buf[0] = '\0';
++	list_for_each_entry(rng, &rng_list, list) {
++		ret += strlen(rng->name);
++		strcat(buf, rng->name);
++		ret += 1;
++		strcat(buf, " ");
+ 	}
++	strcat(buf, "\n");
++	ret += 1;
++	mutex_unlock(&rng_mutex);
+ 
+-	DPRINTK ("EXIT, returning 0\n");
+-	return 0;
++	return ret;
++}
+ 
+-err_out_cleanup_hw:
+-	rng_ops->cleanup();
+-err_out:
+-	DPRINTK ("EXIT, returning %d\n", rc);
+-	return rc;
++static CLASS_DEVICE_ATTR(rng_current, S_IRUGO | S_IWUSR,
++			 hwrng_attr_current_show,
++			 hwrng_attr_current_store);
++static CLASS_DEVICE_ATTR(rng_available, S_IRUGO,
++			 hwrng_attr_available_show,
++			 NULL);
++
++
++static void unregister_miscdev(void)
++{
++	class_device_remove_file(rng_miscdev.class,
++				 &class_device_attr_rng_available);
++	class_device_remove_file(rng_miscdev.class,
++				 &class_device_attr_rng_current);
++	misc_deregister(&rng_miscdev);
++}
++
++static int register_miscdev(void)
++{
++	int err;
++
++	err = misc_register(&rng_miscdev);
++	if (err)
++		goto out;
++	err = class_device_create_file(rng_miscdev.class,
++				       &class_device_attr_rng_current);
++	if (err)
++		goto err_misc_dereg;
++	err = class_device_create_file(rng_miscdev.class,
++				       &class_device_attr_rng_available);
++	if (err)
++		goto err_remove_current;
++out:
++	return err;
++
++err_remove_current:
++	class_device_remove_file(rng_miscdev.class,
++				 &class_device_attr_rng_current);
++err_misc_dereg:
++	misc_deregister(&rng_miscdev);
++	goto out;
++}
++
++int hwrng_register(struct hwrng *rng)
++{
++	int must_register_misc;
++	int err;
++	struct hwrng *old_current;
++
++	if (rng->name == NULL)
++		return -EINVAL;
++	if (rng->data_read == NULL)
++		return -EINVAL;
++	if (rng->n_bytes < 1 || rng->n_bytes > sizeof(u32))
++		return -EINVAL;
++
++	mutex_lock(&rng_mutex);
++	must_register_misc = (current_rng == NULL);
++	old_current = current_rng;
++	if (!current_rng) {
++		if (rng->init) {
++			err = rng->init(rng);
++			if (err) {
++				mutex_unlock(&rng_mutex);
++				return err;
++			}
++		}
++		current_rng = rng;
++	}
++	INIT_LIST_HEAD(&rng->list);
++	list_add_tail(&rng->list, &rng_list);
++	err = 0;
++	if (must_register_misc) {
++		err = register_miscdev();
++		if (err) {
++			if (rng->cleanup)
++				rng->cleanup(rng);
++			list_del(&rng->list);
++			current_rng = old_current;
++		}
++	}
++
++	mutex_unlock(&rng_mutex);
++
++	return err;
+ }
++EXPORT_SYMBOL_GPL(hwrng_register);
+ 
++void hwrng_unregister(struct hwrng *rng)
++{
++	mutex_lock(&rng_mutex);
++	list_del(&rng->list);
++	if (current_rng == rng) {
++		if (rng->cleanup)
++			rng->cleanup(rng);
++		if (list_empty(&rng_list))
++			current_rng = NULL;
++		else
++			current_rng = list_entry(rng_list.prev, struct hwrng, list);
++	}
++	if (list_empty(&rng_list))
++		unregister_miscdev();
++	mutex_unlock(&rng_mutex);
++}
++EXPORT_SYMBOL_GPL(hwrng_unregister);
+ 
+ 
+ MODULE_AUTHOR("The Linux Kernel team");
+@@ -637,7 +810,7 @@
+  */
+ static int __init rng_init (void)
+ {
+-	int rc;
++	int err;
+ 	struct pci_dev *pdev = NULL;
+ 	const struct pci_device_id *ent;
+ 
+@@ -647,28 +820,30 @@
+ 	for_each_pci_dev(pdev) {
+ 		ent = pci_match_id(rng_pci_tbl, pdev);
+ 		if (ent) {
+-			rng_ops = &rng_vendor_ops[ent->driver_data];
+-			goto match;
++			err = hwrng_register(&rng_vendor_ops[ent->driver_data]);
++			if (err) {
++				printk(KERN_ERR PFX "Could not register Intel, "
++						    "AMD or Geode RNG\n");
++				return err;
++			}
++			goto out;
+ 		}
+ 	}
+ 
+ #ifdef __i386__
+ 	/* Probe for VIA RNG */
+ 	if (cpu_has_xstore) {
+-		rng_ops = &rng_vendor_ops[rng_hw_via];
+-		pdev = NULL;
+-		goto match;
++		err = hwrng_register(&rng_vendor_ops[rng_hw_via]);
++		if (err) {
++			printk(KERN_ERR PFX "Could not register VIA RNG\n");
++			return err;
++		}
++		goto out;
+ 	}
+ #endif
+ 
+-	DPRINTK ("EXIT, returning -ENODEV\n");
+-	return -ENODEV;
+-
+-match:
+-	rc = rng_init_one (pdev);
+-	if (rc)
+-		return rc;
+-
++	DPRINTK ("no device found\n");
++out:
+ 	pr_info( RNG_DRIVER_NAME " loaded\n");
+ 
+ 	DPRINTK ("EXIT, returning 0\n");
+@@ -683,10 +858,8 @@
+ {
+ 	DPRINTK ("ENTER\n");
+ 
+-	misc_deregister (&rng_miscdev);
+-
+-	if (rng_ops->cleanup)
+-		rng_ops->cleanup();
++	if (current_rng)
++		hwrng_unregister(current_rng);
+ 
+ 	DPRINTK ("EXIT\n");
+ }
+diff -urNX 2.6.16-rc4-mm2/Documentation/dontdiff 2.6.16-rc4-mm2.orig/drivers/char/Kconfig 2.6.16-rc4-mm2/drivers/char/Kconfig
+--- 2.6.16-rc4-mm2.orig/drivers/char/Kconfig	2006-02-28 11:54:48.000000000 +0100
++++ 2.6.16-rc4-mm2/drivers/char/Kconfig	2006-02-28 11:55:34.000000000 +0100
+@@ -653,8 +653,8 @@
+ 	  If you're not sure, say N.
+ 
+ config HW_RANDOM
+-	tristate "Intel/AMD/VIA HW Random Number Generator support"
+-	depends on (X86 || IA64) && PCI
++	tristate "Intel/AMD/VIA/Generic HW Random Number Generator support"
++	depends on PCI
+ 	---help---
+ 	  This driver provides kernel-side support for the Random Number
+ 	  Generator hardware found on Intel i8xx-based motherboards,
+diff -urNX 2.6.16-rc4-mm2/Documentation/dontdiff 2.6.16-rc4-mm2.orig/include/linux/hw_random.h 2.6.16-rc4-mm2/include/linux/hw_random.h
+--- 2.6.16-rc4-mm2.orig/include/linux/hw_random.h	1970-01-01 01:00:00.000000000 +0100
++++ 2.6.16-rc4-mm2/include/linux/hw_random.h	2006-02-28 11:55:34.000000000 +0100
+@@ -0,0 +1,48 @@
++/*
++	Hardware Random Number Generator
++
++	Please read Documentation/hw_random.txt for details on use.
++
++	----------------------------------------------------------
++	This software may be used and distributed according to the terms
++        of the GNU General Public License, incorporated herein by reference.
++
++ */
++
++#ifndef LINUX_HWRANDOM_H_
++#define LINUX_HWRANDOM_H_
++
++#include <linux/types.h>
++#include <linux/list.h>
++
++struct pci_dev;
++
++struct hwrng {
++	/** Unique name. */
++	const char *name;
++	/** Pointer to the PCI device (can be NULL). */
++	struct pci_dev *dev;
++
++	/** Initialization callback. */
++	int (*init) (struct hwrng *rng);
++	/** Cleanup callback. */
++	void (*cleanup) (struct hwrng *rng);
++	/** Is the RNG able to provide data now? */
++	unsigned int (*data_present) (struct hwrng *rng);
++	/** Read data from the RNG device. */
++	u32 (*data_read) (struct hwrng *rng);
++	/** Number of bytes read per data_read() call.
++	  * This must be > 0 and < sizeof(u32).
++	  */
++	unsigned int n_bytes;
++	/** Private data, for use by the RNG driver. */
++	unsigned long priv;
++
++	/* internal. */
++	struct list_head list;
++};
++
++extern int hwrng_register(struct hwrng *rng);
++extern void hwrng_unregister(struct hwrng *rng);
++
++#endif /* LINUX_HWRANDOM_H_ */
+-- 
+Greetings Michael.
+[unhandled content-type:application/x-bzip2][unhandled content-type:application/pgp-signature]

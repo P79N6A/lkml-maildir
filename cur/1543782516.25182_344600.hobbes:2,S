@@ -1,0 +1,167 @@
+Date: Thu, 25 Aug 2005 10:12:52 -0700
+From: Zachary Amsden <>
+Subject: Re: [PATCH] x86_64 Avoid some atomic operations during address space destruction
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2005/8/25/210
+
+Andi Kleen wrote:
+>On Sunday 07 August 2005 14:16, Zachary Amsden wrote:
+> 
+>
+>FYI I have queued it, but cannot apply it because the necessary generic
+>code support is still not in mainline.
+> 
+>
+Here's the patch for generic / i386 support; it's already in the -mm tree.
+>Do you have any other optimizations pending for x86-64? 
+>
+>There is still the iopl optimization that you did that is on my TODO list to 
+>add. Anything else.
+> 
+>
+I started porting the IOPL work, but got confused in my tree and end up 
+patching asm-i386 with x86-64 code.  The joy of  unenforced source control!
+I have some other MMU optimizations pending that will hopefully be a win 
+for all architectures; still measuring which alternative is best there.
+Zach
+Add a new accessor for PTEs, which passes the full hint from the mmu_gather
+struct; this allows architectures with hardware pagetables to optimize away
+atomic PTE operations when destroying an address space.  Removing the locked
+operation should allow better pipelining of memory access in this loop.  I
+measured an average savings of 30-35 cycles per zap_pte_range on the first 500
+destructions on Pentium-M, but I believe the optimization would win more on
+older processors which still assert the bus lock on xchg for an exclusive
+cacheline.
+Update: I made some new measurements, and this saves exactly 26 cycles over
+ptep_get_and_clear on Pentium M.  On P4, with a PAE kernel, this saves 180
+cycles per ptep_get_and_clear, for a whopping 92160 cycles savings for a full
+address space destruction.
+pte_clear_full is not yet used, but is provided for future optimizations (in
+particular, when running inside of a hypervisor that queues page table updates,
+the full hint allows us to avoid queueing unnecessary page table update for an
+address space in the process of being destroyed.
+This is not a huge win, but it does help a bit, and sets the stage for further
+hypervisor optimization of the mm layer on all architectures.
+Signed-off-by: Zachary Amsden <zach@vmware.com>
+Index: linux-2.6.13/include/asm-generic/pgtable.h
+===================================================================
+--- linux-2.6.13.orig/include/asm-generic/pgtable.h	2005-07-29 11:03:10.000000000 -0700
++++ linux-2.6.13/include/asm-generic/pgtable.h	2005-07-29 15:26:58.000000000 -0700
+@@ -101,6 +101,22 @@
+ })
+ #endif
+ 
++#ifndef __HAVE_ARCH_PTEP_GET_AND_CLEAR_FULL
++#define ptep_get_and_clear_full(__mm, __address, __ptep, __full)	\
++({									\
++	pte_t __pte;							\
++	__pte = ptep_get_and_clear((__mm), (__address), (__ptep));	\
++	__pte;								\
++})
++#endif
++
++#ifndef __HAVE_ARCH_PTE_CLEAR_FULL
++#define pte_clear_full(__mm, __address, __ptep, __full)		\
++do {									\
++	pte_clear((__mm), (__address), (__ptep));			\
++} while (0)
++#endif
++
+ #ifndef __HAVE_ARCH_PTEP_CLEAR_FLUSH
+ #define ptep_clear_flush(__vma, __address, __ptep)			\
+ ({									\
+Index: linux-2.6.13/include/asm-i386/pgtable.h
+===================================================================
+--- linux-2.6.13.orig/include/asm-i386/pgtable.h	2005-07-29 11:03:10.000000000 -0700
++++ linux-2.6.13/include/asm-i386/pgtable.h	2005-07-29 15:26:58.000000000 -0700
+@@ -258,6 +258,18 @@
+ 	return test_and_clear_bit(_PAGE_BIT_ACCESSED, &ptep->pte_low);
+ }
+ 
++static inline pte_t ptep_get_and_clear_full(struct mm_struct *mm, unsigned long addr, pte_t *ptep, int full) 
++{
++	pte_t pte;
++	if (full) {
++		pte = *ptep;
++		*ptep = __pte(0);
++	} else {
++		pte = ptep_get_and_clear(mm, addr, ptep);
++	}
++	return pte;
++}
++
+ static inline void ptep_set_wrprotect(struct mm_struct *mm, unsigned long addr, pte_t *ptep)
+ {
+ 	clear_bit(_PAGE_BIT_RW, &ptep->pte_low);
+@@ -415,6 +427,7 @@
+ #define __HAVE_ARCH_PTEP_TEST_AND_CLEAR_YOUNG
+ #define __HAVE_ARCH_PTEP_TEST_AND_CLEAR_DIRTY
+ #define __HAVE_ARCH_PTEP_GET_AND_CLEAR
++#define __HAVE_ARCH_PTEP_GET_AND_CLEAR_FULL
+ #define __HAVE_ARCH_PTEP_SET_WRPROTECT
+ #define __HAVE_ARCH_PTE_SAME
+ #include <asm-generic/pgtable.h>
+Index: linux-2.6.13/mm/memory.c
+===================================================================
+--- linux-2.6.13.orig/mm/memory.c	2005-07-29 11:03:11.000000000 -0700
++++ linux-2.6.13/mm/memory.c	2005-07-29 15:26:58.000000000 -0700
+@@ -551,7 +551,7 @@
+ 				     page->index > details->last_index))
+ 					continue;
+ 			}
+-			ptent = ptep_get_and_clear(tlb->mm, addr, pte);
++			ptent = ptep_get_and_clear_full(tlb->mm, addr, pte, tlb->fullmm);
+ 			tlb_remove_tlb_entry(tlb, pte, addr);
+ 			if (unlikely(!page))
+ 				continue;
+@@ -579,7 +579,7 @@
+ 			continue;
+ 		if (!pte_file(ptent))
+ 			free_swap_and_cache(pte_to_swp_entry(ptent));
+-		pte_clear(tlb->mm, addr, pte);
++		pte_clear_full(tlb->mm, addr, pte, tlb->fullmm);
+ 	} while (pte++, addr += PAGE_SIZE, addr != end);
+ 	pte_unmap(pte - 1);
+ }Any architecture that has hardware updated A/D bits that require
+synchronization against other processors during PTE operations
+can benefit from doing non-atomic PTE updates during address space
+destruction.  Originally done on i386, now ported to x86_64.
+Doing a read/write pair instead of an xchg() operation saves the
+implicit lock, which turns out to be a big win on 32-bit (esp w PAE).
+Diffs-against: 2.6.13-rc5-mm1
+Signed-off-by: Zachary Amsden <zach@vmware.com>
+Index: linux-2.6.13-rc5-mm1/include/asm-x86_64/pgtable.h
+===================================================================
+--- linux-2.6.13-rc5-mm1.orig/include/asm-x86_64/pgtable.h	2005-08-07 04:56:37.000000000 -0700
++++ linux-2.6.13-rc5-mm1/include/asm-x86_64/pgtable.h	2005-08-07 04:59:18.601856096 -0700
+@@ -104,6 +104,19 @@
+ ((unsigned long) __va(pud_val(pud) & PHYSICAL_PAGE_MASK))
+ 
+ #define ptep_get_and_clear(mm,addr,xp)	__pte(xchg(&(xp)->pte, 0))
++
++static inline pte_t ptep_get_and_clear_full(struct mm_struct *mm, unsigned long addr, pte_t *ptep, int full)
++{
++	pte_t pte;
++	if (full) {
++		pte = *ptep;
++		*ptep = __pte(0);
++	} else {
++		pte = ptep_get_and_clear(mm, addr, ptep);
++	}
++	return pte;
++}
++
+ #define pte_same(a, b)		((a).pte == (b).pte)
+ 
+ #define PMD_SIZE	(1UL << PMD_SHIFT)
+@@ -433,6 +446,7 @@
+ #define __HAVE_ARCH_PTEP_TEST_AND_CLEAR_YOUNG
+ #define __HAVE_ARCH_PTEP_TEST_AND_CLEAR_DIRTY
+ #define __HAVE_ARCH_PTEP_GET_AND_CLEAR
++#define __HAVE_ARCH_PTEP_GET_AND_CLEAR_FULL
+ #define __HAVE_ARCH_PTEP_SET_WRPROTECT
+ #define __HAVE_ARCH_PTE_SAME
+ #include <asm-generic/pgtable.h>

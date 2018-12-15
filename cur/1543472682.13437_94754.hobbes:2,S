@@ -1,0 +1,155 @@
+Date: Tue, 22 Dec 1998 01:59:48 +0100 (CET)
+From: Andrea Arcangeli <>
+Subject: [patch] disable_bh/enable_bh race fix [Re: Program to freeze keyboard in 2.1.131]
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1998/12/21/167
+
+On Sat, 19 Dec 1998, George wrote:
+>
+>#include <stdio.h>
+>#include <pthread.h>
+>
+>#define NUM_THREADS     60
+>
+>pthread_t teds[NUM_THREADS];
+>
+>void *thread_run(void *data)
+>{
+>  int x;
+>
+>  for (;;)
+>    printf("%d:%d ", pthread_self(), ++x);
+>}
+>
+>int main(void)
+>{
+>  int i;
+>
+>  for (i = 0; i < NUM_THREADS; i++)
+>    pthread_create(&teds[i], NULL, thread_run, NULL);
+>
+>  for (;;)
+>    pause();
+>
+>  return 0;
+>}
+>
+>Compiled with egcs 1.1.1 and 'gcc -O2 -o spam spam.c -lpthread'
+>
+>Now, just pick your favorite virtual terminal and run this program.  It'll
+>spit a bunch of numbers on the screen and shoot your load average up.  Now
+>just hold down ALT+D or CTRL+C, or any other key combination that will
+>generate a lot of interrupts really fast.  Watch the screen while holding
+>the keys down for a few minutes or so, 10 should be enough in most cases to
+>trigger the race.
+*snip*
+>Tested with 2.1.131-ac11 SMP and 'init=/bin/sh' with a 'vmstat 1 >
+>/dev/tty2' running in the background to give me something to attempt to
+>switch to.  Tyan Tomcat IV, dual Pentium 233 MMX, RAM and hard drive
+>shouldn't matter in this test.  Don't know if UP does it, but SMP does it
+>enough to irritate me if I run a program that causes a lot of output. 
+>Previous kernels have done the same thing.  AT keyboard and nothing
+>otherwise PS/2 attached motherboard.
+This evening I tried to reproduce and worked ;) and it' s also very easier
+to lockup the console in 2.1.132-3 and previous:
+main() { for (;;) printf("ciao\n"); }
+Running this proggy and pressing a character continously will cause the
+console to lockup.
+I' ll explain why:
+	Both the console_bh (from the keyboard irq handler to print the
+	pressed char) and the process (from sys_write() to print ciao),
+	was running at the same time do_con_write() and so they was
+	executing at the same time disable_bh(). Since bh_mask_count was
+	not accessed in atomic way it was racing and at some time the
+	CONSOLE_BH was disabled all the time because bh_mask_count[] was 1
+	instead of 0 while nobody was writting to the console.
+	As proof of my thought I added a enable_bh() in a SYS-RQ (sysrq
+	still work even if CONSOLE_BH is disabled because they are handled
+	by the raw keyboard-irq while the console is handled by console_bh
+	that runs after the keyboard irq has full the queue with the
+	incoming char) and I was able to restore perfectly from the
+	console lockup using the SYS-RQ.
+	The race was really very subtle...
+This my patch I developed in the last hours (ugh even if it' s very late
+seems to work, strange ;)) fixes perfectly the console race here. 
+Patch against 2.1.132-3.
+Please try the patch and feedback ;)).
+Linus I don't know a lot about Copyright and laws, and I don' t know if
+it' s right to add it where I placed it and/or for the changes I done. I
+added it just to be sure that if somebody will want to change Linux
+licence, he will have also to ask to me so I' ll reply NO ;)
+The ugly thing of the patch is that all archs will have to be updated by
+DaveM and other friends... 
+Index: linux/include/asm-i386/softirq.h
+diff -u linux/include/asm-i386/softirq.h:1.1.1.1 linux/include/asm-i386/softirq.h:1.1.1.1.2.3
+--- linux/include/asm-i386/softirq.h:1.1.1.1	Fri Nov 20 00:01:22 1998
++++ linux/include/asm-i386/softirq.h	Tue Dec 22 01:34:47 1998
+@@ -12,7 +12,7 @@
+ extern inline void init_bh(int nr, void (*routine)(void))
+ {
+ 	bh_base[nr] = routine;
+-	bh_mask_count[nr] = 0;
++	atomic_set(&bh_mask_count[nr], 0);
+ 	bh_mask |= 1 << nr;
+ }
+ 
+@@ -97,13 +97,13 @@
+ extern inline void disable_bh(int nr)
+ {
+ 	bh_mask &= ~(1 << nr);
+-	bh_mask_count[nr]++;
++	atomic_inc(&bh_mask_count[nr]);
+ 	synchronize_bh();
+ }
+ 
+ extern inline void enable_bh(int nr)
+ {
+-	if (!--bh_mask_count[nr])
++	if (atomic_dec_and_test(&bh_mask_count[nr]))
+ 		bh_mask |= 1 << nr;
+ }
+ 
+Index: linux/include/linux/interrupt.h
+diff -u linux/include/linux/interrupt.h:1.1.1.2 linux/include/linux/interrupt.h:1.1.1.1.2.4
+--- linux/include/linux/interrupt.h:1.1.1.2	Thu Dec 17 16:38:10 1998
++++ linux/include/linux/interrupt.h	Tue Dec 22 01:34:48 1998
+@@ -17,7 +17,7 @@
+ 
+ extern volatile unsigned char bh_running;
+ 
+-extern int bh_mask_count[32];
++extern atomic_t bh_mask_count[32];
+ extern unsigned long bh_active;
+ extern unsigned long bh_mask;
+ extern void (*bh_base[32])(void);
+Index: linux/kernel/softirq.c
+diff -u linux/kernel/softirq.c:1.1.1.2 linux/kernel/softirq.c:1.1.1.1.2.3
+--- linux/kernel/softirq.c:1.1.1.2	Fri Nov 27 11:19:09 1998
++++ linux/kernel/softirq.c	Tue Dec 22 01:53:26 1998
+@@ -6,6 +6,9 @@
+  * do_bottom_half() runs at normal kernel priority: all interrupts
+  * enabled.  do_bottom_half() is atomic with respect to itself: a
+  * bottom_half handler need not be re-entrant.
++ *
++ * Fixed a disable_bh()/enable_bh() race (was causing a console lockup)
++ * due bh_mask_count not atomic handling. Copyright (C) 1998  Andrea Arcangeli
+  */
+ 
+ #include <linux/mm.h>
+@@ -17,7 +20,7 @@
+ 
+ /* intr_count died a painless death... -DaveM */
+ 
+-int bh_mask_count[32];
++atomic_t bh_mask_count[32];
+ unsigned long bh_active = 0;
+ unsigned long bh_mask = 0;
+ void (*bh_base[32])(void);
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

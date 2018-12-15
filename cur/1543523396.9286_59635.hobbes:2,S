@@ -1,0 +1,553 @@
+Date: Mon, 24 Jan 2000 15:17:58 -0500
+From: Jeff Garzik <>
+Subject: PATCH 2.3.41.2: Intel 810 Random Number Generator driver
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/1/25/29
+
+Attached is a patch against 2.3.41.2 which adds support for the Intel
+i8xx chipset RNG.  This driver is quite simple -- it uses a kernel timer
+to add a byte of entropy every N jiffies, currently N=HZ/2.
+In order to do so, it was necessary to export a single function from
+random.c.  In addition, I took this opportunity to clean up the random.c
+EXPORTs.
+Sorry Matt, it was faster to write a new driver from scratch to
+illustrate this approach to the RNG implementation.  :)
+Comments welcome.  I don't have any i810 hardware, so please test!  It
+looks ok to me, and the RNG hardware is pretty damn simple.
+	Jeff
+-- 
+Jeff Garzik         | Andre the Giant has a posse.
+Building 1024       |
+MandrakeSoft, Inc.  |diff -urN /spare/vanilla/linux-2.3.41-pre2/include/linux/random.h linux/include/linux/random.h
+--- /spare/vanilla/linux-2.3.41-pre2/include/linux/random.h	Thu Jan  6 13:14:36 2000
++++ linux/include/linux/random.h	Mon Jan 24 14:56:51 2000
+@@ -46,6 +46,8 @@
+ extern void rand_initialize_irq(int irq);
+ extern void rand_initialize_blkdev(int irq, int mode);
+ 
++extern void batch_entropy_store(u32 a, u32 b, int num);
++
+ extern void add_keyboard_randomness(unsigned char scancode);
+ extern void add_mouse_randomness(__u32 mouse_data);
+ extern void add_interrupt_randomness(int irq);
+diff -urN /spare/vanilla/linux-2.3.41-pre2/drivers/char/Config.in linux/drivers/char/Config.in
+--- /spare/vanilla/linux-2.3.41-pre2/drivers/char/Config.in	Sun Jan 23 19:25:52 2000
++++ linux/drivers/char/Config.in	Mon Jan 24 14:56:49 2000
+@@ -125,6 +125,7 @@
+ if [ "$CONFIG_ALPHA_BOOK1" = "y" ]; then
+    bool 'Tadpole ANA H8 Support'  CONFIG_H8
+ fi
++dep_tristate 'Intel i8xx Random Number Generator (RNG) support (EXPERIMENTAL)' CONFIG_I810_RNG $CONFIG_EXPERIMENTAL
+ 
+ mainmenu_option next_comment
+ comment 'Video For Linux'
+diff -urN /spare/vanilla/linux-2.3.41-pre2/drivers/char/Makefile linux/drivers/char/Makefile
+--- /spare/vanilla/linux-2.3.41-pre2/drivers/char/Makefile	Sun Jan 23 19:25:52 2000
++++ linux/drivers/char/Makefile	Mon Jan 24 14:56:50 2000
+@@ -20,8 +20,8 @@
+ 
+ O_TARGET := char.o
+ M_OBJS   :=
+-O_OBJS   := tty_io.o n_tty.o tty_ioctl.o mem.o random.o raw.o
+-OX_OBJS  := pty.o misc.o
++O_OBJS   := tty_io.o n_tty.o tty_ioctl.o mem.o raw.o
++OX_OBJS  := pty.o misc.o random.o
+ 
+ KEYMAP   =defkeymap.o
+ KEYBD    =pc_keyb.o
+@@ -380,6 +380,14 @@
+     ifeq ($(CONFIG_PPC),)
+     M_OBJS += nvram.o
+     endif
++  endif
++endif
++
++ifeq ($(CONFIG_I810_RNG),y)
++O_OBJS += i810_rng.o
++else
++  ifeq ($(CONFIG_I810_RNG),m)
++    M_OBJS += i810_rng.o
+   endif
+ endif
+ 
+diff -urN /spare/vanilla/linux-2.3.41-pre2/drivers/char/i810_rng.c linux/drivers/char/i810_rng.c
+--- /spare/vanilla/linux-2.3.41-pre2/drivers/char/i810_rng.c	Wed Dec 31 19:00:00 1969
++++ linux/drivers/char/i810_rng.c	Mon Jan 24 15:06:16 2000
+@@ -0,0 +1,422 @@
++/*
++
++	Hardware driver for Intel i810 Random Number Generator (RNG)
++	Copyright 2000 Jeff Garzik <jgarzik@mandrakesoft.com>
++	
++	Based on:
++	Intel® 82802AB/82802AC Firmware Hub (FWH) Datasheet
++		May 1999 Order Number: 290658-002 R
++	
++	Intel 82802 Firmware Hub: Random Number Generator
++	Programmer's Reference Manual
++	December 1999 Order Number: 298029-001 R
++	
++	Intel 82802 Firmware HUB Random Number Generator Driver
++	Copyright (c) 2000 Matt Sottek msottek@quiknet.com
++	
++	----------------------------------------------------------
++	
++	This software may be used and distributed according to the terms
++        of the GNU Public License, incorporated herein by reference.
++
++	----------------------------------------------------------
++	
++	From the firmware hub datasheet:
++	
++	The Firmware Hub integrates a Random Number Generator (RNG)
++	using thermal noise generated from inherently random quantum
++	mechanical properties of silicon. When not generating new random
++	bits the RNG circuitry will enter a low power state. Intel will
++	provide a binary software driver to give third party software
++	access to our RNG for use as a security feature. At this time,
++	the RNG is only to be used with a system in an OS-present state.
++
++ */
++
++
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/fs.h>
++#include <linux/init.h>
++#include <linux/pci.h>
++#include <linux/spinlock.h>
++#include <linux/random.h>
++#include <linux/sysctl.h>
++
++#include <asm/io.h>
++
++
++/*
++ * core module and version information
++ */
++#define RNG_VERSION "0.0.1"
++#define RNG_MODULE_NAME "i810_rng"
++#define RNG_DRIVER_NAME   RNG_MODULE_NAME " hardware driver " RNG_VERSION
++#define PFX RNG_MODULE_NAME ": "                                                                                 
++
++
++/*
++ * debugging macros
++ */
++#undef RNG_DEBUG /* define to 1 to enable copious debugging info */
++ 
++#ifdef RNG_DEBUG
++/* note: prints function name for you */
++#define DPRINTK(fmt, args...) printk(KERN_DEBUG "%s: " fmt, __FUNCTION__ , ## args)
++#else
++#define DPRINTK(fmt, args...)
++#endif
++ 
++#define RNG_NDEBUG 0        /* define to 1 to disable lightweight runtime checks */
++#if RNG_NDEBUG
++#define assert(expr)
++#else
++#define assert(expr) \
++        if(!(expr)) {                                   \
++        printk( "Assertion failed! %s,%s,%s,line=%d\n", \
++        #expr,__FILE__,__FUNCTION__,__LINE__);          \
++        }
++#endif
++
++ 
++/*
++ * misc helper macros
++ */
++#define arraysize(x)            (sizeof(x)/sizeof(*(x)))                                                             
++
++
++/*
++ * RNG registers
++ */
++#define RNG_HW_STATUS			0
++#define		RNG_PRESENT		0x40
++#define		RNG_ENABLED		0x01
++#define RNG_STATUS			1
++#define		RNG_DATA_PRESENT	0x01
++#define RNG_DATA			2
++
++#define RNG_ADDR		0xFFBC015F
++#define RNG_ADDR_LEN		3
++
++
++/*
++ * Frequency that data is added to kernel entropy pool
++ */
++#define RNG_TIMER_LEN		(HZ >> 1)
++
++
++/*
++ * various RNG status variables.  they are globals
++ * as we only support a single RNG device
++ */
++static int rng_allocated = 0;
++static int rng_enabled = 0;
++static int rng_enabled_sysctl;
++void *rng_mem = NULL;
++spinlock_t rng_lock = SPIN_LOCK_UNLOCKED;
++static struct timer_list rng_timer;
++
++
++/*
++ * inlined helper functions for RNG registers
++ */
++static inline u8 rng_hwstatus (void)
++{
++	assert (rng_mem != NULL);
++	return readb (rng_mem + RNG_HW_STATUS);
++}
++
++
++static inline void rng_hwstatus_set (u8 hw_status)
++{
++	assert (rng_mem != NULL);
++	writeb (hw_status, rng_mem + RNG_HW_STATUS);
++}
++
++
++static inline int rng_data_present (void)
++{
++	assert (rng_mem != NULL);
++	assert (rng_enabled == 1);
++	
++	return (readb (rng_mem + RNG_STATUS) & RNG_DATA_PRESENT) ? 1 : 0;
++}
++
++
++static inline int rng_data_read (void)
++{
++	assert (rng_mem != NULL);
++	assert (rng_enabled == 1);
++	
++	return readb (rng_mem + RNG_DATA);
++}
++
++
++/*
++ * rng_timer_ticker - executes every RNG_TIMER_LEN jiffies,
++ *		      adds a single byte of entropy
++ */
++static void rng_timer_tick(unsigned long data)
++{
++	unsigned long flags;
++
++	del_timer (&rng_timer);
++
++	spin_lock_irqsave (&rng_lock, flags);
++
++	if (rng_data_present ()) {
++		static int rng_data;
++
++		rng_data = rng_data_read ();
++
++		batch_entropy_store (rng_data, jiffies,
++				     8 /* # bits entropy added */);
++	}
++	
++	spin_unlock_irqrestore (&rng_lock, flags);
++
++	rng_timer.expires = jiffies + RNG_TIMER_LEN;
++	add_timer (&rng_timer);
++}
++
++
++/*
++ * rng_enable - enable or disable the RNG and internal timer
++ */
++static int rng_enable (int enable)
++{
++	unsigned long flags;
++	u8 hw_status;
++	
++	DPRINTK ("ENTER\n");
++	
++	spin_lock_irqsave (&rng_lock, flags);
++
++	hw_status = rng_hwstatus ();
++	
++	if (enable && ((hw_status & RNG_ENABLED) == 0)) {
++		rng_timer.expires = jiffies + RNG_TIMER_LEN;
++		add_timer (&rng_timer);
++
++		rng_hwstatus_set (hw_status | RNG_ENABLED);
++
++		MOD_INC_USE_COUNT;
++		DPRINTK ("RNG enabled\n");
++		rng_enabled = 1;
++	}
++	
++	else if (!enable && (hw_status & RNG_ENABLED)) {
++		del_timer (&rng_timer);
++
++		hw_status &= ~RNG_ENABLED;
++		rng_hwstatus_set (hw_status);
++
++		MOD_DEC_USE_COUNT;
++		DPRINTK ("RNG disabled\n");
++		rng_enabled = 0;
++	}
++	
++	if (hw_status != rng_hwstatus ()) {
++		spin_unlock_irqrestore (&rng_lock, flags);
++		printk (KERN_ERR PFX "Unable to %sable the RNG\n",
++			enable ? "en" : "dis");
++		DPRINTK ("EXIT, returning -EIO\n");
++		return -EIO;
++	}
++
++	spin_unlock_irqrestore (&rng_lock, flags);
++
++	DPRINTK ("EXIT, returning 0\n");
++	return 0;
++}
++
++
++/*
++ * rng_handle_sysctl - handle a read or write of our sysctl
++ */
++ 
++int rng_handle_sysctl (ctl_table * table, int write, struct file *filp,
++		       void *buffer, size_t * lenp)
++{
++	unsigned long flags;
++	int enabled_save, rc;
++
++	DPRINTK ("ENTER\n");
++	
++	spin_lock_irqsave (&rng_lock, flags);
++	rng_enabled_sysctl = enabled_save = rng_enabled;
++	spin_unlock_irqrestore (&rng_lock, flags);
++
++	rc = proc_dointvec (table, write, filp, buffer, lenp);
++	if (rc)
++		return rc;
++	
++	if (enabled_save != rng_enabled_sysctl)
++		rng_enable (rng_enabled_sysctl);
++
++	DPRINTK ("EXIT, returning 0\n");
++	return 0;
++}
++
++
++/*
++ * rng_sysctl - add or remove the rng sysctl
++ */
++static void rng_sysctl (int add)
++{
++#define FS_NTFS             1
++	/* Definition of the sysctl */
++	static ctl_table rng_sysctls[] = {
++		{FS_NTFS,	/* ID */
++		 RNG_MODULE_NAME,	/* name in /proc */
++		 &rng_enabled_sysctl,
++		 sizeof (rng_enabled_sysctl),	/* data ptr, data size */
++		 0644,		/* mode */
++		 0,		/* child */
++		 rng_handle_sysctl,	/* proc handler */
++		 0,		/* strategy */
++		 0,		/* proc control block */
++		 0, 0}
++		,		/* extra */
++		{0}
++	};
++
++	/* Define the parent file : /proc/sys/dev */
++	static ctl_table sysctls_root[] = {
++		{CTL_DEV,
++		 "dev",
++		 NULL, 0,
++		 0555,
++		 rng_sysctls},
++		{0}
++	};
++	static struct ctl_table_header *sysctls_root_header = NULL;
++
++	if (add) {
++		if (!sysctls_root_header)
++			sysctls_root_header = register_sysctl_table (sysctls_root, 0);
++	} else if (sysctls_root_header) {
++		unregister_sysctl_table (sysctls_root_header);
++		sysctls_root_header = NULL;
++	}
++}
++
++
++/*
++ * rng_probe - look for and attempt to init a single RNG
++ */
++static int __init rng_probe (struct pci_dev *dev,
++			     const struct pci_device_id *id)
++{
++	int rc;
++	u8 input;
++	
++	DPRINTK ("ENTER\n");
++
++	if (rng_allocated) {
++		printk (KERN_ERR PFX "this driver only supports one RNG\n");
++		DPRINTK ("EXIT, returning -EBUSY\n");
++		return -EBUSY;
++	}
++
++	if (!request_mem_region (RNG_ADDR, RNG_ADDR_LEN, RNG_MODULE_NAME)) {
++		printk (KERN_ERR PFX "RNG Memory region not available\n");
++		DPRINTK ("EXIT, returning -EBUSY\n");
++		return -EBUSY;
++	}
++
++	/* Check for Intel 82802 */
++	rng_mem = ioremap (RNG_ADDR, RNG_ADDR_LEN);
++	if (rng_mem == NULL) {
++		printk (KERN_ERR PFX "cannot ioremap RNG Memory\n");
++		DPRINTK ("EXIT, returning -EBUSY\n");
++		rc = -EBUSY;
++		goto err_out;
++	}
++
++	input = rng_hwstatus ();
++	if ((input & RNG_PRESENT) == 0) {
++		printk (KERN_ERR PFX "RNG not detected\n");
++		DPRINTK ("EXIT, returning -ENODEV\n");
++		rc = -ENODEV;
++		goto err_out;
++	}
++
++	rc = rng_enable (1);
++	if (rc) {
++		DPRINTK ("EXIT, returning %d\n", rc);
++		goto err_out;
++	}
++
++	rng_allocated = 1;
++	init_timer (&rng_timer);
++	rng_timer.function = rng_timer_tick;
++	
++	rng_sysctl (1);
++
++	DPRINTK ("EXIT, returning 0\n");
++	return 0;
++
++err_out:
++	if (rng_mem)
++		iounmap (rng_mem);
++	release_mem_region (RNG_ADDR, RNG_ADDR_LEN);
++	return rc;
++}
++
++
++/*
++ * Data for PCI driver interface
++ */
++const static struct pci_device_id rng_pci_tbl[] __initdata = {
++        { 0x8086, 0x2418, PCI_ANY_ID, PCI_ANY_ID, },
++        { 0x8086, 0x2428, PCI_ANY_ID, PCI_ANY_ID, },
++	{ 0, },
++};
++MODULE_DEVICE_TABLE (pci, rng_pci_tbl);                                                                          
++
++
++static struct pci_driver rng_driver = {
++       name:           RNG_MODULE_NAME,
++       id_table:       rng_pci_tbl,
++       probe:          rng_probe,
++};
++
++
++/*
++ * rng_init - initialize RNG module
++ */
++static int __init rng_init (void)
++{
++	DPRINTK ("ENTER\n");
++	
++	if (pci_register_driver (&rng_driver) < 1) {
++		DPRINTK ("EXIT, returning -ENODEV\n");
++		return -ENODEV;
++	}
++
++	printk (KERN_INFO RNG_DRIVER_NAME "loaded\n");
++
++	DPRINTK ("EXIT, returning 0\n");
++	return 0;
++}
++
++
++/*
++ * rng_init - shutdown RNG module
++ */
++static void __exit rng_cleanup (void)
++{
++	DPRINTK ("ENTER\n");
++
++	rng_sysctl (0);
++	rng_enable (0);	
++	pci_unregister_driver (&rng_driver);
++	release_mem_region (RNG_ADDR, RNG_ADDR_LEN);
++
++	DPRINTK ("EXIT\n");
++}
++
++
++module_init (rng_init);
++module_exit (rng_cleanup);
+diff -urN /spare/vanilla/linux-2.3.41-pre2/drivers/char/random.c linux/drivers/char/random.c
+--- /spare/vanilla/linux-2.3.41-pre2/drivers/char/random.c	Thu Jan  6 13:14:36 2000
++++ linux/drivers/char/random.c	Mon Jan 24 14:56:50 2000
+@@ -235,6 +235,7 @@
+ 
+ #include <linux/utsname.h>
+ #include <linux/config.h>
++#include <linux/module.h>
+ #include <linux/kernel.h>
+ #include <linux/major.h>
+ #include <linux/string.h>
+@@ -626,7 +627,7 @@
+ 	return 0;
+ }
+ 
+-static void batch_entropy_store(__u32 a, __u32 b, int num)
++void batch_entropy_store(u32 a, u32 b, int num)
+ {
+ 	int	new;
+ 
+@@ -2238,3 +2239,12 @@
+ 	return (cookie - tmp[17]) & COOKIEMASK;	/* Leaving the data behind */
+ }
+ #endif
++
++
++
++EXPORT_SYMBOL(add_keyboard_randomness);
++EXPORT_SYMBOL(add_mouse_randomness);
++EXPORT_SYMBOL(add_interrupt_randomness);
++EXPORT_SYMBOL(add_blkdev_randomness);
++EXPORT_SYMBOL(batch_entropy_store);
++
+diff -urN /spare/vanilla/linux-2.3.41-pre2/kernel/ksyms.c linux/kernel/ksyms.c
+--- /spare/vanilla/linux-2.3.41-pre2/kernel/ksyms.c	Tue Jan 18 21:54:21 2000
++++ linux/kernel/ksyms.c	Mon Jan 24 14:56:51 2000
+@@ -183,7 +183,6 @@
+ EXPORT_SYMBOL(ll_rw_block);
+ EXPORT_SYMBOL(__wait_on_buffer);
+ EXPORT_SYMBOL(___wait_on_page);
+-EXPORT_SYMBOL(add_blkdev_randomness);
+ EXPORT_SYMBOL(block_read_full_page);
+ EXPORT_SYMBOL(block_write_full_page);
+ EXPORT_SYMBOL(block_write_partial_page);
+@@ -436,7 +435,6 @@
+ EXPORT_SYMBOL(fs_overflowgid);
+ 
+ /* all busmice */
+-EXPORT_SYMBOL(add_mouse_randomness);
+ EXPORT_SYMBOL(fasync_helper);
+ 
+ #ifdef CONFIG_BLK_DEV_MD

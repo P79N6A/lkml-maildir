@@ -1,0 +1,657 @@
+Date: Fri, 28 Jul 2000 07:44:13 +0200
+From: Andi Kleen <>
+Subject: [PATCH] Decrease hash table memory overhead
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/7/28/10
+
+Linux uses double linked list heads in the inode and dcache hash tables.
+That wastes a lot of memory, especially since neither inode nor dcache
+ever try to access the tail of the hash list. The following patch adds
+a new hlist_* implementation that works on double linked lists with a 
+single pointer head. It adds a few jumps over the list_* rings, but IMHO
+the decreased cache line usage in the hash heads is more than worth it
+(you can do a lot of jumps in a single cache miss) 
+This saves about 96K memory on my 128MB machine, more on machines with
+bigger ram.
+It also fixes at least two potential dcache bugs: it used list_del without
+clearing the head and tested it later with list_empty with undefined
+results. I added a hlist_del_init() inline to make this easier.
+The usage of hlist is very similar to list, you just have to distingush
+between nodes and list heads in a few cases. The last element is 
+delimited by a NULL pointer so loops over them are cheaper (no need to
+waste a register for the head required in the list end test). Accessing
+the tail is not possible anymore in O(1)
+I added a new __LINUX_LISTS__ macro that user programs can define
+when they want to use linux/list.h.
+Patch against 2.4.0test5-pre5
+I think it would be useful to integrate it into 2.4.
+-Andi
+--- linux-pre-work/fs/nfs/inode.c-HHASH	Wed Jul 26 17:50:59 2000
++++ linux-pre-work/fs/nfs/inode.c	Wed Jul 26 22:19:52 2000
+@@ -559,7 +559,7 @@
+ 	unhashed = 0;
+ 	while ((tmp = tmp->next) != head) {
+ 		struct dentry *dentry = list_entry(tmp, struct dentry, d_alias);
+-		if (list_empty(&dentry->d_hash))
++		if (hnode_empty(&dentry->d_hash))
+ 			unhashed++;
+ 	}
+ 	spin_unlock(&dcache_lock);
+--- linux-pre-work/fs/autofs4/root.c-HHASH	Wed Jul 26 17:43:07 2000
++++ linux-pre-work/fs/autofs4/root.c	Wed Jul 26 22:21:32 2000
+@@ -400,7 +400,7 @@
+ 		spin_unlock(&dcache_lock);
+ 		return -ENOTEMPTY;
+ 	}
+-	list_del(&dentry->d_hash);
++	hlist_del_init(&dentry->d_hash);
+ 	spin_unlock(&dcache_lock);
+ 
+ 	dput(ino->dentry);
+--- linux-pre-work/fs/dcache.c-HHASH	Wed Jul 26 17:50:59 2000
++++ linux-pre-work/fs/dcache.c	Wed Jul 26 22:27:20 2000
+@@ -48,7 +48,7 @@
+ 
+ static unsigned int d_hash_mask;
+ static unsigned int d_hash_shift;
+-static struct list_head *dentry_hashtable;
++static struct hlist_head *dentry_hashtable;
+ static LIST_HEAD(dentry_unused);
+ 
+ struct {
+@@ -140,7 +140,7 @@
+ 			goto unhash_it;
+ 	}
+ 	/* Unreachable? Get rid of it */
+-	if (list_empty(&dentry->d_hash))
++	if (hnode_empty(&dentry->d_hash))
+ 		goto kill_it;
+ 	list_add(&dentry->d_lru, &dentry_unused);
+ 	dentry_stat.nr_unused++;
+@@ -152,7 +152,7 @@
+ 	return;
+ 
+ unhash_it:
+-	list_del(&dentry->d_hash);
++	hlist_del_init(&dentry->d_hash);
+ 
+ kill_it: {
+ 		struct dentry *parent;
+@@ -186,7 +186,7 @@
+ 	 * If it's already been dropped, return OK.
+ 	 */
+ 	spin_lock(&dcache_lock);
+-	if (list_empty(&dentry->d_hash)) {
++	if (hnode_empty(&dentry->d_hash)) {
+ 		spin_unlock(&dcache_lock);
+ 		return 0;
+ 	}
+@@ -217,8 +217,7 @@
+ 		}
+ 	}
+ 
+-	list_del(&dentry->d_hash);
+-	INIT_LIST_HEAD(&dentry->d_hash);
++	hlist_del_init(&dentry->d_hash);
+ 	spin_unlock(&dcache_lock);
+ 	return 0;
+ }
+@@ -263,7 +262,7 @@
+ 		tmp = next;
+ 		next = tmp->next;
+ 		alias = list_entry(tmp, struct dentry, d_alias);
+-		if (!list_empty(&alias->d_hash)) {
++		if (!hnode_empty(&alias->d_hash)) {
+ 			__dget_locked(alias);
+ 			spin_unlock(&dcache_lock);
+ 			return alias;
+@@ -306,7 +305,7 @@
+ {
+ 	struct dentry * parent;
+ 
+-	list_del(&dentry->d_hash);
++	hlist_del_init(&dentry->d_hash);
+ 	list_del(&dentry->d_child);
+ 	dentry_iput(dentry);
+ 	parent = dentry->d_parent;
+@@ -613,7 +612,7 @@
+ 	dentry->d_op = NULL;
+ 	dentry->d_fsdata = NULL;
+ 	INIT_LIST_HEAD(&dentry->d_vfsmnt);
+-	INIT_LIST_HEAD(&dentry->d_hash);
++	INIT_HLIST_NODE(&dentry->d_hash);
+ 	INIT_LIST_HEAD(&dentry->d_lru);
+ 	INIT_LIST_HEAD(&dentry->d_subdirs);
+ 	INIT_LIST_HEAD(&dentry->d_alias);
+@@ -678,7 +677,7 @@
+ 	return res;
+ }
+ 
+-static inline struct list_head * d_hash(struct dentry * parent, unsigned long hash)
++static inline struct hlist_head *d_hash(struct dentry * parent, unsigned long hash)
+ {
+ 	hash += (unsigned long) parent / L1_CACHE_BYTES;
+ 	hash = hash ^ (hash >> D_HASHBITS) ^ (hash >> D_HASHBITS*2);
+@@ -701,14 +700,13 @@
+ 	unsigned int len = name->len;
+ 	unsigned int hash = name->hash;
+ 	const unsigned char *str = name->name;
+-	struct list_head *head = d_hash(parent,hash);
+-	struct list_head *tmp;
++	struct hlist_node *tmp;
+ 
+ 	spin_lock(&dcache_lock);
+-	tmp = head->next;
++	tmp = d_hash(parent,hash)->first;
+ 	for (;;) {
+-		struct dentry * dentry = list_entry(tmp, struct dentry, d_hash);
+-		if (tmp == head)
++		struct dentry * dentry = hlist_entry(tmp, struct dentry, d_hash);
++		if (!tmp)
+ 			break;
+ 		tmp = tmp->next;
+ 		if (dentry->d_name.hash != hash)
+@@ -752,14 +750,12 @@
+ int d_validate(struct dentry *dentry, struct dentry *dparent,
+ 	       unsigned int hash, unsigned int len)
+ {
+-	struct list_head *base, *lhp;
+ 	int valid = 1;
+ 
+ 	spin_lock(&dcache_lock);
+ 	if (dentry != dparent) {
+-		base = d_hash(dparent, hash);
+-		lhp = base;
+-		while ((lhp = lhp->next) != base) {
++		struct hlist_node *lhp;
++		for (lhp = d_hash(dparent, hash)->first;lhp;lhp = lhp->next) { 
+ 			if (dentry == list_entry(lhp, struct dentry, d_hash)) {
+ 				__dget_locked(dentry);
+ 				goto out;
+@@ -837,9 +833,9 @@
+  
+ void d_rehash(struct dentry * entry)
+ {
+-	struct list_head *list = d_hash(entry->d_parent, entry->d_name.hash);
++	struct hlist_head *list = d_hash(entry->d_parent, entry->d_name.hash);
+ 	spin_lock(&dcache_lock);
+-	list_add(&entry->d_hash, list);
++	hlist_add_head(&entry->d_hash, list);
+ 	spin_unlock(&dcache_lock);
+ }
+ 
+@@ -908,12 +904,11 @@
+ 
+ 	spin_lock(&dcache_lock);
+ 	/* Move the dentry to the target hash queue */
+-	list_del(&dentry->d_hash);
+-	list_add(&dentry->d_hash, &target->d_hash);
++	hlist_del(&dentry->d_hash);
++	hlist_add_before(&dentry->d_hash, &target->d_hash);
+ 
+ 	/* Unhash the target: dput() will then get rid of it */
+-	list_del(&target->d_hash);
+-	INIT_LIST_HEAD(&target->d_hash);
++	hlist_del_init(&target->d_hash);
+ 
+ 	list_del(&dentry->d_child);
+ 	list_del(&target->d_child);
+@@ -955,7 +950,7 @@
+ 
+ 	*--end = '\0';
+ 	buflen--;
+-	if (!IS_ROOT(dentry) && list_empty(&dentry->d_hash)) {
++	if (!IS_ROOT(dentry) && hnode_empty(&dentry->d_hash)) {
+ 		buflen -= 10;
+ 		end -= 10;
+ 		memcpy(end, " (deleted)", 10);
+@@ -1036,9 +1031,9 @@
+ 	read_unlock(&current->fs->lock);
+ 
+ 	error = -ENOENT;
+-	/* Has the current directory has been unlinked? */
++	/* Has the current directory been unlinked? */
+ 	spin_lock(&dcache_lock);
+-	if (pwd->d_parent == pwd || !list_empty(&pwd->d_hash)) {
++	if (pwd->d_parent == pwd || !hnode_empty(&pwd->d_hash)) {
+ 		unsigned long len;
+ 		char * cwd;
+ 
+@@ -1170,7 +1165,7 @@
+ 
+ void __init dcache_init(unsigned long mempages)
+ {
+-	struct list_head *d;
++	struct hlist_head *d;
+ 	unsigned long order;
+ 	unsigned int nr_hash;
+ 	int i;
+@@ -1200,7 +1195,7 @@
+ 		unsigned long tmp;
+ 
+ 		nr_hash = (1UL << order) * PAGE_SIZE /
+-			sizeof(struct list_head);
++			sizeof(struct hlist_head);
+ 		d_hash_mask = (nr_hash - 1);
+ 
+ 		tmp = nr_hash;
+@@ -1208,7 +1203,7 @@
+ 		while ((tmp >>= 1UL) != 0UL)
+ 			d_hash_shift++;
+ 
+-		dentry_hashtable = (struct list_head *)
++		dentry_hashtable = (struct hlist_head *)
+ 			__get_free_pages(GFP_ATOMIC, order);
+ 	} while (dentry_hashtable == NULL && --order >= 0);
+ 
+@@ -1221,7 +1216,7 @@
+ 	d = dentry_hashtable;
+ 	i = nr_hash;
+ 	do {
+-		INIT_LIST_HEAD(d);
++		INIT_HLIST_HEAD(d);
+ 		d++;
+ 		i--;
+ 	} while (i);
+--- linux-pre-work/fs/inode.c-HHASH	Wed Jul 26 17:50:59 2000
++++ linux-pre-work/fs/inode.c	Wed Jul 26 22:43:41 2000
+@@ -53,8 +53,8 @@
+ 
+ static LIST_HEAD(inode_in_use);
+ static LIST_HEAD(inode_unused);
+-static struct list_head *inode_hashtable;
+-static LIST_HEAD(anon_hash_chain); /* for inodes with NULL i_sb */
++static struct hlist_head *inode_hashtable;
++static HLIST_HEAD(anon_hash_chain); /* for inodes with NULL i_sb */
+ 
+ /*
+  * A simple spinlock to protect the list manipulations.
+@@ -93,7 +93,7 @@
+ 	{
+ 		memset(inode, 0, sizeof(*inode));
+ 		init_waitqueue_head(&inode->i_wait);
+-		INIT_LIST_HEAD(&inode->i_hash);
++		INIT_HLIST_NODE(&inode->i_hash);
+ 		INIT_LIST_HEAD(&inode->i_data.pages);
+ 		INIT_LIST_HEAD(&inode->i_dentry);
+ 		sema_init(&inode->i_sem, 1);
+@@ -131,7 +131,7 @@
+ 		if (!(inode->i_state & I_DIRTY)) {
+ 			inode->i_state |= I_DIRTY;
+ 			/* Only add valid (ie hashed) inodes to the dirty list */
+-			if (!list_empty(&inode->i_hash)) {
++			if (!hnode_empty(&inode->i_hash)) {
+ 				list_del(&inode->i_list);
+ 				list_add(&inode->i_list, &sb->s_dirty);
+ 			}
+@@ -352,8 +352,7 @@
+ 		if (inode->i_sb != sb)
+ 			continue;
+ 		if (!atomic_read(&inode->i_count)) {
+-			list_del(&inode->i_hash);
+-			INIT_LIST_HEAD(&inode->i_hash);
++			hlist_del_init(&inode->i_hash);
+ 			list_del(&inode->i_list);
+ 			list_add(&inode->i_list, dispose);
+ 			inode->i_state |= I_FREEING;
+@@ -440,8 +439,7 @@
+ 		if (atomic_read(&inode->i_count))
+ 			BUG();
+ 		list_del(tmp);
+-		list_del(&inode->i_hash);
+-		INIT_LIST_HEAD(&inode->i_hash);
++		hlist_del_init(&inode->i_hash);
+ 		list_add(tmp, freeable);
+ 		inode->i_state |= I_FREEING;
+ 		count++;
+@@ -477,27 +475,21 @@
+  * by hand after calling find_inode now! This simplifies iunique and won't
+  * add any additional branch in the common code.
+  */
+-static struct inode * find_inode(struct super_block * sb, unsigned long ino, struct list_head *head, find_inode_t find_actor, void *opaque)
++static struct inode * find_inode(struct super_block * sb, unsigned long ino, struct hlist_node *tmp, find_inode_t find_actor, void *opaque)
+ {
+-	struct list_head *tmp;
+ 	struct inode * inode;
+ 
+-	tmp = head;
+-	for (;;) {
+-		tmp = tmp->next;
+-		inode = NULL;
+-		if (tmp == head)
+-			break;
+-		inode = list_entry(tmp, struct inode, i_hash);
++	for (; tmp; tmp = tmp->next) {
++		inode = hlist_entry(tmp, struct inode, i_hash);
+ 		if (inode->i_sb != sb)
+ 			continue;
+ 		if (inode->i_ino != ino)
+ 			continue;
+ 		if (find_actor && !find_actor(inode, ino, opaque))
+ 			continue;
+-		break;
++		return inode;
+ 	}
+-	return inode;
++	return NULL;
+ }
+ 
+ /*
+@@ -570,7 +562,7 @@
+  * We no longer cache the sb_flags in i_flags - see fs.h
+  *	-- rmk@arm.uk.linux.org
+  */
+-static struct inode * get_new_inode(struct super_block *sb, unsigned long ino, struct list_head *head, find_inode_t find_actor, void *opaque)
++static struct inode * get_new_inode(struct super_block *sb, unsigned long ino, struct hlist_head *head, find_inode_t find_actor, void *opaque)
+ {
+ 	struct inode * inode;
+ 
+@@ -580,11 +572,11 @@
+ 
+ 		spin_lock(&inode_lock);
+ 		/* We released the lock, so.. */
+-		old = find_inode(sb, ino, head, find_actor, opaque);
++		old = find_inode(sb, ino, head->first, find_actor, opaque);
+ 		if (!old) {
+ 			inodes_stat.nr_inodes++;
+ 			list_add(&inode->i_list, &inode_in_use);
+-			list_add(&inode->i_hash, head);
++			hlist_add_head(&inode->i_hash, head);
+ 			inode->i_sb = sb;
+ 			inode->i_dev = sb->s_dev;
+ 			inode->i_ino = ino;
+@@ -652,13 +644,13 @@
+ {
+ 	static ino_t counter = 0;
+ 	struct inode *inode;
+-	struct list_head * head;
++	struct hlist_head * head;
+ 	ino_t res;
+ 	spin_lock(&inode_lock);
+ retry:
+ 	if (counter > max_reserved) {
+ 		head = inode_hashtable + hash(sb,counter);
+-		inode = find_inode(sb, res = counter++, head, NULL, NULL);
++		inode = find_inode(sb, res = counter++, head->first, NULL, NULL);
+ 		if (!inode) {
+ 			spin_unlock(&inode_lock);
+ 			return res;
+@@ -691,11 +683,11 @@
+ 
+ struct inode *iget4(struct super_block *sb, unsigned long ino, find_inode_t find_actor, void *opaque)
+ {
+-	struct list_head * head = inode_hashtable + hash(sb,ino);
++	struct hlist_head * head = inode_hashtable + hash(sb,ino);
+ 	struct inode * inode;
+ 
+ 	spin_lock(&inode_lock);
+-	inode = find_inode(sb, ino, head, find_actor, opaque);
++	inode = find_inode(sb, ino, head->first, find_actor, opaque);
+ 	if (inode) {
+ 		__iget(inode);
+ 		spin_unlock(&inode_lock);
+@@ -721,11 +713,11 @@
+  
+ void insert_inode_hash(struct inode *inode)
+ {
+-	struct list_head *head = &anon_hash_chain;
++	struct hlist_head *head = &anon_hash_chain;
+ 	if (inode->i_sb)
+ 		head = inode_hashtable + hash(inode->i_sb, inode->i_ino);
+ 	spin_lock(&inode_lock);
+-	list_add(&inode->i_hash, head);
++	hlist_add_head(&inode->i_hash, head);
+ 	spin_unlock(&inode_lock);
+ }
+ 
+@@ -739,8 +731,7 @@
+ void remove_inode_hash(struct inode *inode)
+ {
+ 	spin_lock(&inode_lock);
+-	list_del(&inode->i_hash);
+-	INIT_LIST_HEAD(&inode->i_hash);
++	hlist_del_init(&inode->i_hash);
+ 	spin_unlock(&inode_lock);
+ }
+ 
+@@ -766,8 +757,7 @@
+ 			return;
+ 
+ 		if (!inode->i_nlink) {
+-			list_del(&inode->i_hash);
+-			INIT_LIST_HEAD(&inode->i_hash);
++			hlist_del_init(&inode->i_hash);
+ 			list_del(&inode->i_list);
+ 			INIT_LIST_HEAD(&inode->i_list);
+ 			inode->i_state|=I_FREEING;
+@@ -785,7 +775,7 @@
+ 			if (inode->i_state != I_CLEAR)
+ 				BUG();
+ 		} else {
+-			if (!list_empty(&inode->i_hash)) {
++			if (!hnode_empty(&inode->i_hash)) {
+ 				if (!(inode->i_state & I_DIRTY)) {
+ 					list_del(&inode->i_list);
+ 					list_add(&inode->i_list,
+@@ -843,7 +833,7 @@
+  */
+ void __init inode_init(unsigned long mempages)
+ {
+-	struct list_head *head;
++	struct hlist_head *head;
+ 	unsigned long order;
+ 	unsigned int nr_hash;
+ 	int i;
+@@ -857,7 +847,7 @@
+ 		unsigned long tmp;
+ 
+ 		nr_hash = (1UL << order) * PAGE_SIZE /
+-			sizeof(struct list_head);
++			sizeof(struct hlist_head);
+ 		i_hash_mask = (nr_hash - 1);
+ 
+ 		tmp = nr_hash;
+@@ -865,7 +855,7 @@
+ 		while ((tmp >>= 1UL) != 0UL)
+ 			i_hash_shift++;
+ 
+-		inode_hashtable = (struct list_head *)
++		inode_hashtable = (struct hlist_head *)
+ 			__get_free_pages(GFP_ATOMIC, order);
+ 	} while (inode_hashtable == NULL && --order >= 0);
+ 
+@@ -878,7 +868,7 @@
+ 	head = inode_hashtable;
+ 	i = nr_hash;
+ 	do {
+-		INIT_LIST_HEAD(head);
++		INIT_HLIST_HEAD(head);
+ 		head++;
+ 		i--;
+ 	} while (i);
+--- linux-pre-work/fs/readdir.c-HHASH	Wed Jul 26 17:43:09 2000
++++ linux-pre-work/fs/readdir.c	Wed Jul 26 22:21:30 2000
+@@ -81,7 +81,7 @@
+ 			while(1) {
+ 				struct dentry *de = list_entry(list, struct dentry, d_child);
+ 
+-				if (!list_empty(&de->d_hash) && de->d_inode) {
++				if (!hnode_empty(&de->d_hash) && de->d_inode) {
+ 					spin_unlock(&dcache_lock);
+ 					if (filldir(dirent, de->d_name.name, de->d_name.len, filp->f_pos, de->d_inode->i_ino) < 0)
+ 						break;
+--- linux-pre-work/include/linux/dcache.h-HHASH	Wed Jul 26 17:43:11 2000
++++ linux-pre-work/include/linux/dcache.h	Thu Jul 27 03:16:48 2000
+@@ -62,7 +62,7 @@
+ 	struct inode  * d_inode;	/* Where the name belongs to - NULL is negative */
+ 	struct dentry * d_parent;	/* parent directory */
+ 	struct list_head d_vfsmnt;
+-	struct list_head d_hash;	/* lookup hash list */
++	struct hlist_node d_hash;	/* lookup hash list */
+ 	struct list_head d_lru;		/* d_count = 0 LRU list */
+ 	struct list_head d_child;	/* child of parent list */
+ 	struct list_head d_subdirs;	/* our children */
+@@ -138,8 +138,7 @@
+ static __inline__ void d_drop(struct dentry * dentry)
+ {
+ 	spin_lock(&dcache_lock);
+-	list_del(&dentry->d_hash);
+-	INIT_LIST_HEAD(&dentry->d_hash);
++	hlist_del_init(&dentry->d_hash);
+ 	spin_unlock(&dcache_lock);
+ }
+ 
+@@ -250,7 +249,7 @@
+  
+ static __inline__ int d_unhashed(struct dentry *dentry)
+ {
+-	return list_empty(&dentry->d_hash);
++	return hnode_empty(&dentry->d_hash);
+ }
+ 
+ extern void dput(struct dentry *);
+--- linux-pre-work/include/linux/fs.h-HHASH	Wed Jul 26 22:55:02 2000
++++ linux-pre-work/include/linux/fs.h	Thu Jul 27 03:16:48 2000
+@@ -377,7 +377,7 @@
+ };
+ 
+ struct inode {
+-	struct list_head	i_hash;
++	struct hlist_node	i_hash;
+ 	struct list_head	i_list;
+ 	struct list_head	i_dentry;
+ 
+--- linux-pre-work/include/linux/list.h-HLIST	Wed Jul 26 21:20:45 2000
++++ linux-pre-work/include/linux/list.h	Wed Jul 26 21:54:46 2000
+@@ -1,7 +1,7 @@
+ #ifndef _LINUX_LIST_H
+ #define _LINUX_LIST_H
+ 
+-#ifdef __KERNEL__
++#if defined(__KERNEL__) || defined(__LINUX_LISTS__) 
+ 
+ /*
+  * Simple doubly linked list implementation.
+@@ -85,6 +85,7 @@
+ /**
+  * list_del - deletes entry from list.
+  * @entry: the element to delete from the list.
++ * Note: list_empty will not return true on entry afterwards.
+  */
+ static __inline__ void list_del(struct list_head *entry)
+ {
+@@ -137,6 +138,104 @@
+  */
+ #define list_for_each(pos, head) \
+ 	for (pos = (head)->next; pos != (head); pos = pos->next)
++
++/* 
++ * Double linked lists with a single pointer list head. 
++ * Mostly useful for hash tables where the two pointer list head is 
++ * too wasteful.
++ * You lose the ability to access the tail in O(1).
++ */ 
++
++struct hlist_head { 
++	struct hlist_node *first; 
++}; 
++
++struct hlist_node { 
++	struct hlist_node *next, **pprev; 
++}; 
++
++#define HLIST_HEAD_INIT { first: NULL } 
++#define HLIST_HEAD(name) struct hlist_head name = {  first: NULL }
++#define INIT_HLIST_HEAD(ptr) ((ptr)->first = NULL) 
++#define INIT_HLIST_NODE(ptr) ((ptr)->next = NULL, (ptr)->pprev = NULL)
++
++/* this is really misnamed */ 
++static __inline__ int hnode_empty(struct hlist_node *h) 
++{ 
++	return h->pprev==0;
++} 
++
++/** 
++ * hlist_empty - Check if a hlist is empty 
++ * @h: hlist head to check
++ */ 
++static __inline__ int hlist_empty(struct hlist_head *h) 
++{ 
++	return !h->first;
++} 
++
++/**
++ * hlist_del - Remove a node from a hlist.
++ * @n: Node to remove.
++ * Note: hnode_empty will not return true on n afterwards.
++ */
++static __inline__ void hlist_del(struct hlist_node *n) 
++{
++	/* The if could be avoided by a common dummy pprev target. */
++	if (!n->pprev) 
++		return; 
++	*(n->pprev) = n->next;  
++	if (n->next) 
++		n->next->pprev = n->pprev;
++}  
++
++/**
++ * hlist_del_init - Remove a node from a hlist and clear node.
++ * @n: Node to remove.
++ * hnode_empty will return true on n afterwards.
++ */
++static __inline__ void hlist_del_init(struct hlist_node *n) 
++{
++	hlist_del(n);
++	n->next = 0;
++	n->pprev = 0; 
++}
++
++/**
++ * hlist_add_head - Add a node on front of a list
++ * @n: node to be added
++ * @h: hlist head of the list
++ */ 
++static __inline__ void hlist_add_head(struct hlist_node *n, struct hlist_head *h) 
++{ 
++	n->next = h->first; 
++	if (h->first) 
++		h->first->pprev = &n->next;
++	h->first = n; 
++	n->pprev = &h->first; 
++} 
++
++/** 
++ * hlist_add_before - Insert a hlist node in front of another node 
++ * @n: node to insert
++ * @next: the node to insert before. 
++ *
++ * next must be non NULL. 
++ */ 
++static __inline__ void hlist_add_before(struct hlist_node *n, struct hlist_node *next)
++{
++	n->pprev = next->pprev;
++	n->next = next; 
++	next->pprev = &n->next; 
++	*(n->pprev) = n;
++}
++
++#define hlist_entry(ptr, type, member) list_entry(ptr,type,member) 
++#define hlist_for_each(pos, head) \
++	for (pos = (head)->first; pos; pos = pos->next)
++#define hlist_for_each_entry(pos, type, member, head) \
++	for (pos = hlist_entry((head)->first,type,member); pos; \
++	     pos = list_entry((pos)->member.next, type, member)) 
+ 
+ #endif /* __KERNEL__ */
+ 
+-- 
+This is like TV. I don't like TV.
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

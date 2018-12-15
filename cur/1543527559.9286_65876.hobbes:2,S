@@ -1,0 +1,153 @@
+Date: Sat, 26 Feb 2000 15:58:24 +0100
+From: Manfred Spraul <>
+Subject: Re: SMBFS: recvmsg called within BH (was: Re: One more boobytrap needed  for 2.2.15pre ?)
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/2/26/34
+
+Andris Pavenis wrote:
+> 
+> On Wed, 23 Feb 2000, Manfred Spraul wrote:
+> > Andris, do you use smbfs?
+> 
+> Yes.
+> 
+> And there are also some problems with SMBFS (new with 2.2.X):
+> After some time connection to shares (shared from WinNT 4.0) is lost.
+> This problem appeared when I upgraded to 2.2.X. Therefore I used some
+> periodic task (once per some minutes called 'df -t smbfs') to keep
+> connection alive
+> 
+Could you try the attached patch?
+Changes:
+* recvmsg() is now called from tq_scheduler, this should prevent the
+runqueue corruptions.
+* it seems that the keepalive implementation works again. I set
+"keepalive=1" in my smb.conf, and the connection remains alive for 5
+minute.  tcpdump shows both the keepalive packet and the ack's.
+--
+	Manfred--- 2.2/fs/smbfs/sock.c	Sat Feb 28 22:29:35 1998
++++ build-2.2/fs/smbfs/sock.c	Fri Feb 25 17:47:46 2000
+@@ -15,6 +15,7 @@
+ #include <linux/net.h>
+ #include <linux/mm.h>
+ #include <linux/netdevice.h>
++#include <linux/smp_lock.h>
+ #include <net/scm.h>
+ #include <net/ip.h>
+ 
+@@ -79,13 +80,31 @@
+ 	return err;
+ }
+ 
++struct data_callback {
++	struct tq_struct cb;
++	struct sock *sk;
++};
+ /*
+  * N.B. What happens if we're in here when the socket closes??
+  */
+ static void
+-smb_data_callback(struct sock *sk, int len)
++found_data(struct sock *sk)
+ {
+-	struct socket *socket = sk->socket;
++	/*
++	 * FIXME: copied from sock_def_readable, it should be a call to
++	 * server->data_ready();
++	 */
++	if(!sk->dead) {
++		wake_up_interruptible(sk->sleep);
++		sock_wake_async(sk->socket,1);
++	}
++}
++
++static void
++smb_data_callback(void* ptr)
++{
++	struct data_callback* job=ptr;
++	struct socket *socket = job->sk->socket;
+ 	unsigned char peek_buf[4];
+ 	int result;
+ 	mm_segment_t fs;
+@@ -93,10 +112,11 @@
+ 	fs = get_fs();
+ 	set_fs(get_ds());
+ 
++	lock_kernel();
+ 	while (1)
+ 	{
+ 		result = -EIO;
+-		if (sk->dead)
++		if (job->sk->dead)
+ 		{
+ #ifdef SMBFS_PARANOIA
+ 			printk("smb_data_callback: sock dead!\n");
+@@ -120,12 +140,30 @@
+ 		if (result == -EAGAIN)
+ 			break;
+ 	}
++	unlock_kernel();
+ 	set_fs(fs);
+ 
+ 	if (result != -EAGAIN)
+-	{
+-		wake_up_interruptible(sk->sleep);
++		found_data(job->sk);
++	kfree(ptr);
++}
++
++static void
++smb_data_ready(struct sock *sk, int len)
++{
++	struct data_callback* job;
++	job = kmalloc(sizeof(struct data_callback),GFP_ATOMIC);
++	if(job == 0) {
++		printk("smb_data_ready(): lost SESSION KEEPALIVE due to OOM.\n");
++		found_data(sk);
++		return;
+ 	}
++	job->cb.next = NULL;
++	job->cb.sync = 0;
++	job->cb.routine = smb_data_callback;
++	job->cb.data = job;
++	job->sk = sk;
++	queue_task(&job->cb, &tq_scheduler);
+ }
+ 
+ int
+@@ -182,8 +220,8 @@
+ 	/*
+ 	 * Install the callback atomically to avoid races ...
+ 	 */
+-	data_ready = xchg(&sk->data_ready, smb_data_callback);
+-	if (data_ready != smb_data_callback)
++	data_ready = xchg(&sk->data_ready, smb_data_ready);
++	if (data_ready != smb_data_ready)
+ 	{
+ 		server->data_ready = data_ready;
+ 		error = 0;
+@@ -232,10 +270,10 @@
+ 	 */
+ 	data_ready = xchg(&sk->data_ready, server->data_ready);
+ 	server->data_ready = NULL;
+-	if (data_ready != smb_data_callback)
++	if (data_ready != smb_data_ready)
+ 	{
+ 		printk("smb_dont_catch_keepalive: "
+-		       "sk->data_callback != smb_data_callback\n");
++		       "sk->data_ready != smb_data_ready\n");
+ 	}
+ 	error = 0;
+ out:
+@@ -256,7 +294,7 @@
+ printk("smb_close_socket: closing socket %p\n", server_sock(server));
+ #endif
+ #ifdef SMBFS_PARANOIA
+-if (server_sock(server)->sk->data_ready == smb_data_callback)
++if (server_sock(server)->sk->data_ready == smb_data_ready)
+ printk("smb_close_socket: still catching keepalives!\n");
+ #endif
+ 		server->sock_file = NULL;

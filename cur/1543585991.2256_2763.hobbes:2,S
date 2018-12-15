@@ -1,0 +1,131 @@
+Date: Tue, 27 Mar 2001 16:29:07 -0500 (EST)
+From: Richard Jerrell <>
+Subject: Re: [PATCH] mm/memory.c, 2.4.1 : memory leak with swap cache (updated)
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2001/3/27/143
+
+> fork and exit are very hot paths in the kernel, and this patch can force
+> a page cache lookup on a large number of pte which wouldn't be looked
+> up before.
+True, but I don't know how large of a performance hit the system takes.
+> Given that the leak is, as you say, temporary, and that the leak will
+> be recovered as soon as we start swapping again, do we really want to
+> pollute the fast path for the sake of a bit more speed during
+> swapping?
+It isn't speed of swapping that is the biggest problem.  The problem is
+that if you run a memory intensive task, exit after being placed on an
+lru, and run it again, there won't be enough memory to execute because all
+the memory you used previously is now sitting in the swap cache.  That
+isn't to say that without being patched the speed isn't poor.  After all,
+we'd be paging out a dead processes pages.
+But you are right, this fix is slow and that can be improved.  So,
+hopefully this patch is satisfactory in respect to speed and fixing the
+leak.  And will also remove the panic which is possible with the other
+patches (can't do a lookup_swap_cache with a spinlock held).
+Instead of removing the swap cache page at process exit and possibly
+expending time doing disk IO as you have pointed out, we check during
+refill_inactive_scan and page_launder for a page that is 
+1)  in the swap cache 
+2)  is not locked 
+3)  is only being referenced by the swap cache, us, and possibly by
+    buffers
+4)  has no one else referencing the swap cell
+If that is true, we can safely remove that page without writing it to
+disk.  In addition, the number of swap cache pages are included in the
+amount returned from vm_enough_memory to get rid of the temporary leak.
+So, the exit path remains unchanged, reclaiming a page is faster for when
+the page is no longer being mapped, and the lazy reclaiming for multiply
+referenced pages remains intact.
+Rich
+diff -rNu linux-2.4.1/include/linux/swap.h linux-2.4.1-paging-fix/include/linux/swap.h
+--- linux-2.4.1/include/linux/swap.h	Tue Jan 30 02:24:56 2001
++++ linux-2.4.1-paging-fix/include/linux/swap.h	Tue Mar 27 10:43:22 2001
+@@ -69,6 +69,7 @@
+ FASTCALL(unsigned int nr_free_buffer_pages(void));
+ extern int nr_active_pages;
+ extern int nr_inactive_dirty_pages;
++extern int nr_swap_cache_pages;
+ extern atomic_t nr_async_pages;
+ extern struct address_space swapper_space;
+ extern atomic_t page_cache_size;
+diff -rNu linux-2.4.1/mm/mmap.c linux-2.4.1-paging-fix/mm/mmap.c
+--- linux-2.4.1/mm/mmap.c	Mon Jan 29 11:10:41 2001
++++ linux-2.4.1-paging-fix/mm/mmap.c	Tue Mar 27 10:38:17 2001
+@@ -63,6 +63,7 @@
+ 	free += atomic_read(&page_cache_size);
+ 	free += nr_free_pages();
+ 	free += nr_swap_pages;
++	free += nr_swap_cache_pages;
+ 	return free > pages;
+ }
+ 
+diff -rNu linux-2.4.1/mm/swap_state.c linux-2.4.1-paging-fix/mm/swap_state.c
+--- linux-2.4.1/mm/swap_state.c	Fri Dec 29 18:04:27 2000
++++ linux-2.4.1-paging-fix/mm/swap_state.c	Tue Mar 27 10:41:04 2001
+@@ -17,6 +17,8 @@
+ 
+ #include <asm/pgtable.h>
+ 
++int nr_swap_cache_pages = 0;
++
+ static int swap_writepage(struct page *page)
+ {
+ 	rw_swap_page(WRITE, page, 0);
+@@ -58,6 +60,7 @@
+ #ifdef SWAP_CACHE_INFO
+ 	swap_cache_add_total++;
+ #endif
++	nr_swap_cache_pages++;
+ 	if (!PageLocked(page))
+ 		BUG();
+ 	if (PageTestandSetSwapCache(page))
+@@ -96,6 +99,7 @@
+ #ifdef SWAP_CACHE_INFO
+ 	swap_cache_del_total++;
+ #endif
++	nr_swap_cache_pages--;
+ 	remove_from_swap_cache(page);
+ 	swap_free(entry);
+ }
+diff -rNu linux-2.4.1/mm/vmscan.c linux-2.4.1-paging-fix/mm/vmscan.c
+--- linux-2.4.1/mm/vmscan.c	Mon Jan 15 15:36:49 2001
++++ linux-2.4.1-paging-fix/mm/vmscan.c	Tue Mar 27 12:31:04 2001
+@@ -466,6 +466,17 @@
+ 			continue;
+ 		}
+ 
++		if (PageSwapCache(page)) {
++			page_cache_get(page);
++			if(!is_page_shared(page)) {
++				delete_from_swap_cache_nolock(page);
++				UnlockPage(page);
++				page_cache_release(page);
++				continue;
++			}
++			page_cache_release(page);
++		}
++
+ 		/*
+ 		 * Dirty swap-cache page? Write it out if
+ 		 * last copy..
+@@ -650,6 +661,17 @@
+ 			list_del(page_lru);
+ 			nr_active_pages--;
+ 			continue;
++		}
++
++		if (PageSwapCache(page)) {
++			page_cache_get(page);
++			if(!is_page_shared(page) && !TryLockPage(page)) {
++				delete_from_swap_cache_nolock(page);
++				UnlockPage(page);
++				page_cache_release(page);
++				continue;
++			}
++			page_cache_release(page);
+ 		}
+ 
+ 		/* Do aging on the pages. */

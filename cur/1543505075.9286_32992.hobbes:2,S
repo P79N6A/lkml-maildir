@@ -1,0 +1,139 @@
+Date: Fri, 6 Aug 1999 20:15:39 -0400 (EDT)
+From: Richard Guy Briggs <>
+Subject: IPSEC transport mode w/2.2.x kernels and large packets
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/8/7/93
+
+-----BEGIN PGP SIGNED MESSAGE-----
+Some of you may have seen some of this somewhere before recently in
+correspondence with me.  To those, I appologise to have to see it
+appear again here, please correct me if I mis-interpreted your
+essence.  To everyone else, it is a summary of the mess.
+Due to very popular demand, here is a status report on the situation
+with oversize packets in the 2.2.x kernels with FreeS/WAN.
+Until recently (0.92) FreeS/WAN (a free IPSEC {un-}implementation for
+Linux <www.xs4all.nl/~freeswan/>) didn't handle packets close to the MTU
+or with DF set properly.  That was (mostly) shaken down by a pile of
+testing with John S. Denker (thanks JSD).  This all happenned under
+2.0.36.  If the packet was less than the MTU, we just simply sent it
+on its way by calling dev_queue_xmit() with the underlying physical
+device as a parameter.  If it was larger, we sent it to ip_fragment(),
+which also accepts a device parameter.  In both these cases, it allows
+us to change the outgoing device from the virtual ipsec[0-3] device to
+the underlying physical device, whatever it might be.
+For 2.2.x, we had planned to get away from all this silly virtual
+device stuff and route stealing and routing table mucking about.  We
+wanted to move things up the stack to avoid having to deal with the
+link layer stuff, removing and re-assembling the hard_header, among
+other things.
+This didn't happen because we were handed a quick and dirty patch to
+do 2.2.x kernels by Marc Boucher of Zero Knowledge Systems (Thanks
+very much Marc!).  It used the same idea as the 2.0.x kernels,
+changing a couple of calls and their number of arguments to make it
+compile and seem to work.
+It was made to work as a module or static immediately.
+Large packet handling was not checked at the time and was tripped over
+afterwards.  When large packets hit a 2.2.x kernel with ipsec and were
+passed to ip_fragment(), the machine oopsed, sometimes hard.  The
+output function passed to ip_fragment() was skb->dst->output().  Once
+it was changed to neigh_compat_output(), as was used in the place of
+dev_queue_xmit() from 2.0.x to 2.2.x, the problem went away *for me*
+and got worse for others.  This started my quest as to what function
+should be used for output, and lead into cflow diagrams...
+There have been reports of severe crashes under the 2.2 kernels with
+large packets.  I was seeing fairly regular crashes under 2.2.7 which
+would start with a small oops and keep rolling to larger and larger
+oopses until they finally exhausted themselves.  I upgraded to 2.2.10
+and those problems largely went away, with only the occasional crash.
+Others have reported exactly the opposite behaviour with relative
+stability under 2.2.7 and crashing consistently under 2.2.10.  There
+have been many reports on this list and linux-kernel about
+instability, locking up, tcp stalling and such for many of the 2.2.x
+series kernels, so we are not certain it is anything we are doing.
+There was a report on the list that 2.2.11pre4 is more stable.  I am
+trying that, but still have some unexplained behaviour, which might be
+the 2.0.36 machine at the other end, which is not able to re-assemble
+the fragments for some reason.  Investigation pending.
+At the same time, I did a FreeS/WAN presentation at the Ottawa Linux
+Symposium and in discussions with a number of other developpers,
+describing the problem elucidated some of the issues surrounding doing
+transport mode IPSEC.  It confirmed that we need to move our
+processing up the stack, before things are fragmented.  In particular,
+Alan Cox suggested setting the MTU to the maximum allowed:0xfff0, then
+fragmenting after encryption to the MTU of the physical device.
+This seems to work under the 2.0.x kernels since before I call
+dev_queue_xmit() or ip_fragment(), I can change the ownership of the
+skb from the virtual device to the physical device.  In the process of
+testing all this, I started getting some skb's that were not getting
+skb_copy_expand()ed properly.  For some reason,
+skb->truesize-sizeof(sk_buff) was not quite right.  I have changed it
+to be the same as that used in the 2.2.x kernels by Marc Boucher and I
+am starting to see some 'cannot get free page' messages, which I am
+not certain are from that change or the maximum mtu change.  It only
+seems to happen with connections directly to the gateway, and not
+connections *through* the gateway that use ipsec.
+Under 2.2.x kernels, this is not so simple, since even if I change the
+ownership of the skb, skb->dev, the skb still has a dst cache entry
+pointer, skb->dst, which still assumes the old device, skb->dst->dev.
+How do we change the dst entry?  We can't do another routing table
+lookup since that is unreliable and prone to route stealing, besides
+we are trying to move away from that method.  Do we blow it away?  It
+would then need to do a routing lookup.  How do we tell it to use the
+new device without corrupting the dst cache?  The only way I could
+come up with was to patch net/ipv4/ip_output.c:ip_fragment() so that
+if skb->dst->dev, the device pointed to in the dst cache pointer, and
+skb->dev, the device pointed to by the skb, were different, it would
+take its MTU information from skb->dev->mtu, rather than where it does
+now, from skb->dst->pmtu.
+At first response from Alexey Kuznetsov, he suggested I was passing an
+invalid packet to the output function skb->dst->output.  This is quite
+possible as I am changing the ownership of the packet, ie.: skb->dev,
+which does not agree with skb->dst->dev, amongst other things.
+Alexey also thinks:
+"I think, you will not able to implement transport mode IPsec TCP
+without significant changes in TCP itself."
+I am not so sure I agree, based on some interesting ideas that have
+come up in discussion around the Ottawa Linux Symposium.
+Later he concludes that our processing should be done before
+ip_build_xmit(), which echoes some of our previous instincts.  He also
+suggests that our eroute lookup should happen when the dst stuff does
+now, and suggests that we should store a per-eroute pmtu.
+Steve Whitehouse (DECnet under Linux) said:
+"Ah, this sounds like you are encapsulating packets in another
+protocol before sending them, like ip_gre.c for example. I have come
+across the same problem (I'd like to see DECnet in ip_gre) but I have
+no solution at the moment. One way may be to have an array of dst
+pointers in an skb, each one refering to a layer of encapsulation,
+plus an index to indicate the current layer. I may suggest this to
+Alexey, he may well have a better idea."
+Where does that leave us/me?  Testing.  Alan Cox has just announced
+2.2.7-pre5.
+Any comments, hints and suggestions welcome.  Patches welcome only
+from non-Americans outside the USA.  Thanks for reading this far...
+	slainte mhath, RGB
+- -- 
+The first Ottawa Linux Symposium was a huge success! <ottawalinuxsymposium.org>
+This SunRayce was a wet one!  DroughtRelief_99? -- <www.sunrayce.com/sunrayce/>
+Richard Guy Briggs -- PGP key available                Auto-Free Ottawa! Canada
+<
+http://www.conscoop.ottawa.on.ca/rgb/>
+                   </www.flora.org/afo/>
+Prevent Internet Wiretapping!       --      FreeS/WAN:<www.xs4all.nl/~freeswan>
+Thanks for voting Green! -- <green.ca>          Marillion:<www.marillion.co.uk>
+-----BEGIN PGP SIGNATURE-----
+Version: 2.6.3i
+Charset: noconv
+iQCVAwUBN6t6qd+sBuIhFagtAQEK3wQAjwOprnYLwFj3dwZojWVhD7iDpwvJ2ikQ
+R1G+e7uJpe6J+FPH8xtimrrFN1Vehp3TC8s33XzRAVExP35GPOEDYEZsOgW3XiWJ
+qFvTzWIPXXb85Aa4t3DUVti3shAt7XwGaYAXle21nyq6o6H7Di3+vI+JLZ33tn5e
+TPPza2Fnhk0=
+=pQkP
+-----END PGP SIGNATURE-----
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

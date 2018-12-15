@@ -1,0 +1,535 @@
+Date: Tue, 29 Aug 2000 14:00:16 +1100
+From: Rusty Russell <>
+Subject: Re: [PATCH] thread wakeup fix for 2.4.0-test7
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/8/28/137
+
+In message <200008281632.UAA04197@ms2.inr.ac.ru> you write:
+> > > Also, lingering (i.e. waiting for looong time) in fput() smells
+> > > interesting. 8)
+> > 
+> > Yes? Receiving process doesn't care to do recvmsg() on SCM_RIGHTS
+> > datagram. What should happen on close(), again?
+> 
+> Nothing. close() decreases f_users and exits, because f_users is not zero.
+I didn't use second reference count because it needs to be associated
+with each fd in struct files_struct.  NOT like f_count, which is in
+`struct file'.
+Consider:
+fd2 = dup(fd1);
+pthread_create(thread1);
+pthread_create(thread2);
+fork() => child1;
+Thread 0	Thread 1	Thread 2		Child 1
+		read(fd1);	read(fd2);		read(fd1);
+close(fd1);
+		MUST -EBADF	MUST NOT -EBADF		MUST NOT -EBADF
+And then it becomes obvious that count is not needed, it is always 1
+or 0; ie. only threads waiting on same fd in same struct files_struct
+must be woken.  My patch (at head of thread) was cc:'d to
+vger.rutgers.edu by mistake.  See below for original post.
+Hope this clarifies,
+Rusty.
+--
+Hacking time.
+================
+Hi all,
+	BUG: thread 1 is doing poll() on an fd, thread 2 closes it,
+and thread 1 doesn't wake up.  Included is a small test program and
+Makefile.
+	Simply waking up everyone polling on a filp on every close
+would suck for performance, so I only wake up those waiting with the
+same struct files_struct (ie. those sharing the file table).
+Unfortunately, the wait queue is not in the common part of the inode,
+so this needs to be implemented for every pollable device.  I have
+only implemented it for sockets, pipes and fifos.
+Before patch:
+	rusty@unpatched$ sudo make
+	UDP test
+	unwoken child: SUCCESS
+	FAILED: didn't wake me
+	unwoken: SUCCESS
+	TCP test
+	unwoken child: SUCCESS
+	FAILED: didn't wake me
+	unwoken: SUCCESS
+	RAW test
+	unwoken child: SUCCESS
+	FAILED: didn't wake me
+	unwoken: SUCCESS
+	PIPE test
+	unwoken child: SUCCESS
+	FAILED: didn't wake me
+	unwoken: SUCCESS
+	FIFO test
+	unwoken child: SUCCESS
+	FAILED: didn't wake me
+	unwoken: SUCCESS
+	CHARDEV test
+	unwoken child: SUCCESS
+	FAILED: didn't wake me
+	unwoken: SUCCESS
+After patch:
+	rusty@patched $ sudo make
+	cc -Wall -W -o polltest polltest.c -lpthread
+	UDP test
+	woken: SUCCESS
+	unwoken: SUCCESS
+	unwoken child: SUCCESS
+	TCP test
+	woken: SUCCESS
+	unwoken: SUCCESS
+	unwoken child: SUCCESS
+	RAW test
+	woken: SUCCESS
+	unwoken: SUCCESS
+	unwoken child: SUCCESS
+	PIPE test
+	woken: SUCCESS
+	unwoken: SUCCESS
+	unwoken child: SUCCESS
+	FIFO test
+	woken: SUCCESS
+	unwoken: SUCCESS
+	unwoken child: SUCCESS
+	CHARDEV test
+	unwoken: SUCCESS
+	unwoken child: SUCCESS
+	FAILED: didn't wake me
+Cheers,
+Rusty.
+--
+Hacking time.
+diff -ur -X /tmp/filexiytUc --minimal linux-2.4.0-test7-official/fs/open.c working-2.4.0-test7/fs/open.c
+--- linux-2.4.0-test7-official/fs/open.c	Fri Aug 25 13:11:36 2000
++++ working-2.4.0-test7/fs/open.c	Fri Aug 25 16:18:17 2000
+@@ -791,6 +791,8 @@
+ 		unlock_kernel();
+ 	}
+ 	locks_remove_posix(filp, id);
++	if (filp->f_op && filp->f_op->fdclosed)
++		filp->f_op->fdclosed(filp, id);
+ 	fput(filp);
+ 	return retval;
+ }
+diff -ur -X /tmp/filexiytUc --minimal linux-2.4.0-test7-official/fs/pipe.c working-2.4.0-test7/fs/pipe.c
+--- linux-2.4.0-test7-official/fs/pipe.c	Fri Aug 25 13:11:36 2000
++++ working-2.4.0-test7/fs/pipe.c	Fri Aug 25 15:39:50 2000
+@@ -375,6 +375,26 @@
+ 	return 0;
+ }
+ 
++static void pipe_fdclosed(struct file *filp, struct files_struct *files)
++{
++	struct inode *inode = filp->f_dentry->d_inode;
++	struct list_head *i;
++	unsigned long flags;
++
++	/* Wake up everyone using same file table. */
++	down(PIPE_SEM(*inode));
++	wq_write_lock_irqsave(&PIPE_WAIT(*inode)->lock, flags);
++	for (i = PIPE_WAIT(*inode)->task_list.next;
++	     i != &PIPE_WAIT(*inode)->task_list;
++	     i = i->next) {
++		wait_queue_t *curr = list_entry(i, wait_queue_t, task_list);
++		if (curr->task->files == files)
++			wake_up_process(curr->task);
++	}
++	wq_write_unlock_irqrestore(&PIPE_WAIT(*inode)->lock, flags);
++	up(PIPE_SEM(*inode));
++}
++
+ /*
+  * The file_operations structs are not static because they
+  * are also used in linux/fs/fifo.c to do operations on FIFOs.
+@@ -387,6 +407,7 @@
+ 	ioctl:		pipe_ioctl,
+ 	open:		pipe_read_open,
+ 	release:	pipe_read_release,
++	fdclosed:	pipe_fdclosed,
+ };
+ 
+ struct file_operations write_fifo_fops = {
+@@ -397,6 +418,7 @@
+ 	ioctl:		pipe_ioctl,
+ 	open:		pipe_write_open,
+ 	release:	pipe_write_release,
++	fdclosed:	pipe_fdclosed,
+ };
+ 
+ struct file_operations rdwr_fifo_fops = {
+@@ -407,6 +429,7 @@
+ 	ioctl:		pipe_ioctl,
+ 	open:		pipe_rdwr_open,
+ 	release:	pipe_rdwr_release,
++	fdclosed:	pipe_fdclosed,
+ };
+ 
+ struct file_operations read_pipe_fops = {
+@@ -417,6 +440,7 @@
+ 	ioctl:		pipe_ioctl,
+ 	open:		pipe_read_open,
+ 	release:	pipe_read_release,
++	fdclosed:	pipe_fdclosed,
+ };
+ 
+ struct file_operations write_pipe_fops = {
+@@ -427,6 +451,7 @@
+ 	ioctl:		pipe_ioctl,
+ 	open:		pipe_write_open,
+ 	release:	pipe_write_release,
++	fdclosed:	pipe_fdclosed,
+ };
+ 
+ struct file_operations rdwr_pipe_fops = {
+@@ -437,6 +462,7 @@
+ 	ioctl:		pipe_ioctl,
+ 	open:		pipe_rdwr_open,
+ 	release:	pipe_rdwr_release,
++	fdclosed:	pipe_fdclosed,
+ };
+ 
+ struct inode* pipe_new(struct inode* inode)
+diff -ur -X /tmp/filexiytUc --minimal linux-2.4.0-test7-official/include/linux/fs.h working-2.4.0-test7/include/linux/fs.h
+--- linux-2.4.0-test7-official/include/linux/fs.h	Fri Aug 25 13:11:43 2000
++++ working-2.4.0-test7/include/linux/fs.h	Fri Aug 25 13:38:43 2000
+@@ -746,6 +746,7 @@
+ 	int (*lock) (struct file *, int, struct file_lock *);
+ 	ssize_t (*readv) (struct file *, const struct iovec *, unsigned long, loff_t *);
+ 	ssize_t (*writev) (struct file *, const struct iovec *, unsigned long, loff_t *);
++	void (*fdclosed) (struct file *, struct files_struct *);
+ };
+ 
+ struct inode_operations {
+diff -ur -X /tmp/filexiytUc --minimal linux-2.4.0-test7-official/include/linux/net.h working-2.4.0-test7/include/linux/net.h
+--- linux-2.4.0-test7-official/include/linux/net.h	Fri Aug 25 12:10:21 2000
++++ working-2.4.0-test7/include/linux/net.h	Fri Aug 25 13:38:43 2000
+@@ -82,6 +82,7 @@
+ 
+ struct scm_cookie;
+ struct vm_area_struct;
++struct files_struct;
+ 
+ struct proto_ops {
+   int	family;
+@@ -108,6 +109,7 @@
+   int   (*sendmsg)	(struct socket *sock, struct msghdr *m, int total_len, struct scm_cookie *scm);
+   int   (*recvmsg)	(struct socket *sock, struct msghdr *m, int total_len, int flags, struct scm_cookie *scm);
+   int	(*mmap)		(struct file *file, struct socket *sock, struct vm_area_struct * vma);
++  void	(*fdclosed)	(struct socket *sock, struct files_struct *files);
+ };
+ 
+ struct net_proto_family 
+diff -ur -X /tmp/filexiytUc --minimal linux-2.4.0-test7-official/include/net/sock.h working-2.4.0-test7/include/net/sock.h
+--- linux-2.4.0-test7-official/include/net/sock.h	Fri Aug 25 13:11:48 2000
++++ working-2.4.0-test7/include/net/sock.h	Fri Aug 25 13:39:12 2000
+@@ -708,6 +708,8 @@
+ 					int *addr_len);
+ 	int			(*bind)(struct sock *sk, 
+ 					struct sockaddr *uaddr, int addr_len);
++	void			(*fdclosed)(struct sock *sk,
++					    struct files_struct *files);
+ 
+ 	int			(*backlog_rcv) (struct sock *sk, 
+ 						struct sk_buff *skb);
+@@ -836,6 +838,8 @@
+ extern void sock_kfree_s(struct sock *sk, void *mem, int size);
+ 
+ extern int copy_and_csum_toiovec(struct iovec *iov, struct sk_buff *skb, int hlen);
++extern void sock_fdclosed(struct socket *sock, struct files_struct *files);
++
+ 
+ /*
+  * Functions to fill in entries in struct proto_ops when a protocol
+diff -ur -X /tmp/filexiytUc --minimal linux-2.4.0-test7-official/net/core/sock.c working-2.4.0-test7/net/core/sock.c
+--- linux-2.4.0-test7-official/net/core/sock.c	Fri Aug 25 13:11:48 2000
++++ working-2.4.0-test7/net/core/sock.c	Fri Aug 25 13:36:53 2000
+@@ -107,6 +107,7 @@
+ #include <linux/interrupt.h>
+ #include <linux/poll.h>
+ #include <linux/init.h>
++#include <linux/wait.h>
+ 
+ #include <asm/uaccess.h>
+ #include <asm/system.h>
+@@ -1062,6 +1063,28 @@
+ {
+ 	/* Mirror missing mmap method error code */
+ 	return -ENODEV;
++}
++
++void sock_fdclosed(struct socket *sock, struct files_struct *files)
++{
++	struct sock *sk = sock->sk;
++	struct list_head *i;
++
++	if (sk->sleep && waitqueue_active(sk->sleep)) {
++		unsigned long flags;
++
++		/* Wake up everyone using same file table. */
++		wq_write_lock_irqsave(&sk->sleep->lock, flags);
++		for (i = sk->sleep->task_list.next;
++		     i != &sk->sleep->task_list;
++		     i = i->next) {
++			wait_queue_t *curr = list_entry(i, wait_queue_t,
++							task_list);
++			if (curr->task->files == files)
++				wake_up_process(curr->task);
++		}
++		wq_write_unlock_irqrestore(&sk->sleep->lock, flags);
++	}
+ }
+ 
+ /*
+diff -ur -X /tmp/filexiytUc --minimal linux-2.4.0-test7-official/net/ipv4/af_inet.c working-2.4.0-test7/net/ipv4/af_inet.c
+--- linux-2.4.0-test7-official/net/ipv4/af_inet.c	Fri Aug 25 13:11:48 2000
++++ working-2.4.0-test7/net/ipv4/af_inet.c	Fri Aug 25 13:36:53 2000
+@@ -910,7 +910,8 @@
+ 	getsockopt:	inet_getsockopt,
+ 	sendmsg:	inet_sendmsg,
+ 	recvmsg:	inet_recvmsg,
+-	mmap:		sock_no_mmap
++	mmap:		sock_no_mmap,
++	fdclosed:	sock_fdclosed
+ };
+ 
+ struct proto_ops inet_dgram_ops = {
+@@ -931,6 +932,7 @@
+ 	sendmsg:	inet_sendmsg,
+ 	recvmsg:	inet_recvmsg,
+ 	mmap:		sock_no_mmap,
++	fdclosed:	sock_fdclosed
+ };
+ 
+ struct net_proto_family inet_family_ops = {
+diff -ur -X /tmp/filexiytUc --minimal linux-2.4.0-test7-official/net/socket.c working-2.4.0-test7/net/socket.c
+--- linux-2.4.0-test7-official/net/socket.c	Fri Aug 25 13:11:50 2000
++++ working-2.4.0-test7/net/socket.c	Fri Aug 25 13:36:53 2000
+@@ -104,7 +104,7 @@
+ 			  unsigned long count, loff_t *ppos);
+ static ssize_t sock_writev(struct file *file, const struct iovec *vector,
+ 			  unsigned long count, loff_t *ppos);
+-
++static void sock_do_fdclosed(struct file *file, struct files_struct *files);
+ 
+ /*
+  *	Socket files have a set of 'special' operations as well as the generic file ones. These don't appear
+@@ -122,7 +122,8 @@
+ 	release:	sock_close,
+ 	fasync:		sock_fasync,
+ 	readv:		sock_readv,
+-	writev:		sock_writev
++	writev:		sock_writev,
++	fdclosed:	sock_do_fdclosed
+ };
+ 
+ /*
+@@ -706,6 +707,15 @@
+ 	sock_fasync(-1, filp, 0);
+ 	sock_release(socki_lookup(inode));
+ 	return 0;
++}
++
++static void sock_do_fdclosed(struct file *file, struct files_struct *files)
++{
++	struct socket *sock;
++
++	sock = socki_lookup(file->f_dentry->d_inode);
++	if (sock->ops->fdclosed)
++		sock->ops->fdclosed(sock, files);
+ }
+ 
+ /*
+================================================================
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/socket.h>
+#include <sys/errno.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <netinet/udp.h>
+#include <netinet/ip.h>
+#include <stddef.h>
+#include <unistd.h>
+#include <stdio.h>
+#include <poll.h>
+#include <pthread.h>
+#include <sys/wait.h>
+/* We expect to be woken within 10 seconds. */
+void *woken(void *arg)
+{
+	struct pollfd pfd;
+	char buf[10];
+	int r;
+	time_t start = time(NULL);
+	pfd.fd = (int)arg;
+	pfd.events = POLLIN;
+	/* 10 seconds. */
+	r = poll(&pfd, 1, 10000);
+	if (r == 1 && (pfd.revents & POLLNVAL)) {
+		if (recv(pfd.fd, buf, 10, 0) >= 0)
+			printf("FAILED: recv didn't fail\n");
+		else if (errno != EBADF)
+			printf("FAILED: errno %u != EBADF\n", errno);
+		else if (time(NULL) >= start + 10)
+			printf("FAILED: didn't wake me\n");
+		else
+			printf("woken: SUCCESS\n");
+	} else {
+		printf("FAILED: Poll didn't %s...\n",
+		       r == 0 ? "wake me" : "mark fd");
+	}
+	return NULL;
+}
+/* We expect NOT to be woken (dup'ed fd) */
+void *unwoken(void *arg)
+{
+	struct pollfd pfd;
+	pfd.fd = (int)arg;
+	pfd.events = POLLIN;
+	/* 10 seconds. */
+	if (poll(&pfd, 1, 10000) != 0)
+		printf("FAILED: Poll woke me!\n");
+	else
+		printf("unwoken: SUCCESS\n");
+	return NULL;
+}
+/* We're a child: same fd, different file table, should not be woken */
+void unwoken_child(int fd)
+{
+	struct pollfd pfd;
+	pfd.fd = fd;
+	pfd.events = POLLIN;
+	/* 10 seconds. */
+	if (poll(&pfd, 1, 10000) != 0)
+		printf("FAILED: Poll woke child!\n");
+	else
+		printf("unwoken child: SUCCESS\n");
+	exit(0);
+}
+int main(int argc, const char *argv[])
+{
+     pthread_t waker, sleeper;
+     int fd, fd2;
+     if (argc != 2) {
+	     fprintf(stderr, "Usage: polltest [pipe|fifo|udp|tcp|raw|<filename>]\n");
+	     exit(1);
+     }
+     if (strcmp(argv[1], "udp") == 0) {
+	     struct sockaddr_in name;
+	     if ((fd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+		     perror("opening datagram socket");
+		     exit(1);
+	     }
+	     name.sin_family = AF_INET;
+	     name.sin_addr.s_addr = INADDR_ANY;
+	     name.sin_port = 0;
+	     if (bind(fd, &name, sizeof(name)) != 0) {
+		     perror("binding datagram socket");
+		     exit(1);
+	     }
+     } else if (strcmp(argv[1], "tcp") == 0) {
+	     struct sockaddr_in name;
+	     if ((fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+		     perror("opening stream socket");
+		     exit(1);
+	     }
+	     name.sin_family = AF_INET;
+	     name.sin_addr.s_addr = INADDR_ANY;
+	     name.sin_port = 0;
+	     if (bind(fd, &name, sizeof(name)) != 0) {
+		     perror("binding stream socket");
+		     exit(1);
+	     }
+	     if (listen(fd, 5) < 0) {
+		     perror("listening on stream socket");
+		     exit(1);
+	     }
+     } else if (strcmp(argv[1], "raw") == 0) {
+	     if ((fd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW)) < 0) {
+		     perror("opening raw socket");
+		     exit(1);
+	     }
+     } else if (strcmp(argv[1], "pipe") == 0) {
+	     int fds[2];
+	     if (pipe(fds) != 0) {
+		     perror("creating pipe");
+		     exit(1);
+	     }
+	     fd = fds[0];
+     } else if (strcmp(argv[1], "fifo") == 0) {
+	     unlink("/tmp/fifotest");
+	     /* Linux doesn't block on mkfifo O_RDWR, so save a fork */
+	     if ((mkfifo("/tmp/fifotest", O_RDWR)) < 0) {
+		     perror("creating fifo");
+		     exit(1);
+	     }
+	     if ((fd = open("/tmp/fifotest", O_RDWR)) < 0) {
+		     perror("opening fifo");
+		     exit(1);
+	     }
+     } else {
+	     /* Some character device, I presume */
+	     if ((fd = open(argv[1], O_RDONLY)) < 0) {
+		     perror("opening file");
+		     exit(1);
+	     }
+     }
+     if ((fd2 = dup(fd)) < 0) {
+	     perror("doing dup");
+	     exit(1);
+     }
+     switch (fork()) {
+     case -1:
+	     perror("doing fork");
+	     exit(1);
+     case 0:
+	     unwoken_child(fd);
+	     break;
+     }
+     if (pthread_create(&waker, NULL, woken, (void *)fd) != 0) {
+	     perror("Creating waker thread");
+	     exit(1);
+     }
+     if (pthread_create(&sleeper, NULL, unwoken, (void *)fd2) != 0) {
+	     perror("Creating sleeper thread");
+	     exit(1);
+     }
+     sleep(4);
+     close(fd);
+     pthread_join(waker, NULL);
+     pthread_join(sleeper, NULL);
+     wait(NULL);
+     return 0;
+}
+================
+#! /usr/bin/make
+# This needs to be a quiescent device (ie. won't wake up things on poll).
+CHARDEV:=/dev/ttyS1
+CFLAGS:=-Wall -W
+default: alltests
+alltests: polltest udptest tcptest rawtest pipetest fifotest chardevtest
+udptest:
+	@echo UDP test; ./polltest udp
+tcptest:
+	@echo TCP test; ./polltest tcp
+rawtest:
+	@echo RAW test; ./polltest raw
+pipetest:
+	@echo PIPE test; ./polltest pipe
+fifotest:
+	@echo FIFO test; ./polltest fifo
+chardevtest:
+	@echo CHARDEV test; ./polltest $(CHARDEV)
+polltest: polltest.c
+	$(CC) $(CFLAGS) -o $@ $< -lpthread
+clean:
+	@rm -f polltest
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+Please read the FAQ at 
+http://www.tux.org/lkml/

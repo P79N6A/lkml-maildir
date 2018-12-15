@@ -1,0 +1,275 @@
+Date: Mon, 19 Jul 1999 01:30:10 +0200 (MEST)
+From: Bernd Paysan <>
+Subject: [Patch] Re: Memory hogs
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/7/18/123
+
+On Sat, 17 Jul 1999, Rik van Riel wrote:
+> Sounds like a winning idea if my OOM killer turns out not
+> to work good enough in all cases, but experience shows
+> that already works quite well...
+Ok, I adapted that stuff to 2.3.10, and my SIGTERM idea. I choosed SIGTERM
+finally, because that doesn't resemble a keyboard event (SIGQUIT), so
+processes know that they got to finish, and not just display a silly
+message ("my keybindings say that ^\ really means something different").
+I tested this with a self-written memory hog, and it got SIGTERMed. Well,
+I'm testing it again while I'm writing this mail with the term signal
+more or less ignored (catches forced signal and continues to allocate
+memory). Got killed.
+It looks good to me, now try and give your comments (the next two
+processes in the high score were Emacs and Enlightenment, and that's
+really a good memory bloat index ;-).
+Bernd Paysan
+"If you want it done right, you have to do it yourself"
+http://www.jwdt.com/~paysan/
+--- linux-2.3.10/mm/vmscan.c.orig	Sun Jul 18 13:08:32 1999
++++ linux-2.3.10/mm/vmscan.c	Mon Jul 19 01:06:49 1999
+@@ -468,6 +468,7 @@
+ int kswapd(void *unused)
+ {
+ 	struct task_struct *tsk = current;
++	int state = 0;
+ 
+ 	kswapd_process = tsk;
+ 	tsk->session = 1;
+@@ -504,8 +505,34 @@
+ 
+ 			if (!do_try_to_free_pages(GFP_KSWAPD))
+ 				break;
++
+ 			run_task_queue(&tq_disk);
+ 		} while (!tsk->need_resched);
++		{
++			extern void oom_kill(int sig);
++			extern int  oom_free(struct sysinfo *val);
++			extern int  oom_quit_limit(struct sysinfo *val);
++			extern int  oom_kill_limit(struct sysinfo *val);
++			struct sysinfo val;
++			int free, quit_limit, kill_limit, limit;
++			
++			si_meminfo(&val);
++			si_swapinfo(&val);
++			
++			free = oom_free(&val);
++			quit_limit = oom_quit_limit(&val);
++			kill_limit = oom_kill_limit(&val);
++			limit = state ? kill_limit : quit_limit;
++
++			if((((long long) free) * 100) < ((long long) limit)) {
++				printk(KERN_ERR "OOM: have to kill someone: %d %d %d %d\n",
++				       free, quit_limit, kill_limit, state);
++				oom_kill(state ? SIGKILL : SIGTERM);
++				state = 1;
++			} else if((((long long) free) * 100) > ((long long) quit_limit)) {
++				state = 0;
++			}
++		}
+ 		tsk->state = TASK_INTERRUPTIBLE;
+ 		schedule_timeout(HZ);
+ 	}
+--- linux-2.3.10/mm/Makefile.orig	Sun Jul 18 13:08:47 1999
++++ linux-2.3.10/mm/Makefile	Sun Jul 18 15:39:30 1999
+@@ -9,7 +9,7 @@
+ 
+ O_TARGET := mm.o
+ O_OBJS	 := memory.o mmap.o filemap.o mprotect.o mlock.o mremap.o \
+-	    vmalloc.o slab.o \
++	    vmalloc.o slab.o oom_kill.o \
+ 	    swap.o vmscan.o page_io.o page_alloc.o swap_state.o swapfile.o
+ 
+ include $(TOPDIR)/Rules.make
+--- linux-2.3.10/mm/oom_kill.c.orig	Sun Jul 18 13:09:00 1999
++++ linux-2.3.10/mm/oom_kill.c	Mon Jul 19 01:24:27 1999
+@@ -0,0 +1,189 @@
++/*
++ *  linux/mm/oom_kill.c
++ * 
++ *  Copyright (C)  1998  Rik van Riel
++ *	Thanks go out to Claus Fischer for some serious inspiration and
++ *	for goading me into coding this file...
++ *
++ *  The routines in this file are used to kill a process when
++ *  we're seriously out of memory. This gets called from kswapd()
++ *  in linux/mm/vmscan.c when we really Run out of memory.
++ *
++ *  Since we won't call these routines often (on a well-configured
++ *  machine) this file will double as a 'coding guide' and a signpost
++ *  for newbie kernel hackers. It features several pointers to major
++ *  kernel subsystems and hints as to where to find out what things do.
++ */
++
++#include <linux/mm.h>
++#include <linux/sched.h>
++#include <linux/stddef.h>
++#include <linux/swap.h>
++#include <linux/swapctl.h>
++#include <linux/timex.h>
++
++#define DEBUG
++/* Hmm, I remember a global declaration. Haven't found
++ * it though...
++ */
++#define min(a,b) (((a)<(b))?(a):(b))
++
++/*
++ * Wow, black magic :)  [read closely, the TCP code is hairier]
++ */
++inline int int_sqrt(unsigned int x)
++{
++	unsigned int out = x;
++	while (x & ~(unsigned int)1) x >>=2, out >>=1;
++	if (x) out -= out >> 2;
++	return (out ? out : 1);
++}	
++
++/*
++ * Basically, points = size / (sqrt(CPU_used) * sqrt(sqrt(time_running)))
++ * with some bonusses/penalties.
++ *
++ * The definition of the task_struct, the structure describing the state
++ * of each process, can be found in include/linux/sched.h. For
++ * capability info, you should read include/linux/capability.h.
++ */
++
++inline int badness(struct task_struct *p)
++{
++	int points = p->mm->total_vm;
++	points /= int_sqrt((p->times.tms_utime + p->times.tms_stime) >> (SHIFT_HZ + 3));
++	points /= int_sqrt(int_sqrt((jiffies - p->start_time) >> (SHIFT_HZ + 10)));
++/*
++ * DEF_PRIORITY is the lenght of the standard process priority;
++ * see include/linux/sched.h for more info.
++ */
++	if (p->priority < DEF_PRIORITY)
++		points <<= 1;
++/*
++ * p->(e)uid is the process User ID, ID 0 is root, the super user. Since
++ * the super user can do anything, and does almost nothing (on a proper
++ * system), we have to assume that the process is trusted/good.
++ * Besides, the super user usually runs important system services, which
++ * we don't want to kill...
++ */
++	if (p->uid == 0 || p->euid == 0 || p->cap_effective & CAP_TO_MASK(CAP_SYS_ADMIN))
++		points >>= 2;
++/*
++ * NEVER, EVER kill a process with direct hardware acces. Since
++ * they function almost as a device driver, killing one of those
++ * might hang the system -- which is something we need to prevent
++ * at all cost...
++ */
++	if (p->cap_effective & CAP_TO_MASK(CAP_SYS_RAWIO)
++#ifdef __i386__
++	|| p->tss.bitmap == offsetof(struct thread_struct, io_bitmap)
++#endif	
++	)
++		points = 0;
++#ifdef DEBUG
++	printk(KERN_DEBUG "OOMkill: task %d (%s) got %d points\n",
++	p->pid, p->comm, points);
++#endif
++	return points;
++}
++
++inline struct task_struct * select_bad_process(void)
++{
++	int points = 0, maxpoints = 0;
++	struct task_struct *p = NULL;
++	struct task_struct *chosen = NULL;
++/*
++ * These locks are used to prevent modification of critical
++ * structures while we're working with them. Remember that
++ * Linux is a multitasking (and sometimes SMP) system.
++ *  -- Luckily these nice macros are made available so we don't
++ * have to do cumbersome locking ourselves :)
++ */
++	read_lock(&tasklist_lock);
++	for_each_task(p)
++	{
++		if (p->pid)
++			points = badness(p);
++		if (points > maxpoints) {
++			chosen = p;
++			maxpoints = points;
++		}
++	}
++	read_unlock(&tasklist_lock);
++	return chosen;
++}
++
++/*
++ * The SCHED_FIFO magic should make sure that the killed context
++ * gets absolute priority when killing itself. This should prevent
++ * a looping kswapd from interfering with the process killing.
++ * Read kernel/sched.c::goodness() and kernel/sched.c::schedule()
++ * for more info.
++ */
++void oom_kill(int sig)
++{
++
++	struct task_struct *p = select_bad_process();
++	if (p == NULL)
++		return;
++	printk(KERN_ERR "Out of Memory: Killed process %d (%s).\n", p->pid, p->comm);
++	force_sig(sig, p);
++	return;
++}
++
++/*
++ * These definitions should move to linux/include/linux/swapctl.h
++ * but I want to change as little files as possible while the patch
++ * is still in alpha -- this will have to change before submission
++ * however -- Rik.
++ */
++
++/*
++ * These are percentages. Memory is low if the free amount of memory is
++ * less than said percentage of either ram or total space, whatever is
++ * smaller (thus a box with much more swap than RAM gets tight when the
++ * percentage of RAM is short, whereas other machines can exhaust everything
++ * but a small swap space). I made the swap percentage 3 resp. 4 percent,
++ * which should be enough.
++ */
++
++typedef struct vm_kill_t
++{
++	unsigned int ram;
++	unsigned int total;
++} vm_kill_t;
++
++struct vm_kill_t vm_kill = {25, 3};
++struct vm_kill_t vm_quit = {30, 4};
++
++/*
++ * Are we out of memory?
++ *
++ * We ignore swap cache pages and simplify the situation a bit.
++ * This won't do any damage, because we're only called when kswapd
++ * is already failing to free pages and when that is happening we
++ * can assume that the swap cache is very small. See the test in
++ * mm/vmscan.c::kswapd() for more info.
++ */
++
++int oom_free(struct sysinfo *val)
++{
++	long free_vm;
++
++	free_vm = ((val->freeram + val->bufferram + val->freeswap) >> PAGE_SHIFT);
++	free_vm += atomic_read(&page_cache_size);
++
++	return free_vm;
++}
++
++int oom_quit_limit(struct sysinfo *val)
++{
++	return min(vm_quit.ram * (val->totalram >> PAGE_SHIFT),
++		   vm_quit.total * ((val->totalram + val->totalswap) >> PAGE_SHIFT));
++}
++
++int oom_kill_limit(struct sysinfo *val)
++{
++	return min(vm_kill.ram * (val->totalram >> PAGE_SHIFT),
++		   vm_kill.total * ((val->totalram + val->totalswap) >> PAGE_SHIFT));
++}

@@ -1,0 +1,1917 @@
+Date: Sat, 13 Nov 1999 20:22:03 +0100 (CET)
+From: Ingo Molnar <>
+Subject: [patch] zoned-2.3.28-G4, zone-allocator, highmem, bootmem fixes
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/11/13/66
+
+Changes:
+- implemented 'zone chains' zonelist_t and gfp_mask indexed zonelists[]
+  speedups (Linus' idea) to handle fallback zones. This should enable
+  advanced NUMA-style allocations as well. [fallback to different CPUs is 
+  possible via changing build_zonelists().]
+- <=16MB RAM boxes should boot just fine now.
+- added page->zone for easier deallocation and generic cleanliness. This
+  also helps NUMA.
+- cleaned up the page-allocator namespace, there are only two 'core'
+  page-allocation functions left: __alloc_pages() and __free_pages_ok().
+- modules should compile again.
+- we are now inlining the 'put_page_testzero()' part of __free_page_ok.
+  This is subtle as page->count for reserved pages is now 'rotating' -
+  this is fine though and lets us to put the rare PageReserved() branch
+  into __free_page_ok().
+- cleaned up pgtable.h, split into lowlevel and highlevel parts, this
+  fixes dependencies in mm.h & misc.c.
+- serial.c didnt clear freshly allocated bootmem - as a result now all
+  bootmem allocations are explicitly cleared, it's not performance
+  critical anyway.
+- fixed code,data,initmem reporting.
+- fixed boot task's swapper_pg_dir clearing
+comments, reports welcome.
+-- mingo
+--- linux/fs/exec.c.orig	Sat Nov 13 05:46:12 1999
++++ linux/fs/exec.c	Sat Nov 13 05:46:17 1999
+@@ -35,7 +35,7 @@
+ #include <linux/highmem.h>
+ 
+ #include <asm/uaccess.h>
+-#include <asm/pgtable.h>
++#include <asm/pgalloc.h>
+ #include <asm/mmu_context.h>
+ 
+ #ifdef CONFIG_KMOD
+--- linux/fs/binfmt_elf.c.orig	Sat Nov 13 05:49:43 1999
++++ linux/fs/binfmt_elf.c	Sat Nov 13 05:49:49 1999
+@@ -31,7 +31,7 @@
+ #include <linux/init.h>
+ 
+ #include <asm/uaccess.h>
+-#include <asm/pgtable.h>
++#include <asm/pgalloc.h>
+ 
+ #include <linux/config.h>
+ 
+--- linux/init/main.c.orig	Sat Nov 13 01:56:40 1999
++++ linux/init/main.c	Sat Nov 13 02:11:21 1999
+@@ -479,7 +479,6 @@
+ 		
+ 		size = prof_len * sizeof(unsigned int) + PAGE_SIZE-1;
+ 		prof_buffer = (unsigned int *) alloc_bootmem(size);
+-		memset(prof_buffer, 0, size);
+ 	}
+ 
+ 	kmem_cache_init();
+--- linux/kernel/fork.c.orig	Sat Nov 13 05:10:34 1999
++++ linux/kernel/fork.c	Sat Nov 13 05:10:36 1999
+@@ -19,6 +19,7 @@
+ #include <linux/vmalloc.h>
+ 
+ #include <asm/pgtable.h>
++#include <asm/pgalloc.h>
+ #include <asm/uaccess.h>
+ #include <asm/mmu_context.h>
+ 
+--- linux/kernel/ksyms.c.orig	Sat Nov 13 11:05:27 1999
++++ linux/kernel/ksyms.c	Sat Nov 13 11:05:28 1999
+@@ -92,9 +92,8 @@
+ EXPORT_SYMBOL(exit_sighand);
+ 
+ /* internal kernel memory management */
+-EXPORT_SYMBOL(__get_free_pages);
+-EXPORT_SYMBOL(free_pages);
+-EXPORT_SYMBOL(__free_page);
++EXPORT_SYMBOL(__allocate_pages);
++EXPORT_SYMBOL(__free_pages_ok);
+ EXPORT_SYMBOL(kmem_find_general_cachep);
+ EXPORT_SYMBOL(kmem_cache_create);
+ EXPORT_SYMBOL(kmem_cache_destroy);
+--- linux/mm/bootmem.c.orig	Sat Nov 13 01:56:46 1999
++++ linux/mm/bootmem.c	Sat Nov 13 09:24:33 1999
+@@ -196,7 +196,7 @@
+ 	for (i = start; i < start+areasize; i++)
+ 		if (test_and_set_bit(i, bootmem_map))
+ 			BUG();
+-
++	memset(ret, 0, size);
+ 	return ret;
+ }
+ 
+--- linux/mm/page_alloc.c.orig	Sat Nov 13 01:56:46 1999
++++ linux/mm/page_alloc.c	Sat Nov 13 10:53:04 1999
+@@ -26,57 +26,15 @@
+ int nr_lru_pages;
+ LIST_HEAD(lru_cache);
+ 
+-/*
+- * Free area management
+- *
+- * The free_area_list arrays point to the queue heads of the free areas
+- * of different sizes
+- */
+-
+-#if CONFIG_AP1000
+-/* the AP+ needs to allocate 8MB contiguous, aligned chunks of ram
+-   for the ring buffers */
+-#define MAX_ORDER 12
+-#else
+-#define MAX_ORDER 10
+-#endif
+-
+-typedef struct free_area_struct {
+-	struct list_head free_list;
+-	unsigned int * map;
+-} free_area_t;
+-
+-#define ZONE_DMA		0
+-#define ZONE_NORMAL		1
+-
+-#ifdef CONFIG_HIGHMEM
+-# define ZONE_HIGHMEM		2
+-# define NR_ZONES		3
+-#else
+-# define NR_ZONES		2
+-#endif
+-
+-typedef struct zone_struct {
+-	spinlock_t lock;
+-	unsigned long offset;
+-	unsigned long size;
+-	free_area_t free_area[MAX_ORDER];
+-
+-	unsigned long free_pages;
+-	unsigned long pages_low, pages_high;
+-	int low_on_memory;
+-	char * name;
+-} zone_t;
+-
+-static zone_t zones[NR_ZONES] =
++static zone_t zones [MAX_NR_ZONES] =
+ 	{
+ 		{ name: "DMA" },
+ 		{ name: "Normal" },
+-#ifdef CONFIG_HIGHMEM
+ 		{ name: "HighMem" }
+-#endif
+ 	};
+ 
++zonelist_t zonelists [NR_GFPINDEX];
++
+ /*
+  * Free_page() adds the page to the free lists. This is optimized for
+  * fast normal cases (no error jumps taken normally).
+@@ -108,28 +66,13 @@
+  * Hint: -mask = 1+~mask
+  */
+ 
+-static inline void free_pages_ok (struct page *page, unsigned long map_nr, unsigned long order)
++static inline void addqueue (zone_t *zone, struct page *page,
++				unsigned long map_nr, unsigned long order)
+ {
+-	struct free_area_struct *area;
+ 	unsigned long index, page_idx, mask, offset;
++	struct free_area_struct *area;
+ 	unsigned long flags;
+ 	struct page *buddy;
+-	zone_t *zone;
+-	int i;
+-
+-	/*
+-	 * Which zone is this page belonging to.
+-	 *
+-	 * (NR_ZONES is low, and we do not want (yet) to introduce
+-	 * put page->zone, it increases the size of mem_map[]
+-	 * unnecesserily. This small loop is basically equivalent
+-	 * to the previous #ifdef jungle, speed-wise.)
+-	 */
+-	i = NR_ZONES-1;
+-	zone = zones + i;
+-	for ( ; i >= 0; i--, zone--)
+-		if (map_nr >= zone->offset)
+-			break;
+ 
+ 	mask = (~0UL) << order;
+ 	offset = zone->offset;
+@@ -178,36 +121,37 @@
+ 	change_bit((index) >> (1+(order)), (area)->map)
+ #define ADDRESS(x) (PAGE_OFFSET + ((x) << PAGE_SHIFT))
+ 
+-int __free_page (struct page *page)
++void __free_pages_ok (struct page *page, unsigned long order)
+ {
+-	if (!PageReserved(page) && put_page_testzero(page)) {
+-		if (PageSwapCache(page))
+-			PAGE_BUG(page);
+-		if (PageLocked(page))
+-			PAGE_BUG(page);
++	unsigned long map_nr;
++	zone_t *zone;
+ 
+-		free_pages_ok(page, page-mem_map, 0);
+-		return 1;
+-	}
+-	return 0;
+-}
++	/*
++	 * Subtle.
++	 */
++	if (PageReserved(page))
++		return;
+ 
+-int free_pages (unsigned long addr, unsigned long order)
+-{
+-	unsigned long map_nr = MAP_NR(addr);
++	if (PageSwapCache(page))
++		PAGE_BUG(page);
++	if (PageLocked(page))
++		PAGE_BUG(page);
+ 
+-	if (map_nr < max_mapnr) {
+-		mem_map_t * map = mem_map + map_nr;
+-		if (!PageReserved(map) && put_page_testzero(map)) {
+-			if (PageSwapCache(map))
+-				PAGE_BUG(map);
+-			if (PageLocked(map))
+-				PAGE_BUG(map);
+-			free_pages_ok(map, map_nr, order);
+-			return 1;
+-		}
+-	}
+-	return 0;
++	/*
++	 * Which zone does this page belong to.
++	 *
++	 * (MAX_NR_ZONES is low, and we do not want (yet) to introduce
++	 * put page->zone, it increases the size of mem_map[]
++	 * unnecesserily. This small loop is basically equivalent
++	 * to the previous #ifdef jungle, speed-wise.)
++	 */
++	map_nr = page-mem_map;
++	if (map_nr >= max_mapnr)
++		BUG();
++
++	zone = page->zone;
++
++	addqueue(zone, page, map_nr, order);
+ }
+ 
+ static inline unsigned long EXPAND (zone_t *zone, struct page *map, unsigned long index,
+@@ -268,6 +212,9 @@
+ 	return NULL;
+ }
+ 
++#define ZONE_BALANCED(zone) \
++	(((zone)->free_pages > (zone)->pages_low) && (!(zone)->low_on_memory))
++
+ static inline int balance_memory (zone_t *zone, int gfp_mask)
+ {
+ 	int freed;
+@@ -286,6 +233,14 @@
+ 	}
+ 	zone->low_on_memory = 1;
+ 
++	/*
++	 * In the atomic allocation case we only 'kick' the
++	 * state machine, but do not try to free pages
++	 * ourselves.
++	 */
++	if (!(gfp_mask & __GFP_WAIT))
++		return 1;
++
+ 	current->flags |= PF_MEMALLOC;
+ 	freed = try_to_free_pages(gfp_mask);
+ 	current->flags &= ~PF_MEMALLOC;
+@@ -295,10 +250,14 @@
+ 	return 1;
+ }
+ 
+-static inline struct page * __get_pages (zone_t *zone, unsigned int gfp_mask,
+-			unsigned long order)
++/*
++ * This is the 'heart' of the zoned buddy allocator:
++ */
++struct page * __alloc_pages (zonelist_t *zonelist, unsigned long order)
+ {
++	zone_t **zone;
+ 	struct page *page;
++	int gfp_mask;
+ 
+ 	if (order >= MAX_ORDER)
+ 		goto nopage;
+@@ -306,28 +265,31 @@
+ 	/*
+ 	 * If anyone calls gfp from interrupts nonatomically then it
+ 	 * will sooner or later tripped up by a schedule().
+-	 */
+-
+-	/*
+-	 * If this is a recursive call, we'd better
+-	 * do our best to just allocate things without
+-	 * further thought.
+-	 */
+-	if (!(current->flags & PF_MEMALLOC))
+-		if (!balance_memory(zone, gfp_mask))
+-			goto nopage;
+-	/*
++	 *
+ 	 * We are falling back to lower-level zones if allocation
+-	 * in a higher zone fails. This assumes a hierarchical
+-	 * dependency between zones, which is true currently. If
+-	 * you need something else then move this loop outside
+-	 * this function, into the zone-specific allocator.
++	 * in a higher zone fails.
+ 	 */
++	zone = zonelist->zones;
++	gfp_mask = zonelist->gfp_mask;
+ 	do {
+-		page = rmqueue(zone, order);
++		if (!(*zone)->size)
++			BUG();
++		/*
++		 * If this is a recursive call, we'd better
++		 * do our best to just allocate things without
++		 * further thought.
++		 */
++		if (!(current->flags & PF_MEMALLOC))
++			/*
++			 * fastpath
++			 */
++			if (!ZONE_BALANCED(*zone))
++				goto balance;
++ready:
++		page = rmqueue(*zone, order);
+ 		if (page)
+ 			return page;
+-	} while (zone-- != zones) ;
++	} while (*(++zone)) ;
+ 
+ 	/*
+ 	 * If we can schedule, do so, and make sure to yield.
+@@ -341,37 +303,14 @@
+ 
+ nopage:
+ 	return NULL;
+-}
+-
+-static inline zone_t * gfp_mask_to_zone (int gfp_mask)
+-{
+-	zone_t *zone;
+-
+-#if CONFIG_HIGHMEM
+-	if (gfp_mask & __GFP_HIGHMEM)
+-		zone = zones + ZONE_HIGHMEM;
+-	else
+-#endif
+-		if (gfp_mask & __GFP_DMA)
+-			zone = zones + ZONE_DMA;
+-		else
+-			zone = zones + ZONE_NORMAL;
+-	return zone;
+-}
+-
+-unsigned long __get_free_pages (int gfp_mask, unsigned long order)
+-{
+-	struct page *page;
+ 
+-	page = __get_pages(gfp_mask_to_zone(gfp_mask), gfp_mask, order);
+-	if (!page)
+-		return 0;
+-	return page_address(page);
+-}
+-
+-struct page * alloc_pages (int gfp_mask, unsigned long order)
+-{
+-	return __get_pages(gfp_mask_to_zone(gfp_mask), gfp_mask, order);
++/*
++ * The main chunk of the balancing code is in this offline branch:
++ */
++balance:
++	if (!balance_memory(*zone, gfp_mask))
++		goto nopage;
++	goto ready;
+ }
+ 
+ /*
+@@ -383,7 +322,7 @@
+ 	zone_t *zone;
+ 
+ 	sum = 0;
+-	for (zone = zones; zone < zones+NR_ZONES; zone++)
++	for (zone = zones; zone < zones + MAX_NR_ZONES; zone++)
+ 		sum += zone->free_pages;
+ 	return sum;
+ }
+@@ -429,7 +368,7 @@
+ 		freepages.low,
+ 		freepages.high);
+ 
+-	for (type = 0; type < NR_ZONES; type++) {
++	for (type = 0; type < MAX_NR_ZONES; type++) {
+ 		zone_t *zone = zones + type;
+  		unsigned long total = 0;
+ 
+@@ -455,6 +394,55 @@
+ #endif	
+ }
+ 
++/*
++ * Builds allocation fallback zone lists. We are basically ready
++ * to do NUMA-allocations, only this function has to be modified
++ * and the zonelists array be made per-CPU.
++ */
++static inline void build_zonelists (void)
++{
++	int i, j, k;
++
++	for (i = 0; i < NR_GFPINDEX; i++) {
++		zonelist_t *zonelist;
++		zone_t *zone;
++
++		zonelist = zonelists + i;
++		memset(zonelist, 0, sizeof(*zonelist));
++
++		zonelist->gfp_mask = i;
++		j = 0;
++		k = ZONE_NORMAL;
++		if (i & __GFP_HIGHMEM)
++			k = ZONE_HIGHMEM;
++		if (i & __GFP_DMA)
++			k = ZONE_DMA;
++
++		switch (k) {
++			default:
++				BUG();
++			/*
++			 * fallthrough:
++			 */
++			case ZONE_HIGHMEM:
++				zone = zones + ZONE_HIGHMEM;
++				if (zone->size) {
++#ifndef CONFIG_HIGHMEM
++					BUG();
++#endif
++					zonelist->zones[j++] = zone;
++				}
++			case ZONE_NORMAL:
++				zone = zones + ZONE_NORMAL;
++				if (zone->size)
++					zonelist->zones[j++] = zone;
++			case ZONE_DMA:
++				zonelist->zones[j++] = zones + ZONE_DMA;
++		}
++		zonelist->zones[j++] = NULL;
++	} 
++}
++
+ #define LONG_ALIGN(x) (((x)+(sizeof(long))-1)&~((sizeof(long))-1))
+ 
+ /*
+@@ -471,7 +459,7 @@
+ 	unsigned int totalpages, offset;
+ 
+ 	totalpages = 0;
+-	for (i = 0; i < NR_ZONES; i++)
++	for (i = 0; i < MAX_NR_ZONES; i++)
+ 		totalpages += zones_size[i];
+ 	printk("totalpages: %08x\n", totalpages);
+ 
+@@ -498,7 +486,6 @@
+ 	 */
+ 	map_size = totalpages*sizeof(struct page);
+ 	mem_map = (struct page *) alloc_bootmem(map_size);
+-	memset(mem_map, 0, map_size);
+ 
+ 	/*
+ 	 * Initially all pages are reserved - free ones are freed
+@@ -514,18 +501,27 @@
+ 	}
+ 
+ 	offset = 0;	
+-	for (j = 0; j < NR_ZONES; j++) {
++	for (j = 0; j < MAX_NR_ZONES; j++) {
+ 		zone_t *zone = zones + j;
+ 		unsigned long mask = -1;
+ 		unsigned long size;
+ 
+ 		size = zones_size[j];
++		printk("zone(%ld): %ld pages.\n", j, size);
+ 		zone->size = size;
++		if (!size)
++			continue;
++
+ 		zone->offset = offset;
+ 		zone->pages_low = freepages.low;
+ 		zone->pages_high = freepages.high;
+ 		zone->low_on_memory = 0;
+ 
++		for (i = 0; i < size; i++) {
++			struct page *page = mem_map + offset + i;
++			page->zone = zone;
++		}
++
+ 		offset += size;
+ 		for (i = 0; i < MAX_ORDER; i++) {
+ 			unsigned long bitmap_size;
+@@ -541,4 +537,5 @@
+ 			memset((void *) map, 0, bitmap_size);
+ 		}
+ 	}
++	build_zonelists();
+ }
+--- linux/mm/mprotect.c.orig	Sat Nov 13 05:39:11 1999
++++ linux/mm/mprotect.c	Sat Nov 13 05:44:33 1999
+@@ -9,7 +9,7 @@
+ #include <linux/mman.h>
+ 
+ #include <asm/uaccess.h>
+-#include <asm/pgtable.h>
++#include <asm/pgalloc.h>
+ 
+ static inline void change_pte_range(pmd_t * pmd, unsigned long address,
+ 	unsigned long size, pgprot_t newprot)
+--- linux/mm/mmap.c.orig	Sat Nov 13 05:43:55 1999
++++ linux/mm/mmap.c	Sat Nov 13 05:43:59 1999
+@@ -14,7 +14,7 @@
+ #include <linux/file.h>
+ 
+ #include <asm/uaccess.h>
+-#include <asm/pgtable.h>
++#include <asm/pgalloc.h>
+ 
+ /* description of effects of mapping type and prot in current implementation.
+  * this is due to the limited x86 page protection hardware.  The expected
+--- linux/mm/memory.c.orig	Sat Nov 13 05:02:27 1999
++++ linux/mm/memory.c	Sat Nov 13 05:44:29 1999
+@@ -39,14 +39,14 @@
+ #include <linux/mm.h>
+ #include <linux/mman.h>
+ #include <linux/swap.h>
+-#include <linux/pagemap.h>
+ #include <linux/smp_lock.h>
+ #include <linux/swapctl.h>
+ #include <linux/iobuf.h>
++#include <asm/uaccess.h>
++#include <asm/pgalloc.h>
+ #include <linux/highmem.h>
++#include <linux/pagemap.h>
+ 
+-#include <asm/uaccess.h>
+-#include <asm/pgtable.h>
+ 
+ unsigned long max_mapnr = 0;
+ unsigned long num_physpages = 0;
+--- linux/mm/filemap.c.orig	Sat Nov 13 05:42:40 1999
++++ linux/mm/filemap.c	Sat Nov 13 05:42:46 1999
+@@ -23,7 +23,7 @@
+ #include <linux/init.h>
+ #include <linux/mm.h>
+ 
+-#include <asm/pgtable.h>
++#include <asm/pgalloc.h>
+ #include <asm/uaccess.h>
+ 
+ #include <linux/highmem.h>
+--- linux/mm/mremap.c.orig	Sat Nov 13 05:08:10 1999
++++ linux/mm/mremap.c	Sat Nov 13 05:44:35 1999
+@@ -11,7 +11,7 @@
+ #include <linux/swap.h>
+ 
+ #include <asm/uaccess.h>
+-#include <asm/pgtable.h>
++#include <asm/pgalloc.h>
+ 
+ extern int vm_enough_memory(long pages);
+ 
+--- linux/mm/vmalloc.c.orig	Sat Nov 13 05:07:42 1999
++++ linux/mm/vmalloc.c	Sat Nov 13 05:07:49 1999
+@@ -9,6 +9,7 @@
+ #include <linux/vmalloc.h>
+ 
+ #include <asm/uaccess.h>
++#include <asm/pgalloc.h>
+ 
+ struct vm_struct * vmlist = NULL;
+ 
+--- linux/mm/slab.c.orig	Sat Nov 13 08:09:48 1999
++++ linux/mm/slab.c	Sat Nov 13 08:10:46 1999
+@@ -1043,20 +1043,12 @@
+ int
+ kmem_cache_shrink(kmem_cache_t *cachep)
+ {
+-	if (!cachep) {
+-		printk(KERN_ERR "kmem_shrink: NULL ptr\n");
+-		return 2;
+-	}
+-	if (in_interrupt()) {
+-		printk(KERN_ERR "kmem_shrink: Called during int - %s\n", cachep->c_name);
+-		return 2;
+-	}
+-
+-	if (!is_chained_kmem_cache(cachep)) {
+-		printk(KERN_ERR "kmem_shrink: Invalid cache addr %p\n",
+-		       cachep);
+-		return 2;
+-	}
++	if (!cachep)
++		BUG();
++	if (in_interrupt())
++		BUG();
++	if (!is_chained_kmem_cache(cachep))
++		BUG();
+ 
+ 	return __kmem_cache_shrink(cachep);
+ }
+--- linux/include/linux/mm.h.orig	Sat Nov 13 02:38:39 1999
++++ linux/include/linux/mm.h	Sat Nov 13 10:36:21 1999
+@@ -16,6 +16,7 @@
+ extern int page_cluster;
+ 
+ #include <asm/page.h>
++#include <asm/pgtable.h>
+ #include <asm/atomic.h>
+ 
+ /*
+@@ -118,6 +119,8 @@
+ 	unsigned long val;
+ } swp_entry_t;
+ 
++struct zone_struct;
++
+ /*
+  * Try to keep the most commonly accessed fields in single cache lines
+  * here (16 bytes or greater).  This ordering should be particularly
+@@ -127,7 +130,6 @@
+  * is used for linear searches (eg. clock algorithm scans). 
+  */
+ typedef struct page {
+-	/* these must be first (free area handling) */
+ 	struct list_head list;
+ 	struct address_space *mapping;
+ 	unsigned long index;
+@@ -139,6 +141,7 @@
+ 	struct page **pprev_hash;
+ 	struct buffer_head * buffers;
+ 	unsigned long virtual; /* nonzero if kmapped */
++	struct zone_struct *zone;
+ } mem_map_t;
+ 
+ #define get_page(p)		atomic_inc(&(p)->count)
+@@ -283,19 +286,109 @@
+ extern mem_map_t * mem_map;
+ 
+ /*
+- * This is timing-critical - most of the time in getting a new page
+- * goes to clearing the page. If you want a page without the clearing
+- * overhead, just use __get_free_page() directly..
+- *
+- * We have two allocation namespaces - the *get*page*() variants
+- * return virtual kernel addresses to the allocated page(s), the
+- * alloc_page*() variants return 'struct page *'.
+- */
+-#define __get_free_page(gfp_mask) __get_free_pages((gfp_mask),0)
+-#define __get_dma_pages(gfp_mask, order) __get_free_pages((gfp_mask) | GFP_DMA,(order))
+-extern unsigned long FASTCALL(__get_free_pages(int gfp_mask, unsigned long order));
+-extern struct page * FASTCALL(alloc_pages(int gfp_mask, unsigned long order));
+-#define alloc_page(gfp_mask) alloc_pages(gfp_mask, 0)
++ * Free memory management - zoned buddy allocator.
++ */
++
++#if CONFIG_AP1000
++/* the AP+ needs to allocate 8MB contiguous, aligned chunks of ram
++   for the ring buffers */
++#define MAX_ORDER 12
++#else
++#define MAX_ORDER 10
++#endif
++
++typedef struct free_area_struct {
++	struct list_head free_list;
++	unsigned int * map;
++} free_area_t;
++
++typedef struct zone_struct {
++	/*
++	 * Commonly accessed fields:
++	 */
++	spinlock_t lock;
++	unsigned long offset;
++	unsigned long free_pages;
++	int low_on_memory;
++	unsigned long pages_low, pages_high;
++
++	/*
++	 * free areas of different sizes
++	 */
++	free_area_t free_area[MAX_ORDER];
++
++	/*
++	 * rarely used fields:
++	 */
++	char * name;
++	unsigned long size;
++} zone_t;
++
++#define ZONE_DMA		0
++#define ZONE_NORMAL		1
++#define ZONE_HIGHMEM		2
++
++/*
++ * NUMA architectures will have more:
++ */
++#define MAX_NR_ZONES		3
++
++/*
++ * One allocation request operates on a zonelist. A zonelist
++ * is a list of zones, the first one is the 'goal' of the
++ * allocation, the other zones are fallback zones, in decreasing
++ * priority. On NUMA we want to fall back on other CPU's zones
++ * as well.
++ *
++ * Right now a zonelist takes up less than a cacheline. We never
++ * modify it apart from boot-up, and only a few indices are used,
++ * so despite the zonelist table being relatively big, the cache
++ * footprint of this construct is very small.
++ */
++typedef struct zonelist_struct {
++	zone_t * zones [MAX_NR_ZONES+1]; // NULL delimited
++	int gfp_mask;
++} zonelist_t;
++
++#define NR_GFPINDEX		0x100
++
++extern zonelist_t zonelists [NR_GFPINDEX];
++
++/*
++ * There is only one page-allocator function, and two main namespaces to
++ * it. The alloc_page*() variants return 'struct page *' and as such
++ * can allocate highmem pages, the *get*page*() variants return
++ * virtual kernel addresses to the allocated page(s).
++ */
++extern struct page * FASTCALL(__alloc_pages(zonelist_t *zonelist, unsigned long order));
++
++extern inline struct page * alloc_pages(int gfp_mask, unsigned long order)
++{
++	struct page *__ret;
++	if (zonelists[gfp_mask].gfp_mask != (gfp_mask))
++		BUG();
++	__ret = __alloc_pages(zonelists+(gfp_mask), order);
++	return __ret;
++}
++
++#define alloc_page(gfp_mask) \
++		alloc_pages(gfp_mask, 0)
++
++extern inline unsigned long __get_free_pages (int gfp_mask, unsigned long order)
++{
++	struct page * page;
++
++	page = alloc_pages(gfp_mask, order);
++	if (!page)
++		return 0;
++	return page_address(page);
++}
++
++#define __get_free_page(gfp_mask) \
++		__get_free_pages((gfp_mask),0)
++
++#define __get_dma_pages(gfp_mask, order) \
++		__get_free_pages((gfp_mask) | GFP_DMA,(order))
+ 
+ extern inline unsigned long get_zeroed_page(int gfp_mask)
+ {
+@@ -312,11 +405,29 @@
+  */
+ #define get_free_page get_zeroed_page
+ 
+-/* memory.c & swap.c*/
++/*
++ * There is only one 'core' page-freeing function.
++ */
++extern void FASTCALL(__free_pages_ok(struct page * page, unsigned long order));
++
++extern inline void __free_pages(struct page *page, unsigned long order)
++{
++	if (!put_page_testzero(page))
++		return;
++	__free_pages_ok(page, order);
++}
++
++#define __free_page(page) __free_pages(page, 0)
++
++extern inline void free_pages(unsigned long addr, unsigned long order)
++{
++	unsigned long map_nr = MAP_NR(addr);
++
++	if (map_nr < max_mapnr)
++		__free_pages(mem_map + map_nr, order);
++}
+ 
+ #define free_page(addr) free_pages((addr),0)
+-extern int FASTCALL(free_pages(unsigned long addr, unsigned long order));
+-extern int FASTCALL(__free_page(struct page *));
+ 
+ extern void show_free_areas(void);
+ extern struct page * put_dirty_page(struct task_struct * tsk, struct page *page,
+@@ -398,7 +509,7 @@
+ #define GFP_DMA		__GFP_DMA
+ 
+ /* Flag - indicates that the buffer can be taken from high memory which is not
+-   directly addressable by the kernel */
++   permanently mapped by the kernel */
+ 
+ #define GFP_HIGHMEM	__GFP_HIGHMEM
+ 
+@@ -446,7 +557,6 @@
+ #define vmlist_access_unlock(mm)	spin_unlock(&mm->page_table_lock)
+ #define vmlist_modify_lock(mm)		vmlist_access_lock(mm)
+ #define vmlist_modify_unlock(mm)	vmlist_access_unlock(mm)
+-
+ 
+ #endif /* __KERNEL__ */
+ 
+--- linux/include/linux/highmem.h.orig	Sat Nov 13 05:39:39 1999
++++ linux/include/linux/highmem.h	Sat Nov 13 10:36:23 1999
+@@ -3,7 +3,7 @@
+ 
+ #include <linux/config.h>
+ #include <linux/pagemap.h>
+-#include <asm/pgtable.h>
++#include <asm/pgalloc.h>
+ 
+ #ifdef CONFIG_HIGHMEM
+ 
+--- linux/include/asm-i386/pgtable-3level.h.orig	Sat Nov 13 01:56:41 1999
++++ linux/include/asm-i386/pgtable-3level.h	Sat Nov 13 05:05:01 1999
+@@ -27,11 +27,11 @@
+ #define PTRS_PER_PTE	512
+ 
+ #define pte_ERROR(e) \
+-	printk("%s:%d: bad pte %016Lx.\n", __FILE__, __LINE__, pte_val(e))
++	printk("%s:%d: bad pte %p(%016Lx).\n", __FILE__, __LINE__, &(e), pte_val(e))
+ #define pmd_ERROR(e) \
+-	printk("%s:%d: bad pmd %016Lx.\n", __FILE__, __LINE__, pmd_val(e))
++	printk("%s:%d: bad pmd %p(%016Lx).\n", __FILE__, __LINE__, &(e), pmd_val(e))
+ #define pgd_ERROR(e) \
+-	printk("%s:%d: bad pgd %016Lx.\n", __FILE__, __LINE__, pgd_val(e))
++	printk("%s:%d: bad pgd %p(%016Lx).\n", __FILE__, __LINE__, &(e), pgd_val(e))
+ 
+ /*
+  * Subtle, in PAE mode we cannot have zeroes in the top level
+@@ -63,62 +63,5 @@
+ /* Find an entry in the second-level page table.. */
+ #define pmd_offset(dir, address) ((pmd_t *) pgd_page(*(dir)) + \
+ 			__pmd_offset(address))
+-
+-extern __inline__ pmd_t *get_pmd_slow(void)
+-{
+-	pmd_t *ret = (pmd_t *)__get_free_page(GFP_KERNEL);
+-
+-	if (ret)
+-		memset(ret, 0, PAGE_SIZE);
+-	return ret;
+-}
+-
+-extern __inline__ pmd_t *get_pmd_fast(void)
+-{
+-	unsigned long *ret;
+-
+-	if ((ret = pmd_quicklist) != NULL) {
+-		pmd_quicklist = (unsigned long *)(*ret);
+-		ret[0] = 0;
+-		pgtable_cache_size--;
+-	} else
+-		ret = (unsigned long *)get_pmd_slow();
+-	return (pmd_t *)ret;
+-}
+-
+-extern __inline__ void free_pmd_fast(pmd_t *pmd)
+-{
+-	*(unsigned long *)pmd = (unsigned long) pmd_quicklist;
+-	pmd_quicklist = (unsigned long *) pmd;
+-	pgtable_cache_size++;
+-}
+-
+-extern __inline__ void free_pmd_slow(pmd_t *pmd)
+-{
+-	free_page((unsigned long)pmd);
+-}
+-
+-extern inline pmd_t * pmd_alloc(pgd_t *pgd, unsigned long address)
+-{
+-	if (!pgd)
+-		BUG();
+-	address = (address >> PMD_SHIFT) & (PTRS_PER_PMD - 1);
+-	if (pgd_none(*pgd)) {
+-		pmd_t *page = get_pmd_fast();
+-
+-		if (!page)
+-			page = get_pmd_slow();
+-		if (page) {
+-			if (pgd_none(*pgd)) {
+-				pgd_val(*pgd) = 1 + __pa(page);
+-				__flush_tlb();
+-				return page + address;
+-			} else
+-				free_pmd_fast(page);
+-		} else
+-			return NULL;
+-	}
+-	return (pmd_t *)pgd_page(*pgd) + address;
+-}
+ 
+ #endif /* _I386_PGTABLE_3LEVEL_H */
+--- linux/include/asm-i386/pgtable.h.orig	Sat Nov 13 04:42:32 1999
++++ linux/include/asm-i386/pgtable.h	Sat Nov 13 10:36:21 1999
+@@ -19,27 +19,6 @@
+ 
+ extern pgd_t swapper_pg_dir[1024];
+ 
+-/* Caches aren't brain-dead on the intel. */
+-#define flush_cache_all()			do { } while (0)
+-#define flush_cache_mm(mm)			do { } while (0)
+-#define flush_cache_range(mm, start, end)	do { } while (0)
+-#define flush_cache_page(vma, vmaddr)		do { } while (0)
+-#define flush_page_to_ram(page)			do { } while (0)
+-#define flush_icache_range(start, end)		do { } while (0)
+-
+-/*
+- * TLB flushing:
+- *
+- *  - flush_tlb() flushes the current mm struct TLBs
+- *  - flush_tlb_all() flushes all processes TLBs
+- *  - flush_tlb_mm(mm) flushes the specified mm context TLB's
+- *  - flush_tlb_page(vma, vmaddr) flushes one page
+- *  - flush_tlb_range(mm, start, end) flushes a range of pages
+- *
+- * ..but the i386 has somewhat limited tlb flushing capabilities,
+- * and page-granular flushes are available only on i486 and up.
+- */
+-
+ #define __flush_tlb() \
+ do { unsigned long tmpreg; __asm__ __volatile__("movl %%cr3,%0\n\tmovl %0,%%cr3":"=r" (tmpreg) : :"memory"); } while (0)
+ 
+@@ -49,65 +28,9 @@
+ #define __flush_tlb_one(addr) \
+ __asm__ __volatile__("invlpg %0": :"m" (*(char *) addr))
+ #endif
+- 
+-#ifndef __SMP__
+-
+-#define flush_tlb() __flush_tlb()
+-#define flush_tlb_all() __flush_tlb()
+-#define local_flush_tlb() __flush_tlb()
+-
+-static inline void flush_tlb_mm(struct mm_struct *mm)
+-{
+-	if (mm == current->active_mm)
+-		__flush_tlb();
+-}
+-
+-static inline void flush_tlb_page(struct vm_area_struct *vma,
+-	unsigned long addr)
+-{
+-	if (vma->vm_mm == current->active_mm)
+-		__flush_tlb_one(addr);
+-}
+-
+-static inline void flush_tlb_range(struct mm_struct *mm,
+-	unsigned long start, unsigned long end)
+-{
+-	if (mm == current->active_mm)
+-		__flush_tlb();
+-}
+-
+-#else
+-
+-/*
+- * We aren't very clever about this yet -  SMP could certainly
+- * avoid some global flushes..
+- */
+-
+-#include <asm/smp.h>
+-
+-#define local_flush_tlb() \
+-	__flush_tlb()
+-
+-extern void flush_tlb_all(void);
+-extern void flush_tlb_current_task(void);
+-extern void flush_tlb_mm(struct mm_struct *);
+-extern void flush_tlb_page(struct vm_area_struct *, unsigned long);
+-
+-#define flush_tlb()	flush_tlb_current_task()
+ 
+-static inline void flush_tlb_range(struct mm_struct * mm, unsigned long start, unsigned long end)
+-{
+-	flush_tlb_mm(mm);
+-}
+-
+-#endif
+ #endif /* !__ASSEMBLY__ */
+ 
+-#define pgd_quicklist (current_cpu_data.pgd_quick)
+-#define pmd_quicklist (current_cpu_data.pmd_quick)
+-#define pte_quicklist (current_cpu_data.pte_quick)
+-#define pgtable_cache_size (current_cpu_data.pgtable_cache_sz)
+-
+ /*
+  * The Linux x86 paging architecture is 'compile-time dual-mode', it
+  * implements both the traditional 2-level x86 page tables and the
+@@ -277,14 +200,14 @@
+  * and a page entry and page directory to the page they refer to.
+  */
+ 
+-extern inline pte_t mk_pte(struct page *page, pgprot_t pgprot)
+-{
+-	pte_t __pte;
+-
+-	pte_val(__pte) = (page-mem_map)*(unsigned long long)PAGE_SIZE +
+-				pgprot_val(pgprot);
+-	return __pte;
+-}
++#define mk_pte(page,pgprot) \
++({									\
++	pte_t __pte;							\
++									\
++	pte_val(__pte) = ((page)-mem_map)*(unsigned long long)PAGE_SIZE + \
++				pgprot_val(pgprot);			\
++	__pte;								\
++})
+ 
+ /* This takes a physical page address that is used by the remapping functions */
+ #define mk_pte_phys(physpage, pgprot) \
+@@ -317,182 +240,10 @@
+ 			__pte_offset(address))
+ 
+ /*
+- * Allocate and free page tables. The xxx_kernel() versions are
+- * used to allocate a kernel page table - this turns on ASN bits
+- * if any.
+- */
+-
+-extern __inline__ pgd_t *get_pgd_slow(void)
+-{
+-	pgd_t *ret = (pgd_t *)__get_free_page(GFP_KERNEL);
+-
+-	if (ret) {
+-#if 0
+-		/*
+-		 * On PAE allocating a whole page is overkill - we will
+-		 * either embedd this in mm_struct, or do a SLAB cache.
+-		 */
+-		memcpy(ret, swapper_pg_dir, PTRS_PER_PGD * sizeof(pgd_t));
+-#endif
+-#if CONFIG_X86_PAE
+-		int i;
+-		for (i = 0; i < USER_PTRS_PER_PGD; i++)
+-			__pgd_clear(ret + i);
+-#else
+-		memset(ret, 0, USER_PTRS_PER_PGD * sizeof(pgd_t));
+-#endif
+-		memcpy(ret + USER_PTRS_PER_PGD, swapper_pg_dir + USER_PTRS_PER_PGD, (PTRS_PER_PGD - USER_PTRS_PER_PGD) * sizeof(pgd_t));
+-	}
+-	return ret;
+-}
+-
+-extern __inline__ pgd_t *get_pgd_fast(void)
+-{
+-	unsigned long *ret;
+-
+-	if ((ret = pgd_quicklist) != NULL) {
+-		pgd_quicklist = (unsigned long *)(*ret);
+-		ret[0] = 0;
+-		pgtable_cache_size--;
+-	} else
+-		ret = (unsigned long *)get_pgd_slow();
+-	return (pgd_t *)ret;
+-}
+-
+-extern __inline__ void free_pgd_fast(pgd_t *pgd)
+-{
+-	*(unsigned long *)pgd = (unsigned long) pgd_quicklist;
+-	pgd_quicklist = (unsigned long *) pgd;
+-	pgtable_cache_size++;
+-}
+-
+-extern __inline__ void free_pgd_slow(pgd_t *pgd)
+-{
+-	free_page((unsigned long)pgd);
+-}
+-
+-extern pte_t *get_pte_slow(pmd_t *pmd, unsigned long address_preadjusted);
+-extern pte_t *get_pte_kernel_slow(pmd_t *pmd, unsigned long address_preadjusted);
+-
+-extern __inline__ pte_t *get_pte_fast(void)
+-{
+-	unsigned long *ret;
+-
+-	if((ret = (unsigned long *)pte_quicklist) != NULL) {
+-		pte_quicklist = (unsigned long *)(*ret);
+-		ret[0] = ret[1];
+-		pgtable_cache_size--;
+-	}
+-	return (pte_t *)ret;
+-}
+-
+-extern __inline__ void free_pte_fast(pte_t *pte)
+-{
+-	*(unsigned long *)pte = (unsigned long) pte_quicklist;
+-	pte_quicklist = (unsigned long *) pte;
+-	pgtable_cache_size++;
+-}
+-
+-extern __inline__ void free_pte_slow(pte_t *pte)
+-{
+-	free_page((unsigned long)pte);
+-}
+-
+-#define pte_free_kernel(pte)    free_pte_slow(pte)
+-#define pte_free(pte)	   free_pte_slow(pte)
+-#define pgd_free(pgd)	   free_pgd_slow(pgd)
+-#define pgd_alloc()	     get_pgd_fast()
+-
+-extern inline pte_t * pte_alloc_kernel(pmd_t * pmd, unsigned long address)
+-{
+-	if (!pmd)
+-		BUG();
+-	address = (address >> PAGE_SHIFT) & (PTRS_PER_PTE - 1);
+-	if (pmd_none(*pmd)) {
+-		pte_t * page = (pte_t *) get_pte_fast();
+-		
+-		if (!page)
+-			return get_pte_kernel_slow(pmd, address);
+-		pmd_val(*pmd) = _KERNPG_TABLE + __pa(page);
+-		return page + address;
+-	}
+-	if (pmd_bad(*pmd)) {
+-		__handle_bad_pmd_kernel(pmd);
+-		return NULL;
+-	}
+-	return (pte_t *) pmd_page(*pmd) + address;
+-}
+-
+-extern inline pte_t * pte_alloc(pmd_t * pmd, unsigned long address)
+-{
+-	address = (address >> PAGE_SHIFT) & (PTRS_PER_PTE - 1);
+-
+-	if (pmd_none(*pmd))
+-		goto getnew;
+-	if (pmd_bad(*pmd))
+-		goto fix;
+-	return (pte_t *)pmd_page(*pmd) + address;
+-getnew:
+-{
+-	unsigned long page = (unsigned long) get_pte_fast();
+-	
+-	if (!page)
+-		return get_pte_slow(pmd, address);
+-	pmd_val(*pmd) = _PAGE_TABLE + __pa(page);
+-	return (pte_t *)page + address;
+-}
+-fix:
+-	__handle_bad_pmd(pmd);
+-	return NULL;
+-}
+-
+-/*
+- * allocating and freeing a pmd is trivial: the 1-entry pmd is
+- * inside the pgd, so has no extra memory associated with it.
+- * (In the PAE case we free the page.)
+- */
+-#define pmd_free(pmd)	   free_pmd_slow(pmd)
+-
+-#define pmd_free_kernel		pmd_free
+-#define pmd_alloc_kernel	pmd_alloc
+-
+-extern int do_check_pgt_cache(int, int);
+-
+-extern inline void set_pgdir(unsigned long address, pgd_t entry)
+-{
+-	struct task_struct * p;
+-	pgd_t *pgd;
+-#ifdef __SMP__
+-	int i;
+-#endif	
+-
+-	read_lock(&tasklist_lock);
+-	for_each_task(p) {
+-		if (!p->mm)
+-			continue;
+-		*pgd_offset(p->mm,address) = entry;
+-	}
+-	read_unlock(&tasklist_lock);
+-#ifndef __SMP__
+-	for (pgd = (pgd_t *)pgd_quicklist; pgd; pgd = (pgd_t *)*(unsigned long *)pgd)
+-		pgd[address >> PGDIR_SHIFT] = entry;
+-#else
+-	/* To pgd_alloc/pgd_free, one holds master kernel lock and so does our callee, so we can
+-	   modify pgd caches of other CPUs as well. -jj */
+-	for (i = 0; i < NR_CPUS; i++)
+-		for (pgd = (pgd_t *)cpu_data[i].pgd_quick; pgd; pgd = (pgd_t *)*(unsigned long *)pgd)
+-			pgd[address >> PGDIR_SHIFT] = entry;
+-#endif
+-}
+-
+-/*
+  * The i386 doesn't have any external MMU info: the kernel page
+  * tables contain all the necessary information.
+  */
+-extern inline void update_mmu_cache(struct vm_area_struct * vma,
+-	unsigned long address, pte_t pte)
+-{
+-}
++#define update_mmu_cache(vma,address,pte) do { } while (0)
+ 
+ /* Encode and de-code a swap entry */
+ #define SWP_TYPE(x)			(((x).val >> 1) & 0x3f)
+--- linux/include/asm-i386/pgalloc.h.orig	Sat Nov 13 05:00:20 1999
++++ linux/include/asm-i386/pgalloc.h	Sat Nov 13 10:36:21 1999
+@@ -0,0 +1,255 @@
++#ifndef _I386_PGALLOC_H
++#define _I386_PGALLOC_H
++
++#include <linux/config.h>
++#include <asm/processor.h>
++#include <asm/fixmap.h>
++#include <linux/threads.h>
++
++#define pgd_quicklist (current_cpu_data.pgd_quick)
++#define pmd_quicklist (current_cpu_data.pmd_quick)
++#define pte_quicklist (current_cpu_data.pte_quick)
++#define pgtable_cache_size (current_cpu_data.pgtable_cache_sz)
++
++#if CONFIG_X86_PAE
++# include <asm/pgalloc-3level.h>
++#else
++# include <asm/pgalloc-2level.h>
++#endif
++
++/*
++ * Allocate and free page tables. The xxx_kernel() versions are
++ * used to allocate a kernel page table - this turns on ASN bits
++ * if any.
++ */
++
++extern __inline__ pgd_t *get_pgd_slow(void)
++{
++	pgd_t *ret = (pgd_t *)__get_free_page(GFP_KERNEL);
++
++	if (ret) {
++#if CONFIG_X86_PAE
++		int i;
++		for (i = 0; i < USER_PTRS_PER_PGD; i++)
++			__pgd_clear(ret + i);
++#else
++		memset(ret, 0, USER_PTRS_PER_PGD * sizeof(pgd_t));
++#endif
++		memcpy(ret + USER_PTRS_PER_PGD, swapper_pg_dir + USER_PTRS_PER_PGD, (PTRS_PER_PGD - USER_PTRS_PER_PGD) * sizeof(pgd_t));
++	}
++	return ret;
++}
++
++extern __inline__ pgd_t *get_pgd_fast(void)
++{
++	unsigned long *ret;
++
++	if ((ret = pgd_quicklist) != NULL) {
++		pgd_quicklist = (unsigned long *)(*ret);
++		ret[0] = 0;
++		pgtable_cache_size--;
++	} else
++		ret = (unsigned long *)get_pgd_slow();
++	return (pgd_t *)ret;
++}
++
++extern __inline__ void free_pgd_fast(pgd_t *pgd)
++{
++	*(unsigned long *)pgd = (unsigned long) pgd_quicklist;
++	pgd_quicklist = (unsigned long *) pgd;
++	pgtable_cache_size++;
++}
++
++extern __inline__ void free_pgd_slow(pgd_t *pgd)
++{
++	free_page((unsigned long)pgd);
++}
++
++extern pte_t *get_pte_slow(pmd_t *pmd, unsigned long address_preadjusted);
++extern pte_t *get_pte_kernel_slow(pmd_t *pmd, unsigned long address_preadjusted);
++
++extern __inline__ pte_t *get_pte_fast(void)
++{
++	unsigned long *ret;
++
++	if((ret = (unsigned long *)pte_quicklist) != NULL) {
++		pte_quicklist = (unsigned long *)(*ret);
++		ret[0] = ret[1];
++		pgtable_cache_size--;
++	}
++	return (pte_t *)ret;
++}
++
++extern __inline__ void free_pte_fast(pte_t *pte)
++{
++	*(unsigned long *)pte = (unsigned long) pte_quicklist;
++	pte_quicklist = (unsigned long *) pte;
++	pgtable_cache_size++;
++}
++
++extern __inline__ void free_pte_slow(pte_t *pte)
++{
++	free_page((unsigned long)pte);
++}
++
++#define pte_free_kernel(pte)    free_pte_slow(pte)
++#define pte_free(pte)	   free_pte_slow(pte)
++#define pgd_free(pgd)	   free_pgd_slow(pgd)
++#define pgd_alloc()	     get_pgd_fast()
++
++extern inline pte_t * pte_alloc_kernel(pmd_t * pmd, unsigned long address)
++{
++	if (!pmd)
++		BUG();
++	address = (address >> PAGE_SHIFT) & (PTRS_PER_PTE - 1);
++	if (pmd_none(*pmd)) {
++		pte_t * page = (pte_t *) get_pte_fast();
++		
++		if (!page)
++			return get_pte_kernel_slow(pmd, address);
++		pmd_val(*pmd) = _KERNPG_TABLE + __pa(page);
++		return page + address;
++	}
++	if (pmd_bad(*pmd)) {
++		__handle_bad_pmd_kernel(pmd);
++		return NULL;
++	}
++	return (pte_t *) pmd_page(*pmd) + address;
++}
++
++extern inline pte_t * pte_alloc(pmd_t * pmd, unsigned long address)
++{
++	address = (address >> PAGE_SHIFT) & (PTRS_PER_PTE - 1);
++
++	if (pmd_none(*pmd))
++		goto getnew;
++	if (pmd_bad(*pmd))
++		goto fix;
++	return (pte_t *)pmd_page(*pmd) + address;
++getnew:
++{
++	unsigned long page = (unsigned long) get_pte_fast();
++	
++	if (!page)
++		return get_pte_slow(pmd, address);
++	pmd_val(*pmd) = _PAGE_TABLE + __pa(page);
++	return (pte_t *)page + address;
++}
++fix:
++	__handle_bad_pmd(pmd);
++	return NULL;
++}
++
++/*
++ * allocating and freeing a pmd is trivial: the 1-entry pmd is
++ * inside the pgd, so has no extra memory associated with it.
++ * (In the PAE case we free the page.)
++ */
++#define pmd_free(pmd)	   free_pmd_slow(pmd)
++
++#define pmd_free_kernel		pmd_free
++#define pmd_alloc_kernel	pmd_alloc
++
++extern int do_check_pgt_cache(int, int);
++
++extern inline void set_pgdir(unsigned long address, pgd_t entry)
++{
++	struct task_struct * p;
++	pgd_t *pgd;
++#ifdef __SMP__
++	int i;
++#endif	
++
++	read_lock(&tasklist_lock);
++	for_each_task(p) {
++		if (!p->mm)
++			continue;
++		*pgd_offset(p->mm,address) = entry;
++	}
++	read_unlock(&tasklist_lock);
++#ifndef __SMP__
++	for (pgd = (pgd_t *)pgd_quicklist; pgd; pgd = (pgd_t *)*(unsigned long *)pgd)
++		pgd[address >> PGDIR_SHIFT] = entry;
++#else
++	/* To pgd_alloc/pgd_free, one holds master kernel lock and so does our callee, so we can
++	   modify pgd caches of other CPUs as well. -jj */
++	for (i = 0; i < NR_CPUS; i++)
++		for (pgd = (pgd_t *)cpu_data[i].pgd_quick; pgd; pgd = (pgd_t *)*(unsigned long *)pgd)
++			pgd[address >> PGDIR_SHIFT] = entry;
++#endif
++}
++
++/* Caches aren't brain-dead on the intel. */
++#define flush_cache_all()			do { } while (0)
++#define flush_cache_mm(mm)			do { } while (0)
++#define flush_cache_range(mm, start, end)	do { } while (0)
++#define flush_cache_page(vma, vmaddr)		do { } while (0)
++#define flush_page_to_ram(page)			do { } while (0)
++#define flush_icache_range(start, end)		do { } while (0)
++
++/*
++ * TLB flushing:
++ *
++ *  - flush_tlb() flushes the current mm struct TLBs
++ *  - flush_tlb_all() flushes all processes TLBs
++ *  - flush_tlb_mm(mm) flushes the specified mm context TLB's
++ *  - flush_tlb_page(vma, vmaddr) flushes one page
++ *  - flush_tlb_range(mm, start, end) flushes a range of pages
++ *
++ * ..but the i386 has somewhat limited tlb flushing capabilities,
++ * and page-granular flushes are available only on i486 and up.
++ */
++
++#ifndef __SMP__
++
++#define flush_tlb() __flush_tlb()
++#define flush_tlb_all() __flush_tlb()
++#define local_flush_tlb() __flush_tlb()
++
++static inline void flush_tlb_mm(struct mm_struct *mm)
++{
++	if (mm == current->active_mm)
++		__flush_tlb();
++}
++
++static inline void flush_tlb_page(struct vm_area_struct *vma,
++	unsigned long addr)
++{
++	if (vma->vm_mm == current->active_mm)
++		__flush_tlb_one(addr);
++}
++
++static inline void flush_tlb_range(struct mm_struct *mm,
++	unsigned long start, unsigned long end)
++{
++	if (mm == current->active_mm)
++		__flush_tlb();
++}
++
++#else
++
++/*
++ * We aren't very clever about this yet -  SMP could certainly
++ * avoid some global flushes..
++ */
++
++#include <asm/smp.h>
++
++#define local_flush_tlb() \
++	__flush_tlb()
++
++extern void flush_tlb_all(void);
++extern void flush_tlb_current_task(void);
++extern void flush_tlb_mm(struct mm_struct *);
++extern void flush_tlb_page(struct vm_area_struct *, unsigned long);
++
++#define flush_tlb()	flush_tlb_current_task()
++
++static inline void flush_tlb_range(struct mm_struct * mm, unsigned long start, unsigned long end)
++{
++	flush_tlb_mm(mm);
++}
++
++#endif
++
++#endif /* _I386_PGALLOC_H */
+--- linux/include/asm-i386/pgalloc-3level.h.orig	Sat Nov 13 05:03:47 1999
++++ linux/include/asm-i386/pgalloc-3level.h	Sat Nov 13 05:04:43 1999
+@@ -0,0 +1,68 @@
++#ifndef _I386_PGALLOC_3LEVEL_H
++#define _I386_PGALLOC_3LEVEL_H
++
++/*
++ * Intel Physical Address Extension (PAE) Mode - three-level page
++ * tables on PPro+ CPUs. Page-table allocation routines.
++ *
++ * Copyright (C) 1999 Ingo Molnar <mingo@redhat.com>
++ */
++
++extern __inline__ pmd_t *get_pmd_slow(void)
++{
++	pmd_t *ret = (pmd_t *)__get_free_page(GFP_KERNEL);
++
++	if (ret)
++		memset(ret, 0, PAGE_SIZE);
++	return ret;
++}
++
++extern __inline__ pmd_t *get_pmd_fast(void)
++{
++	unsigned long *ret;
++
++	if ((ret = pmd_quicklist) != NULL) {
++		pmd_quicklist = (unsigned long *)(*ret);
++		ret[0] = 0;
++		pgtable_cache_size--;
++	} else
++		ret = (unsigned long *)get_pmd_slow();
++	return (pmd_t *)ret;
++}
++
++extern __inline__ void free_pmd_fast(pmd_t *pmd)
++{
++	*(unsigned long *)pmd = (unsigned long) pmd_quicklist;
++	pmd_quicklist = (unsigned long *) pmd;
++	pgtable_cache_size++;
++}
++
++extern __inline__ void free_pmd_slow(pmd_t *pmd)
++{
++	free_page((unsigned long)pmd);
++}
++
++extern inline pmd_t * pmd_alloc(pgd_t *pgd, unsigned long address)
++{
++	if (!pgd)
++		BUG();
++	address = (address >> PMD_SHIFT) & (PTRS_PER_PMD - 1);
++	if (pgd_none(*pgd)) {
++		pmd_t *page = get_pmd_fast();
++
++		if (!page)
++			page = get_pmd_slow();
++		if (page) {
++			if (pgd_none(*pgd)) {
++				pgd_val(*pgd) = 1 + __pa(page);
++				__flush_tlb();
++				return page + address;
++			} else
++				free_pmd_fast(page);
++		} else
++			return NULL;
++	}
++	return (pmd_t *)pgd_page(*pgd) + address;
++}
++
++#endif /* _I386_PGALLOC_3LEVEL_H */
+--- linux/include/asm-i386/pgtable-2level.h.orig	Sat Nov 13 05:05:17 1999
++++ linux/include/asm-i386/pgtable-2level.h	Sat Nov 13 05:06:36 1999
+@@ -42,19 +42,4 @@
+ 	return (pmd_t *) dir;
+ }
+ 
+-extern __inline__ pmd_t *get_pmd_fast(void)
+-{
+-	return (pmd_t *)0;
+-}
+-
+-extern __inline__ void free_pmd_fast(pmd_t *pmd) { }
+-extern __inline__ void free_pmd_slow(pmd_t *pmd) { }
+-
+-extern inline pmd_t * pmd_alloc(pgd_t *pgd, unsigned long address)
+-{
+-	if (!pgd)
+-		BUG();
+-	return (pmd_t *) pgd;
+-}
+-
+ #endif /* _I386_PGTABLE_2LEVEL_H */
+--- linux/include/asm-i386/pgalloc-2level.h.orig	Sat Nov 13 05:05:28 1999
++++ linux/include/asm-i386/pgalloc-2level.h	Sat Nov 13 05:06:07 1999
+@@ -0,0 +1,23 @@
++#ifndef _I386_PGALLOC_2LEVEL_H
++#define _I386_PGALLOC_2LEVEL_H
++
++/*
++ * traditional i386 two-level paging, page table allocation routines:
++ */
++
++extern __inline__ pmd_t *get_pmd_fast(void)
++{
++	return (pmd_t *)0;
++}
++
++extern __inline__ void free_pmd_fast(pmd_t *pmd) { }
++extern __inline__ void free_pmd_slow(pmd_t *pmd) { }
++
++extern inline pmd_t * pmd_alloc(pgd_t *pgd, unsigned long address)
++{
++	if (!pgd)
++		BUG();
++	return (pmd_t *) pgd;
++}
++
++#endif /* _I386_PGALLOC_2LEVEL_H */
+--- linux/include/asm-i386/io.h.orig	Sat Nov 13 05:21:39 1999
++++ linux/include/asm-i386/io.h	Sat Nov 13 10:36:21 1999
+@@ -103,7 +103,6 @@
+ 
+ #ifdef __KERNEL__
+ 
+-#include <asm/page.h>
+ #include <linux/vmalloc.h>
+ 
+ /*
+--- linux/drivers/char/mem.c.orig	Sat Nov 13 05:45:42 1999
++++ linux/drivers/char/mem.c	Sat Nov 13 05:45:48 1999
+@@ -21,7 +21,7 @@
+ 
+ #include <asm/uaccess.h>
+ #include <asm/io.h>
+-#include <asm/pgtable.h>
++#include <asm/pgalloc.h>
+ 
+ #ifdef CONFIG_SOUND
+ void soundcore_init(void);
+--- linux/arch/i386/boot/compressed/misc.c.orig	Sat Nov 13 05:13:42 1999
++++ linux/arch/i386/boot/compressed/misc.c	Sat Nov 13 11:13:24 1999
+@@ -9,10 +9,8 @@
+  * High loaded stuff by Hans Lermen & Werner Almesberger, Feb. 1996
+  */
+ 
+-#include <linux/mm.h>
+-#include <asm/segment.h>
++#include <linux/vmalloc.h>
+ #include <asm/io.h>
+-
+ /*
+  * gzip declarations
+  */
+--- linux/arch/i386/boot/Makefile.orig	Sat Nov 13 01:56:46 1999
++++ linux/arch/i386/boot/Makefile	Sat Nov 13 08:35:21 1999
+@@ -51,8 +51,11 @@
+ bootsect.s: bootsect.S Makefile $(BOOT_INCL)
+ 	$(CPP) -traditional $(SVGA_MODE) $(RAMDISK) $< -o $@
+ 
+-bbootsect: bbootsect.o bsetup.o
+-	$(LD) -Ttext 0x0 -R bsetup.o -s -oformat binary $< -o $@
++bbootsect: bbootsect.o bbootsect_kludge.o
++	$(LD) -Ttext 0x0 -R bbootsect_kludge.o -s -oformat binary $< -o $@
++
++bbootsect_kludge.o:	bbootsect.o bsetup.o
++	$(LD) -r $^ -o $@
+ 
+ bbootsect.o: bbootsect.s
+ 	$(AS) -o $@ $<
+@@ -84,4 +87,5 @@
+ 	rm -f tools/build
+ 	rm -f setup bootsect zImage compressed/vmlinux.out
+ 	rm -f bsetup bbootsect bzImage compressed/bvmlinux.out
++	rm -f bbootsect_kludge.o
+ 	@$(MAKE) -C compressed clean
+--- linux/arch/i386/mm/init.c.orig	Sat Nov 13 01:56:45 1999
++++ linux/arch/i386/mm/init.c	Sat Nov 13 11:01:26 1999
+@@ -30,6 +30,7 @@
+ #include <asm/system.h>
+ #include <asm/uaccess.h>
+ #include <asm/pgtable.h>
++#include <asm/pgalloc.h>
+ #include <asm/dma.h>
+ #include <asm/fixmap.h>
+ #include <asm/e820.h>
+@@ -285,7 +286,6 @@
+ #if CONFIG_X86_PAE
+ 		if (pgd_none(*pgd)) {
+ 			pmd = (pmd_t *) alloc_bootmem_low_pages(PAGE_SIZE);
+-			memset((void*)pmd, 0, PAGE_SIZE);
+ 			pgd_val(*pgd) = __pa(pmd) + 0x1;
+ 			if (pmd != pmd_offset(pgd, start))
+ 				BUG();
+@@ -297,7 +297,6 @@
+ 		for (; (j < PTRS_PER_PMD) && start; pmd++, j++) {
+ 			if (pmd_none(*pmd)) {
+ 				pte = (pte_t *) alloc_bootmem_low_pages(PAGE_SIZE);
+-				memset((void*)pte, 0, PAGE_SIZE);
+ 				pmd_val(*pmd) = _KERNPG_TABLE + __pa(pte);
+ 				if (pte != pte_offset(pmd, 0))
+ 					BUG();
+@@ -327,7 +326,6 @@
+ 		vaddr = i*PGDIR_SIZE;
+ #if CONFIG_X86_PAE
+ 		pmd = (pmd_t *) alloc_bootmem_low_pages(PAGE_SIZE);
+-		memset((void*)pmd, 0, PAGE_SIZE);
+ 		pgd_val(*pgd) = __pa(pmd) + 0x1;
+ #else
+ 		pmd = (pmd_t *)pgd;
+@@ -352,7 +350,6 @@
+ 			}
+ 
+ 			pte = (pte_t *) alloc_bootmem_low_pages(PAGE_SIZE);
+-			memset((void*)pte, 0, PAGE_SIZE);
+ 			pmd_val(*pmd) = _KERNPG_TABLE + __pa(pte);
+ 
+ 			if (pte != pte_offset(pmd, 0))
+@@ -412,7 +409,11 @@
+ 	 * that case).
+ 	 */
+ 	for (i = 0; i < USER_PTRS_PER_PGD; i++)
++#if CONFIG_X86_PAE
++		pgd_clear(swapper_pg_dir+i);
++#else
+ 		pgd_val(swapper_pg_dir[i]) = 0;
++#endif
+ 	flush_tlb_all();
+ }
+ 
+@@ -448,13 +449,21 @@
+ 	kmap_init();
+ #endif
+ 	{
+-		unsigned int zones_size[3];
++		unsigned int zones_size[MAX_NR_ZONES] = {0, 0, 0};
++		unsigned int max_dma;
+ 
+-		zones_size[0] = virt_to_phys((char *)MAX_DMA_ADDRESS)
+-					 >> PAGE_SHIFT;
+-		zones_size[1] = max_low_pfn - zones_size[0];
+-		zones_size[2] = highend_pfn - zones_size[0] - zones_size[1];
++		max_dma = virt_to_phys((char *)MAX_DMA_ADDRESS) >> PAGE_SHIFT;
+ 
++		if (max_low_pfn < max_dma)
++			zones_size[ZONE_DMA] = max_low_pfn;
++		else {
++			zones_size[ZONE_DMA] = max_dma;
++			zones_size[ZONE_NORMAL] = max_low_pfn - zones_size[0];
++#ifdef CONFIG_HIGHMEM
++			zones_size[ZONE_HIGHMEM] =
++				highend_pfn - zones_size[0] - zones_size[1];
++#endif
++		}
+ 		free_area_init(zones_size);
+ 	}
+ 	return;
+@@ -528,15 +537,13 @@
+ 
+ void __init mem_init(void)
+ {
+-	int codepages = 0;
+-	int reservedpages = 0;
+-	int datapages = 0;
+-	int initpages = 0;
+-#ifdef CONFIG_HIGHMEM
++	int codesize, reservedpages, datasize, initsize;
+ 	int tmp;
+ 
+ 	if (!mem_map)
+ 		BUG();
++
++#ifdef CONFIG_HIGHMEM
+ 	highmem_start_page = mem_map + highstart_pfn;
+ 	/* cache the highmem_mapnr */
+ 	highmem_mapnr = highstart_pfn;
+@@ -552,6 +559,13 @@
+ 	/* this will put all low memory onto the freelists */
+ 	totalram_pages += free_all_bootmem();
+ 
++	reservedpages = 0;
++	for (tmp = 0; tmp < max_low_pfn; tmp++)
++		/*
++		 * Only count reserved RAM pages
++		 */
++		if (page_is_ram(tmp) && PageReserved(mem_map+tmp))
++			reservedpages++;
+ #ifdef CONFIG_HIGHMEM
+ 	for (tmp = highstart_pfn; tmp < highend_pfn; tmp++) {
+ 		struct page *page = mem_map + tmp;
+@@ -568,19 +582,23 @@
+ 	}
+ 	totalram_pages += totalhigh_pages;
+ #endif
++	codesize =  (unsigned long) &_etext - (unsigned long) &_text;
++	datasize =  (unsigned long) &_edata - (unsigned long) &_etext;
++	initsize =  (unsigned long) &__init_end - (unsigned long) &__init_begin;
++
+ 	printk("Memory: %luk/%luk available (%dk kernel code, %dk reserved, %dk data, %dk init, %ldk highmem)\n",
+ 		(unsigned long) nr_free_pages() << (PAGE_SHIFT-10),
+ 		max_mapnr << (PAGE_SHIFT-10),
+-		codepages << (PAGE_SHIFT-10),
++		codesize >> 10,
+ 		reservedpages << (PAGE_SHIFT-10),
+-		datapages << (PAGE_SHIFT-10),
+-		initpages << (PAGE_SHIFT-10),
++		datasize >> 10,
++		initsize >> 10,
+ 		(unsigned long) (totalhigh_pages << (PAGE_SHIFT-10))
+ 	       );
+ 
+ #if CONFIG_X86_PAE
+ 	if (!cpu_has_pae)
+-		panic("cannot execute a PAE-enabled kernel on a PAE-incapable CPU!");
++		panic("cannot execute a PAE-enabled kernel on a PAE-less CPU!");
+ #endif
+ 	if (boot_cpu_data.wp_works_ok < 0)
+ 		test_wp_bit();
+--- linux/arch/i386/mm/ioremap.c.orig	Sat Nov 13 05:11:10 1999
++++ linux/arch/i386/mm/ioremap.c	Sat Nov 13 05:11:16 1999
+@@ -10,6 +10,7 @@
+ 
+ #include <linux/vmalloc.h>
+ #include <asm/io.h>
++#include <asm/pgalloc.h>
+ 
+ static inline void remap_area_pte(pte_t * pte, unsigned long address, unsigned long size,
+ 	unsigned long phys_addr, unsigned long flags)
+--- linux/arch/i386/mm/fault.c.orig	Sat Nov 13 05:50:10 1999
++++ linux/arch/i386/mm/fault.c	Sat Nov 13 05:50:14 1999
+@@ -19,7 +19,7 @@
+ 
+ #include <asm/system.h>
+ #include <asm/uaccess.h>
+-#include <asm/pgtable.h>
++#include <asm/pgalloc.h>
+ #include <asm/hardirq.h>
+ 
+ extern void die(const char *,struct pt_regs *,long);
+--- linux/arch/i386/kernel/smpboot.c.orig	Sat Nov 13 01:56:41 1999
++++ linux/arch/i386/kernel/smpboot.c	Sat Nov 13 05:48:41 1999
+@@ -44,6 +44,7 @@
+ #include <linux/delay.h>
+ #include <linux/mc146818rtc.h>
+ #include <asm/mtrr.h>
++#include <asm/pgalloc.h>
+ 
+ /* Set if we find a B stepping CPU			*/
+ static int smp_b_stepping = 0;
+@@ -649,10 +650,11 @@
+ 
+ void __init smp_store_cpu_info(int id)
+ {
+-	struct cpuinfo_x86 *c=&cpu_data[id];
++	struct cpuinfo_x86 *c = cpu_data + id;
+ 
+ 	*c = boot_cpu_data;
+ 	c->pte_quick = 0;
++	c->pmd_quick = 0;
+ 	c->pgd_quick = 0;
+ 	c->pgtable_cache_sz = 0;
+ 	identify_cpu(c);
+@@ -719,7 +721,7 @@
+ 	 * Enable APIC
+ 	 */
+  	value |= (1<<8);
+-#if 0
++#if 1
+ 	/* Enable focus processor (bit==0) */
+  	value &= ~(1<<9);
+ #else
+@@ -821,8 +823,7 @@
+ 		 * could use the real zero-page, but it's safer
+ 		 * this way if some buggy code writes to this page ...
+ 		 */
+-		apic_phys = (unsigned long)alloc_bootmem_pages(PAGE_SIZE);
+-		memset((void *)apic_phys, 0, PAGE_SIZE);
++		apic_phys = (unsigned long) alloc_bootmem_pages(PAGE_SIZE);
+ 		apic_phys = __pa(apic_phys);
+ 	}
+ 	set_fixmap(FIX_APIC_BASE, apic_phys);
+@@ -837,8 +838,7 @@
+ 			if (smp_found_config) {
+ 				ioapic_phys = mp_ioapics[i].mpc_apicaddr;
+ 			} else {
+-				ioapic_phys = (unsigned long)alloc_bootmem_pages(PAGE_SIZE);
+-				memset((void *)ioapic_phys, 0, PAGE_SIZE);
++				ioapic_phys = (unsigned long) alloc_bootmem_pages(PAGE_SIZE);
+ 				ioapic_phys = __pa(ioapic_phys);
+ 			}
+ 			set_fixmap(idx,ioapic_phys);
+--- linux/arch/i386/kernel/vm86.c.orig	Sat Nov 13 05:47:42 1999
++++ linux/arch/i386/kernel/vm86.c	Sat Nov 13 05:47:47 1999
+@@ -14,7 +14,7 @@
+ #include <linux/smp_lock.h>
+ 
+ #include <asm/uaccess.h>
+-#include <asm/pgtable.h>
++#include <asm/pgalloc.h>
+ #include <asm/io.h>
+ 
+ /*
+--- linux/arch/i386/kernel/smp.c.orig	Sat Nov 13 05:48:10 1999
++++ linux/arch/i386/kernel/smp.c	Sat Nov 13 05:48:12 1999
+@@ -18,6 +18,7 @@
+ #include <linux/delay.h>
+ #include <linux/mc146818rtc.h>
+ #include <asm/mtrr.h>
++#include <asm/pgalloc.h>
+ 
+ /*
+  *	Some notes on processor bugs:
+--- linux/arch/i386/kernel/irq.c.orig	Sat Nov 13 05:47:20 1999
++++ linux/arch/i386/kernel/irq.c	Sat Nov 13 05:47:22 1999
+@@ -37,7 +37,7 @@
+ #include <asm/system.h>
+ #include <asm/io.h>
+ #include <asm/bitops.h>
+-#include <asm/pgtable.h>
++#include <asm/pgalloc.h>
+ #include <asm/delay.h>
+ #include <asm/desc.h>
+ #include <asm/irq.h>
+--- linux/arch/i386/kernel/setup.c.orig	Sat Nov 13 10:48:08 1999
++++ linux/arch/i386/kernel/setup.c	Sat Nov 13 10:48:18 1999
+@@ -634,7 +634,6 @@
+ 	highstart_pfn = highend_pfn = max_pfn;
+ 	if (max_pfn > MAXMEM_PFN) {
+ 		highstart_pfn = MAXMEM_PFN;
+-		highend_pfn = max_pfn;
+ 		printk(KERN_NOTICE "%ldMB HIGHMEM available.\n",
+ 			pages_to_mb(highend_pfn - highstart_pfn));
+ 	}

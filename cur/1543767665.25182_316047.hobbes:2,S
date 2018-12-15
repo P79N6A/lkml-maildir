@@ -1,0 +1,89 @@
+Date: Wed, 04 May 2005 16:17:35 +0400
+From: "Artem B. Bityuckiy" <>
+Subject: Re: [PATCH] VFS bugfix: two read_inode() calles without clear_inode() call between
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2005/5/4/55
+
+Hello Andrew,
+here you can find a new patch for the VFS bug which was discussed at
+http://lkml.org/lkml/2005/4/27/84
+I added wake_up_inode() invocation just as Miklos suggested.
+Bug symptoms
+~~~~~~~~~~~~
+For the same inode VFS calls read_inode() twice and doesn't call
+clear_inode() between the two read_inode() invocations.
+Bug description
+~~~~~~~~~~~~~~~
+Suppose we have an inode which has zero reference count but is still in
+the inode cache. Suppose kswapd invokes shrink_icache_memory() to free
+some RAM. In prune_icache() inodes are removed from i_hash. prune_icache
+() is then going to call clear_inode(), but drops the inode_lock
+spinlock before this. If in this moment another task calls iget() for an
+inode which was just removed from i_hash by prune_icache(), then iget()
+invokes read_inode() for this inode, because it is *already removed*
+from i_hash.
+The end result is: we call iget(#N) then iput(#N); inode #N has zero
+i_count now and is in the inode cache; kswapd starts. kswapd removes the
+inode #N from i_hash ans is preempted; we call iget(#N) again;
+read_inode() is invoked as the result; but we expect clear_inode()
+before.
+Fix
+~~~~~~~
+To fix the bug I remove inodes from i_hash later, when clear_inode() is
+actually called. I remove them from i_hash under spinlock protection.
+Since the i_state is set to I_FREEING, it is safe to do this. The others
+will sleep waiting for the inode state change.
+I also postpone removing inodes from i_sb_list. It is not compulsory to
+do so but I do it for readability reasons. Inodes are added/removed to
+the lists together everywhere in the code and there is no point to
+change this rule. This is harmless because the only user of i_sb_list
+which somehow may interfere with me (invalidate_list()) is excluded by
+the iprune_sem mutex.
+The same race is possible in invalidate_list() so I do the same for it.
+The patch is against linux 2.6.11.5.
+The patch was tested for JFFS2.
+Please. apply/comment.
+Cheers,
+Artem.
+-- 
+Best Regards,
+Artem B. Bityuckiy,
+St.-Petersburg, Russia.
+diff -auNrp linux-2.6.11.5/fs/inode.c linux-2.6.11.5_fixed/fs/inode.c
+--- linux-2.6.11.5/fs/inode.c	2005-03-19 09:35:04.000000000 +0300
++++ linux-2.6.11.5_fixed/fs/inode.c	2005-05-04 14:51:14.000000000 +0400
+@@ -284,6 +284,13 @@ static void dispose_list(struct list_hea
+ 		if (inode->i_data.nrpages)
+ 			truncate_inode_pages(&inode->i_data, 0);
+ 		clear_inode(inode);
++		
++		spin_lock(&inode_lock);
++		hlist_del_init(&inode->i_hash);
++		list_del_init(&inode->i_sb_list);
++		spin_unlock(&inode_lock);
++		
++		wake_up_inode(inode);
+ 		destroy_inode(inode);
+ 		nr_disposed++;
+ 	}
+@@ -319,8 +326,6 @@ static int invalidate_list(struct list_h
+ 		inode = list_entry(tmp, struct inode, i_sb_list);
+ 		invalidate_inode_buffers(inode);
+ 		if (!atomic_read(&inode->i_count)) {
+-			hlist_del_init(&inode->i_hash);
+-			list_del(&inode->i_sb_list);
+ 			list_move(&inode->i_list, dispose);
+ 			inode->i_state |= I_FREEING;
+ 			count++;
+@@ -455,8 +460,6 @@ static void prune_icache(int nr_to_scan)
+ 			if (!can_unuse(inode))
+ 				continue;
+ 		}
+-		hlist_del_init(&inode->i_hash);
+-		list_del_init(&inode->i_sb_list);
+ 		list_move(&inode->i_list, &freeable);
+ 		inode->i_state |= I_FREEING;
+ 		nr_pruned++;

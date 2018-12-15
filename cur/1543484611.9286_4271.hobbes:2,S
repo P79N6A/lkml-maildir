@@ -1,0 +1,164 @@
+Date: 05 Feb 1999 18:39:44 +0100
+From: Trond Myklebust <>
+Subject: Update for the NFS write gathering patch
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/2/5/115
+
+Hi,
+  Thanks to a number of people who have been kind enough to help me track
+down problems, I've found a few troublespots in the current code.
+The appended patch fixes the following problems:
+   - Requests flushed by the RPC tasks should not use FLUSH_SYNC
+     flag as it may cause rpc_allocate to sleep if memory is unavailable.
+   - Nasty infinite loop in function 'sync_cluster'.
+   - Spinlock of the asynchronous write error list.
+Cheers,
+  Trond
+diff -urN linux-2.2.1-ac4/fs/nfs/cluster.c linux/fs/nfs/cluster.c
+--- linux-2.2.1-ac4/fs/nfs/cluster.c	Fri Feb  5 14:37:58 1999
++++ linux/fs/nfs/cluster.c	Fri Feb  5 17:25:35 1999
+@@ -690,7 +690,7 @@
+ 
+         /* If we've reached the end of the cluster, flush everything */
+         if ((cluster->end & ~CLUSTER_MASK) == 0) {
+-                sync_cluster(cluster, 0);
++                sync_cluster(cluster, FLUSH_SYNC);
+                 return 0;
+         }
+ 
+@@ -737,7 +737,7 @@
+                 req = cluster->request[j];
+                 if (req && IS_DIRTY(req) && nfs_lock_page(req)) {
+                         /* Fails if out of memory and unlocks the page */
+-                        if (cluster->flush(req, 0) < 0)
++                        if (cluster->flush(req, FLUSH_SYNC) < 0)
+                                 break;
+                         nr++;
+ 		}
+@@ -860,7 +860,6 @@
+ 
+         cluster->count++;
+ 
+-again:
+         for (nr = 0; nr < CLUSTER_PAGES; nr++) {
+                 if (!(req = cluster->request[nr]))
+                         continue;
+@@ -871,18 +870,13 @@
+                         continue;
+ 
+                 if (nfs_lock_page(req)) {
+-                        error = cluster->flush(req, how | FLUSH_SYNC);
++                        error = cluster->flush(req, how);
+                         if (error < 0)
+                                 goto out;
+ 
+                         flushed++;
+                 }
+         }
+-
+-        if (cluster->dirty != cluster->pending) {
+-		dprintk("NFS: sync_cluster dirty = %d  != pending = %d\n", cluster->dirty, cluster->pending);
+-                goto again;
+-	}
+ 
+ out:
+         release_cluster(cluster);
+diff -urN linux-2.2.1-ac4/fs/nfs/file.c linux/fs/nfs/file.c
+--- linux-2.2.1-ac4/fs/nfs/file.c	Fri Feb  5 14:37:58 1999
++++ linux/fs/nfs/file.c	Fri Feb  5 14:39:40 1999
+@@ -199,7 +199,7 @@
+ 
+ 	/* Check for an error from a previous async call */
+ 	result = nfs_write_error(inode);
+-	if (!result)
++	if (result >= 0)
+ 		result = generic_file_write(file, buf, count, ppos);
+ out:
+ 	return result;
+diff -urN linux-2.2.1-ac4/fs/nfs/write.c linux/fs/nfs/write.c
+--- linux-2.2.1-ac4/fs/nfs/write.c	Fri Feb  5 14:37:58 1999
++++ linux/fs/nfs/write.c	Fri Feb  5 17:22:53 1999
+@@ -54,6 +54,8 @@
+ #include <linux/swap.h>
+ #include <linux/pagemap.h>
+ 
++#include <asm/spinlock.h>
++
+ #include <linux/sunrpc/auth.h>
+ #include <linux/sunrpc/clnt.h>
+ #include <linux/nfs_fs.h>
+@@ -99,6 +101,10 @@
+  */
+ static struct nfs_write_error * nfs_write_errors = 0;
+ 
++#ifdef __SMP__
++static spinlock_t write_error_lock = SPIN_LOCK_UNLOCKED;
++#endif
++
+ 
+ /*
+  * Local function declarations
+@@ -322,6 +328,7 @@
+ nfs_report_error(struct inode *inode, pid_t pid, int error)
+ {
+         struct nfs_write_error  *err;
++        unsigned long		flags;
+ 
+         NFS_FLAGS(inode) |= NFS_INO_WRITE_ERROR;
+ 
+@@ -341,8 +348,10 @@
+         err->inode = inode;
+         err->pid = pid;
+         err->errno = error;
++	spin_lock_irqsave(&write_error_lock, flags);
+         err->next = nfs_write_errors;
+         nfs_write_errors = err;
++	spin_unlock_irqrestore(&write_error_lock, flags);
+ }
+ 
+ /*
+@@ -354,16 +363,19 @@
+ {
+         struct nfs_write_error  **errp, *err;
+         int                     status = 0, more;
++	unsigned long		flags;
+ 
+ again:
+ 	if (!nfs_write_errors)
+ 		goto out;
+         more = 0;
++	spin_lock_irqsave(&write_error_lock, flags);
+         for (errp = &nfs_write_errors; (err = *errp); errp = &err->next) {
+                 if (err->inode == inode) {
+                         if (err->pid == pid || pid == 0) {
+                                 status = err->errno;
+                                 *errp = err->next;
++				spin_unlock_irqrestore(&write_error_lock, flags);
+                                 kfree(err);
+                                 goto again; /* kfree may have slept */
+                         } else {
+@@ -371,6 +383,7 @@
+                         }
+                 }
+         }
++	spin_unlock_irqrestore(&write_error_lock, flags);
+ 
+         if (more == 0) {
+                 /* All errors passed to application. Clear flag */
+@@ -822,7 +835,7 @@
+         nfs_writeback_attrs(cluster->inode, resp->fattr);
+ 
+         if (cluster->dirty)
+-                sync_cluster(cluster, FLUSH_SYNC|stable);
++                sync_cluster(cluster, stable);
+         release_cluster(cluster);
+         kfree(task->tk_calldata);
+ }
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

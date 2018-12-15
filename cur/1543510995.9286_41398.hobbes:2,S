@@ -1,0 +1,402 @@
+Date: Wed, 29 Sep 1999 02:16:23 +0200 (CEST)
+From: Andrea Arcangeli <>
+Subject: [patch] 2.3.18ac9 page_alloc types
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/9/28/203
+
+I ported the new page_alloc-type logic to 2.3.18ac9 taking care of bigmem
+(that was just using a separate lists in a by-hand way). I also changed a
+bit __free_page to avoid code duplication on the binary.
+Patch against 2.3.18ac9:
+diff -urN 2.3.18ac9/include/linux/mm.h 2.3.18ac9-page_alloc/include/linux/mm.h
+--- 2.3.18ac9/include/linux/mm.h	Mon Sep 27 12:27:58 1999
++++ 2.3.18ac9-page_alloc/include/linux/mm.h	Wed Sep 29 02:00:02 1999
+@@ -299,7 +299,8 @@
+ 
+ #define free_page(addr) free_pages((addr),0)
+ extern int FASTCALL(free_pages(unsigned long addr, unsigned long order));
+-extern int FASTCALL(__free_page(struct page *));
++#define __free_page(page) __free_pages((page),0)
++extern int FASTCALL(__free_pages(struct page *, unsigned long));
+ 
+ extern void show_free_areas(void);
+ extern unsigned long put_dirty_page(struct task_struct * tsk,unsigned long page,
+diff -urN 2.3.18ac9/kernel/ksyms.c 2.3.18ac9-page_alloc/kernel/ksyms.c
+--- 2.3.18ac9/kernel/ksyms.c	Mon Sep 27 11:07:36 1999
++++ 2.3.18ac9-page_alloc/kernel/ksyms.c	Wed Sep 29 02:00:02 1999
+@@ -92,7 +92,7 @@
+ /* internal kernel memory management */
+ EXPORT_SYMBOL(__get_free_pages);
+ EXPORT_SYMBOL(free_pages);
+-EXPORT_SYMBOL(__free_page);
++EXPORT_SYMBOL(__free_pages);
+ EXPORT_SYMBOL(kmem_find_general_cachep);
+ EXPORT_SYMBOL(kmem_cache_create);
+ EXPORT_SYMBOL(kmem_cache_destroy);
+diff -urN 2.3.18ac9/mm/page_alloc.c 2.3.18ac9-page_alloc/mm/page_alloc.c
+--- 2.3.18ac9/mm/page_alloc.c	Tue Sep 14 14:35:26 1999
++++ 2.3.18ac9-page_alloc/mm/page_alloc.c	Wed Sep 29 02:00:15 1999
+@@ -39,22 +39,23 @@
+ #else
+ #define NR_MEM_LISTS 10
+ #endif
++#ifndef CONFIG_BIGMEM
++#define NR_MEM_TYPES 2		/* GFP_DMA vs not for now. */
++#else
++#define NR_MEM_TYPES 3
++#endif
+ 
+ /* The start of this MUST match the start of "struct page" */
+ struct free_area_struct {
+ 	struct page *next;
+ 	struct page *prev;
+ 	unsigned int * map;
++	unsigned long count;
+ };
+ 
+ #define memory_head(x) ((struct page *)(x))
+ 
+-#ifdef CONFIG_BIGMEM
+-#define BIGMEM_LISTS_OFFSET	NR_MEM_LISTS
+-static struct free_area_struct free_area[NR_MEM_LISTS*2];
+-#else
+-static struct free_area_struct free_area[NR_MEM_LISTS];
+-#endif
++static struct free_area_struct free_area[NR_MEM_TYPES][NR_MEM_LISTS];
+ 
+ static inline void init_mem_queue(struct free_area_struct * head)
+ {
+@@ -70,6 +71,7 @@
+ 	entry->next = next;
+ 	next->prev = entry;
+ 	head->next = entry;
++	head->count++;
+ }
+ 
+ static inline void remove_mem_queue(struct page * entry)
+@@ -99,9 +101,9 @@
+  */
+ spinlock_t page_alloc_lock = SPIN_LOCK_UNLOCKED;
+ 
+-static inline void free_pages_ok(unsigned long map_nr, unsigned long order)
++static inline void free_pages_ok(unsigned long map_nr, unsigned long order, unsigned type)
+ {
+-	struct free_area_struct *area = free_area + order;
++	struct free_area_struct *area = free_area[type] + order;
+ 	unsigned long index = map_nr >> (1 + order);
+ 	unsigned long mask = (~0UL) << order;
+ 	unsigned long flags;
+@@ -111,8 +113,9 @@
+ #define list(x) (mem_map+(x))
+ 
+ #ifdef CONFIG_BIGMEM
+-	if (map_nr >= bigmem_mapnr) {
+-		area += BIGMEM_LISTS_OFFSET;
++	if (map_nr >= bigmem_mapnr)
++	{
++		area = free_area[2] + order;
+ 		nr_free_bigpages -= mask;
+ 	}
+ #endif
+@@ -121,6 +124,7 @@
+ 	while (mask + (1 << (NR_MEM_LISTS-1))) {
+ 		if (!test_and_change_bit(index, area->map))
+ 			break;
++		area->count--;
+ 		remove_mem_queue(list(map_nr ^ -mask));
+ 		mask <<= 1;
+ 		area++;
+@@ -134,7 +138,7 @@
+ 	spin_unlock_irqrestore(&page_alloc_lock, flags);
+ }
+ 
+-int __free_page(struct page *page)
++int __free_pages(struct page *page, unsigned long order)
+ {
+ 	if (!PageReserved(page) && put_page_testzero(page)) {
+ 		if (PageSwapCache(page))
+@@ -142,7 +146,7 @@
+ 		if (PageLocked(page))
+ 			PAGE_BUG(page);
+ 
+-		free_pages_ok(page - mem_map, 0);
++		free_pages_ok(page - mem_map, order, PageDMA(page) ? 1 : 0);
+ 		return 1;
+ 	}
+ 	return 0;
+@@ -151,19 +155,12 @@
+ int free_pages(unsigned long addr, unsigned long order)
+ {
+ 	unsigned long map_nr = MAP_NR(addr);
++	int ret = 0;
+ 
+-	if (map_nr < max_mapnr) {
+-		mem_map_t * map = mem_map + map_nr;
+-		if (!PageReserved(map) && put_page_testzero(map)) {
+-			if (PageSwapCache(map))
+-				PAGE_BUG(map);
+-			if (PageLocked(map))
+-				PAGE_BUG(map);
+-			free_pages_ok(map_nr, order);
+-			return 1;
+-		}
+-	}
+-	return 0;
++	if (map_nr < max_mapnr)
++		ret = __free_pages(mem_map + map_nr, order);
++
++	return ret;
+ }
+ 
+ /*
+@@ -171,14 +168,21 @@
+  */
+ #define MARK_USED(index, order, area) \
+ 	change_bit((index) >> (1+(order)), (area)->map)
+-#define CAN_DMA(x) (PageDMA(x))
+ #define ADDRESS(x) (PAGE_OFFSET + ((x) << PAGE_SHIFT))
+-
+ #ifdef CONFIG_BIGMEM
+-#define RMQUEUEBIG(order, gfp_mask) \
+-if (gfp_mask & __GFP_BIGMEM) { \
+-	struct free_area_struct * area = free_area+order+BIGMEM_LISTS_OFFSET; \
+-	unsigned long new_order = order; \
++#define UPDATE_NR_FREE_BIGPAGES(map_nr, order)			\
++	do							\
++	{							\
++		if ((map_nr) >= bigmem_mapnr)			\
++			nr_free_bigpages -= 1 << (order);	\
++	}							\
++	while (0)
++#else
++#define UPDATE_NR_FREE_BIGPAGES(map_nr, order) do { } while (0)
++#endif
++#define RMQUEUE_TYPE(order, type) \
++do { struct free_area_struct * area = free_area[type]+order; \
++     unsigned long new_order = order; \
+ 	do { struct page *prev = memory_head(area), *ret = prev->next; \
+ 		if (memory_head(area) != ret) { \
+ 			unsigned long map_nr; \
+@@ -186,36 +190,14 @@
+ 			map_nr = ret - mem_map; \
+ 			MARK_USED(map_nr, new_order, area); \
+ 			nr_free_pages -= 1 << order; \
+-			nr_free_bigpages -= 1 << order; \
++			UPDATE_NR_FREE_BIGPAGES(map_nr, order); \
++			area->count--; \
+ 			EXPAND(ret, map_nr, order, new_order, area); \
+ 			spin_unlock_irqrestore(&page_alloc_lock, flags); \
+ 			return ADDRESS(map_nr); \
+ 		} \
+ 		new_order++; area++; \
+ 	} while (new_order < NR_MEM_LISTS); \
+-}
+-#endif
+-
+-#define RMQUEUE(order, gfp_mask) \
+-do { struct free_area_struct * area = free_area+order; \
+-     unsigned long new_order = order; \
+-	do { struct page *prev = memory_head(area), *ret = prev->next; \
+-		while (memory_head(area) != ret) { \
+-			if (!(gfp_mask & __GFP_DMA) || CAN_DMA(ret)) { \
+-				unsigned long map_nr; \
+-				(prev->next = ret->next)->prev = prev; \
+-				map_nr = ret - mem_map; \
+-				MARK_USED(map_nr, new_order, area); \
+-				nr_free_pages -= 1 << order; \
+-				EXPAND(ret, map_nr, order, new_order, area); \
+-				spin_unlock_irqrestore(&page_alloc_lock,flags);\
+-				return ADDRESS(map_nr); \
+-			} \
+-			prev = ret; \
+-			ret = ret->next; \
+-		} \
+-		new_order++; area++; \
+-	} while (new_order < NR_MEM_LISTS); \
+ } while (0)
+ 
+ #define EXPAND(map,index,low,high,area) \
+@@ -303,10 +285,16 @@
+ 	}
+ ok_to_allocate:
+ 	spin_lock_irqsave(&page_alloc_lock, flags);
++	/* if it's not a dma request, try non-dma first */
++	if (!(gfp_mask & __GFP_DMA))
++	{
+ #ifdef CONFIG_BIGMEM
+-	RMQUEUEBIG(order, gfp_mask);
++		if (gfp_mask & __GFP_BIGMEM)
++			RMQUEUE_TYPE(order, 2);
+ #endif
+-	RMQUEUE(order, gfp_mask);
++		RMQUEUE_TYPE(order, 0);
++	}
++	RMQUEUE_TYPE(order, 1);
+ 	spin_unlock_irqrestore(&page_alloc_lock, flags);
+ 
+ 	/*
+@@ -331,8 +319,9 @@
+ void show_free_areas(void)
+ {
+  	unsigned long order, flags;
+- 	unsigned long total = 0;
++	unsigned type;
+ 
++	spin_lock_irqsave(&page_alloc_lock, flags);
+ 	printk("Free pages:      %6dkB (%6dkB BigMem)\n ( ",
+ 		nr_free_pages<<(PAGE_SHIFT-10),
+ 		nr_free_bigpages<<(PAGE_SHIFT-10));
+@@ -342,25 +331,30 @@
+ 		freepages.min,
+ 		freepages.low,
+ 		freepages.high);
+-	spin_lock_irqsave(&page_alloc_lock, flags);
+- 	for (order=0 ; order < NR_MEM_LISTS; order++) {
+-		struct page * tmp;
+-		unsigned long nr = 0;
+-		for (tmp = free_area[order].next ; tmp != memory_head(free_area+order) ; tmp = tmp->next) {
+-			nr ++;
+-		}
++	for (type = 0; type < NR_MEM_TYPES; type++) {
++		unsigned long total = 0;
+ #ifdef CONFIG_BIGMEM
+-		for (tmp = free_area[BIGMEM_LISTS_OFFSET+order].next;
+-		     tmp != memory_head(free_area+BIGMEM_LISTS_OFFSET+order);
+-		     tmp = tmp->next) {
+-			nr ++;
++		switch (type)
++		{
++		case 0:
++		case 1:
++#endif
++		printk("%sDMA: ", type ? "" : "Non");
++#ifdef CONFIG_BIGMEM
++			break;
++		case 2:
++			printk("BIGMEM: ");
+ 		}
+ #endif
+-		total += nr * ((PAGE_SIZE>>10) << order);
+-		printk("%lu*%lukB ", nr, (unsigned long)((PAGE_SIZE>>10) << order));
++		for (order=0 ; order < NR_MEM_LISTS; order++) {
++			unsigned long nr = free_area[type][order].count;
++
++			total += nr * ((PAGE_SIZE>>10) << order);
++			printk("%lu*%lukB ", nr, (unsigned long)((PAGE_SIZE>>10) << order));
++		}
++		printk("= %lukB)\n", total);
+ 	}
+ 	spin_unlock_irqrestore(&page_alloc_lock, flags);
+-	printk("= %lukB)\n", total);
+ #ifdef SWAP_CACHE_INFO
+ 	show_swap_cache_info();
+ #endif	
+@@ -377,8 +371,7 @@
+ unsigned long __init free_area_init(unsigned long start_mem, unsigned long end_mem)
+ {
+ 	mem_map_t * p;
+-	unsigned long mask = PAGE_MASK;
+-	unsigned long i;
++	unsigned long i, j;
+ 
+ 	/*
+ 	 * Select nr of pages we try to keep free for important stuff
+@@ -406,25 +399,20 @@
+ 		init_waitqueue_head(&p->wait);
+ 	} while (p > mem_map);
+ 
+-	for (i = 0 ; i < NR_MEM_LISTS ; i++) {
+-		unsigned long bitmap_size;
+-		init_mem_queue(free_area+i);
+-#ifdef CONFIG_BIGMEM
+-		init_mem_queue(free_area+BIGMEM_LISTS_OFFSET+i);
+-#endif
+-		mask += mask;
+-		end_mem = (end_mem + ~mask) & mask;
+-		bitmap_size = (end_mem - PAGE_OFFSET) >> (PAGE_SHIFT + i);
+-		bitmap_size = (bitmap_size + 7) >> 3;
+-		bitmap_size = LONG_ALIGN(bitmap_size);
+-		free_area[i].map = (unsigned int *) start_mem;
+-		memset((void *) start_mem, 0, bitmap_size);
+-		start_mem += bitmap_size;
+-#ifdef CONFIG_BIGMEM
+-		free_area[BIGMEM_LISTS_OFFSET+i].map = (unsigned int *) start_mem;
+-		memset((void *) start_mem, 0, bitmap_size);
+-		start_mem += bitmap_size;
+-#endif
++	for (j = 0; j < NR_MEM_TYPES; j++) {
++		unsigned long mask = PAGE_MASK;
++		for (i = 0 ; i < NR_MEM_LISTS ; i++) {
++			unsigned long bitmap_size;
++			init_mem_queue(free_area[j]+i);
++			mask += mask;
++			end_mem = (end_mem + ~mask) & mask;
++			bitmap_size = (end_mem - PAGE_OFFSET) >> (PAGE_SHIFT + i);
++			bitmap_size = (bitmap_size + 7) >> 3;
++			bitmap_size = LONG_ALIGN(bitmap_size);
++			free_area[j][i].map = (unsigned int *) start_mem;
++			memset((void *) start_mem, 0, bitmap_size);
++			start_mem += bitmap_size;
++		}
+ 	}
+ 	return start_mem;
+ }
+Then I backported the __free_pages-not-inline change to 2.2.13pre14:
+diff -urN 2.2.13pre14/include/linux/mm.h 2.2.13pre14-page_alloc/include/linux/mm.h
+--- 2.2.13pre14/include/linux/mm.h	Wed Sep 22 01:37:02 1999
++++ 2.2.13pre14-page_alloc/include/linux/mm.h	Wed Sep 29 01:17:38 1999
+@@ -275,7 +275,8 @@
+ 
+ #define free_page(addr) free_pages((addr),0)
+ extern void FASTCALL(free_pages(unsigned long addr, unsigned long order));
+-extern void FASTCALL(__free_page(struct page *));
++#define __free_page(page) __free_pages((page),0)
++extern void FASTCALL(__free_pages(struct page *, unsigned long));
+ 
+ extern void show_free_areas(void);
+ extern unsigned long put_dirty_page(struct task_struct * tsk,unsigned long page,
+diff -urN 2.2.13pre14/kernel/ksyms.c 2.2.13pre14-page_alloc/kernel/ksyms.c
+--- 2.2.13pre14/kernel/ksyms.c	Tue Sep 28 18:32:39 1999
++++ 2.2.13pre14-page_alloc/kernel/ksyms.c	Wed Sep 29 01:16:13 1999
+@@ -90,7 +90,7 @@
+ /* internal kernel memory management */
+ EXPORT_SYMBOL(__get_free_pages);
+ EXPORT_SYMBOL(free_pages);
+-EXPORT_SYMBOL(__free_page);
++EXPORT_SYMBOL(__free_pages);
+ EXPORT_SYMBOL(kmem_find_general_cachep);
+ EXPORT_SYMBOL(kmem_cache_create);
+ EXPORT_SYMBOL(kmem_cache_shrink);
+diff -urN 2.2.13pre14/mm/page_alloc.c 2.2.13pre14-page_alloc/mm/page_alloc.c
+--- 2.2.13pre14/mm/page_alloc.c	Tue Sep 28 18:32:40 1999
++++ 2.2.13pre14-page_alloc/mm/page_alloc.c	Wed Sep 29 01:14:44 1999
+@@ -123,7 +123,7 @@
+ 	spin_unlock_irqrestore(&page_alloc_lock, flags);
+ }
+ 
+-static inline void __free_pages(struct page *page, unsigned long order)
++void __free_pages(struct page *page, unsigned long order)
+ {
+ 	if (!PageReserved(page) && atomic_dec_and_test(&page->count)) {
+ 		if (PageSwapCache(page))
+@@ -132,11 +132,6 @@
+ 		free_pages_ok(page - mem_map, order, PageDMA(page) ? 1 : 0);
+ 		return;
+ 	}
+-}
+-
+-void __free_page(struct page *page)
+-{
+-	__free_pages(page, 0);
+ }
+ 
+ void free_pages(unsigned long addr, unsigned long order)
+Andrea
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

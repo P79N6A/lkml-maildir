@@ -1,0 +1,606 @@
+Date: Thu, 3 Jun 1999 21:07:43 -0400 (EDT)
+From: Chuck Lever <>
+Subject: removing the global lock from sys_brk()
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/6/3/209
+
+On Sun, 30 May 1999, Linus Torvalds wrote:
+> A _bad_ user might do something like this:
+> 
+> 	/* Allocate the anonymous brk */
+> 	area = sbrk(largeamount);
+> 
+> 	/* Tee-hee, we'll mess with the kernels mind */
+> 	mmap(file, area, largeamount);
+> 
+> 	sbrk(-largeamount);
+> 
+> and then the unmap _will_ have a file backing from sys_brk().
+> 
+> Basically, if you want to drop the kernel lock (which is a good idea: it's
+> a rather nasty one to hold there, and in theory we really shouldn't need
+> it in normal use), you have to be more careful about it. Sadly.
+> 
+> (The case where do_mmap() unmaps the old area is already protected
+> against: sys_brk() checks that there is no vma overlap, and refuses to
+> create a new mapping on top of an old one. So THAT case is safe, but it's
+> still true that you should never call do_mmap() without holding the kernel
+> lock, simply because as it is right now that would be a rule violation
+> even if you can prove that it "happens to work"). 
+linus-
+is this more like what you had in mind?  this patch makes do_munmap() safe
+to call without holding the global lock, and creates a new do_brk()
+function that is also safe to call without holding the global lock.  to
+test these, sys_brk() now uses both, and i changed most of the binary
+loaders to use do_brk() where appropriate.  loading an elf binary, for
+instance, can possibly behave exactly as you describe above.
+the global lock protects anything that might call vm_ops or filesystem
+code, or that directly alters inodes or dentry structs.  we should be
+protected now when merging or shrinking a mapped file in order to create
+an anonymous map.
+the next biggest lock in my profile is the one in handle_pte_fault(),
+which i broke up in the last patch i sent to this list.  that mod isn't
+included in this patch.  will parallelizing the page cache help here?  by
+my calculations, the kernel spends almost 10% of the CPU spinning on this
+lock on a loaded dual processor.
+comments welcome; this diff is against 2.3.3.
+ps:  part of the sysirix.c diff included below fixes a bug -- those should
+be obvious, and safe and reasonable to apply to 2.3.
+diff -ruN linux-2.3.3/arch/mips/kernel/irixelf.c linux/arch/mips/kernel/irixelf.c
+--- linux-2.3.3/arch/mips/kernel/irixelf.c	Wed Nov 11 14:49:59 1998
++++ linux/arch/mips/kernel/irixelf.c	Mon May 31 22:53:26 1999
+@@ -132,9 +132,7 @@
+ 	end = PAGE_ALIGN(end);
+ 	if (end <= start) 
+ 		return;
+-	do_mmap(NULL, start, end - start,
+-		PROT_READ | PROT_WRITE | PROT_EXEC,
+-		MAP_FIXED | MAP_PRIVATE, 0);
++	do_brk(start, end - start);
+ }
+ 
+ 
+@@ -394,9 +392,7 @@
+ 
+ 	/* Map the last of the bss segment */
+ 	if (last_bss > len) {
+-		do_mmap(NULL, len, (last_bss - len),
+-			PROT_READ|PROT_WRITE|PROT_EXEC,
+-			MAP_FIXED|MAP_PRIVATE, 0);
++		do_brk(len, (last_bss - len));
+ 	}
+ 	kfree(elf_phdata);
+ 
+@@ -589,8 +585,7 @@
+ 	unsigned long v;
+ 	struct prda *pp;
+ 
+-	v =  do_mmap (NULL, PRDA_ADDRESS, PAGE_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC,
+-		      MAP_FIXED | MAP_PRIVATE, 0);
++	v =  do_brk (PRDA_ADDRESS, PAGE_SIZE);
+ 	
+ 	if (v < 0)
+ 		return;
+@@ -931,9 +926,7 @@
+ 	len = (elf_phdata->p_filesz + elf_phdata->p_vaddr+ 0xfff) & 0xfffff000;
+ 	bss = elf_phdata->p_memsz + elf_phdata->p_vaddr;
+ 	if (bss > len)
+-	  do_mmap(NULL, len, bss-len,
+-		  PROT_READ|PROT_WRITE|PROT_EXEC,
+-		  MAP_FIXED|MAP_PRIVATE, 0);
++	  do_brk(len, bss-len);
+ 	kfree(elf_phdata);
+ 	return 0;
+ }
+diff -ruN linux-2.3.3/arch/mips/kernel/sysirix.c linux/arch/mips/kernel/sysirix.c
+--- linux-2.3.3/arch/mips/kernel/sysirix.c	Sun May 23 20:03:59 1999
++++ linux/arch/mips/kernel/sysirix.c	Wed Jun  2 10:13:59 1999
+@@ -571,7 +571,7 @@
+ 	 * Check against existing mmap mappings.
+ 	 */
+ 	if (find_vma_intersection(mm, oldbrk, newbrk+PAGE_SIZE)) {
+-		return -ENOMEM;
++		ret = -ENOMEM;
+ 		goto out;
+ 	}
+ 
+@@ -579,7 +579,7 @@
+ 	 * Check if we have enough memory..
+ 	 */
+ 	if (!vm_enough_memory((newbrk-oldbrk) >> PAGE_SHIFT)) {
+-		return -ENOMEM;
++		ret = -ENOMEM;
+ 		goto out;
+ 	}
+ 
+@@ -587,10 +587,7 @@
+ 	 * Ok, looks good - let it rip.
+ 	 */
+ 	mm->brk = brk;
+-	do_mmap(NULL, oldbrk, newbrk-oldbrk,
+-		PROT_READ|PROT_WRITE|PROT_EXEC,
+-		MAP_FIXED|MAP_PRIVATE, 0);
+-
++	do_brk(oldbrk, newbrk-oldbrk);
+ 	ret = 0;
+ 
+ out:
+diff -ruN linux-2.3.3/arch/sparc/kernel/sys_sunos.c linux/arch/sparc/kernel/sys_sunos.c
+--- linux-2.3.3/arch/sparc/kernel/sys_sunos.c	Tue Oct 27 12:52:20 1998
++++ linux/arch/sparc/kernel/sys_sunos.c	Wed Jun  2 10:27:14 1999
+@@ -150,7 +150,6 @@
+ 	unsigned long newbrk, oldbrk;
+ 
+ 	down(&current->mm->mmap_sem);
+-	lock_kernel();
+ 	if(ARCH_SUN4C_SUN4) {
+ 		if(brk >= 0x20000000 && brk < 0xe0000000) {
+ 			goto out;
+@@ -210,12 +209,9 @@
+ 	 * Ok, we have probably got enough memory - let it rip.
+ 	 */
+ 	current->mm->brk = brk;
+-	do_mmap(NULL, oldbrk, newbrk-oldbrk,
+-		PROT_READ|PROT_WRITE|PROT_EXEC,
+-		MAP_FIXED|MAP_PRIVATE, 0);
++	do_brk(oldbrk, newbrk-oldbrk)
+ 	retval = 0;
+ out:
+-	unlock_kernel();
+ 	up(&current->mm->mmap_sem);
+ 	return retval;
+ }
+diff -ruN linux-2.3.3/arch/sparc64/kernel/binfmt_aout32.c linux/arch/sparc64/kernel/binfmt_aout32.c
+--- linux-2.3.3/arch/sparc64/kernel/binfmt_aout32.c	Sun May 23 20:03:15 1999
++++ linux/arch/sparc64/kernel/binfmt_aout32.c	Mon May 31 22:54:06 1999
+@@ -48,9 +48,7 @@
+ 	end = PAGE_ALIGN(end);
+ 	if (end <= start)
+ 		return;
+-	do_mmap(NULL, start, end - start,
+-		PROT_READ | PROT_WRITE | PROT_EXEC,
+-		MAP_FIXED | MAP_PRIVATE, 0);
++	do_brk(start, end - start);
+ }
+ 
+ /*
+@@ -284,24 +282,18 @@
+  	current->flags &= ~PF_FORKNOEXEC;
+ 	if (N_MAGIC(ex) == NMAGIC) {
+ 		/* Fuck me plenty... */
+-		error = do_mmap(NULL, N_TXTADDR(ex), ex.a_text,
+-				PROT_READ|PROT_WRITE|PROT_EXEC,
+-				MAP_FIXED|MAP_PRIVATE, 0);
++		error = do_brk(N_TXTADDR(ex), ex.a_text);
+ 		read_exec(bprm->dentry, fd_offset, (char *) N_TXTADDR(ex),
+ 			  ex.a_text, 0);
+-		error = do_mmap(NULL, N_DATADDR(ex), ex.a_data,
+-				PROT_READ|PROT_WRITE|PROT_EXEC,
+-				MAP_FIXED|MAP_PRIVATE, 0);
++		error = do_brk(N_DATADDR(ex), ex.a_data);
+ 		read_exec(bprm->dentry, fd_offset + ex.a_text, (char *) N_DATADDR(ex),
+ 			  ex.a_data, 0);
+ 		goto beyond_if;
+ 	}
+ 
+ 	if (N_MAGIC(ex) == OMAGIC) {
+-		do_mmap(NULL, N_TXTADDR(ex) & PAGE_MASK,
+-			ex.a_text+ex.a_data + PAGE_SIZE - 1,
+-			PROT_READ|PROT_WRITE|PROT_EXEC,
+-			MAP_FIXED|MAP_PRIVATE, 0);
++		do_brk(N_TXTADDR(ex) & PAGE_MASK,
++			ex.a_text+ex.a_data + PAGE_SIZE - 1);
+ 		read_exec(bprm->dentry, fd_offset, (char *) N_TXTADDR(ex),
+ 			  ex.a_text+ex.a_data, 0);
+ 	} else {
+@@ -316,9 +308,7 @@
+ 
+ 		if (!file->f_op || !file->f_op->mmap) {
+ 			sys_close(fd);
+-			do_mmap(NULL, 0, ex.a_text+ex.a_data,
+-				PROT_READ|PROT_WRITE|PROT_EXEC,
+-				MAP_FIXED|MAP_PRIVATE, 0);
++			do_brk(0, ex.a_text+ex.a_data);
+ 			read_exec(bprm->dentry, fd_offset,
+ 				  (char *) N_TXTADDR(ex), ex.a_text+ex.a_data, 0);
+ 			goto beyond_if;
+@@ -442,9 +432,7 @@
+ 	len = PAGE_ALIGN(ex.a_text + ex.a_data);
+ 	bss = ex.a_text + ex.a_data + ex.a_bss;
+ 	if (bss > len) {
+-		error = do_mmap(NULL, start_addr + len, bss - len,
+-				PROT_READ | PROT_WRITE | PROT_EXEC,
+-				MAP_PRIVATE | MAP_FIXED, 0);
++		error = do_brk(start_addr + len, bss - len);
+ 		retval = error;
+ 		if (error != start_addr + len)
+ 			goto out_putf;
+diff -ruN linux-2.3.3/arch/sparc64/kernel/sys_sunos32.c linux/arch/sparc64/kernel/sys_sunos32.c
+--- linux-2.3.3/arch/sparc64/kernel/sys_sunos32.c	Tue Oct 27 12:52:20 1998
++++ linux/arch/sparc64/kernel/sys_sunos32.c	Wed Jun  2 10:35:44 1999
+@@ -134,7 +134,6 @@
+ 	unsigned long newbrk, oldbrk, brk = (unsigned long) baddr;
+ 
+ 	down(&current->mm->mmap_sem);
+-	lock_kernel();
+ 	if (brk < current->mm->end_code)
+ 		goto out;
+ 	newbrk = PAGE_ALIGN(brk);
+@@ -175,12 +174,9 @@
+ 		goto out;
+ 	/* Ok, we have probably got enough memory - let it rip. */
+ 	current->mm->brk = brk;
+-	do_mmap(NULL, oldbrk, newbrk-oldbrk,
+-		PROT_READ|PROT_WRITE|PROT_EXEC,
+-		MAP_FIXED|MAP_PRIVATE, 0);
++	do_brk(oldbrk, newbrk-oldbrk);
+ 	retval = 0;
+ out:
+-	unlock_kernel();
+ 	up(&current->mm->mmap_sem);
+ 	return retval;
+ }
+diff -ruN linux-2.3.3/fs/binfmt_aout.c linux/fs/binfmt_aout.c
+--- linux-2.3.3/fs/binfmt_aout.c	Sun May 23 20:04:02 1999
++++ linux/fs/binfmt_aout.c	Mon May 31 22:52:18 1999
+@@ -49,9 +49,7 @@
+ 	end = PAGE_ALIGN(end);
+ 	if (end <= start)
+ 		return;
+-	do_mmap(NULL, start, end - start,
+-		PROT_READ | PROT_WRITE | PROT_EXEC,
+-		MAP_FIXED | MAP_PRIVATE, 0);
++	do_brk(start, end - start);
+ }
+ 
+ /*
+@@ -373,14 +371,10 @@
+ #ifdef __sparc__
+ 	if (N_MAGIC(ex) == NMAGIC) {
+ 		/* Fuck me plenty... */
+-		error = do_mmap(NULL, N_TXTADDR(ex), ex.a_text,
+-				PROT_READ|PROT_WRITE|PROT_EXEC,
+-				MAP_FIXED|MAP_PRIVATE, 0);
++		error = do_brk(N_TXTADDR(ex), ex.a_text);
+ 		read_exec(bprm->dentry, fd_offset, (char *) N_TXTADDR(ex),
+ 			  ex.a_text, 0);
+-		error = do_mmap(NULL, N_DATADDR(ex), ex.a_data,
+-				PROT_READ|PROT_WRITE|PROT_EXEC,
+-				MAP_FIXED|MAP_PRIVATE, 0);
++		error = do_brk(N_DATADDR(ex), ex.a_data);
+ 		read_exec(bprm->dentry, fd_offset + ex.a_text, (char *) N_DATADDR(ex),
+ 			  ex.a_data, 0);
+ 		goto beyond_if;
+@@ -389,16 +383,12 @@
+ 
+ 	if (N_MAGIC(ex) == OMAGIC) {
+ #if defined(__alpha__) || defined(__sparc__)
+-		do_mmap(NULL, N_TXTADDR(ex) & PAGE_MASK,
+-			ex.a_text+ex.a_data + PAGE_SIZE - 1,
+-			PROT_READ|PROT_WRITE|PROT_EXEC,
+-			MAP_FIXED|MAP_PRIVATE, 0);
++		do_brk(N_TXTADDR(ex) & PAGE_MASK,
++			ex.a_text+ex.a_data + PAGE_SIZE - 1)
+ 		read_exec(bprm->dentry, fd_offset, (char *) N_TXTADDR(ex),
+ 			  ex.a_text+ex.a_data, 0);
+ #else
+-		do_mmap(NULL, 0, ex.a_text+ex.a_data,
+-			PROT_READ|PROT_WRITE|PROT_EXEC,
+-			MAP_FIXED|MAP_PRIVATE, 0);
++		do_brk(0, ex.a_text+ex.a_data);
+ 		read_exec(bprm->dentry, 32, (char *) 0, ex.a_text+ex.a_data, 0);
+ #endif
+ 		flush_icache_range((unsigned long) 0,
+@@ -415,9 +405,7 @@
+ 
+ 		if (!file->f_op || !file->f_op->mmap) {
+ 			sys_close(fd);
+-			do_mmap(NULL, 0, ex.a_text+ex.a_data,
+-				PROT_READ|PROT_WRITE|PROT_EXEC,
+-				MAP_FIXED|MAP_PRIVATE, 0);
++			do_brk(0, ex.a_text+ex.a_data);
+ 			read_exec(bprm->dentry, fd_offset,
+ 				  (char *) N_TXTADDR(ex), ex.a_text+ex.a_data, 0);
+ 			flush_icache_range((unsigned long) N_TXTADDR(ex),
+@@ -546,9 +534,7 @@
+ 	len = PAGE_ALIGN(ex.a_text + ex.a_data);
+ 	bss = ex.a_text + ex.a_data + ex.a_bss;
+ 	if (bss > len) {
+-		error = do_mmap(NULL, start_addr + len, bss - len,
+-				PROT_READ | PROT_WRITE | PROT_EXEC,
+-				MAP_PRIVATE | MAP_FIXED, 0);
++		error = do_brk(start_addr + len, bss - len);
+ 		retval = error;
+ 		if (error != start_addr + len)
+ 			goto out_putf;
+diff -ruN linux-2.3.3/fs/binfmt_elf.c linux/fs/binfmt_elf.c
+--- linux-2.3.3/fs/binfmt_elf.c	Sun May 23 20:04:02 1999
++++ linux/fs/binfmt_elf.c	Mon May 31 22:52:44 1999
+@@ -77,9 +77,7 @@
+ 	end = ELF_PAGEALIGN(end);
+ 	if (end <= start)
+ 		return;
+-	do_mmap(NULL, start, end - start,
+-		PROT_READ | PROT_WRITE | PROT_EXEC,
+-		MAP_FIXED | MAP_PRIVATE, 0);
++	do_brk(start, end - start);
+ }
+ 
+ 
+@@ -328,9 +326,7 @@
+ 
+ 	/* Map the last of the bss segment */
+ 	if (last_bss > elf_bss)
+-		do_mmap(NULL, elf_bss, last_bss - elf_bss,
+-			PROT_READ|PROT_WRITE|PROT_EXEC,
+-			MAP_FIXED|MAP_PRIVATE, 0);
++		do_brk(elf_bss, last_bss - elf_bss);
+ 
+ 	*interp_load_addr = load_addr;
+ 	error = ((unsigned long) interp_elf_ex->e_entry) + load_addr;
+@@ -370,17 +366,15 @@
+ 		goto out;
+ 	}
+ 
+-	do_mmap(NULL, 0, text_data,
+-		PROT_READ|PROT_WRITE|PROT_EXEC, MAP_FIXED|MAP_PRIVATE, 0);
++	do_brk(0, text_data);
+ 	retval = read_exec(interpreter_dentry, offset, addr, text_data, 0);
+ 	if (retval < 0)
+ 		goto out;
+ 	flush_icache_range((unsigned long)addr,
+ 	                   (unsigned long)addr + text_data);
+ 
+-	do_mmap(NULL, ELF_PAGESTART(text_data + ELF_EXEC_PAGESIZE - 1),
+-		interp_ex->a_bss,
+-		PROT_READ|PROT_WRITE|PROT_EXEC, MAP_FIXED|MAP_PRIVATE, 0);
++	do_brk(ELF_PAGESTART(text_data + ELF_EXEC_PAGESIZE - 1),
++		interp_ex->a_bss);
+ 	elf_entry = interp_ex->a_entry;
+ 
+ out:
+@@ -886,9 +880,7 @@
+ 				ELF_EXEC_PAGESIZE - 1);
+ 	bss = elf_phdata->p_memsz + elf_phdata->p_vaddr;
+ 	if (bss > len)
+-		do_mmap(NULL, len, bss - len,
+-			PROT_READ|PROT_WRITE|PROT_EXEC,
+-			MAP_FIXED|MAP_PRIVATE, 0);
++		do_brk(len, bss - len);
+ 	error = 0;
+ 
+ out_free_ph:
+diff -ruN linux-2.3.3/include/linux/mm.h linux/include/linux/mm.h
+--- linux-2.3.3/include/linux/mm.h	Sun May 23 20:04:45 1999
++++ linux/include/linux/mm.h	Wed Jun  2 10:36:25 1999
+@@ -314,6 +314,7 @@
+ extern unsigned long do_mmap(struct file *, unsigned long, unsigned long,
+ 	unsigned long, unsigned long, unsigned long);
+ extern int do_munmap(unsigned long, size_t);
++extern unsigned long do_brk(unsigned long, unsigned long);
+ 
+ /* filemap.c */
+ extern void remove_inode_page(struct page *);
+diff -ruN linux-2.3.3/kernel/ksyms.c linux/kernel/ksyms.c
+--- linux-2.3.3/kernel/ksyms.c	Sun May 23 20:05:01 1999
++++ linux/kernel/ksyms.c	Wed Jun  2 10:40:27 1999
+@@ -82,6 +82,7 @@
+ /* process memory management */
+ EXPORT_SYMBOL(do_mmap);
+ EXPORT_SYMBOL(do_munmap);
++EXPORT_SYMBOL(do_brk);
+ EXPORT_SYMBOL(exit_mm);
+ EXPORT_SYMBOL(exit_files);
+ EXPORT_SYMBOL(exit_fs);
+diff -ruN linux-2.3.3/mm/mmap.c linux/mm/mmap.c
+--- linux-2.3.3/mm/mmap.c	Sun May 23 20:04:04 1999
++++ linux/mm/mmap.c	Wed Jun  2 10:57:16 1999
+@@ -84,6 +84,13 @@
+ 	}
+ }
+ 
++/*
++ *  sys_brk() for the most part doesn't need the global kernel
++ *  lock, except when an application is doing something nasty
++ *  like trying to un-brk an area that has already been mapped
++ *  to a regular file.  in this case, the unmapping will need
++ *  to invoke file system routines that need the global lock.
++ */
+ asmlinkage unsigned long sys_brk(unsigned long brk)
+ {
+ 	unsigned long rlim, retval;
+@@ -92,20 +99,6 @@
+ 
+ 	down(&mm->mmap_sem);
+ 
+-	/*
+-	 * This lock-kernel is one of the main contention points for
+-	 * certain normal loads.  And it really should not be here: almost
+-	 * everything in brk()/mmap()/munmap() is protected sufficiently by
+-	 * the mmap semaphore that we got above.
+-	 *
+-	 * We should move this into the few things that really want the
+-	 * lock, namely anything that actually touches a file descriptor
+-	 * etc.  We can do all the normal anonymous mapping cases without
+-	 * ever getting the lock at all - the actual memory management
+-	 * code is already completely thread-safe.
+-	 */
+-	lock_kernel();
+-
+ 	if (brk < mm->end_code)
+ 		goto out;
+ 	newbrk = PAGE_ALIGN(brk);
+@@ -134,15 +127,12 @@
+ 		goto out;
+ 
+ 	/* Ok, looks good - let it rip. */
+-	if (do_mmap(NULL, oldbrk, newbrk-oldbrk,
+-		   PROT_READ|PROT_WRITE|PROT_EXEC,
+-		   MAP_FIXED|MAP_PRIVATE, 0) != oldbrk)
++	if (do_brk(oldbrk, newbrk-oldbrk) != oldbrk)
+ 		goto out;
+ set_brk:
+ 	mm->brk = brk;
+ out:
+ 	retval = mm->brk;
+-	unlock_kernel();
+ 	up(&mm->mmap_sem);
+ 	return retval;
+ }
+@@ -662,6 +652,8 @@
+ 		end = end > mpnt->vm_end ? mpnt->vm_end : end;
+ 		size = end - st;
+ 
++		lock_kernel();
++
+ 		if (mpnt->vm_ops && mpnt->vm_ops->unmap)
+ 			mpnt->vm_ops->unmap(mpnt, st, size);
+ 
+@@ -676,6 +668,8 @@
+ 		 * Fix the mapping, and free the old area if it wasn't reused.
+ 		 */
+ 		extra = unmap_fixup(mpnt, st, size, extra);
++
++		unlock_kernel();
+ 	}
+ 
+ 	/* Release the extra vma struct if it wasn't used */
+@@ -693,11 +687,87 @@
+ 	int ret;
+ 
+ 	down(&current->mm->mmap_sem);
+-	lock_kernel();
+ 	ret = do_munmap(addr, len);
+-	unlock_kernel();
+ 	up(&current->mm->mmap_sem);
+ 	return ret;
++}
++
++/*
++ *  this is really a simplified "do_mmap".  it only handles
++ *  anonymous maps.  eventually we may be able to do some
++ *  brk-specific accounting here.
++ */
++unsigned long do_brk(unsigned long addr, unsigned long len)
++{
++	struct mm_struct * mm = current->mm;
++	struct vm_area_struct * vma;
++	unsigned long flags, retval;
++
++	/*
++	 * mlock MCL_FUTURE?
++	 */
++	if (mm->def_flags & VM_LOCKED) {
++		unsigned long locked = mm->locked_vm << PAGE_SHIFT;
++		locked += len;
++		if (locked > current->rlim[RLIMIT_MEMLOCK].rlim_cur)
++			return -EAGAIN;
++	}
++
++	/*
++	 * Clear old maps.  this also does some error checking for us
++	 */
++	retval = do_munmap(addr, len);
++	if (retval != 0)
++		return retval;
++
++	/* Check against address space limits *after* clearing old maps... */
++	if ((mm->total_vm << PAGE_SHIFT) + len
++	    > current->rlim[RLIMIT_AS].rlim_cur)
++		return -ENOMEM;
++
++	if (mm->map_count > MAX_MAP_COUNT)
++		return -ENOMEM;
++
++	if (!vm_enough_memory(len >> PAGE_SHIFT))
++		return -ENOMEM;
++
++	/*
++	 * create a vma struct for an anonymous mapping
++	 */
++	vma = kmem_cache_alloc(vm_area_cachep, SLAB_KERNEL);
++	if (!vma)
++		return -ENOMEM;
++
++	vma->vm_mm = mm;
++	vma->vm_start = addr;
++	vma->vm_end = addr + len;
++	vma->vm_flags = vm_flags(PROT_READ|PROT_WRITE|PROT_EXEC,
++				MAP_FIXED|MAP_PRIVATE) | mm->def_flags;
++
++	vma->vm_flags |= VM_MAYREAD | VM_MAYWRITE | VM_MAYEXEC;
++	vma->vm_page_prot = protection_map[vma->vm_flags & 0x0f];
++	vma->vm_ops = NULL;
++	vma->vm_offset = 0;
++	vma->vm_file = NULL;
++	vma->vm_pte = 0;
++
++	/*
++	 * merge_segments may merge our vma, so we can't refer to it
++	 * after the call.  Save the values we need now ...
++	 */
++	flags = vma->vm_flags;
++	addr = vma->vm_start;
++	lock_kernel();
++	insert_vm_struct(mm, vma);
++	merge_segments(mm, vma->vm_start, vma->vm_end);
++	unlock_kernel();
++	
++	mm->total_vm += len >> PAGE_SHIFT;
++	if (flags & VM_LOCKED) {
++		mm->locked_vm += len >> PAGE_SHIFT;
++		make_pages_present(addr, addr + len);
++	}
++	return addr;
+ }
+ 
+ /* Build the AVL tree corresponding to the VMA list. */
+diff -ruN linux-2.3.3/mm/mremap.c linux/mm/mremap.c
+--- linux-2.3.3/mm/mremap.c	Sun Nov 22 12:38:19 1998
++++ linux/mm/mremap.c	Wed Jun  2 10:59:15 1999
+@@ -134,12 +134,14 @@
+ 			new_vma->vm_start = new_addr;
+ 			new_vma->vm_end = new_addr+new_len;
+ 			new_vma->vm_offset = vma->vm_offset + (addr - vma->vm_start);
++			lock_kernel();
+ 			if (new_vma->vm_file)
+ 				new_vma->vm_file->f_count++;
+ 			if (new_vma->vm_ops && new_vma->vm_ops->open)
+ 				new_vma->vm_ops->open(new_vma);
+ 			insert_vm_struct(current->mm, new_vma);
+ 			merge_segments(current->mm, new_vma->vm_start, new_vma->vm_end);
++			unlock_kernel();
+ 			do_munmap(addr, old_len);
+ 			current->mm->total_vm += new_len >> PAGE_SHIFT;
+ 			if (new_vma->vm_flags & VM_LOCKED) {
+@@ -166,7 +168,6 @@
+ 	unsigned long ret = -EINVAL;
+ 
+ 	down(&current->mm->mmap_sem);
+-	lock_kernel();
+ 	if (addr & ~PAGE_MASK)
+ 		goto out;
+ 	old_len = PAGE_ALIGN(old_len);
+@@ -239,7 +240,6 @@
+ 	else
+ 		ret = -ENOMEM;
+ out:
+-	unlock_kernel();
+ 	up(&current->mm->mmap_sem);
+ 	return ret;
+ }
+	- Chuck Lever
+--
+corporate:	<chuckl@netscape.com>
+personal:	<chucklever@netscape.net> or <cel@monkey.org>
+The Linux Scalability project:
+	
+http://www.citi.umich.edu/projects/linux-scalability/
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

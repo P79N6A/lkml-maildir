@@ -1,0 +1,212 @@
+Date: Tue, 21 Mar 2000 22:42:17 +0100
+From: Pavel Machek <>
+Subject: Re: [2.3.99pre2] [CORRUPTION] Doh!  Corruption problems again...
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/3/23/108
+
+Hi!
+> Looking at the 2.3.48pre4-2.3.48 diff, I see there are a huge amount of
+> changes (as usual).  Some IDE changes, but there are quite a few other
+> places that I look like they could be causing this.
+Do you know if corruption is due to IDE or due to something walking
+kernel mem?
+Hmm, I should probably finish that crc loop option... :-) Only
+userspace tools are neccessary at this point... Guess it might even
+help?
+								Pavel
+--- clean//drivers/block/loop.c	Mon Feb 21 10:32:21 2000
++++ linux/drivers/block/loop.c	Mon Feb 21 10:25:35 2000
+@@ -31,6 +31,9 @@
+  * max_loop=<1-255> to the kernel on boot.
+  * Erik I. Bolsø, <eriki@himolde.no>, Oct 31, 1999
+  *
++ * Added crc method, usefull if you don't trust your disks.
++ * Pavel Machek, <pavel@suse.cz>, 1999
++ *
+  * Still To Fix:
+  * - Advisory locking is ignored here. 
+  * - Should use an own CAP_* category instead of CAP_SYS_ADMIN 
+@@ -61,6 +64,7 @@
+ #include <linux/devfs_fs_kernel.h>
+ 
+ #include <asm/uaccess.h>
++#include <asm/checksum.h>
+ 
+ #include <linux/loop.h>		
+ 
+@@ -118,6 +122,97 @@
+ 	return 0;
+ }
+ 
++#define ID printk(KERN_ERR "crc: info about (%s, %d, %d) ", kdevname(lo->lo_device), real_block, blksize);
++
++
++static int transfer_crc(struct loop_device *lo, int cmd, char *raw_buf,
++		  char *loop_buf, int size, int real_block)
++{
++	struct buffer_head *bh;
++	int blksize = 4096, nsect;	/* Size of block on auxilary media */
++	int cksum;
++	u32 *data;
++	nsect = blksize / 4;
++
++	bh = getblk(lo->second_device, 1+real_block/nsect, blksize);
++	if (!bh) {
++		ID; printk( "getblk returned NULL.\n" );
++		return -1;
++	}
++	if (!buffer_uptodate(bh)) {
++		ll_rw_block(READ, 1, &bh);
++		wait_on_buffer(bh);
++		if (!buffer_uptodate(bh)) {
++			ID; printk(  "could not read block with CRC\n" );
++			goto error;
++		}
++	}
++
++	data = bh->b_data;
++	if (cmd == READ)
++		cksum = csum_partial_copy_nocheck(raw_buf, loop_buf, size, 0);
++	else
++		cksum = csum_partial_copy_nocheck(loop_buf, raw_buf, size, 0);
++
++	if (cmd == READ) {
++		if (le32_to_cpu(data[real_block%nsect]) != cksum) {
++			if (lo->lo_encrypt_key_size == 0) {	/* Normal mode */
++				ID; printk( "wrong checksum reading, is %x, should be %x\n", cksum, 0x1234 );
++				goto error;
++			} else { 
++				ID; printk( "wrong checksum repairing, setting to %x\n", cksum );
++				goto repair;
++			}
++		}
++	} else {
++	repair:
++		data[real_block%nsect] = cpu_to_le32(cksum);
++		mark_buffer_uptodate(bh, 1);
++		mark_buffer_dirty(bh, 1);
++	}
++
++	brelse(bh);
++	return 0;
++error:
++	brelse(bh);
++	return -1;
++
++}
++
++static int ioctl_crc(struct loop_device *lo, int cmd, unsigned long arg)
++{
++	struct file	*file;
++	struct inode	*inode;
++	int error;
++
++	printk( "Entering ioctl_crc\n" );
++	if (cmd != LOOP_CRC_SET_FD)
++		return -EINVAL;
++
++	error = -EBADF;
++	file = fget(arg);
++	if (!file)
++		return -EINVAL;
++
++	error = -EINVAL;
++	inode = file->f_dentry->d_inode;
++	if (!inode) {
++		printk(KERN_ERR "ioctl_crc: NULL inode?!?\n");
++		goto out;
++	}
++
++	if (S_ISBLK(inode->i_mode)) {
++		error = blkdev_open(inode, file);
++		lo->second_device = inode->i_rdev;
++		printk( "loop_crc: Registered device %x\n", lo->second_device );
++		return error;
++	} else {
++	out:
++		fput(file);
++		return -EINVAL;
++	}
++}
++
+ static int none_status(struct loop_device *lo, struct loop_info *info)
+ {
+ 	return 0; 
+@@ -142,10 +237,19 @@
+ 	init: xor_status
+ }; 	
+ 
++struct loop_func_table crc_funcs = { 
++	number: LO_CRYPT_CRC,
++	transfer: transfer_crc,
++	init: none_status,
++	ioctl: ioctl_crc
++}; 	
++
+ /* xfer_funcs[0] is special - its release function is never called */ 
+ struct loop_func_table *xfer_funcs[MAX_LO_CRYPT] = {
+ 	&none_funcs,
+-	&xor_funcs  
++	&xor_funcs,
++	NULL, NULL, NULL, NULL, NULL,
++	&crc_funcs,
+ };
+ 
+ #define MAX_DISK_SIZE 1024*1024*1024
+@@ -539,6 +643,7 @@
+ 	lo->transfer = NULL;
+ 	lo->ioctl = NULL;
+ 	lo->lo_device = 0;
++	lo->second_device = 0;
+ 	lo->lo_encrypt_type = 0;
+ 	lo->lo_offset = 0;
+ 	lo->lo_encrypt_key_size = 0;
+--- clean//include/linux/loop.h	Tue Dec  1 22:11:49 1998
++++ linux/include/linux/loop.h	Mon Jan 31 22:55:35 2000
+@@ -22,6 +22,7 @@
+ 	struct dentry	*lo_dentry;
+ 	int		lo_refcnt;
+ 	kdev_t		lo_device;
++	kdev_t		second_device; /* For crc method, device to write crc's to */
+ 	int		lo_offset;
+ 	int		lo_encrypt_type;
+ 	int		lo_encrypt_key_size;
+@@ -58,9 +59,11 @@
+  * from a glibc program, because glibc has a 32bit dev_t.
+  * Prevent people from shooting in their own foot.  
+  */
+-#if __GLIBC__ >= 2 && !defined(dev_t)
++#if 0 
++/* __GLIBC__ >= 2 && !defined(dev_t) */
+ #error "Wrong dev_t in loop.h"
+ #endif 
++#define dev_t __u16
+ 
+ /*
+  *	This uses kdev_t because glibc currently has no appropiate
+@@ -94,6 +97,7 @@
+ #define LO_CRYPT_BLOW     4
+ #define LO_CRYPT_CAST128  5
+ #define LO_CRYPT_IDEA     6
++#define LO_CRYPT_CRC	  7
+ #define LO_CRYPT_DUMMY    9
+ #define LO_CRYPT_SKIPJACK 10
+ #define MAX_LO_CRYPT	20
+@@ -126,5 +130,6 @@
+ #define LOOP_CLR_FD	0x4C01
+ #define LOOP_SET_STATUS	0x4C02
+ #define LOOP_GET_STATUS	0x4C03
++#define LOOP_CRC_SET_FD 0x4C04
+ 
+ #endif
+-- 
+I'm pavel@ucw.cz. "In my country we have almost anarchy and I don't care."
+Panos Katsaloulis describing me w.r.t. patents me at discuss@linmodems.org
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

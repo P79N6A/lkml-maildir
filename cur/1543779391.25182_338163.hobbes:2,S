@@ -1,0 +1,288 @@
+Date: Mon, 1 Aug 2005 03:01:22 -0700
+From: Lukasz Kosewski <>
+Subject: [PATCH 2/3] Add disk hotswap support to libata RESEND #2
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2005/8/1/69
+
+Patch 02:  Add a hotswap infrastructure to libata
+As described in the archives, this patch adds a framework and API to
+libata to allow for hotswapping.
+This version comes with a debounce timer... exciting!
+Luke Kosewski
+01.08.05  Luke Kosewski  <lkosewsk@nit.ca>
+	* A patch to add a general-purpose hotswap framework to libata.  From
+	  the point of view of the driver writer, we only have one new API
+	  function; 'ata_hotplug_op', which is called to schedule a plug/unplug
+	  event.  We also need to prepare our driver to tell this function, when
+	  executed, whether we are doing a plug/unplug; for this we also have
+	  to fill in the ap->ops->hotplug_action callback in our driver.
+	* A few misc changes are necessary to properly reset flags which are
+	  set by devices when they are present to make sure that new devices
+	  (for instance, disks with different max UDMA transfer rates, not using
+	  LBA48, etc.) being swapped in do not assume values for the old
+	  devices.
+	* Gratuitous comments here that can probably be removed, so that anyone
+	  looking at this can understand this and poke holes in my logic.
+	* This is a resend of the original patch which in particular:
+	  - uses a 'debounce handler', done with a timer, to take care of cases
+	    where we get spurious interrupts, usually caused by the metal pins
+	    on a connector wobbling irregularly as they're pushed in.
+Signed-off-by:  Luke Kosewski <lkosewsk@nit.ca>
+--- linux-2.6.13-rc3/drivers/scsi/libata-core.c.old	2005-08-01 00:21:55.000000000 -0700
++++ linux-2.6.13-rc3/drivers/scsi/libata-core.c	2005-08-01 02:13:36.000000000 -0700
+@@ -1134,6 +1135,11 @@ static void ata_dev_identify(struct ata_
+ 		return;
+ 	}
+ 
++	/* Necessary if we had an LBA48 drive in, we pulled it out, and put in
++	 * a non-LBA48 drive to replace it.
++	 */
++	dev->flags &= ~ATA_DFLAG_LBA48;
++
+ 	if (ap->flags & (ATA_FLAG_SRST | ATA_FLAG_SATA_RESET))
+ 		using_edd = 0;
+ 	else
+@@ -3635,6 +3641,93 @@ idle_irq:
+ 	return 0;	/* irq not handled */
+ }
+ 
++void ata_check_kill_qc(struct ata_port *ap)
++{
++	struct ata_queued_cmd *qc = ata_qc_from_tag(ap, ap->active_tag);
++
++	if (unlikely(qc)) {
++		/* This is SO bad.  But we can't just run
++		 * ata_qc_complete without doing this, because
++		 * ata_scsi_qc_complete wants to talk to the device,
++		 * and we can't let it do that since it doesn't exist
++		 * anymore.
++		 */
++		ata_scsi_prepare_qc_abort(qc);
++		ata_qc_complete(qc, ATA_ERR);
++	}
++}
++
++static inline void ata_hotplug_unplug_func(struct ata_port *ap)
++{
++	DPRINTK("Got an unplug request on port %d\n", ap->id);
++
++	ata_port_disable(ap);  //Gone gone gone!
++	ata_scsi_handle_unplug(ap);
++}
++
++static inline void ata_hotplug_plug_func(struct ata_port *ap)
++{
++	DPRINTK("Got a plug request on port %d\n", ap->id);
++
++	/* Pure evil.  Suppose that you have an 'unplug' waiting on your
++	 * queue, and this function executes while it's there (because 
++	 * you unplugged/plugged in a disk on an SMP system VERY FAST).
++	 * REALLY bad news, because when you unplugged your disk, you
++	 * might have had a pending qc which will now sit there and time
++	 * out like the mofo it is.  Check to see if we have one sitting
++	 * around and KILL IT if this is so.
++	 */
++	ata_check_kill_qc(ap);
++	ap->flags |= ATA_FLAG_SATA_RESET; // Necessary on some Seagate drives.
++	ap->udma_mask = ap->orig_udma_mask;
++
++	if (ata_bus_probe(ap))
++		ata_scsi_handle_unplug(ap);  //might be necessary on SMP
++	else
++		ata_scsi_handle_plug(ap);
++}
++
++static void ata_hotplug_timer_func(unsigned long _data)
++{
++	struct ata_port *ap = (struct ata_port *)_data;
++	int action;
++
++	//A driver that wants to play with hotplugging HAS to define this func.
++	BUG_ON(!ap->ops->hotplug_action);
++
++	spin_lock(&ap->host_set->lock);
++	/* I would have thought that we can just set a 'plug' or 'unplug'
++	 * function up as the timer caller.  However, some info from the Sil
++	 * guys indicates that we should do another check to see whether we want
++	 * to plug or unplug.  Hence, we use this function callback instead.
++	 * This has the advantage of only having one timer per ap; we can't use
++	 * only one timer to make callbacks for both plug/unplug because on an
++	 * SMP non-x86 (?) system, we might be overriding the memory location
++	 * storing a pointer to the callback at the same time as a CPU grabs
++	 * that timer and tries to run it == possible kernel panic.
++	 * That COULD have been fixed by running del_timer_sync rather than
++	 * del_timer in the ata_hotplug_(un)plug functions, except we can't run
++	 * del_timer_sync from an interrupt context, so we have this
++	 * hotplug_action solution instead.
++	 */
++	action = ap->ops->hotplug_action(ap);
++	spin_unlock(&ap->host_set->lock);
++
++	if (action)
++		ata_hotplug_plug_func(ap);
++	else
++		ata_hotplug_unplug_func(ap);
++}
++
++/* Should be protected by host_set->lock */
++void ata_hotplug_op(struct ata_port *ap)
++{
++	del_timer(&ap->hotplug_timer);
++
++	ap->hotplug_timer.expires = jiffies + ATA_TMOUT_HOTSWAP;
++	add_timer(&ap->hotplug_timer);
++}
++
+ /**
+  *	ata_interrupt - Default ATA host interrupt handler
+  *	@irq: irq line (unused)
+@@ -3860,7 +3953,11 @@ static void ata_host_init(struct ata_por
+ 	ap->cbl = ATA_CBL_NONE;
+ 	ap->active_tag = ATA_TAG_POISON;
+ 	ap->last_ctl = 0xFF;
++	ap->orig_udma_mask = ent->udma_mask;
+ 
++	ap->hotplug_timer.function = ata_hotplug_timer_func;
++	ap->hotplug_timer.data = (unsigned int)ap;
++	init_timer(&ap->hotplug_timer);
+ 	INIT_WORK(&ap->packet_task, atapi_packet_task, ap);
+ 	INIT_WORK(&ap->pio_task, ata_pio_task, ap);
+ 
+@@ -4531,6 +4628,7 @@ EXPORT_SYMBOL_GPL(ata_dev_classify);
+ EXPORT_SYMBOL_GPL(ata_dev_id_string);
+ EXPORT_SYMBOL_GPL(ata_dev_config);
+ EXPORT_SYMBOL_GPL(ata_scsi_simulate);
++EXPORT_SYMBOL_GPL(ata_hotplug_op);
+ 
+ #ifdef CONFIG_PCI
+ EXPORT_SYMBOL_GPL(pci_test_config_bits);
+--- linux-2.6.13-rc3/drivers/scsi/libata-scsi.c.old	2005-08-01 00:22:01.000000000 -0700
++++ linux-2.6.13-rc3/drivers/scsi/libata-scsi.c	2005-08-01 00:22:26.000000000 -0700
+@@ -1011,6 +1011,53 @@ static int ata_scsi_qc_complete(struct a
+ 	return 0;
+ }
+ 
++static int ata_scsi_qc_abort(struct ata_queued_cmd *qc, u8 drv_stat)
++{
++	struct scsi_cmnd *cmd = qc->scsicmd;
++
++	cmd->result = SAM_STAT_TASK_ABORTED; //FIXME:  Is this what we want?
++
++	qc->scsidone(cmd);
++
++	return 0;
++}
++
++void ata_scsi_prepare_qc_abort(struct ata_queued_cmd *qc)
++{
++	// For some reason or another, we can't allow a normal scsi_qc_complete
++	if (qc->complete_fn == ata_scsi_qc_complete);
++		qc->complete_fn = ata_scsi_qc_abort;
++}
++
++void ata_scsi_handle_plug(struct ata_port *ap)
++{
++	//Currently SATA only
++	scsi_add_device(ap->host, 0, 0, 0);
++}
++
++void ata_scsi_handle_unplug(struct ata_port *ap)
++{
++	//SATA only, no PATA
++	struct scsi_device *scd = scsi_device_lookup(ap->host, 0, 0, 0);
++	/* scd might not exist; someone did 'echo "scsi remove-single-device
++	 * ... " > /proc/scsi/scsi' or somebody  was turning the key in the
++	 * hotswap bay between on and off really really fast.
++	 */
++	if (scd) {
++		scsi_device_set_state(scd, SDEV_CANCEL);
++		/* We might have a pending qc on I/O to a removed device,
++		 * however, I argue it's impossible unless we have an 'scd'
++		 * because it means we never completed a 'plug' into the system
++		 * (or no device was present on bootup), so either we have no
++		 * possible I/O, or a qc which 'ata_hotplug_plug_func' took
++		 * care of
++		 */
++		ata_check_kill_qc(ap);
++		scsi_remove_device(scd);
++		scsi_device_put(scd);
++	}
++}
++
+ /**
+  *	ata_scsi_translate - Translate then issue SCSI command to ATA device
+  *	@ap: ATA port to which the command is addressed
+--- linux-2.6.13-rc3/drivers/scsi/libata.h.old	2005-08-01 00:22:05.000000000 -0700
++++ linux-2.6.13-rc3/drivers/scsi/libata.h	2005-08-01 00:22:26.000000000 -0700
+@@ -40,6 +40,7 @@ extern struct ata_queued_cmd *ata_qc_new
+ extern void ata_qc_free(struct ata_queued_cmd *qc);
+ extern int ata_qc_issue(struct ata_queued_cmd *qc);
+ extern int ata_check_atapi_dma(struct ata_queued_cmd *qc);
++extern void ata_check_kill_qc(struct ata_port *ap);
+ extern void ata_dev_select(struct ata_port *ap, unsigned int device,
+                            unsigned int wait, unsigned int can_sleep);
+ extern void ata_tf_to_host_nolock(struct ata_port *ap, struct ata_taskfile *tf);
+@@ -76,6 +77,9 @@ extern void ata_scsi_badcmd(struct scsi_
+ extern void ata_scsi_rbuf_fill(struct ata_scsi_args *args, 
+                         unsigned int (*actor) (struct ata_scsi_args *args,
+                                            u8 *rbuf, unsigned int buflen));
++extern void ata_scsi_prepare_qc_abort(struct ata_queued_cmd *qc);
++extern void ata_scsi_handle_plug(struct ata_port *ap);
++extern void ata_scsi_handle_unplug(struct ata_port *ap);
+ 
+ static inline void ata_bad_scsiop(struct scsi_cmnd *cmd, void (*done)(struct scsi_cmnd *))
+ {
+--- linux-2.6.13-rc3/include/linux/libata.h.old	2005-08-01 00:22:13.000000000 -0700
++++ linux-2.6.13-rc3/include/linux/libata.h	2005-08-01 02:13:57.000000000 -0700
+@@ -29,6 +29,7 @@
+ #include <asm/io.h>
+ #include <linux/ata.h>
+ #include <linux/workqueue.h>
++#include <linux/timer.h>
+ 
+ /*
+  * compile-time options
+@@ -127,6 +128,7 @@ enum {
+ 	ATA_TMOUT_BOOT_QUICK	= 7 * HZ,	/* hueristic */
+ 	ATA_TMOUT_CDB		= 30 * HZ,
+ 	ATA_TMOUT_CDB_QUICK	= 5 * HZ,
++	ATA_TMOUT_HOTSWAP	= HZ / 2,	/* Heuristic suggested by Sil */
+ 
+ 	/* ATA bus states */
+ 	BUS_UNKNOWN		= 0,
+@@ -319,6 +321,7 @@ struct ata_port {
+ 	struct ata_host_stats	stats;
+ 	struct ata_host_set	*host_set;
+ 
++	struct timer_list	hotplug_timer;
+ 	struct work_struct	packet_task;
+ 
+ 	struct work_struct	pio_task;
+@@ -326,6 +329,8 @@ struct ata_port {
+ 	unsigned long		pio_task_timeout;
+ 
+ 	void			*private_data;
++
++	unsigned int		orig_udma_mask;
+ };
+ 
+ struct ata_port_operations {
+@@ -372,6 +377,7 @@ struct ata_port_operations {
+ 
+ 	void (*bmdma_stop) (struct ata_port *ap);
+ 	u8   (*bmdma_status) (struct ata_port *ap);
++	int (*hotplug_action) (struct ata_port *ap);
+ };
+ 
+ struct ata_port_info {
+@@ -402,6 +408,7 @@ extern int ata_scsi_queuecmd(struct scsi
+ extern int ata_scsi_error(struct Scsi_Host *host);
+ extern int ata_scsi_release(struct Scsi_Host *host);
+ extern unsigned int ata_host_intr(struct ata_port *ap, struct ata_queued_cmd *qc);
++extern void ata_hotplug_op(struct ata_port *ap);
+ /*
+  * Default driver ops implementations
+  */

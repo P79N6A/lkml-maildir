@@ -1,0 +1,132 @@
+Date: Mon, 28 Aug 2000 19:09:00 +0200 (CEST)
+From: Andrea Arcangeli <>
+Subject: Re: [patch] waitqueue optimization, 2.4.0-test7
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/8/28/3
+
+On Mon, 28 Aug 2000, Ingo Molnar wrote:
+>a substantial percentage of __wake_up() calls are done on empty waitqueues
+Things like process_timeout() knows the task is sleeping thus it would be
+a double waste of CPU time for them to check if the waitqueue is empty and
+then also to grab the waitqueue spinlocks to do the wakeup browsing the
+list with only 1 task in it. I don't think we should force the whole
+kernel not to use wake_up_process, I think there are cases where using
+wake_up_process carefully is better and it doesn't seems to be an abuse of
+the scheduler internals to me. Furthmore the same optimization you did at
+the waitqueue layer can be done also at the wake_up_process layer (not try
+to wakeup a task that is just running). But that would be still a waste
+for a things like process_timeout() and it should be checked carefully
+w.r.t. SMP races since it wouldn't anymore put a barrier between the
+checking of the state and the previous instructions (so it should probably
+called with another name).
+Returning to your patch you're introducing an SMP race in the wait event
+interface. We enforced that wake_up had to provide an implicit memory
+barrier to avoid adding an explicit memory barrier in the middle of things
+like UnlockPage. On IA32 at least UnlockPage can't trigger the race
+because there's the lock on the bus to do the clear_bit, but for example
+on the alpha we do the clear bit with the load locked store conditional
+operations (same thing on sparc64), thus we don't put any memory barrier
+anymore between clearing the bit and reading the waitqueue. Thus I think
+we could read the waitqueue before the effect of the clear_bit become
+visible to the other CPUs, and that will have the effect of reversing the
+order of execution between wake_up and clear_bit.
+	CPU0				CPU1
+					wake_up() -> got reordered before clear_bit
+	add_to_wait_queue() /* too late */
+	do {
+		sync_page()
+		set_current_state(TASK_INTERRUPTIBLE)
+		if (!PageLocked())
+			schedule()
+					clear_bit(PG_locked)
+	*deadlock*
+With the implicit spin_lock() at the preamble of wake_up the above can
+never happen.
+Something like the above can trigger also in IA32 due the write buffer (if
+the event setting isn't done with atomic operations of course :), btw, the
+only reason we have the atomic operation while clearing the page->flags is
+because of things like shrink_mmap that play with the referenced bit even
+while the page may be locked).
+I see there are things like UnlockPage() that doesn't have any waiter most
+of time while doing normal reads and writes and we can safely optimize
+some suprious spin_lock/_unlock away this way:
+diff -urN 2.4.0-test7/include/asm-alpha/mm.h unlockpage/include/asm-alpha/mm.h
+--- 2.4.0-test7/include/asm-alpha/mm.h	Thu Jan  1 01:00:00 1970
++++ unlockpage/include/asm-alpha/mm.h	Mon Aug 28 18:46:24 2000
+@@ -0,0 +1,12 @@
++#ifndef _ALPHA_MM_H
++#define _ALPHA_MM_H
++
++#define __HAVE_ARCH_UNLOCKPAGE
++#define UnlockPage(page)	do {						\
++					clear_bit(PG_locked, &(page)->flags);	\
++					mb();					\
++					if (waitqueue_active(&page->wait))	\
++						wake_up(&page->wait);		\
++				} while (0)
++
++#endif /* _ALPHA_MM_H */
+diff -urN 2.4.0-test7/include/asm-i386/mm.h unlockpage/include/asm-i386/mm.h
+--- 2.4.0-test7/include/asm-i386/mm.h	Thu Jan  1 01:00:00 1970
++++ unlockpage/include/asm-i386/mm.h	Mon Aug 28 18:45:58 2000
+@@ -0,0 +1,11 @@
++#ifndef _I386_MM_H
++#define _I386_MM_H
++
++#define __HAVE_ARCH_UNLOCKPAGE
++#define UnlockPage(page)	do {						\
++					clear_bit(PG_locked, &(page)->flags);	\
++					if (waitqueue_active(&page->wait))	\
++						wake_up(&page->wait);		\
++				} while (0)
++
++#endif /* _I386_MM_H */
+diff -urN 2.4.0-test7/include/asm-sparc64/mm.h unlockpage/include/asm-sparc64/mm.h
+--- 2.4.0-test7/include/asm-sparc64/mm.h	Thu Jan  1 01:00:00 1970
++++ unlockpage/include/asm-sparc64/mm.h	Mon Aug 28 18:55:38 2000
+@@ -0,0 +1,12 @@
++#ifndef _SPARC64_MM_H
++#define _SPARC64_MM_H
++
++#define __HAVE_ARCH_UNLOCKPAGE
++#define UnlockPage(page)	do {						\
++					clear_bit(PG_locked, &(page)->flags);	\
++					membar("#StoreLoad")			\
++					if (waitqueue_active(&page->wait))	\
++						wake_up(&page->wait);		\
++				} while (0)
++
++#endif /* _SPARC64_MM_H */
+diff -urN 2.4.0-test7/include/linux/mm.h unlockpage/include/linux/mm.h
+--- 2.4.0-test7/include/linux/mm.h	Sun Aug 27 16:21:01 2000
++++ unlockpage/include/linux/mm.h	Mon Aug 28 18:56:02 2000
+@@ -20,6 +20,7 @@
+ #include <asm/page.h>
+ #include <asm/pgtable.h>
+ #include <asm/atomic.h>
++#include <asm/mm.h>
+ 
+ /*
+  * Linux kernel virtual memory manager primitives.
+@@ -189,10 +190,12 @@
+ #define PageLocked(page)	test_bit(PG_locked, &(page)->flags)
+ #define LockPage(page)		set_bit(PG_locked, &(page)->flags)
+ #define TryLockPage(page)	test_and_set_bit(PG_locked, &(page)->flags)
++#ifndef __HAVE_ARCH_UNLOCKPAGE
+ #define UnlockPage(page)	do { \
+ 					clear_bit(PG_locked, &(page)->flags); \
+ 					wake_up(&page->wait); \
+ 				} while (0)
++#endif
+ #define PageError(page)		test_bit(PG_error, &(page)->flags)
+ #define SetPageError(page)	set_bit(PG_error, &(page)->flags)
+ #define ClearPageError(page)	clear_bit(PG_error, &(page)->flags)
+Andrea
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+Please read the FAQ at 
+http://www.tux.org/lkml/

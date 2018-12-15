@@ -1,0 +1,1319 @@
+Date: 11 Aug 2000 15:23:15 -0700
+From: Dimitris Michailidis <>
+Subject: [patch] scheduler fixes
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/8/11/148
+
+This is an updated version of my scheduler patch for -test6.
+Changes/fixes:
+* RT processes are on a separate queue, goodness() deals only with SCHED_OTHER;
+* counter recalculation is lazy, doesn't race, and doesn't mess with RT
+  processes;
+* sched_yield works for all processes.  Includes allowing a high
+  goodness SCHED_OTHER process to yield to a lower goodness one;
+* merged cpus_allowed & has_cpu;
+* reschedule_idle() uses a faster version of goodness(), 5 instructions long
+  vs 20 of the stock version.  Other reschedule_idle() speedups;
+* we don't try to preempt CPUs with pending preemption requests.  Among other
+  things fixes bug where several woken up processes (eg, from a wait queue)
+  all try to reschedule on the same cpu;
+* SCHED_FIFO processes are scheduled FIFO rather than LIFO and get an 
+  'infinite' slice;
+* SCHED_RR processes are scheduled round-robin;
+* removed runqueue_lock from sched_yield() and release() and the tasklist lock
+  from schedule();
+* fixed several bugs in setscheduler();
+* comment fixes;
+* probably assorted lesser fixes.
+---
+Dimitris Michailidis				dimitris@engr.sgi.com
+diff -ruN -X diff.ignore linux-2.4.0-6/arch/i386/kernel/process.c linux-2.4.0-6.sched/arch/i386/kernel/process.c
+--- linux-2.4.0-6/arch/i386/kernel/process.c	Tue Jul 11 13:53:03 2000
++++ linux-2.4.0-6.sched/arch/i386/kernel/process.c	Fri Aug 11 13:04:48 2000
+@@ -94,23 +94,14 @@
+  */
+ static void poll_idle (void)
+ {
+-	int oldval;
+-
+ 	__sti();
+-
+-	/*
+-	 * Deal with another CPU just having chosen a thread to
+-	 * run here:
+-	 */
+-	oldval = xchg(&current->need_resched, -1);
+-
+-	if (!oldval)
+-		asm volatile(
+-			"2:"
+-			"cmpl $-1, %0;"
+-			"rep; nop;"
+-			"je 2b;"
+-				: :"m" (current->need_resched));
++	asm volatile(
++		"1:"
++		"cmpl $0, %0;"
++		"jne 2f;"
++		"rep; nop;"
++		"jmp 1b;"
++		"2:" : :"m" (current->need_resched));
+ }
+ 
+ /*
+@@ -140,8 +131,11 @@
+ static int __init idle_setup (char *str)
+ {
+ 	if (!strncmp(str, "poll", 4)) {
++		extern int idlers_need_IPI;
++
+ 		printk("using polling idle threads.\n");
+ 		pm_idle = poll_idle;
++		idlers_need_IPI = 0;
+ 	}
+ 
+ 	return 1;
+diff -ruN -X diff.ignore linux-2.4.0-6/arch/i386/kernel/smpboot.c linux-2.4.0-6.sched/arch/i386/kernel/smpboot.c
+--- linux-2.4.0-6/arch/i386/kernel/smpboot.c	Mon Jun 26 13:05:02 2000
++++ linux-2.4.0-6.sched/arch/i386/kernel/smpboot.c	Fri Aug 11 12:52:45 2000
+@@ -564,12 +564,11 @@
+ 	idle->processor = cpu;
+ 	x86_cpu_to_apicid[cpu] = apicid;
+ 	x86_apicid_to_cpu[apicid] = cpu;
+-	idle->has_cpu = 1; /* we schedule the first task manually */
++	idle->cpus_allowed = 0; 	/* we schedule idle tasks manually */
+ 	idle->thread.eip = (unsigned long) start_secondary;
+ 
+ 	del_from_runqueue(idle);
+ 	unhash_process(idle);
+-	init_tasks[cpu] = idle;
+ 
+ 	/* start_eip had better be page-aligned! */
+ 	start_eip = setup_trampoline();
+@@ -856,7 +855,6 @@
+ 	x86_cpu_to_apicid[0] = boot_cpu_id;
+ 	global_irq_holder = 0;
+ 	current->processor = 0;
+-	init_idle();
+ 	smp_tune_scheduling();
+ 
+ 	/*
+diff -ruN -X diff.ignore linux-2.4.0-6/fs/proc/proc_misc.c linux-2.4.0-6.sched/fs/proc/proc_misc.c
+--- linux-2.4.0-6/fs/proc/proc_misc.c	Fri Jul 28 13:50:28 2000
++++ linux-2.4.0-6.sched/fs/proc/proc_misc.c	Fri Aug 11 12:52:45 2000
+@@ -98,7 +98,7 @@
+ 	int len;
+ 
+ 	uptime = jiffies;
+-	idle = init_tasks[0]->times.tms_utime + init_tasks[0]->times.tms_stime;
++	idle = init_task.times.tms_utime + init_task.times.tms_stime;
+ 
+ 	/* The formula for the fraction parts really is ((t * 100) / HZ) % 100, but
+ 	   that would overflow about every five days at HZ == 100.
+diff -ruN -X diff.ignore linux-2.4.0-6/include/linux/sched.h linux-2.4.0-6.sched/include/linux/sched.h
+--- linux-2.4.0-6/include/linux/sched.h	Fri Aug 11 14:21:15 2000
++++ linux-2.4.0-6.sched/include/linux/sched.h	Fri Aug 11 13:11:08 2000
+@@ -286,15 +286,19 @@
+  */
+ 	long counter;
+ 	long nice;
++	unsigned long rt_priority;
+ 	unsigned long policy;
+ 	struct mm_struct *mm;
+-	int has_cpu, processor;
+-	unsigned long cpus_allowed;
++	int processor;
++	unsigned long cpus_allowed; /* CPUs allowed to select us in schedule */
+ 	/*
+ 	 * (only the 'next' pointer fits into the cacheline, but
+ 	 * that's just fine.)
+ 	 */
+ 	struct list_head run_list;
++	struct list_head *runq_head;
++	int counter_recalc;
++	unsigned long cpu_runon_map; /* CPUs we may run on */
+ 
+ 	struct task_struct *next_task, *prev_task;
+ 	struct mm_struct *active_mm;
+@@ -326,7 +330,6 @@
+ 
+ 	wait_queue_head_t wait_chldexit;	/* for wait4() */
+ 	struct semaphore *vfork_sem;		/* for vfork() */
+-	unsigned long rt_priority;
+ 	unsigned long it_real_value, it_prof_value, it_virt_value;
+ 	unsigned long it_real_incr, it_prof_incr, it_virt_incr;
+ 	struct timer_list real_timer;
+@@ -426,8 +429,8 @@
+     policy:		SCHED_OTHER,					\
+     mm:			NULL,						\
+     active_mm:		&init_mm,					\
+-    cpus_allowed:	-1,						\
+-    run_list:		LIST_HEAD_INIT(tsk.run_list),			\
++    cpu_runon_map:	~0,						\
++    run_list:		{ NULL, NULL },					\
+     next_task:		&tsk,						\
+     prev_task:		&tsk,						\
+     p_opptr:		&tsk,						\
+@@ -468,7 +471,6 @@
+ extern union task_union init_task_union;
+ 
+ extern struct   mm_struct init_mm;
+-extern struct task_struct *init_tasks[NR_CPUS];
+ 
+ /* PID hashing. (shouldnt this be dynamic?) */
+ #define PIDHASH_SZ (4096 >> 2)
+diff -ruN -X diff.ignore linux-2.4.0-6/kernel/exit.c linux-2.4.0-6.sched/kernel/exit.c
+--- linux-2.4.0-6/kernel/exit.c	Thu Aug 10 16:50:38 2000
++++ linux-2.4.0-6.sched/kernel/exit.c	Fri Aug 11 13:25:35 2000
+@@ -29,17 +29,13 @@
+ 		/*
+ 		 * Wait to make sure the process isn't on the
+ 		 * runqueue (active on some other CPU still)
++		 *
++		 * The scheduler will notify us when it's done with this task
++		 * by setting cpu_runon_map to 0.
+ 		 */
+-		for (;;) {
+-			spin_lock_irq(&runqueue_lock);
+-			if (!p->has_cpu)
+-				break;
+-			spin_unlock_irq(&runqueue_lock);
+-			do {
+-				barrier();
+-			} while (p->has_cpu);
+-		}
+-		spin_unlock_irq(&runqueue_lock);
++		do {
++			rmb();
++		} while (p->cpu_runon_map);
+ #endif
+ 		atomic_dec(&p->user->processes);
+ 		free_uid(p->user);
+diff -ruN -X diff.ignore linux-2.4.0-6/kernel/fork.c linux-2.4.0-6.sched/kernel/fork.c
+--- linux-2.4.0-6/kernel/fork.c	Thu Aug 10 16:50:38 2000
++++ linux-2.4.0-6.sched/kernel/fork.c	Fri Aug 11 12:52:46 2000
+@@ -611,7 +611,7 @@
+ #ifdef CONFIG_SMP
+ 	{
+ 		int i;
+-		p->has_cpu = 0;
++		p->cpus_allowed = p->cpu_runon_map;
+ 		p->processor = current->processor;
+ 		/* ?? should we just memset this ?? */
+ 		for(i = 0; i < smp_num_cpus; i++)
+diff -ruN -X diff.ignore linux-2.4.0-6/kernel/sched.c linux-2.4.0-6.sched/kernel/sched.c
+--- linux-2.4.0-6/kernel/sched.c	Thu Aug 10 16:50:38 2000
++++ linux-2.4.0-6.sched/kernel/sched.c	Fri Aug 11 12:57:04 2000
+@@ -1,7 +1,7 @@
+ /*
+  *  linux/kernel/sched.c
+  *
+- *  Kernel scheduler and related syscalls
++ *  Kernel scheduler, scheduling primitives and related syscalls
+  *
+  *  Copyright (C) 1991, 1992  Linus Torvalds
+  *
+@@ -12,13 +12,6 @@
+  *  1998-12-28  Implemented better SMP scheduling by Ingo Molnar
+  */
+ 
+-/*
+- * 'sched.c' is the main kernel file. It contains scheduling primitives
+- * (sleep_on, wakeup, schedule etc) as well as a number of simple system
+- * call functions (type getpid()), which just extract a field from
+- * current-task
+- */
+-
+ #include <linux/config.h>
+ #include <linux/mm.h>
+ #include <linux/init.h>
+@@ -33,14 +26,8 @@
+ extern void tqueue_bh(void);
+ extern void immediate_bh(void);
+ 
+-/*
+- * scheduler variables
+- */
+-
+ unsigned securebits = SECUREBITS_DEFAULT; /* systemwide security settings */
+ 
+-extern void mem_use(void);
+-
+ /*
+  * Scheduling quanta.
+  *
+@@ -72,93 +59,97 @@
+  *	via the SMP irq return path.
+  */
+  
+-struct task_struct * init_tasks[NR_CPUS] = {&init_task, };
++/*
++ * The task-list lock protects the linked list of all processes.
++ */
++rwlock_t tasklist_lock __cacheline_aligned = RW_LOCK_UNLOCKED;
+ 
+ /*
+- * The tasklist_lock protects the linked list of processes.
+- *
+- * The scheduler lock is protecting against multiple entry
+- * into the scheduling code, and doesn't need to worry
+- * about interrupts (because interrupts cannot call the
+- * scheduler).
+- *
+- * The run-queue lock locks the parts that actually access
+- * and change the run-queues, and have to be interrupt-safe.
++ * The run-queue lock protects the linked lists of runnable processes (run
++ * queues).  It also protects the list of idle CPUs just because we happen to
++ * be holding this lock when we need to manipulate the idle list.
++ * Interrupts should be disabled while holding this lock.
+  */
+-spinlock_t runqueue_lock __cacheline_aligned = SPIN_LOCK_UNLOCKED;  /* second */
+-rwlock_t tasklist_lock __cacheline_aligned = RW_LOCK_UNLOCKED;	/* third */
++spinlock_t runqueue_lock __cacheline_aligned = SPIN_LOCK_UNLOCKED;
+ 
+-static LIST_HEAD(runqueue_head);
++struct run_queue {
++	struct list_head rt_q;   /* holds RT processes */
++	struct list_head so_q;   /* holds SCHED_OTHER processes */
++	int recalc;              /* # of counter recalculations on so_q */
++} ____cacheline_aligned;
++
++static struct run_queue runq __cacheline_aligned;
++
++/*
++ * If set, reschedule_idle must send an IPI to an idle CPU to attract its 
++ * attention, otherwise the idle CPU is polling its need_resched.
++ */
++int idlers_need_IPI = 1;
+ 
+ /*
+  * We align per-CPU scheduling data on cacheline boundaries,
+  * to prevent cacheline ping-pong.
+  */
+-static union {
+-	struct schedule_data {
+-		struct task_struct * curr;
+-		cycles_t last_schedule;
+-	} schedule_data;
+-	char __pad [SMP_CACHE_BYTES];
+-} aligned_data [NR_CPUS] __cacheline_aligned = { {{&init_task,0}}};
++struct schedule_data {
++	struct task_struct *curr;   /* (selected to become) current task */
++	struct task_struct *idler;  /* idle task for this CPU */
++	unsigned long mask;         /* 1 << CPU# */
++	int prio;                   /* curr->rt_priority */
++	int preempt_pending;        /* CPU has a pending preemption request */
++	struct list_head next_idle; /* links for list of idle CPUs */
++} ____cacheline_aligned;
++
++static struct schedule_data schedule_data[NR_CPUS] __cacheline_aligned = {
++	{ &init_task, &init_task }
++};
+ 
+-#define cpu_curr(cpu) aligned_data[(cpu)].schedule_data.curr
+-#define last_schedule(cpu) aligned_data[(cpu)].schedule_data.last_schedule
++#define cpu_curr(cpu) (schedule_data[(cpu)].curr)
+ 
+ struct kernel_stat kstat;
+ 
+ #ifdef CONFIG_SMP
+ 
+-#define idle_task(cpu) (init_tasks[cpu_number_map(cpu)])
+-#define can_schedule(p,cpu) ((!(p)->has_cpu) && \
+-				((p)->cpus_allowed & (1 << cpu)))
++#define idle_task(cpu)			(schedule_data[(cpu)].idler)
++#define can_schedule(p, cpumask)	((p)->cpus_allowed & (cpumask))
++
++/* FIFO list of idle CPUs. */
++static LIST_HEAD(idle_cpu_list);
+ 
+ #else
+ 
+-#define idle_task(cpu) (&init_task)
+-#define can_schedule(p,cpu) (1)
++#define idle_task(cpu)			(&init_task)
++#define can_schedule(p, cpumask)	(1)
+ 
+ #endif
+ 
+ void scheduling_functions_start_here(void) { }
+ 
+ /*
+- * This is the function that decides how desirable a process is..
++ * This is the function that decides how desirable a SCHED_OTHER process is.
+  * You can weigh different processes against each other depending
+  * on what CPU they've run on lately etc to try to handle cache
+  * and TLB miss penalties.
+  *
+  * Return values:
+- *	 -1000: never select this
++ *	  -100: p is an idle task
+  *	     0: out of time, recalculate counters (but it might still be
+  *		selected)
+  *	   +ve: "goodness" value (the larger, the better)
+- *	 +1000: realtime process, select this.
+  */
+-
+-static inline int goodness(struct task_struct * p, int this_cpu, struct mm_struct *this_mm)
++static inline int goodness(struct task_struct *p, int this_cpu,
++			   struct mm_struct *this_mm)
+ {
+ 	int weight;
+ 
+ 	/*
+-	 * Realtime process, select the first one on the
+-	 * runqueue (taking priorities within processes
+-	 * into account).
+-	 */
+-	if (p->policy != SCHED_OTHER) {
+-		weight = 1000 + p->rt_priority;
+-		goto out;
+-	}
+-
+-	/*
+ 	 * Give the process a first-approximation goodness value
+ 	 * according to the number of clock-ticks it has left.
+ 	 *
+ 	 * Don't do any other calculations if the time slice is
+-	 * over..
++	 * over or if this is an idle task or a yielding process.
+ 	 */
+ 	weight = p->counter;
+-	if (!weight)
++	if (weight <= 0)
+ 		goto out;
+ 			
+ #ifdef CONFIG_SMP
+@@ -178,30 +169,36 @@
+ }
+ 
+ /*
+- * subtle. We want to discard a yielded process only if it's being
+- * considered for a reschedule. Wakeup-time 'queries' of the scheduling
+- * state do not count. Another optimization we do: sched_yield()-ed
+- * processes are runnable (and thus will be considered for scheduling)
+- * right when they are calling schedule(). So the only place we need
+- * to care about SCHED_YIELD is when we calculate the previous process'
+- * goodness ...
++ * Special case of goodness when p is known to be some CPU's current process.
++ * Such processes are known to have CPU and MM affinity.
+  */
+-static inline int prev_goodness(struct task_struct * p, int this_cpu, struct mm_struct *this_mm)
++static inline int curr_goodness(struct task_struct *p)
+ {
+-	if (p->policy & SCHED_YIELD) {
+-		p->policy &= ~SCHED_YIELD;
+-		return 0;
+-	}
+-	return goodness(p, this_cpu, this_mm);
++	int weight = p->counter;
++
++	if (weight > 0) {
++#ifdef CONFIG_SMP
++		weight += (20 + PROC_CHANGE_PENALTY + 1) - p->nice;
++#else
++		weight += (20 + 1) - p->nice;
++#endif
++ 	}
++	return weight;
+ }
+ 
+ /*
+- * the 'goodness value' of replacing a process on a given CPU.
+- * positive value means 'replace', zero or negative means 'dont'.
++ * Difference in two process's goodness to allow preemption.  SCHED_OTHER only.
++ *
++ * Tune this.
+  */
+-static inline int preemption_goodness(struct task_struct * prev, struct task_struct * p, int cpu)
++#define PREEMPT_THRESHOLD 0
++
++/* return true if process p can preempt CPU s */
++static inline int can_preempt(struct task_struct *p, struct schedule_data *s)
+ {
+-	return goodness(p, cpu, prev->active_mm) - goodness(prev, cpu, prev->active_mm);
++	return p->rt_priority > s->prio ||
++		(s->prio == 0 &&
++		 curr_goodness(p) > curr_goodness(s->curr) + (PREEMPT_THRESHOLD + 1));
+ }
+ 
+ /*
+@@ -210,139 +207,208 @@
+  * up unlocking it early, so the caller must not unlock the
+  * runqueue, it's always done by reschedule_idle().
+  *
+- * This function must be inline as anything that saves and restores
+- * flags has to do so within the same register window on sparc (Anton)
++ * The MP version of this function is large so we don't inline all of it,
++ * otherwise we get a ridiculous number of copies and I-cache pollution.
+  */
+-static inline void reschedule_idle(struct task_struct * p, unsigned long flags)
+-{
+ #ifdef CONFIG_SMP
+-	int this_cpu = smp_processor_id();
+-	struct task_struct *tsk, *target_tsk;
+-	int cpu, best_cpu, i, max_prio;
+-	cycles_t oldest_idle;
+ 
+-	/*
+-	 * shortcut if the woken up task's last CPU is
+-	 * idle now.
+-	 */
+-	best_cpu = p->processor;
+-	if (can_schedule(p, best_cpu)) {
+-		tsk = idle_task(best_cpu);
+-		if (cpu_curr(best_cpu) == tsk)
+-			goto send_now_idle;
++/*
++ * Determine if pick_resched_target() should consider CPU s when looking for a
++ * CPU for process p.  s is eligible if p may run on it and there is no
++ * preemption request pending against s.  Note that trying to preempt a CPU 
++ * with a pending preemption due to a previous process is both wasteful and a 
++ * bug in the MP case.
++ */
++#define eligible(p, s) (can_schedule((p), (s)->mask) && !(s)->preempt_pending)
+ 
+-		/*
+-		 * Maybe this process has enough priority to preempt
+-		 * its preferred CPU. (this is a shortcut):
+-		 */
+-		tsk = cpu_curr(best_cpu);
+-		if (preemption_goodness(tsk, p, best_cpu) > 0)
++static struct task_struct *pick_resched_target(struct task_struct *p)
++{
++	struct schedule_data *s;
++	struct task_struct *tsk;
++	struct list_head *tmp;
++
++	/*
++	 * Reschedule Rule #1:
++	 *
++	 * Check if the process can run on its preferred CPU.  This happens if
++	 * that CPU is either idle or can be preempted.  Note that we do not 
++	 * try to preempt CPUs that have pending preemption requests.
++	 */
++	s = &schedule_data[p->processor];
++	if (eligible(p, s)) {
++		if (s->next_idle.next)     /* is it on the idle list? */
++			goto found_idle;
++		if (can_preempt(p, s))
+ 			goto preempt_now;
+ 	}
+ 
+ 	/*
+-	 * We know that the preferred CPU has a cache-affine current
+-	 * process, lets try to find a new idle CPU for the woken-up
+-	 * process. Select the least recently active idle CPU. (that
+-	 * one will have the least active cache context.) Also find
+-	 * the executing process which has the least priority.
+-	 */
+-	oldest_idle = -1ULL;
+-	target_tsk = NULL;
+-	max_prio = 1;
+-
+-	for (i = 0; i < smp_num_cpus; i++) {
+-		cpu = cpu_logical_map(i);
+-		if (!can_schedule(p, cpu))
+-			continue;
+-		tsk = cpu_curr(cpu);
++	 * We cannot use the preferred CPU either because it's busy with some
++	 * higher priority task or because p has just been pinned and can no
++	 * longer use its preferred CPU.  Try to find some other CPU.
++	 *
++	 * Reschedule Rule #2:
++	 *
++	 * Select the least recently active idle CPU.
++	 *
++	 * In the vast majority of situations processes are not pinned and
++	 * finding an idle CPU is very fast now that we have a FIFO list of
++	 * such CPUs.  If p is pinned it will be typically pinned to its
++	 * preferred CPU and all subsequent tests can be skipped.  The 
++	 * processes that require the most reschedule effort are those that 
++	 * are pinned to a non-singleton subset of CPUs.  Happily, this
++	 * situation is not common.
++	 */
++	if (p->cpus_allowed == s->mask)  /* process is pinned --- give up */
++		return NULL;
++	list_for_each(tmp, &idle_cpu_list) {
++		s = list_entry(tmp, struct schedule_data, next_idle);
++		if (can_schedule(p, s->mask))
++			goto found_idle;
++	}
++	
++	/*
++	 * Reschedule Rule #3:
++	 *
++	 * See if we can preempt some CPU.
++	 *
++	 * We do this part separately for RT and SCHED_OTHER processes because
++	 * the tests are of sufficiently different nature and cost.
++	 */
++	s = NULL;
++	if (p->rt_priority > 0) {
++		int i, min_prio = p->rt_priority;
++
++		for (i = 0; i < smp_num_cpus; i++) {
++			struct schedule_data *t;
++
++			t = &schedule_data[cpu_logical_map(i)];
++			if (eligible(p, t) && t->prio < min_prio)
++				s = t, min_prio = t->prio;
++		}
++	} else if (p->counter > 0) {       /* ignore exhausted processes */
++		int i, min_prio;
++
+ 		/*
+-		 * We use the first available idle CPU. This creates
+-		 * a priority list between idle CPUs, but this is not
+-		 * a problem.
++		 * We calculate p's goodness up front since we know that it
++		 * won't have CPU affinity.  We also ignore MM affinity, the 
++		 * potential loss is minor.
+ 		 */
+-		if (tsk == idle_task(cpu)) {
+-			if (last_schedule(cpu) < oldest_idle) {
+-				oldest_idle = last_schedule(cpu);
+-				target_tsk = tsk;
+-			}
+-		} else {
+-			if (oldest_idle == -1ULL) {
+-				int prio = preemption_goodness(tsk, p, cpu);
+-
+-				if (prio > max_prio) {
+-					max_prio = prio;
+-					target_tsk = tsk;
+-				}
++		min_prio = p->counter + (20 - PREEMPT_THRESHOLD) - p->nice;
++		
++		for (i = 0; i < smp_num_cpus; i++) {
++			struct schedule_data *t;
++
++			t = &schedule_data[cpu_logical_map(i)];
++			if (eligible(p, t) && !t->prio) {
++				int gdn = curr_goodness(t->curr);
++
++				if (gdn < min_prio)
++					s = t, min_prio = gdn;
+ 			}
+ 		}
+ 	}
+-	tsk = target_tsk;
+-	if (tsk) {
+-		if (oldest_idle != -1ULL)
+-			goto send_now_idle;
+-		goto preempt_now;
+-	}
++	if (!s)
++		return NULL;        /* all has failed */
+ 
+-	spin_unlock_irqrestore(&runqueue_lock, flags);
+-	return;
+-		
+-send_now_idle:
++preempt_now:
++	tsk = s->curr;
++	s->preempt_pending = tsk->need_resched = 1;
++	return tsk;
++
++found_idle:
+ 	/*
+-	 * If need_resched == -1 then we can skip sending the IPI
+-	 * altogether, tsk->need_resched is actively watched by the
+-	 * idle thread.
+-	 */
+-	if ((tsk->processor != current->processor) && !tsk->need_resched)
+-		smp_send_reschedule(tsk->processor);
+-	tsk->need_resched = 1;
+-	spin_unlock_irqrestore(&runqueue_lock, flags);
+-	return;
++	 * A CPU from the idle list has been selected.  Take it off the list
++	 * and kick it.  We are guaranteed that need_resched==0, otherwise the
++	 * CPU would not appear on the idle list.
++	 */
++	list_del(&s->next_idle);
++	s->next_idle.next = NULL;
++	tsk = s->curr;
++	s->preempt_pending = tsk->need_resched = 1;
++	return idlers_need_IPI ? tsk : NULL;
++}
++
++/*
++ * We need to inline this part because some CPUs (e.g., SPARC) won't allow
++ * the spin_unlock_irqrestore() otherwise.
++ */
++static inline void reschedule_idle(struct task_struct *p, unsigned long flags)
++{
++	struct task_struct *target = pick_resched_target(p);
+ 
+-preempt_now:
+-	tsk->need_resched = 1;
+ 	spin_unlock_irqrestore(&runqueue_lock, flags);
+ 	/*
+-	 * the APIC stuff can go outside of the lock because
++	 * the IPI stuff can go outside the lock because
+ 	 * it uses no task information, only CPU#.
+ 	 */
+-	if (tsk->processor != this_cpu)
+-		smp_send_reschedule(tsk->processor);
+-	return;
++	if (target && target->processor != smp_processor_id())
++		smp_send_reschedule(target->processor);
++}
+ #else /* UP */
+-	int this_cpu = smp_processor_id();
+-	struct task_struct *tsk;
+-
+-	tsk = cpu_curr(this_cpu);
+-	if (preemption_goodness(tsk, p, this_cpu) > 1)
+-		tsk->need_resched = 1;
++static inline void reschedule_idle(struct task_struct *p, unsigned long flags)
++{
++	struct schedule_data *s = &schedule_data[smp_processor_id()];
++	
++	if (!s->preempt_pending && can_preempt(p, s))
++		s->curr->need_resched = s->preempt_pending = 1;
+ 	spin_unlock_irqrestore(&runqueue_lock, flags);
+-#endif
+ }
++#endif
+ 
+-/*
+- * Careful!
+- *
+- * This has to add the process to the _beginning_ of the
+- * run-queue, not the end. See the comment about "This is
+- * subtle" in the scheduler proper..
+- */
+ static inline void add_to_runqueue(struct task_struct * p)
+ {
+-	list_add(&p->run_list, &runqueue_head);
++	if (p->policy != SCHED_OTHER)
++		list_add_tail(&p->run_list, p->runq_head);
++	else {
++		int c, diff;
++
++		list_add(&p->run_list, p->runq_head);
++
++		/*
++		 * Apply any counter recalculations that occured while we were
++		 * not on the run queue.  If too many such recalculations have
++		 * taken place we fast path the calculation by setting
++		 * p->counter to its max for this process.  Here, 'too many'
++		 * is 9, the base-2 log of the max priority.
++		 */
++		if ((diff = runq.recalc - p->counter_recalc) != 0) {
++			p->counter_recalc = runq.recalc;
++			c = 2 * NICE_TO_TICKS(p->nice);
++			p->counter = diff > 8 ? c - 1 :  /* max priority */
++				                c + ((p->counter - c) >> diff);
++		}
++	}
+ 	nr_running++;
+ }
+ 
+ static inline void move_last_runqueue(struct task_struct * p)
+ {
+ 	list_del(&p->run_list);
+-	list_add_tail(&p->run_list, &runqueue_head);
++	list_add_tail(&p->run_list, p->runq_head);
+ }
+ 
+ static inline void move_first_runqueue(struct task_struct * p)
+ {
+ 	list_del(&p->run_list);
+-	list_add(&p->run_list, &runqueue_head);
++	list_add(&p->run_list, p->runq_head);
++}
++
++/* 
++ * Move a process between run queues.  If the process is runnable it will be
++ * moved to the end of its new queue.  Called with the runqueue_lock held.
++ */
++static inline void migrate_to_runqueue(struct task_struct *p,
++				       struct list_head *new_q)
++{
++	if (new_q == p->runq_head)
++		return;
++	if (task_on_runqueue(p)) {
++		list_del(&p->run_list);
++		list_add_tail(&p->run_list, new_q);
++	}
++	p->runq_head = new_q;
++	p->counter_recalc = runq.recalc;
+ }
+ 
+ /*
+@@ -454,18 +520,22 @@
+  */
+ static inline void __schedule_tail(struct task_struct *prev)
+ {
+-	current->need_resched |= prev->need_resched;
++	prev->need_resched = 0;
+ #ifdef CONFIG_SMP
+-	if ((prev->state == TASK_RUNNING) &&
+-			(prev != idle_task(smp_processor_id()))) {
++	if (prev->counter < 0) return;  /* nothing to do for idle tasks */
++	if (prev->state == TASK_RUNNING && !(prev->policy & SCHED_YIELD)) {
+ 		unsigned long flags;
+ 
+ 		spin_lock_irqsave(&runqueue_lock, flags);
+-		prev->has_cpu = 0;
+-		reschedule_idle(prev, flags); // spin_unlocks runqueue
++		prev->cpus_allowed = prev->cpu_runon_map;
++		reschedule_idle(prev, flags);    /* spin_unlocks runqueue */
+ 	} else {
++		prev->policy &= ~SCHED_YIELD;
+ 		wmb();
+-		prev->has_cpu = 0;
++		if (prev->state == TASK_ZOMBIE)
++			prev->cpu_runon_map = 0; /* notify exit.c:release() */
++		else
++			prev->cpus_allowed = prev->cpu_runon_map;
+ 	}
+ #endif /* CONFIG_SMP */
+ }
+@@ -480,17 +550,14 @@
+  * scheduler: it's not perfect, but certainly works for most things.
+  *
+  * The goto is "interesting".
+- *
+- *   NOTE!!  Task 0 is the 'idle' task, which gets called when no other
+- * tasks can run. It can not be killed, and it cannot sleep. The 'state'
+- * information in task[0] is never used.
+  */
+ asmlinkage void schedule(void)
+ {
+-	struct schedule_data * sched_data;
++	struct schedule_data *sched_data;
+ 	struct task_struct *prev, *next, *p;
+ 	struct list_head *tmp;
+ 	int this_cpu, c;
++	long yield_counter;
+ 
+ 	if (!current->active_mm) BUG();
+ 	if (tq_scheduler)
+@@ -514,14 +581,19 @@
+ 	 * 'sched_data' is protected by the fact that we can run
+ 	 * only one process per CPU.
+ 	 */
+-	sched_data = & aligned_data[this_cpu].schedule_data;
++	sched_data = &schedule_data[this_cpu];
++	next = idle_task(this_cpu);
++	c = -100;
+ 
+ 	spin_lock_irq(&runqueue_lock);
+ 
+-	/* move an exhausted RR process to be last.. */
+-	if (prev->policy == SCHED_RR)
+-		goto move_rr_last;
+-move_rr_back:
++	/*
++	 * Move a process that has voluntarily sched_yield()ed to the end of
++	 * its run queue.  Exhausted SCHED_RR processes are treated similarly.
++	 */
++	if (prev->policy & (SCHED_YIELD | SCHED_RR))
++		goto move2end;
++move2end_back:
+ 
+ 	switch (prev->state & ~TASK_EXCLUSIVE) {
+ 		case TASK_INTERRUPTIBLE:
+@@ -535,71 +607,66 @@
+ 	}
+ 	prev->need_resched = 0;
+ 
++#ifdef CONFIG_SMP
+ 	/*
+-	 * this is the scheduler proper:
++	 * Temporarily set cpus_allowed = cpu_runon_map so can_schedule() may
++	 * return true for the current process in case it is still runnable.
++	 * The runqueue lock protects us from other CPUs.  Just remember to
++	 * clear cpus_allowed before dropping the lock.
+ 	 */
++	prev->cpus_allowed = prev->cpu_runon_map;
++#endif
+ 
+-repeat_schedule:
+-	/*
+-	 * Default process to select..
+-	 */
+-	next = idle_task(this_cpu);
+-	c = -1000;
+-	if (prev->state == TASK_RUNNING)
+-		goto still_running;
++	/* First look for an RT task. */
++	list_for_each(tmp, &runq.rt_q) {
++		p = list_entry(tmp, struct task_struct, run_list);
++		if (can_schedule(p, sched_data->mask) &&
++		    p->rt_priority > next->rt_priority)
++			next = p;
++	}
++	if (next->rt_priority > 0)
++		goto selected_RT_task;
+ 
+-still_running_back:
+-	list_for_each(tmp, &runqueue_head) {
++	/* Next look for a SCHED_OTHER task. */
++	list_for_each(tmp, &runq.so_q) {
+ 		p = list_entry(tmp, struct task_struct, run_list);
+-		if (can_schedule(p, this_cpu)) {
++		if (can_schedule(p, sched_data->mask)) {
+ 			int weight = goodness(p, this_cpu, prev->active_mm);
+ 			if (weight > c)
+ 				c = weight, next = p;
+ 		}
+ 	}
+ 
++	if (prev->policy & SCHED_YIELD)
++		goto handle_yield;
++
++handle_yield_back:
+ 	/* Do we need to re-calculate counters? */
+ 	if (!c)
+ 		goto recalculate;
++
++selected_task:
+ 	/*
+ 	 * from this point on nothing can prevent us from
+ 	 * switching to the next task, save this fact in
+ 	 * sched_data.
+ 	 */
+ 	sched_data->curr = next;
++	sched_data->prio = next->rt_priority;
++	sched_data->preempt_pending = 0;
+ #ifdef CONFIG_SMP
+- 	next->has_cpu = 1;
++ 	next->cpus_allowed = prev->cpus_allowed = 0;
+ 	next->processor = this_cpu;
++
++	/* If we are going idle add this CPU to the idle-CPU list */
++	if (next == idle_task(this_cpu))
++		list_add_tail(&sched_data->next_idle, &idle_cpu_list);
+ #endif
+ 	spin_unlock_irq(&runqueue_lock);
+ 
+ 	if (prev == next)
+ 		goto same_process;
+ 
+-#ifdef CONFIG_SMP
+- 	/*
+- 	 * maintain the per-process 'average timeslice' value.
+- 	 * (this has to be recalculated even if we reschedule to
+- 	 * the same process) Currently this is only used on SMP,
+-	 * and it's approximate, so we do not have to maintain
+-	 * it while holding the runqueue spinlock.
+- 	 */
+-	{
+-		cycles_t t, this_slice;
+-
+-		t = get_cycles();
+-		this_slice = t - sched_data->last_schedule;
+-		sched_data->last_schedule = t;
+-	}
+-
+-	/*
+-	 * We drop the scheduler lock early (it's a global spinlock),
+-	 * thus we have to lock the previous process from getting
+-	 * rescheduled during switch_to().
+-	 */
+-
+-#endif /* CONFIG_SMP */
+-
+ 	kstat.context_swtch++;
+ 	/*
+ 	 * there are 3 processes which are affected by a context switch:
+@@ -614,15 +681,14 @@
+ 	{
+ 		struct mm_struct *mm = next->mm;
+ 		struct mm_struct *oldmm = prev->active_mm;
++
++		if (next->active_mm != mm) BUG();
+ 		if (!mm) {
+-			if (next->active_mm) BUG();
+ 			next->active_mm = oldmm;
+ 			atomic_inc(&oldmm->mm_count);
+ 			enter_lazy_tlb(oldmm, next, this_cpu);
+-		} else {
+-			if (next->active_mm != mm) BUG();
++		} else
+ 			switch_mm(oldmm, mm, next, this_cpu);
+-		}
+ 
+ 		if (!prev->mm) {
+ 			prev->active_mm = NULL;
+@@ -642,21 +708,82 @@
+ 	return;
+ 
+ recalculate:
+-	{
+-		struct task_struct *p;
+-		spin_unlock_irq(&runqueue_lock);
+-		read_lock(&tasklist_lock);
+-		for_each_task(p)
+-			p->counter = (p->counter >> 1) + NICE_TO_TICKS(p->nice);
+-		read_unlock(&tasklist_lock);
+-		spin_lock_irq(&runqueue_lock);
+-	}
+-	goto repeat_schedule;
+-
+-still_running:
+-	c = prev_goodness(prev, this_cpu, prev->active_mm);
+-	next = prev;
+-	goto still_running_back;
++	/*
++	 * Recalculate counters and choose a process to schedule in one pass.
++	 * At this point we are certain that we will find some process to
++	 * schedule.  Counter recalculation applies only to SCHED_OTHER tasks.
++	 */
++	runq.recalc++;
++	list_for_each(tmp, &runq.so_q) {
++		p = list_entry(tmp, struct task_struct, run_list);
++		p->counter = (p->counter >> 1) + NICE_TO_TICKS(p->nice);
++		p->counter_recalc++;
++		if (can_schedule(p, sched_data->mask)) {
++			int weight = goodness(p, this_cpu, prev->active_mm);
++			if (weight > c)
++				c = weight, next = p;
++		}
++	}
++	goto selected_task;
++
++selected_RT_task:
++	/*
++	 * Determine new quantum for an RT process.  SCHED_FIFO processes get
++	 * an "infinite" quantum so they don't time out.  SCHED_RR processes
++	 * get a fresh quantum if they've exhausted their current one.
++	 */
++	if (next->policy == SCHED_FIFO)
++		next->counter = MAX_SCHEDULE_TIMEOUT;
++	else if (next->counter <= 0)
++		next->counter = NICE_TO_TICKS(prev->nice);
++	prev->policy &= ~SCHED_YIELD;  /* do this early for RT processes */
++	goto selected_task;
++
++move2end:
++	/*
++	 * SCHED_YIELD processes are always moved to the end of the run queue.
++	 * SCHED_RR processes are moved only if they've exhausted their slice.
++	 */
++	if ((prev->policy & SCHED_YIELD) || prev->counter == 0)
++ 		move_last_runqueue(prev);
++
++	/*
++	 * If a SCHED_OTHER process is yielding we need to be able to select
++	 * some other SCHED_OTHER process even if it has lower goodness.  We
++	 * achieve this by temporarily setting prev->counter to a negative
++	 * value, which fools goodness() into ranking this process below any
++	 * other SCHED_OTHER.  Just remember to restore prev->counter when we
++	 * are done.
++	 */
++	if (prev->policy == SCHED_YIELD)
++		yield_counter = prev->counter, prev->counter = -1;
++	
++	goto move2end_back;
++
++handle_yield:
++	/*
++	 * If prev sched_yield()ed we come here after the first pass through
++	 * the run queue to decide what should happen to prev.
++	 *
++	 * Cases:
++	 *
++	 * (a) If next == prev then prev was the only runnable process so it 
++	 *     will continue executing despite the sched_yield.  We may need
++	 *     to recalculate counters but because it is the only selectable
++	 *     process we don't need to fool goodness() during the
++	 *     recalculation pass.
++	 *
++	 * (b) If next != prev some other runnable process will go next.  If a
++	 *     recalculation is needed we need to make sure prev is not
++	 *     selected during the recalculation pass.  Instead of trying to
++	 *     fool goodness() again we just make prev unselectable.
++	 */
++	prev->counter = yield_counter;
++	if (prev == next)
++		c = yield_counter;  /* still need to check for recalculation */
++	else
++		prev->cpus_allowed = 0; /* so we don't select it */ 
++	goto handle_yield_back;
+ 
+ handle_softirq:
+ 	do_softirq();
+@@ -671,13 +798,6 @@
+ 	run_task_queue(&tq_scheduler);
+ 	goto tq_scheduler_back;
+ 
+-move_rr_last:
+-	if (!prev->counter) {
+-		prev->counter = NICE_TO_TICKS(prev->nice);
+-		move_last_runqueue(prev);
+-	}
+-	goto move_rr_back;
+-
+ scheduling_in_interrupt:
+ 	printk("Scheduling in interrupt\n");
+ 	BUG();
+@@ -881,11 +1001,13 @@
+ 	return tsk;
+ }
+ 
+-static int setscheduler(pid_t pid, int policy, 
+-			struct sched_param *param)
++#define NO_POLICY_CHANGE -1
++
++static int setscheduler(pid_t pid, int policy, struct sched_param *param)
+ {
+ 	struct sched_param lp;
+ 	struct task_struct *p;
++	unsigned long flags;       /* for reschedule_idle() */
+ 	int retval;
+ 
+ 	retval = -EINVAL;
+@@ -896,32 +1018,21 @@
+ 	if (copy_from_user(&lp, param, sizeof(struct sched_param)))
+ 		goto out_nounlock;
+ 
+-	/*
+-	 * We play safe to avoid deadlocks.
+-	 */
+-	spin_lock_irq(&runqueue_lock);
++	retval = -ESRCH;
+ 	read_lock(&tasklist_lock);
+-
+ 	p = find_process_by_pid(pid);
+-
+-	retval = -ESRCH;
+ 	if (!p)
+-		goto out_unlock;
++		goto out_unlock_tasklist;
+ 			
+-	if (policy < 0)
+-		policy = p->policy;
+-	else {
+-		retval = -EINVAL;
+-		if (policy != SCHED_FIFO && policy != SCHED_RR &&
+-				policy != SCHED_OTHER)
+-			goto out_unlock;
+-	}
++	retval = -EINVAL;
++	spin_lock_irqsave(&runqueue_lock, flags);
++	if (policy == NO_POLICY_CHANGE)
++		policy = p->policy & ~SCHED_YIELD;
+ 	
+ 	/*
+ 	 * Valid priorities for SCHED_FIFO and SCHED_RR are 1..99, valid
+ 	 * priority for SCHED_OTHER is 0.
+ 	 */
+-	retval = -EINVAL;
+ 	if (lp.sched_priority < 0 || lp.sched_priority > 99)
+ 		goto out_unlock;
+ 	if ((policy == SCHED_OTHER) != (lp.sched_priority == 0))
+@@ -936,17 +1047,41 @@
+ 		goto out_unlock;
+ 
+ 	retval = 0;
++
++	/*
++	 * SCHED_FIFOs have an "infinite" slice, so if we are changing from
++	 * SCHED_FIFO we need to set a finite slice.  If we are switching to
++	 * SCHED_FIFO we let the scheduler deal with it.
++	 */
++	if ((p->policy & SCHED_FIFO) && policy != SCHED_FIFO)
++		p->counter = NICE_TO_TICKS(p->nice);
++
+ 	p->policy = policy;
+ 	p->rt_priority = lp.sched_priority;
+-	if (task_on_runqueue(p))
+-		move_first_runqueue(p);
++	migrate_to_runqueue(p, policy == SCHED_OTHER ? &runq.so_q : &runq.rt_q);
+ 
+-	current->need_resched = 1;
++	/* Check if we need to reschedule the process */
++	if (p == cpu_curr(p->processor)) {                /* p is executing */
++		p->need_resched = 1;
++#ifdef CONFIG_SMP
++		if (p != current)
++			smp_send_reschedule(p->processor);
++#endif
++	} else if (p->state == TASK_RUNNING && policy != SCHED_OTHER) {
++		/*
++		 * p is not executing but is runnable.  We may have raised its
++		 * priority so we check if it should run.  We don't need
++		 * to do this if the process is now SCHED_OTHER because then we
++		 * know that its priority hasn't been raised.
++		 */
++		reschedule_idle(p, flags);  /* unlocks runqueue_lock */
++		goto out_unlock_tasklist;
++	}
+ 
+ out_unlock:
+-	read_unlock(&tasklist_lock);
+ 	spin_unlock_irq(&runqueue_lock);
+-
++out_unlock_tasklist:
++	read_unlock(&tasklist_lock);
+ out_nounlock:
+ 	return retval;
+ }
+@@ -954,14 +1089,24 @@
+ asmlinkage long sys_sched_setscheduler(pid_t pid, int policy, 
+ 				      struct sched_param *param)
+ {
++	/*
++	 * setscheduler accepts NO_POLICY_CHANGE as a valid policy so we need
++	 * to validate the supplied policy before calling setscheduler.
++	 */
++	if (policy != SCHED_FIFO && policy != SCHED_RR &&
++	    policy != SCHED_OTHER)
++		return -EINVAL;
++
+ 	return setscheduler(pid, policy, param);
+ }
+ 
+ asmlinkage long sys_sched_setparam(pid_t pid, struct sched_param *param)
+ {
+-	return setscheduler(pid, -1, param);
++	return setscheduler(pid, NO_POLICY_CHANGE, param);
+ }
+ 
++#undef NO_POLICY_CHANGE
++
+ asmlinkage long sys_sched_getscheduler(pid_t pid)
+ {
+ 	struct task_struct *p;
+@@ -992,35 +1137,29 @@
+ 	if (!param || pid < 0)
+ 		goto out_nounlock;
+ 
++	retval = -ESRCH;
+ 	read_lock(&tasklist_lock);
+ 	p = find_process_by_pid(pid);
+-	retval = -ESRCH;
+-	if (!p)
+-		goto out_unlock;
+-	lp.sched_priority = p->rt_priority;
++	if (p)
++		lp.sched_priority = p->rt_priority;
+ 	read_unlock(&tasklist_lock);
+ 
+-	/*
+-	 * This one might sleep, we cannot do it with a spinlock held ...
+-	 */
+-	retval = copy_to_user(param, &lp, sizeof(*param)) ? -EFAULT : 0;
++	if (p)
++		retval = copy_to_user(param, &lp, sizeof(lp)) ? -EFAULT : 0;
+ 
+ out_nounlock:
+ 	return retval;
+-
+-out_unlock:
+-	read_unlock(&tasklist_lock);
+-	return retval;
+ }
+ 
+ asmlinkage long sys_sched_yield(void)
+ {
+-	spin_lock_irq(&runqueue_lock);
+-	if (current->policy == SCHED_OTHER)
+-		current->policy |= SCHED_YIELD;
++	/*
++	 * Don't mess with the run queue here, let the scheduler do it.
++	 * It already has to deal with exhausted SCHED_RR processes and it
++	 * holds the runqueue_lock anyway.
++	 */
++	current->policy |= SCHED_YIELD;
+ 	current->need_resched = 1;
+-	move_last_runqueue(current);
+-	spin_unlock_irq(&runqueue_lock);
+ 	return 0;
+ }
+ 
+@@ -1202,30 +1341,49 @@
+ 
+ void __init init_idle(void)
+ {
+-	struct schedule_data * sched_data;
+-	sched_data = &aligned_data[smp_processor_id()].schedule_data;
++#ifdef CONFIG_SMP
++	unsigned long flags;
++	struct schedule_data *sched_data = &schedule_data[smp_processor_id()];
++
++	if (current->state != TASK_RUNNING || task_on_runqueue(current)) BUG();
+ 
+-	if (current != &init_task && task_on_runqueue(current)) {
+-		printk("UGH! (%d:%d) was on the runqueue, removing.\n",
+-			smp_processor_id(), current->pid);
+-		del_from_runqueue(current);
+-	}
+ 	sched_data->curr = current;
+-	sched_data->last_schedule = get_cycles();
++	sched_data->idler = current;
++	sched_data->prio = current->rt_priority;
++	sched_data->preempt_pending = 0;
++
++	/* 
++	 * The boot CPU has raised need_resched on its own by the time it gets
++	 * here, so it's not idle and we don't add it to the idle list.
++	 */
++	if (current != &init_task) {
++		spin_lock_irqsave(&runqueue_lock, flags);
++		list_add_tail(&sched_data->next_idle, &idle_cpu_list);
++		spin_unlock_irqrestore(&runqueue_lock, flags);
++	}
++
++	/*
++	 * Do this last, a CPU is not available for scheduling until it has a 
++	 * non-0 mask, i.e., until it completes init_idle().
++	 */
++	sched_data->mask = 1 << smp_processor_id();
++#endif
+ }
+ 
+ extern void init_timervecs (void);
+ 
+ void __init sched_init(void)
+ {
++	int nr;
++
+ 	/*
+-	 * We have to do a little magic to get the first
+-	 * process right in SMP mode.
++	 * init_task is never on a run queue, but its children inherit this.
+ 	 */
+-	int cpu = smp_processor_id();
+-	int nr;
++	init_task.runq_head = &runq.so_q;
+ 
+-	init_task.processor = cpu;
++	INIT_LIST_HEAD(&runq.rt_q);
++	INIT_LIST_HEAD(&runq.so_q);
++	runq.recalc = 0;
+ 
+ 	for(nr = 0; nr < PIDHASH_SZ; nr++)
+ 		pidhash[nr] = NULL;
+@@ -1240,5 +1398,5 @@
+ 	 * The boot idle thread does lazy MMU switching as well:
+ 	 */
+ 	atomic_inc(&init_mm.mm_count);
+-	enter_lazy_tlb(&init_mm, current, cpu);
++	enter_lazy_tlb(&init_mm, current, smp_processor_id());
+ }
+diff -ruN -X diff.ignore linux-2.4.0-6/kernel/signal.c linux-2.4.0-6.sched/kernel/signal.c
+--- linux-2.4.0-6/kernel/signal.c	Mon Jun 26 13:05:06 2000
++++ linux-2.4.0-6.sched/kernel/signal.c	Fri Aug 11 12:52:46 2000
+@@ -401,7 +401,7 @@
+ 		 * since signal event passing goes through ->blocked.
+ 		 */
+ 		spin_lock(&runqueue_lock);
+-		if (t->has_cpu && t->processor != smp_processor_id())
++		if (!t->cpus_allowed && t->processor != smp_processor_id())
+ 			smp_send_reschedule(t->processor);
+ 		spin_unlock(&runqueue_lock);
+ #endif /* CONFIG_SMP */
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

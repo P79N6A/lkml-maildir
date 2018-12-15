@@ -1,0 +1,859 @@
+Date: Mon, 22 Feb 1999 02:26:46 +0000
+From: David Woodhouse <>
+Subject: [PATCH (untested)] Subnet support in knfsd.
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/2/21/82
+
+I've had continual problems with knfsd and subnet exports, and I keep making
+idle threats about making knfsd support subnets internally (in kernel code
+instead of from kmountd).
+At last I've actually produced some code, and here it is.
+The user side of it hasn't been done yet, except enough to make it compile and 
+run with the old-style explicit host entries.
+Basically, the kernel with this patch keeps a separate list of subnet exports,
+and whenever a remote IP address isn't found in the normal hash table, the
+subnet list is checked. If a match is then found, the corresponding host entry
+is automatically added to the hash table, and the request is authenticated.
+Previously, new host entries would only be added by the user-space kmountd when
+the host in question sent a mount request. If the rmtab was missing or corrupt,
+then hosts could lose their authenticated status, and complain of "Stale NFS
+file handle"s when the server restarted, and would not get re-authenticated
+unless they unmounted and remounted the filesystem, which wasn't always
+possible.
+With this patch, the host will have its explicit entry re-added automatically 
+when it tries to perform any operation, and the 'Stale NFS file handle' 
+problem should never happen.
+This is work in progress, and I hope to finish it off in the morning. In the
+meantime, comments would be appreciated. Special attention is probably
+warranted by the exp_downgradelock() function and the logic surrounding its
+use. Be kind - it's 2am here and I may have done something extremely stupid :)
+Index: svcproc.c
+===================================================================
+RCS file: /cvs/linux/fs/lockd/svcproc.c,v
+retrieving revision 1.1.1.2
+diff -u -w -r1.1.1.2 svcproc.c
+--- svcproc.c	1999/01/04 10:31:28	1.1.1.2
++++ svcproc.c	1999/02/22 00:25:35
+@@ -443,10 +443,12 @@
+ 	if (nlmsvc_ops != NULL) {
+ 		struct svc_client	*clnt;
+ 		saddr.sin_addr.s_addr = argp->addr;	
++		nlmsvc_ops->exp_readlock();	
+ 		if ((clnt = nlmsvc_ops->exp_getclient(&saddr)) != NULL 
+ 		 && (host = nlm_lookup_host(clnt, &saddr, 0, 0)) != NULL) {
+ 			nlmsvc_free_host_resources(host);
+ 		}
++		nlmsvc_ops->exp_unlock();
+ 		nlm_release_host(host);
+ 	}
+ diff -uNr knfsd-981204-clean/support/export/nfsctl.c knfsd-981204/support/export/nfsctl.c
+--- knfsd-981204-clean/support/export/nfsctl.c	Thu Oct  1 01:31:35 1998
++++ knfsd-981204/support/export/nfsctl.c	Mon Feb 22 01:55:46 1999
+@@ -54,14 +54,17 @@
+ {
+ 	int	i;
+ 
++#if 0
+ 	if (clp->m_type != MCL_FQDN) {
+ 		xlog(L_ERROR, "internal: can't export non-FQDN host");
+ 		return 0;
+ 	}
++#endif
+ 	memset(cltarg, 0, sizeof(*cltarg));
+ 	strncpy(cltarg->cl_ident, clp->m_hostname,
+ 		sizeof (cltarg->cl_ident) - 1);
+ 	cltarg->cl_naddr = clp->m_naddr;
++	cltarg->cl_type = clp->m_type;
+ 	for (i = 0; i < cltarg->cl_naddr && i < NFSCLNT_ADDRMAX; i++)
+ 		cltarg->cl_addrlist[i] = clp->m_addrlist[i];
+ 
+diff -uNr knfsd-981204-clean/support/include/nfs/nfs.h knfsd-981204/support/include/nfs/nfs.h
+--- knfsd-981204-clean/support/include/nfs/nfs.h	Thu Sep 10 17:23:42 1998
++++ knfsd-981204/support/include/nfs/nfs.h	Mon Feb 22 01:53:37 1999
+@@ -40,7 +40,7 @@
+ /*
+  * Version of the syscall interface
+  */
+-#define NFSCTL_VERSION		0x0201
++#define NFSCTL_VERSION		0x0202
+ 
+ /*
+  * These are the commands understood by nfsctl().
+@@ -64,6 +64,7 @@
+ /* ADDCLIENT/DELCLIENT */
+ struct nfsctl_client {
+ 	char			cl_ident[NFSCLNT_IDMAX+1];
++	int			cl_type;
+ 	int			cl_naddr;
+ 	struct in_addr		cl_addrlist[NFSCLNT_ADDRMAX];
+ 	int			cl_fhkeytype;? .nfssvc.o.flags
+? .nfsctl.o.flags
+? .nfsproc.o.flags
+? .nfsfh.o.flags
+? .vfs.o.flags
+? .export.o.flags
+? .auth.o.flags
+? .lockd.o.flags
+? .nfscache.o.flags
+? .nfsxdr.o.flags
+? .stats.o.flags
+? .nfsd.o.flags
+? .depend
+? knfsd-kernel-2.2.1-diff
+Index: export.c
+===================================================================
+RCS file: /cvs/linux/fs/nfsd/export.c,v
+retrieving revision 1.1.1.5
+diff -u -w -r1.1.1.5 export.c
+--- export.c	1999/01/04 10:31:28	1.1.1.5
++++ export.c	1999/02/22 02:04:00
+@@ -38,9 +38,12 @@
+ static svc_export *	exp_child(svc_client *clp, kdev_t dev,
+ 					struct dentry *dentry);
+ static void		exp_unexport_all(svc_client *clp);
++static int		exp_do_export(svc_client *clp, struct nfsctl_export *nxp);
+ static void		exp_do_unexport(svc_export *unexp);
+-static svc_client *	exp_getclientbyname(char *name);
+-static void		exp_freeclient(svc_client *clp);
++static svc_client *	exp_getclientbyname(char *name, svc_client *clp);
++static svc_client *	exp_getsubnetbyname(char *name);
++static void		exp_freeclient_host(svc_client *clp);
++static void		exp_freeclient_subnet(svc_client *clp);
+ static void		exp_unhashclient(svc_client *clp);
+ static int		exp_verify_string(char *cp, int max);
+ 
+@@ -58,7 +61,7 @@
+ 	struct svc_client *	h_client;
+ };
+ static struct svc_clnthash *	clnt_hash[CLIENT_HASHMAX];
+-static svc_client *		clients = NULL;
++static svc_client *		clients = NULL, *subnets = NULL;
+ static int			initialized = 0;
+ 
+ static int			hash_lock = 0;
+@@ -219,14 +222,8 @@
+ int
+ exp_export(struct nfsctl_export *nxp)
+ {
+-	svc_client	*clp;
+-	svc_export	*exp, *parent;
+-	svc_export	**head;
+-	struct dentry	*dentry = NULL;
+-	struct inode	*inode = NULL;
+-	int		i, err;
+-	kdev_t		dev;
+-	ino_t		ino;
++	svc_client	*clp, *hclp;
++	int		err;
+ 
+ 	/* Consistency check */
+ 	err = -EINVAL;
+@@ -237,8 +234,6 @@
+ 	dprintk("exp_export called for %s:%s (%x/%ld fl %x).\n",
+ 			nxp->ex_client, nxp->ex_path,
+ 			nxp->ex_dev, nxp->ex_ino, nxp->ex_flags);
+-	dev = to_kdev_t(nxp->ex_dev);
+-	ino = nxp->ex_ino;
+ 
+ 	/* Try to lock the export table for update */
+ 	if ((err = exp_writelock()) < 0)
+@@ -246,9 +241,50 @@
+ 
+ 	/* Look up client info */
+ 	err = -EINVAL;
+-	if (!(clp = exp_getclientbyname(nxp->ex_client)))
++	if ((clp = exp_getsubnetbyname(nxp->ex_client))) {
++		/* Add the export to the subnet entry */
++		err = exp_do_export(clp, nxp);
++		if (err)
+ 		goto out_unlock;
+ 
++	/* Find all host entries for this ident and copy the master's
++	 * exports to them.
++	 */
++		hclp = NULL;
++
++		while ((hclp = exp_getclientbyname(nxp->ex_client, hclp))) {
++			memcpy(hclp->cl_export, clp->cl_export, 
++			       NFSCLNT_EXPMAX * sizeof (void *));
++		}
++
++	}
++	
++	/* Look for a FQDN match. */
++
++	else if ((clp = exp_getclientbyname(nxp->ex_client, NULL)))
++		err = exp_do_export(clp, nxp);
++
++
++out_unlock:
++	exp_unlock();
++out:
++	return err;
++}
++
++static int 
++exp_do_export(svc_client *clp, struct nfsctl_export *nxp)
++{
++	svc_export	*exp, *parent;
++	svc_export	**head;
++	struct dentry	*dentry = NULL;
++	struct inode	*inode = NULL;
++	kdev_t		dev;
++	ino_t		ino;
++	int		i, err;
++
++	dev = to_kdev_t(nxp->ex_dev);
++	ino = nxp->ex_ino;
++
+ 	/*
+ 	 * If there's already an export for this file, assume this
+ 	 * is just a flag update.
+@@ -257,26 +293,27 @@
+ 		exp->ex_flags    = nxp->ex_flags;
+ 		exp->ex_anon_uid = nxp->ex_anon_uid;
+ 		exp->ex_anon_gid = nxp->ex_anon_gid;
+-		err = 0;
+-		goto out_unlock;
++		return 0;
+ 	}
+ 
+ 	/* Look up the dentry */
+-	err = -EINVAL;
++	//	err = -EINVAL;
+ 	dentry = lookup_dentry(nxp->ex_path, NULL, 0);
+ 	if (IS_ERR(dentry))
+-		goto out_unlock;
++		return -EINVAL;
++
+ 
+ 	err = -ENOENT;
+ 	inode = dentry->d_inode;
+ 	if (!inode)
+-		goto finish;
++		goto dput_out;
++
+ 	err = -EINVAL;
+ 	if (inode->i_dev != dev || inode->i_ino != nxp->ex_ino) {
+ 		printk(KERN_DEBUG "exp_export: i_dev = %x, dev = %x\n",
+ 			inode->i_dev, dev); 
+ 		/* I'm just being paranoid... */
+-		goto finish;
++		goto dput_out;
+ 	}
+ 
+ 	/* We currently export only dirs and regular files.
+@@ -284,24 +321,24 @@
+ 	 */
+ 	err = -ENOTDIR;
+ 	if (!S_ISDIR(inode->i_mode) && !S_ISREG(inode->i_mode))
+-		goto finish;
++		goto dput_out;
+ 
+ 	err = -EINVAL;
+ 	if ((parent = exp_child(clp, dev, dentry)) != NULL) {
+ 		dprintk("exp_export: export not valid (Rule 3).\n");
+-		goto finish;
++		goto dput_out;
+ 	}
+ 	/* Is this is a sub-export, must be a proper subset of FS */
+ 	if ((parent = exp_parent(clp, dev, dentry)) != NULL) {
+ 		if (dev == parent->ex_dev) {
+ 			dprintk("exp_export: sub-export not valid (Rule 2).\n");
+-			goto finish;
++			goto dput_out;
+ 		}
+ 	}
+ 
+ 	err = -ENOMEM;
+ 	if (!(exp = kmalloc(sizeof(*exp), GFP_USER)))
+-		goto finish;
++		goto dput_out;
+ 	dprintk("nfsd: created export entry %p for client %p\n", exp, clp);
+ 
+ 	strcpy(exp->ex_path, nxp->ex_path);
+@@ -331,18 +368,12 @@
+ 	exp->ex_next = *head;
+ 	*head = exp;
+ 
+-	err = 0;
+-
+-	/* Unlock hashtable */
+-out_unlock:
+-	exp_unlock();
+-out:
+-	return err;
++	return 0;
+ 
+-	/* Release the dentry */
+-finish:
++	/* Release the dentry and return error code */
++dput_out:
+ 	dput(dentry);
+-	goto out_unlock;
++	return err;
+ }
+ 
+ /*
+@@ -414,7 +445,7 @@
+ int
+ exp_unexport(struct nfsctl_export *nxp)
+ {
+-	svc_client	*clp;
++	svc_client	*clp, *hclp;
+ 	svc_export	**expp, *exp = NULL;
+ 	int		err;
+ 
+@@ -426,8 +457,28 @@
+ 		goto out;
+ 
+ 	err = -EINVAL;
+-	clp = exp_getclientbyname(nxp->ex_client);
+-	if (clp) {
++
++	if ((clp = exp_getsubnetbyname(nxp->ex_client))) {
++		expp = clp->cl_export + EXPORT_HASH(nxp->ex_dev);
++		while ((exp = *expp) != NULL) {
++			if (exp->ex_dev == nxp->ex_dev) {
++				if (exp->ex_ino == nxp->ex_ino) {
++					*expp = exp->ex_next;
++					exp_do_unexport(exp);
++					err = 0;
++					break;
++				}
++			}
++			expp = &(exp->ex_next);
++		}
++		/* Copy the master's export list into the slaves */
++		hclp = NULL;
++		while ((hclp = exp_getclientbyname(nxp->ex_client, hclp))) {
++			memcpy(hclp->cl_export, clp->cl_export, 
++			       NFSCLNT_EXPMAX * sizeof (void *));
++		}
++	}
++	else if ((clp = exp_getclientbyname(nxp->ex_client, clp))) {
+ 		expp = clp->cl_export + EXPORT_HASH(nxp->ex_dev);
+ 		while ((exp = *expp) != NULL) {
+ 			if (exp->ex_dev == nxp->ex_dev) {
+@@ -516,7 +567,9 @@
+ 
+ /*
+  * Hashtable locking. Write locks are placed only by user processes
+- * wanting to modify export information.
++ * wanting to modify export information, and by the exp_getclient() 
++ * routine when it needs to add an explicit entry for a host which is
++ * authenticated by a subnet entry.
+  */
+ void
+ exp_readlock(void)
+@@ -567,6 +620,25 @@
+ 	wake_up(&hash_wait);
+ }
+ 
++void exp_downgradelock(void)
++{
++	if (!hash_lock)
++		printk(KERN_WARNING "exp_downgradelock: not write locked!\n");
++	if (hash_count)
++		printk(KERN_WARNING "exp_downgradelock: read lock is present!\n");
++
++	/* Atomically grab a read lock, and drop the write lock.
++	 * This doesn't cause any deadlock conditions. If there is another
++	 * process waiting for a write lock, then we steal the read lock
++	 * and leave them waiting, which is a violation of the 'write-priority'
++	 * rule, but we don't care about that. DW.
++	 */
++
++	hash_count++;
++	hash_lock = 0;
++	wake_up(&hash_wait);
++}
++
+ /*
+  * Find a valid client given an inet address. We always move the most
+  * recently used client to the front of the hash chain to speed up
+@@ -578,6 +650,8 @@
+ {
+ 	struct svc_clnthash	**hp, **head, *tmp;
+ 	unsigned long		addr = sin->sin_addr.s_addr;
++	int			hash;
++	struct svc_client	*clp, *hclp;
+ 
+ 	if (!initialized)
+ 		return NULL;
+@@ -597,18 +671,143 @@
+ 		}
+ 	}
+ 
+-	return NULL;
++	/* We haven't found a valid client in the list of explicit exports. 
++	 * Now check the available network entries, and add an explicit 
++	 * entry if we find one.
++	 */
++
++	for (clp = subnets; clp ; clp = clp->cl_next) 
++		if ( (sin->sin_addr.s_addr & clp->cl_mask.s_addr) ==
++		     (clp->cl_addrlist[0].s_addr & clp->cl_mask.s_addr) ) 
++			break;
++	
++	if (clp) {
++		printk("IP %ld.%ld.%ld.%ld matched client subnet %s\n",
++		       addr >>24 , (addr >> 16) &0xff , (addr >>8)&0xff ,
++		       addr & 0xff, clp->cl_ident);
++		
++		/* We have a read lock. We need to add a host entry for this
++		 * host into the client list, but we can't atomically upgrade
++		 * the lock we hold to a write lock without deadlocking.
++		 *
++		 * We could set a timer to add the new host entry, but
++		 * for now we rely on the observed behaviour of the callers
++		 * of this routine - they all obtain the lock immediately
++		 * before calling it. So we can drop the read lock and 
++		 * non-atomically obtain a write lock.
++		 *
++		 * Afterwards, we atomically downgrade it to a read lock,
++		 * which is safe. DW.
++		 */
++		
++		exp_unlock();
++		exp_writelock();
++		
++		/* We need to verify that our subnet is still in the list */
++		
++		for (clp = subnets; clp ; clp = clp->cl_next)
++			if ( (sin->sin_addr.s_addr & clp->cl_mask.s_addr) ==
++			     (clp->cl_addrlist[0].s_addr & clp->cl_mask.s_addr) )
++				break;
++
++		if (!clp)
++			goto downgrade_out;
++
++		/* OK. We've found our subnet entry again. It hasn't been
++		 * deleted while we didn't have a lock. Now we add a host entry
++		 * for the current client.
++		 */
++
++		/* Find a host entry which corresponds to this subnet, and add the
++		 * new IP address to it if it has space.
++		 */
++
++		hclp = clients;
++
++		while ((hclp = exp_getclientbyname(clp->cl_ident, hclp))) {
++			if (clp->cl_naddr < NFSCLNT_ADDRMAX) {
++				/* Allocate space for new hash table entry */
++				if (!(tmp = kmalloc(sizeof(*tmp), GFP_KERNEL))) {
++					clp = NULL;
++					goto downgrade_out;
++				}
++				
++				/* Add new address into client's list */
++				clp->cl_addrlist[clp->cl_naddr++] = sin->sin_addr;
++
++				/* Insert single new entry into hashtable */
++				hash = CLIENT_HASH(sin->sin_addr.s_addr);
++				tmp->h_client = clp;
++				tmp->h_addr = sin->sin_addr;
++				tmp->h_next = clnt_hash[hash];
++				clnt_hash[hash] = tmp;
++
++				goto downgrade_out;
++			}
+ }
+ 
++		/* There wasn't an existing host entry with room in its addr list. 
++		 * We need to create a completely new one, and copy all the export
++		 * entries from the subnet entry.
++		 */
++
++		if (!(hclp = kmalloc(sizeof(*hclp), GFP_KERNEL)))
++			goto downgrade_out;
++		if (!(tmp = kmalloc(sizeof(*tmp), GFP_KERNEL))) {
++			kfree(hclp);
++			goto downgrade_out;
++		}
++			
++
++		dprintk("created client %s (%p)\n", hclp->cl_ident, hclp);
++
++		memcpy(hclp, clp, sizeof(*clp));
++		hclp->cl_next = clients;
++		hclp->cl_naddr = 1;
++		hclp->cl_addrlist[0] = sin->sin_addr;
++
++		/* Insert the new hash table entry */
++		hash = CLIENT_HASH(sin->sin_addr.s_addr);
++		tmp->h_client = hclp;
++		tmp->h_addr = sin->sin_addr;
++		tmp->h_next = clnt_hash[hash];
++		clnt_hash[hash] = tmp;
++
++		/* Set up the return code */
++		clp = hclp;
++	downgrade_out:
++		exp_downgradelock();
++	}
++
++	/* It's not part of a listed subnet either - really reject it. */
++		
++	return clp;
++}
++
+ /*
+  * Find a client given its identifier.
+  */
+ static svc_client *
+-exp_getclientbyname(char *ident)
++exp_getclientbyname(char *ident, svc_client *clp)
+ {
++	if (!clp) clp = clients;
++
++	for ( ; clp; clp = clp->cl_next) {
++		if (!strcmp(clp->cl_ident, ident))
++			return clp;
++	}
++	return NULL;
++}
++
++/*
++ * Find a client subnet given its identifier.
++ */
++static svc_client *
++exp_getsubnetbyname(char *ident)
++{
+ 	svc_client *	clp;
+ 
+-	for (clp = clients; clp; clp = clp->cl_next) {
++	for (clp = subnets; clp; clp = clp->cl_next) {
+ 		if (!strcmp(clp->cl_ident, ident))
+ 			return clp;
+ 	}
+@@ -677,7 +876,7 @@
+ 				len += exp_flags(buffer+len, exp->ex_flags);
+ 				len += sprintf(buffer+len, ") # ");
+ 				for (j = 0; j < clp->cl_naddr; j++) {
+-					struct in_addr	addr = clp->cl_addr[j]; 
++					struct in_addr	addr = clp->cl_addrlist[j]; 
+ 
+ 					head = &clnt_hash[CLIENT_HASH(addr.s_addr)];
+ 					for (hp = head; (tmp = *hp) != NULL; hp = &(tmp->h_next)) {
+@@ -727,7 +926,7 @@
+  * exports and possibly existing uid maps are left untouched.
+  */
+ int
+-exp_addclient(struct nfsctl_client *ncp)
++exp_addclient_host(struct nfsctl_client *ncp)
+ {
+ 	struct svc_clnthash *	ch[NFSCLNT_ADDRMAX];
+ 	svc_client *		clp;
+@@ -761,6 +960,7 @@
+ 
+ 		strcpy(clp->cl_ident, ncp->cl_ident);
+ 		clp->cl_idlen = ilen;
++		clp->cl_type = MCL_FQDN;
+ 	}
+ 
+ 	/* Allocate hash buckets */
+@@ -777,7 +977,7 @@
+ 
+ 	/* Copy addresses. */
+ 	for (i = 0; i < ncp->cl_naddr; i++) {
+-		clp->cl_addr[i] = ncp->cl_addrlist[i];
++		clp->cl_addrlist[i] = ncp->cl_addrlist[i];
+ 	}
+ 	clp->cl_naddr = ncp->cl_naddr;
+ 
+@@ -787,7 +987,7 @@
+ 
+ 	/* Insert client into hashtable. */
+ 	for (i = 0; i < ncp->cl_naddr; i++) {
+-		struct in_addr	addr = clp->cl_addr[i];
++		struct in_addr	addr = clp->cl_addrlist[i];
+ 		int		hash;
+ 
+ 		hash = CLIENT_HASH(addr.s_addr);
+@@ -813,7 +1013,7 @@
+  * Delete a client given an identifier.
+  */
+ int
+-exp_delclient(struct nfsctl_client *ncp)
++exp_delclient_host(struct nfsctl_client *ncp)
+ {
+ 	svc_client	**clpp, *clp;
+ 	int		err;
+@@ -828,12 +1028,12 @@
+ 
+ 	err = -EINVAL;
+ 	for (clpp = &clients; (clp = *clpp); clpp = &(clp->cl_next))
+-		if (!strcmp(ncp->cl_ident, clp->cl_ident))
++		if (!strcmp(ncp->cl_ident, clp->cl_ident) && clp->cl_type == MCL_FQDN)
+ 			break;
+ 
+ 	if (clp) {
+ 		*clpp = clp->cl_next;
+-		exp_freeclient(clp);
++		exp_freeclient_host(clp);
+ 		err = 0;
+ 	}
+ 
+@@ -846,7 +1046,7 @@
+  * Free a client. The caller has already removed it from the client list.
+  */
+ static void
+-exp_freeclient(svc_client *clp)
++exp_freeclient_host(svc_client *clp)
+ {
+ 	exp_unhashclient(clp);
+ 
+@@ -857,6 +1057,150 @@
+ }
+ 
+ /*
++ * Add a client subnet.
++ */
++int
++exp_addclient_subnet(struct nfsctl_client *ncp)
++{
++	svc_client *		clp, *ins = subnets;	
++	int			masklen, ilen;
++	__u32			mask = 0;
++	int		err;
++	
++	err = -EINVAL;
++
++	if (!(ilen=exp_verify_string(ncp->cl_ident, NFSCLNT_IDMAX)))
++		goto out;
++	
++	/* Find the length of the subnet mask */
++
++	for (masklen = 0 ; masklen < 32 ; masklen ++) {
++		mask |= (1 << (32 - masklen));
++		if (htonl( (ncp->cl_mask.s_addr) ) == masklen)
++			break;
++	}
++	
++	/* If it wasn't a valid mask, quit */
++	if (masklen > 31) 
++		goto out;
++
++	/* Lock the hashtable */
++	if ((err = exp_writelock()) < 0)
++		goto out;
++
++	/* First check if this is a change request for a client. */
++	for (clp = subnets; clp; clp = clp->cl_next) {
++		/* Keep a pointer to the last entry with mask > masklen */
++		if (clp->cl_naddr > masklen)
++			ins = clp;
++
++		if (!strcmp(clp->cl_ident, ncp->cl_ident))
++			break;
++	}
++
++	/* There's no valid reason for changing the entry.
++	 * If we want to allow it to be changed, then we have to make 
++	 * sure we keep the subnet list in increasing order of subnet 
++	 * size, so we may have to move the clp.
++	 * It's easier just to return -EEXIST. DW.
++	 */
++
++	err = -EEXIST;
++
++	if (clp)
++		goto out_unlock;
++	
++	/* Allocate space for the new entry */
++
++	if (!(clp = kmalloc(sizeof(*clp), GFP_KERNEL)))
++		goto out_unlock;
++	memset(clp, 0, sizeof(*clp));
++
++	dprintk("created subnet %s (%p)\n", ncp->cl_ident, clp);
++	
++	/* Copy name and address. */
++	strcpy(clp->cl_ident, ncp->cl_ident);
++	clp->cl_idlen = ilen;
++	clp->cl_type = MCL_SUBNETWORK;
++	clp->cl_addrlist[0] = ncp->cl_addrlist[0];
++	clp->cl_naddr = masklen;
++
++	/* Insert client subnet into subnets list. */
++	clp->cl_next = ins->cl_next;
++	ins->cl_next = clp;
++
++	err = 0;
++
++out_unlock:
++	exp_unlock();
++out:
++	return err;
++}
++
++/*
++ * Delete a client subnet given an identifier.
++ */
++int
++exp_delclient_subnet(struct nfsctl_client *ncp)
++{
++	svc_client	**clpp, *clp;
++	int		err;
++
++	err = -EINVAL;
++	if (!exp_verify_string(ncp->cl_ident, NFSCLNT_IDMAX))
++		goto out;
++
++	/* Lock the hashtable */
++	if ((err = exp_writelock()) < 0)
++		goto out;
++
++	err = -EINVAL;
++	for (clpp = &subnets; (clp = *clpp); clpp = &(clp->cl_next))
++		if (!strcmp(ncp->cl_ident, clp->cl_ident))
++			break;
++
++	if (clp) {
++		*clpp = clp->cl_next;
++		exp_freeclient_subnet(clp);
++		err = 0;
++	}
++
++	exp_unlock();
++out:
++	return err;
++}
++
++
++/*
++ * Free a client subnet and all the client hosts that are allowed by it.
++ * The caller has already removed the subnet from the subnet list, but
++ * not the clients.
++ */
++static void
++exp_freeclient_subnet(svc_client *clp)
++{
++	svc_client	**clpp, *hclp;
++
++	/* We already hold the hashtable lock */
++
++	/* Free all host clients with the same ident as the subnet being
++	 * freed. 
++	 */
++
++	for (clpp = &clients ; (hclp = *clpp); clpp = &(hclp->cl_next))
++		if (hclp->cl_type == MCL_SUBNETWORK &&
++		    !strcmp(clp->cl_ident, hclp->cl_ident)) {
++			*clpp = hclp->cl_next;
++			exp_unhashclient(hclp);
++			kfree(hclp);
++		}
++
++	exp_unexport_all(clp);
++	nfsd_lockd_unexport(clp);
++	kfree(clp);
++}
++
++/*
+  * Remove client from hashtable. We first collect all hashtable
+  * entries and free them in one go.
+  * The hash table must be writelocked by the caller.
+@@ -942,6 +1286,7 @@
+ nfsd_export_shutdown(void)
+ {
+ 	int	i;
++	svc_client *clp;
+ 
+ 	dprintk("nfsd: shutting down export module.\n");
+ 	if (!initialized)
+@@ -950,9 +1295,13 @@
+ 		printk(KERN_WARNING "Weird: hashtable locked in exp_shutdown");
+ 		return;
+ 	}
++	for (clp = subnets ; clp ; clp= clp->cl_next)
++		exp_freeclient_subnet(clp);
++	subnets = NULL;
++
+ 	for (i = 0; i < CLIENT_HASHMAX; i++) {
+ 		while (clnt_hash[i])
+-			exp_freeclient(clnt_hash[i]->h_client);
++			exp_freeclient_host(clnt_hash[i]->h_client);
+ 	}
+ 	clients = NULL; /* we may be restarted before the module unloads */
+ 	
+Index: nfsctl.c
+===================================================================
+RCS file: /cvs/linux/fs/nfsd/nfsctl.c,v
+retrieving revision 1.1.1.4
+diff -u -w -r1.1.1.4 nfsctl.c
+--- nfsctl.c	1999/01/04 10:57:44	1.1.1.4
++++ nfsctl.c	1999/02/22 02:04:00
+@@ -94,13 +94,27 @@
+ static inline int
+ nfsctl_addclient(struct nfsctl_client *data)
+ {
+-	return exp_addclient(data);
++	switch(data->cl_type) {
++	case MCL_FQDN:
++		return exp_addclient_host(data);
++	case MCL_SUBNETWORK:
++		return exp_addclient_subnet(data);
++	default:
++		return -EINVAL;
+ }
++}
+ 
+ static inline int
+ nfsctl_delclient(struct nfsctl_client *data)
+ {
+-	return exp_delclient(data);
++	switch(data->cl_type) {
++	case MCL_FQDN:
++		return exp_delclient_host(data);
++	case MCL_SUBNETWORK:
++		return exp_delclient_subnet(data);
++	default:
++		return -EINVAL;
++	}
+ }
+ 
+ static inline int
+Index: vfs.c
+===================================================================
+RCS file: /cvs/linux/fs/nfsd/vfs.c,v
+retrieving revision 1.1.1.15
+diff -u -w -r1.1.1.15 vfs.c
+--- vfs.c	1999/02/01 13:04:23	1.1.1.15
++++ vfs.c	1999/02/22 02:04:00
+@@ -554,7 +554,7 @@
+ 	/* clear setuid/setgid flag after write */
+ 	if (err >= 0 && (inode->i_mode & (S_ISUID | S_ISGID))) {
+ 		struct iattr	ia;
+-		kernel_cap_t	saved_cap;
++		kernel_cap_t	saved_cap = 0;
+ 
+ 		ia.ia_valid = ATTR_MODE;
+ 		ia.ia_mode  = inode->i_mode & ~(S_ISUID | S_ISGID);
+@@ -759,7 +759,7 @@
+ 	struct inode	*inode;
+ 	struct iattr	newattrs;
+ 	int		err;
+-	kernel_cap_t	saved_cap;
++	kernel_cap_t	saved_cap = 0;
+ 
+ 	err = fh_verify(rqstp, fhp, S_IFREG, MAY_WRITE | MAY_TRUNC);
+ 	if (err)
+@@ -1310,7 +1310,7 @@
+ {
+ 	struct inode	*inode = dentry->d_inode;
+ 	int		err;
+-	kernel_cap_t	saved_cap;
++	kernel_cap_t	saved_cap = 0;
+ 
+ 	if (acc == MAY_NOP)
+ 		return 0;----                                 ----                                 ----
+David Woodhouse        David.Woodhouse@mvhi.com       Office: (+44) 1223 810302
+ Project Leader,     Process Information Systems      Mobile: (+44) 976 658355
+    Axiom (Cambridge) Ltd., Swaffham Bulbeck, Cambridge, CB5 0NA, UK.
+             finger dwmw2@ferret.lmh.ox.ac.uk for PGP key.

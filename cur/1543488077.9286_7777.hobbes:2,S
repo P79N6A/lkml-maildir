@@ -1,0 +1,135 @@
+Date: 2 Mar 1999 11:58:06 -0000
+From: Christer Weinigel <>
+Subject: Re: [patch] sleep_on() done with cli() in the NFS code, 2.2.2
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/3/2/42
+
+In <Pine.LNX.3.96.990302102740.16390B-100000@chiara.csoma.elte.hu>
+Ingo Molnar wrote:
+>there is one more place i found that does sleep_on() with cli(), this can
+>lead to lockups under SMP. Are there any unsolved reports of lockups for
+>NFS + SMP-2.2.2?
+I'm a bit confused here. 
+I have seen lots of code (for 2.0.x kernels though, but the 2.2.x
+implementation looks similar as far as I can tell, using spinlocks
+instead of a global cli) which look like this:
+    volatile int condition;
+    void interrupt_handler(...) { condition = 1; wake_up(&wq); }
+    condition = 0;
+    cli();
+    while (!condition)
+        sleep_on(&wq);
+    sti();
+which will be expanded to something like this:
+    cli();
+    while (!condition)
+    {
+	long flags;
+        struct wait_queue wait = { current, NULL };
+        current->state = TASK_UNINTERRUPTIBLE; 
+	save_flags(flags);
+	cli();
+	___add_wait_queue(&wq, &wait);
+	sti();
+	schedule();
+	cli();
+        __remove_wait_queue(p, &wait);
+	restore_flags(flags);
+    }
+This code assumes that sleep_on can be entered with interrupts
+enabled.  If I put a sti() before calling sleep_on there will be a
+small time window between the sti() and the __add_wait_queue where an
+interrupt maight occur and set the condition variable but which won't
+wake up the process.
+Of course, the code ought to be rewritten as:
+    add_wait_queue(&wq, &wait);
+    while (1)
+    {
+	current->state = TASK_UNINTERRUPTIBLE;
+	if (condition)
+	    break;
+        schedule();
+    }   
+    remove_wait_queue(&wq, &wait);
+So either it should be possible to call sleep_on with interrupts
+disabled or everything that uses this modem must be modified to use
+the wait queues properly (the kernel only seems to have a handful of
+these, but there are lots of third party drivers which would have to
+be changed too, among it a lot of code which I have been given the
+responsibility of maintaining, and I'm lazy :-).
+While on the subject, what is the current recommended way of waiting
+for an event?  Is there some kind of skeleton driver which does things
+properly, addressing all the issues regarding SMP, multiple readers
+and so on?
+For example, if I have a driver which uses an interrrupt handler to
+push data into a buffer and then has a read file-operation which is
+supposed to pull data out of this buffer?
+What follows is a code snippet from a hypothetical driver.  Have I
+covered everything?  How should I do the timeout handling for the
+newest 2.2.x kernels which have schedule_timeout()?
+  /Christer
+/* all these buffer functions have to be atomic and SMP safe */
+int buffer_empty(void);
+void buffer_push(struct buffer *buf);
+struct buffer *buffer_pull(void);
+struct wait_queue *buffer_wq;
+void interrupt_handler(int irq, void *dev_id, struct pt_regs *regs)
+{
+    /* allocate and fill in a buffer */
+    buffer_push(buffer);
+    wake_up(&buffer_wq);
+}
+ssize_t foo_read(struct file * file, char *buffer, 
+			size_t count, loff_t *ppos)
+{
+    struct wait_queue wait = { current, NULL };
+    struct buffer *buffer;
+    int len;
+    current->timeout = jiffiest + 3*HZ;
+    add_wait_queue(&buffer_wq, &wait);
+    while (1)
+    {
+	current->state = TASK_INTERRUPTIBLE;
+	if (signal_pending(current))
+            break;
+        if (!current->timeout)
+            break;
+	if (!buffer_emtpy())
+	    break;
+        schedule();
+    }   
+    remove_wait_queue(&wq, &wait);
+    current->state = TASK_RUNNING;  /* is this neccesary? */
+    if (signal_pending(current))
+        return -EINTR;
+    if (!current->timeout)
+        return -EIO;
+    current->timeout = 0; /* is _this_ neccesary, I belive I have seen
+			     a rather interesting bug in an old driver
+			     where and old timeout affected a system
+			     call done three seconds later :-( */
+    buf = buffer_pull();
+    /* I suppose I have a race condition here if on a SMP machine and
+       two reads are woken up at the same time.  What is the `best'
+       way of doing this?  `if (!buf) goto restart;' */
+    len = buf->len;
+    if (len > count)
+        len = count;
+    if (copy_to_user(buffer, buf->data, len))
+    {
+      	buffer_free(buf);
+	return -EFAULT;
+    }
+    buffer_free(buf);
+    return len;
+}
+-- 
+If it's tourist season, why can't we shoot them?
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

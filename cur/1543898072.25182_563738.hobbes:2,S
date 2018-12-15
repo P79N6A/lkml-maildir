@@ -1,0 +1,420 @@
+Date: Fri, 29 Jun 2007 12:59:46 -0400
+From: "Dmitry Torokhov" <>
+Subject: Re: 2.6.22-rc6 spurious hangs
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2007/6/29/205
+
+On 6/29/07, Ingo Molnar <mingo@elte.hu> wrote:
+>
+> * Oleg Nesterov <oleg@tv-sign.ru> wrote:
+>
+> > > > ->disconnect_pending is used without any locks/barriers, perhaps
+> > > > this is the reason.
+> >
+> > I misread cinergyt2_release, it checks !->disconnect_pending, so it is
+> > very clear why cinergyt2_query_rc() tries to take the mutex.
+> >
+> > > > I'll try to look further tomorrow. In any case, cinergyT2 should not
+> > > > use flush_scheduled_work() at all.
+> > >
+> > > would the hack below be worth trying, to see whether there are any
+> > > further problems?
+> [...]
+> > I don't think we can just kill flush_scheduled_work(). We can use
+> > cancel_rearming_delayed_work() instead of
+> > cancel_delayed_work()+flush_scheduled_work()
+> >
+> > Still we can't do this under cinergyt2->sem, because cinergyt2_query()
+> > takes it too. This all looks very wrong to me, I hope maintaners can
+> > explain.
+>
+> i've Cc:-ed the maintainers.
+>
+Well, not really maintainer but I think the short term soluton (at
+least for the RC part) is to alter cinergyt2_query_rc to take
+cinergyt2->sem only around cinergyt2_command(). Ther rest of the
+polling function need not be protected as it does nto tun concurently
+with itself.
+The longer trem solution is to convert cinergyt2 to use polled input
+device framework (as in attached patch - untested). Unfortunately it
+depends on adding suspend/resume support to polled devices now that
+workqueues are not being freezed again.
+Overall the driver makes me cringe...
+- Why does it take cinergyt2->sem in its cinergyt2_poll() function
+before calling poll_wait()? Most of the places that try to wake up
+polling process (such as FE_SET_FRONTEND) attempt to take the same
+mutex and will promptly deadlock unless I am missing something.
+- cinergyt2_query() wakes up pollers before altering poll condition.
+- cinergyt2->iunuse is racy...
+-- 
+Dmitry
+Signed-off-by: Dmitry Torokhov <dtor@mail.ru>
+---
+ drivers/media/dvb/cinergyT2/cinergyT2.c |  209 ++++++++++++++------------------
+ 1 file changed, 94 insertions(+), 115 deletions(-)
+Index: linux/drivers/media/dvb/cinergyT2/cinergyT2.c
+===================================================================
+--- linux.orig/drivers/media/dvb/cinergyT2/cinergyT2.c
++++ linux/drivers/media/dvb/cinergyT2/cinergyT2.c
+@@ -26,7 +26,8 @@
+ #include <linux/module.h>
+ #include <linux/slab.h>
+ #include <linux/usb.h>
+-#include <linux/input.h>
++#include <linux/input-polldev.h>
++#include <linux/usb/input.h>
+ #include <linux/dvb/frontend.h>
+ #include <linux/mutex.h>
+ #include <linux/mm.h>
+@@ -140,11 +141,9 @@ struct cinergyt2 {
+ 	struct urb *stream_urb [STREAM_URB_COUNT];
+ 
+ #ifdef ENABLE_RC
+-	struct input_dev *rc_input_dev;
++	struct input_polled_dev *rc_input;
+ 	char phys[64];
+-	struct delayed_work rc_query_work;
+-	int rc_input_event;
+-	u32 rc_last_code;
++	int last_keycode;
+ 	unsigned long last_event_jiffies;
+ #endif
+ };
+@@ -200,9 +199,9 @@ static const uint32_t rc_keys[] = {
+ 	CINERGYT2_RC_EVENT_TYPE_NEC,	0xa35ceb04,	KEY_NEXT
+ };
+ 
+-static int cinergyt2_command (struct cinergyt2 *cinergyt2,
+-			      char *send_buf, int send_buf_len,
+-			      char *recv_buf, int recv_buf_len)
++static int cinergyt2_command(struct cinergyt2 *cinergyt2,
++			     char *send_buf, int send_buf_len,
++			     char *recv_buf, int recv_buf_len)
+ {
+ 	int actual_len;
+ 	char dummy;
+@@ -232,7 +231,7 @@ static void cinergyt2_control_stream_tra
+ 	cinergyt2_command(cinergyt2, buf, sizeof(buf), NULL, 0);
+ }
+ 
+-static void cinergyt2_sleep (struct cinergyt2 *cinergyt2, int sleep)
++static void cinergyt2_sleep(struct cinergyt2 *cinergyt2, int sleep)
+ {
+ 	char buf [] = { CINERGYT2_EP1_SLEEP_MODE, sleep ? 1 : 0 };
+ 	cinergyt2_command(cinergyt2, buf, sizeof(buf), NULL, 0);
+@@ -476,7 +475,7 @@ static uint16_t compute_tps (struct dvb_
+ 	return tps;
+ }
+ 
+-static int cinergyt2_open (struct inode *inode, struct file *file)
++static int cinergyt2_open(struct inode *inode, struct file *file)
+ {
+ 	struct dvb_device *dvbdev = file->private_data;
+ 	struct cinergyt2 *cinergyt2 = dvbdev->priv;
+@@ -490,7 +489,6 @@ static int cinergyt2_open (struct inode 
+ 		return err;
+ 	}
+ 
+-
+ 	if ((file->f_flags & O_ACCMODE) != O_RDONLY) {
+ 		cinergyt2_sleep(cinergyt2, 0);
+ 		schedule_delayed_work(&cinergyt2->query_work, HZ/2);
+@@ -514,7 +512,7 @@ static void cinergyt2_unregister(struct 
+ 	kfree(cinergyt2);
+ }
+ 
+-static int cinergyt2_release (struct inode *inode, struct file *file)
++static int cinergyt2_release(struct inode *inode, struct file *file)
+ {
+ 	struct dvb_device *dvbdev = file->private_data;
+ 	struct cinergyt2 *cinergyt2 = dvbdev->priv;
+@@ -537,18 +535,18 @@ static int cinergyt2_release (struct ino
+ 	return dvb_generic_release(inode, file);
+ }
+ 
+-static unsigned int cinergyt2_poll (struct file *file, struct poll_table_struct *wait)
++static unsigned int cinergyt2_poll(struct file *file, struct poll_table_struct *wait)
+ {
+ 	struct dvb_device *dvbdev = file->private_data;
+ 	struct cinergyt2 *cinergyt2 = dvbdev->priv;
+-       unsigned int mask = 0;
++	unsigned int mask = 0;
+ 
+ 	if (cinergyt2->disconnect_pending || mutex_lock_interruptible(&cinergyt2->sem))
+ 		return -ERESTARTSYS;
+ 
+ 	poll_wait(file, &cinergyt2->poll_wq, wait);
+ 
+-       if (cinergyt2->pending_fe_events != 0)
++	if (cinergyt2->pending_fe_events != 0)
+ 		mask |= (POLLIN | POLLRDNORM | POLLPRI);
+ 
+ 	mutex_unlock(&cinergyt2->sem);
+@@ -722,142 +720,128 @@ static struct dvb_device cinergyt2_fe_te
+ 
+ #ifdef ENABLE_RC
+ 
+-static void cinergyt2_query_rc (struct work_struct *work)
++static int cinergyt2_get_keycode(struct cinergyt2 *cinergyt2,
++				 struct cinergyt2_rc_event *event)
+ {
+-	struct cinergyt2 *cinergyt2 =
+-		container_of(work, struct cinergyt2, rc_query_work.work);
+-	char buf[1] = { CINERGYT2_EP1_GET_RC_EVENTS };
+-	struct cinergyt2_rc_event rc_events[12];
+-	int n, len, i;
++	int i;
+ 
+-	if (cinergyt2->disconnect_pending || mutex_lock_interruptible(&cinergyt2->sem))
+-		return;
++	if (event->type == CINERGYT2_RC_EVENT_TYPE_NEC && event->value == ~0)
++		return cinergyt2->last_keycode;
+ 
+-	len = cinergyt2_command(cinergyt2, buf, sizeof(buf),
+-				(char *) rc_events, sizeof(rc_events));
+-	if (len < 0)
+-		goto out;
+-	if (len == 0) {
+-		if (time_after(jiffies, cinergyt2->last_event_jiffies +
+-			       msecs_to_jiffies(150))) {
+-			/* stop key repeat */
+-			if (cinergyt2->rc_input_event != KEY_MAX) {
+-				dprintk(1, "rc_input_event=%d Up\n", cinergyt2->rc_input_event);
+-				input_report_key(cinergyt2->rc_input_dev,
+-						 cinergyt2->rc_input_event, 0);
+-				input_sync(cinergyt2->rc_input_dev);
+-				cinergyt2->rc_input_event = KEY_MAX;
+-			}
+-			cinergyt2->rc_last_code = ~0;
++	for (i = 0; i < ARRAY_SIZE(rc_keys); i += 3) {
++		if (rc_keys[i + 0] == event->type &&
++		    rc_keys[i + 1] == le32_to_cpu(event->value)) {
++			return rc_keys[i + 2];
+ 		}
+-		goto out;
+ 	}
+-	cinergyt2->last_event_jiffies = jiffies;
+ 
+-	for (n = 0; n < (len / sizeof(rc_events[0])); n++) {
+-		dprintk(1, "rc_events[%d].value = %x, type=%x\n",
+-			n, le32_to_cpu(rc_events[n].value), rc_events[n].type);
+-
+-		if (rc_events[n].type == CINERGYT2_RC_EVENT_TYPE_NEC &&
+-		    rc_events[n].value == ~0) {
+-			/* keyrepeat bit -> just repeat last rc_input_event */
+-		} else {
+-			cinergyt2->rc_input_event = KEY_MAX;
+-			for (i = 0; i < ARRAY_SIZE(rc_keys); i += 3) {
+-				if (rc_keys[i + 0] == rc_events[n].type &&
+-				    rc_keys[i + 1] == le32_to_cpu(rc_events[n].value)) {
+-					cinergyt2->rc_input_event = rc_keys[i + 2];
+-					break;
++	return KEY_MAX;
++}
++
++static void cinergyt2_query_rc(struct input_polled_dev *poll_dev)
++{
++	struct cinergyt2 *cinergyt2 = poll_dev->private;
++	struct input_dev *input_dev = poll_dev->input;
++	char buf[1] = { CINERGYT2_EP1_GET_RC_EVENTS };
++	struct cinergyt2_rc_event rc_events[12];
++	int n, len, code;
++
++	mutex_lock(&cinergyt2->sem);
++	len = cinergyt2_command(cinergyt2, buf, sizeof(buf),
++				(char *)rc_events, sizeof(rc_events));
++	mutex_unlock(&cinergyt2->sem);
++
++	if (len > 0) {
++		/* we have new data */
++
++		for (n = 0; n < len / sizeof(rc_events[0]); n++) {
++			dprintk(1, "rc_events[%d].value = %x, type=%x\n",
++				n, le32_to_cpu(rc_events[n].value),
++				rc_events[n].type);
++
++			code = cinergyt2_get_keycode(cinergyt2, &rc_events[n]);
++
++			if (code != KEY_MAX) {
++				if (code != cinergyt2->last_keycode &&
++				    cinergyt2->last_keycode != KEY_MAX) {
++					/* emit a key-up for old key */
++					dprintk(1, "rc_input_event=%d UP\n",
++						cinergyt2->last_keycode);
++					input_report_key(input_dev,
++						 cinergyt2->last_keycode, 0);
+ 				}
+-			}
+-		}
+ 
+-		if (cinergyt2->rc_input_event != KEY_MAX) {
+-			if (rc_events[n].value == cinergyt2->rc_last_code &&
+-			    cinergyt2->rc_last_code != ~0) {
+-				/* emit a key-up so the double event is recognized */
+-				dprintk(1, "rc_input_event=%d UP\n", cinergyt2->rc_input_event);
+-				input_report_key(cinergyt2->rc_input_dev,
+-						 cinergyt2->rc_input_event, 0);
++				dprintk(1, "rc_input_event=%d\n", code);
++				input_report_key(input_dev, code, 1);
++				input_sync(input_dev);
++
++				cinergyt2->last_keycode = code;
++				cinergyt2->last_event_jiffies = jiffies;
+ 			}
+-			dprintk(1, "rc_input_event=%d\n", cinergyt2->rc_input_event);
+-			input_report_key(cinergyt2->rc_input_dev,
+-					 cinergyt2->rc_input_event, 1);
+-			input_sync(cinergyt2->rc_input_dev);
+-			cinergyt2->rc_last_code = rc_events[n].value;
+ 		}
+-	}
+-
+-out:
+-	schedule_delayed_work(&cinergyt2->rc_query_work,
+-			      msecs_to_jiffies(RC_QUERY_INTERVAL));
++	} else if (len == 0 &&
++		   cinergyt2->last_keycode != KEY_MAX &&
++		   time_after(jiffies,
++			      cinergyt2->last_event_jiffies +
++					msecs_to_jiffies(150))) {
++		/* stop key repeat */
++		dprintk(1, "rc_input_event=%d Up\n", cinergyt2->last_keycode);
++		input_report_key(input_dev, cinergyt2->last_keycode, 0);
++		input_sync(input_dev);
+ 
+-	mutex_unlock(&cinergyt2->sem);
++		cinergyt2->last_keycode = KEY_MAX;
++	}
+ }
+ 
+ static int cinergyt2_register_rc(struct cinergyt2 *cinergyt2)
+ {
++	struct input_polled_dev *rc_input;
+ 	struct input_dev *input_dev;
+ 	int i;
+ 	int err;
+ 
+-	input_dev = input_allocate_device();
+-	if (!input_dev)
+-		return -ENOMEM;
+-
+ 	usb_make_path(cinergyt2->udev, cinergyt2->phys, sizeof(cinergyt2->phys));
+ 	strlcat(cinergyt2->phys, "/input0", sizeof(cinergyt2->phys));
+-	cinergyt2->rc_input_event = KEY_MAX;
+-	cinergyt2->rc_last_code = ~0;
+-	INIT_DELAYED_WORK(&cinergyt2->rc_query_work, cinergyt2_query_rc);
++	cinergyt2->last_keycode = KEY_MAX;
++
++	cinergyt2->rc_input = rc_input = input_allocate_polled_device();
++	if (!rc_input)
++		return -ENOMEM;
++
++	rc_input->private = cinergyt2;
++	rc_input->poll = cinergyt2_query_rc;
++	rc_input->poll_interval = RC_QUERY_INTERVAL;
+ 
++	input_dev = rc_input->input;
+ 	input_dev->name = DRIVER_NAME " remote control";
+ 	input_dev->phys = cinergyt2->phys;
+ 	input_dev->evbit[0] = BIT(EV_KEY) | BIT(EV_REP);
+ 	for (i = 0; i < ARRAY_SIZE(rc_keys); i += 3)
+ 		set_bit(rc_keys[i + 2], input_dev->keybit);
+-	input_dev->keycodesize = 0;
+-	input_dev->keycodemax = 0;
+-	input_dev->id.bustype = BUS_USB;
+-	input_dev->id.vendor = cinergyt2->udev->descriptor.idVendor;
+-	input_dev->id.product = cinergyt2->udev->descriptor.idProduct;
+-	input_dev->id.version = 1;
+-	input_dev->cdev.dev = &cinergyt2->udev->dev;
++	usb_to_input_id(cinergyt2->udev, &input_dev->id);
++	input_dev->dev.parent = &cinergyt2->udev->dev;
+ 
+-	err = input_register_device(input_dev);
++	err = input_register_polled_device(rc_input);
+ 	if (err) {
+-		input_free_device(input_dev);
++		input_free_polled_device(rc_input);
+ 		return err;
+ 	}
+ 
+-	cinergyt2->rc_input_dev = input_dev;
+-	schedule_delayed_work(&cinergyt2->rc_query_work, HZ/2);
+-
+ 	return 0;
+ }
+ 
+ static void cinergyt2_unregister_rc(struct cinergyt2 *cinergyt2)
+ {
+-	cancel_delayed_work(&cinergyt2->rc_query_work);
+-	input_unregister_device(cinergyt2->rc_input_dev);
+-}
+-
+-static inline void cinergyt2_suspend_rc(struct cinergyt2 *cinergyt2)
+-{
+-	cancel_delayed_work(&cinergyt2->rc_query_work);
+-}
++	struct input_polled_dev *rc_input = cinergyt2->rc_input;
+ 
+-static inline void cinergyt2_resume_rc(struct cinergyt2 *cinergyt2)
+-{
+-	schedule_delayed_work(&cinergyt2->rc_query_work, HZ/2);
++	input_unregister_polled_device(rc_input);
++	input_free_polled_device(rc_input);
+ }
+ 
+ #else
+ 
+ static inline int cinergyt2_register_rc(struct cinergyt2 *cinergyt2) { return 0; }
+ static inline void cinergyt2_unregister_rc(struct cinergyt2 *cinergyt2) { }
+-static inline void cinergyt2_suspend_rc(struct cinergyt2 *cinergyt2) { }
+-static inline void cinergyt2_resume_rc(struct cinergyt2 *cinergyt2) { }
+ 
+ #endif /* ENABLE_RC */
+ 
+@@ -892,7 +876,7 @@ static void cinergyt2_query (struct work
+ 	mutex_unlock(&cinergyt2->sem);
+ }
+ 
+-static int cinergyt2_probe (struct usb_interface *intf,
++static int cinergyt2_probe(struct usb_interface *intf,
+ 		  const struct usb_device_id *id)
+ {
+ 	struct cinergyt2 *cinergyt2;
+@@ -970,15 +954,13 @@ bailout:
+ 	return -ENOMEM;
+ }
+ 
+-static void cinergyt2_disconnect (struct usb_interface *intf)
++static void cinergyt2_disconnect(struct usb_interface *intf)
+ {
+ 	struct cinergyt2 *cinergyt2 = usb_get_intfdata (intf);
+ 
+-	flush_scheduled_work();
+-
+ 	cinergyt2_unregister_rc(cinergyt2);
+ 
+-	cancel_delayed_work(&cinergyt2->query_work);
++	cancel_delayed_rearming_work(&cinergyt2->query_work);
+ 	wake_up_interruptible(&cinergyt2->poll_wq);
+ 
+ 	cinergyt2->demux.dmx.close(&cinergyt2->demux.dmx);
+@@ -998,7 +980,6 @@ static int cinergyt2_suspend (struct usb
+ 	if (1) {
+ 		struct cinergyt2 *cinergyt2 = usb_get_intfdata (intf);
+ 
+-		cinergyt2_suspend_rc(cinergyt2);
+ 		cancel_delayed_work(&cinergyt2->query_work);
+ 		if (cinergyt2->streaming)
+ 			cinergyt2_stop_stream_xfer(cinergyt2);
+@@ -1026,8 +1007,6 @@ static int cinergyt2_resume (struct usb_
+ 		schedule_delayed_work(&cinergyt2->query_work, HZ/2);
+ 	}
+ 
+-	cinergyt2_resume_rc(cinergyt2);
+-
+ 	mutex_unlock(&cinergyt2->sem);
+ 	return 0;
+ }

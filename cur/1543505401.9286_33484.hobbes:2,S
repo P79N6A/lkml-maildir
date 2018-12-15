@@ -1,0 +1,153 @@
+Date: Tue, 10 Aug 1999 11:41:29 +0200
+From: Manfred Spraul <>
+Subject: Re: 2.3.12 - klogd 100%CPU
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/8/12/28
+
+I noticed that the synchronization in do_syslog() is completely broken
+on both SMP & UP.
+Perhaps this explains why klogd stays at 100%: the CD drivers contains a
+bug, this causes unusual printk()'s, and this corrupted the kernel ring
+buffer.
+I've attached the patch I posted a few days ago.
+--
+	Manfred// $Header: /pub/cvs/ms/patches/patch-console_lock,v 1.1 1999/08/08 20:59:16 manfreds Exp $
+// kernel: 2.3.12
+--- 2.3/kernel/printk.c	Wed May 19 14:20:03 1999
++++ build-2.3/kernel/printk.c	Sun Aug  8 22:51:03 1999
+@@ -10,6 +10,8 @@
+  * elsewhere, in preparation for a serial line console (someday).
+  * Ted Ts'o, 2/11/93.
+  * Modified for sysctl support, 1/8/97, Chris Horn.
++ * Fixed SMP synchronization, 08/08/99, Manfred Spraul 
++ *     manfreds@colorfullife.com
+  */
+ 
+ #include <linux/mm.h>
+@@ -40,6 +42,8 @@
+ int minimum_console_loglevel = MINIMUM_CONSOLE_LOGLEVEL;
+ int default_console_loglevel = DEFAULT_CONSOLE_LOGLEVEL;
+ 
++spinlock_t console_lock;
++
+ struct console *console_drivers = NULL;
+ static char log_buf[LOG_BUF_LEN];
+ static unsigned long log_start = 0;
+@@ -115,7 +119,7 @@
+  */
+ int do_syslog(int type, char * buf, int len)
+ {
+-	unsigned long i, j, count, flags;
++	unsigned long i, j, limit, count;
+ 	int do_clear = 0;
+ 	char c;
+ 	int error = -EPERM;
+@@ -141,18 +145,18 @@
+ 		if (error)
+ 			goto out;
+ 		i = 0;
++		spin_lock_irq(&console_lock);
+ 		while (log_size && i < len) {
+-			c = *((char *) log_buf+log_start);
++			c = *((char *) log_buf+(log_start & LOG_BUF_LEN-1));
+ 			log_start++;
+ 			log_size--;
+-			log_start &= LOG_BUF_LEN-1;
+-			sti();
++			spin_unlock_irq(&console_lock);
+ 			__put_user(c,buf);
+ 			buf++;
+ 			i++;
+-			cli();
++			spin_lock_irq(&console_lock);
+ 		}
+-		sti();
++		spin_unlock_irq(&console_lock);
+ 		error = i;
+ 		break;
+ 	case 4:		/* Read/clear last kernel messages */
+@@ -168,26 +172,37 @@
+ 		error = verify_area(VERIFY_WRITE,buf,len);
+ 		if (error)
+ 			goto out;
+-		/*
+-		 * The logged_chars, log_start, and log_size values may
+-		 * change from an interrupt, so we disable interrupts.
+-		 */
+-		__save_flags(flags);
+-		__cli();
++		spin_lock_irq(&console_lock);
+ 		count = len;
+ 		if (count > LOG_BUF_LEN)
+ 			count = LOG_BUF_LEN;
+ 		if (count > logged_chars)
+ 			count = logged_chars;
+-		j = log_start + log_size - count;
+-		__restore_flags(flags);
+-		for (i = 0; i < count; i++) {
+-			c = *((char *) log_buf+(j++ & (LOG_BUF_LEN-1)));
+-			__put_user(c, buf++);
++		limit = log_start + log_size;
++		/*
++		 * __put_user() could sleep, and while we sleep
++		 * the printk() could overwrite the data
++		 * we try to copy to user space. Therefore
++		 * I must copy the data in reverse. <manfreds>
++		 */
++		for(i=0;i < count;i++) {
++			j = limit-1-i;
++			if(j+LOG_BUF_LEN < log_start+log_size)
++				break;
++			c = *((char*) log_buf+( j  & (LOG_BUF_LEN-1)));
++			spin_unlock_irq(&console_lock);
++			__put_user(c,&buf[count-1-i]);
++			spin_lock_irq(&console_lock);
++		}
++		spin_unlock_irq(&console_lock);
++		if(i != count) {
++			/* buffer overflow during copy, correct user buffer. */
++			memmove(buf,&buf[count-i],i);
+ 		}
++		error = i;
++
+ 		if (do_clear)
+ 			logged_chars = 0;
+-		error = i;
+ 		break;
+ 	case 5:		/* Clear ring buffer */
+ 		logged_chars = 0;
+@@ -223,9 +238,6 @@
+ 	return do_syslog(type, buf, len);
+ }
+ 
+-
+-spinlock_t console_lock;
+-
+ asmlinkage int printk(const char *fmt, ...)
+ {
+ 	va_list args;
+@@ -262,10 +274,9 @@
+ 			log_buf[(log_start+log_size) & (LOG_BUF_LEN-1)] = *p;
+ 			if (log_size < LOG_BUF_LEN)
+ 				log_size++;
+-			else {
++			else
+ 				log_start++;
+-				log_start &= LOG_BUF_LEN-1;
+-			}
++
+ 			logged_chars++;
+ 			if (*p == '\n') {
+ 				line_feed = 1;
+@@ -319,7 +330,7 @@
+ void register_console(struct console * console)
+ {
+ 	int	i,j,len;
+-	int	p = log_start;
++	int	p = (log_start& LOG_BUF_LEN-1);
+ 	char	buf[16];
+ 	signed char msg_level = -1;
+ 	char	*q;

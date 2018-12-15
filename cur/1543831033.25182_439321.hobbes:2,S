@@ -1,0 +1,90 @@
+Date: Fri, 30 Jun 2006 10:31:13 +0200
+From: Arjan van de Ven <>
+Subject: [patch] Fix deadlock in pcmcia as found by lockdep
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2006/6/30/39
+
+On Thu, 2006-06-29 at 23:18 -0700, Miles Lane wrote:
+> To trigger this, I booted with a U.S. Robotics USR2210 Wifi card
+> plugged into my cardbus slot.  I then ran "pccardctl eject" and then
+> removed and then reinserted the card.  After looking at the latest
+> PCMCIA info, it seems that I may need to add some kernel boot options
+> to work around a BIOS or other problem that causes trouble when
+> removing a card.
+> 
+> PM: Removing info for pci:0000:02:00.0
+> PCMCIA: socket c1ebc9e0: *** DANGER *** unable to remove socket power
+ok this looks like a real bug:
+void pcmcia_parse_events(struct pcmcia_socket *s, u_int events)
+{
+        cs_dbg(s, 4, "parse_events: events %08x\n", events);
+        if (s->thread) {
+                spin_lock(&s->thread_lock);
+                s->thread_events |= events;
+                spin_unlock(&s->thread_lock);
+                wake_up(&s->thread_wait);
+        }
+} /* pcmcia_parse_events */
+that function gets called from both user context and irq context!
+user context:
+[<c1181270>] pcmcia_parse_events+0x3e/0x6b
+[<c1181945>] pcmcia_register_socket+0x29b/0x2fc
+[<c118a8d1>] yenta_probe+0x51b/0x55c
+[<c110d537>] pci_device_probe+0x39/0x5b
+eg in pcmcia_register_socket:
+        ret = kernel_thread(pccardd, socket, CLONE_KERNEL);
+        if (ret < 0)
+                goto err;
+        wait_for_completion(&socket->thread_done);
+        if(!socket->thread) {
+                printk(KERN_WARNING "PCMCIA: warning: socket thread for
+socket %p did not start\n", socket);
+                return -EIO;
+        }
+        pcmcia_parse_events(socket, SS_DETECT);
+clearly sleeping/user context
+interrupt context:
+yenta_interrupt calls pcmcia_parse_events like this:
+....
+        if (events)
+                pcmcia_parse_events(&socket->socket, events);
+        return IRQ_HANDLED;
+}
+and that's the irq handler.
+Dominik: this really wants to have _irqsave versions of the spinlock
+like this:
+the PCMCIA layer calls pcmcia_parse_events both from user context and
+IRQ context; the lock thus needs to be irqsave to avoid deadlocks
+Signed-off-by: Arjan van de Ven <arjan@linux.intel.com>
+---
+ drivers/pcmcia/cs.c |    5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+Index: linux-2.6.17-mm4/drivers/pcmcia/cs.c
+===================================================================
+--- linux-2.6.17-mm4.orig/drivers/pcmcia/cs.c
++++ linux-2.6.17-mm4/drivers/pcmcia/cs.c
+@@ -697,11 +697,12 @@ static int pccardd(void *__skt)
+  */
+ void pcmcia_parse_events(struct pcmcia_socket *s, u_int events)
+ {
++	unsigned long flags;
+ 	cs_dbg(s, 4, "parse_events: events %08x\n", events);
+ 	if (s->thread) {
+-		spin_lock(&s->thread_lock);
++		spin_lock_irqsave(&s->thread_lock, flags);
+ 		s->thread_events |= events;
+-		spin_unlock(&s->thread_lock);
++		spin_unlock_irqrestore(&s->thread_lock, flags);
+ 
+ 		wake_up(&s->thread_wait);
+ 	}
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+More majordomo info at  
+http://vger.kernel.org/majordomo-info.html
+Please read the FAQ at  
+http://www.tux.org/lkml/

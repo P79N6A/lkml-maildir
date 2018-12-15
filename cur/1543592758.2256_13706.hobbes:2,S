@@ -1,0 +1,537 @@
+Date: Tue, 29 May 2001 19:49:57 +0200 (CEST)
+From: Ingo Molnar <>
+Subject: [patch] softirq-2.4.5-E5
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2001/5/29/93
+
+the attached softirq-2.4.5-E5 patch (against 2.4.5-ac3) tries to solve all
+softirq, tasklet and scheduling latency problems i could identify while
+testing TCP latencies over gigabit connections. The list of problems, as
+of 2.4.5-ac3:
+ - the need_resched check in the arch/i386/kernel/entry.S syscall/irq
+   return code has a race that makes it possible to miss a reschedule for
+   up to smp_num_cpus*HZ jiffies.
+ - the softirq check in entry.S has a race as well.
+ - on x86, APIC interrupts do not trigger do_softirq(). This is especially
+   problematic with the smptimers patch, which is APIC-irq driven.
+ - local_bh_disable() blocks the execution of do_softirq(), and it takes
+   a nondeterministic amount of time after local_bh_enable() for the next
+   do_softirq() to be triggered.
+ - do_softirq() does not execute softirqs that got activated meanwhile,
+   and the next do_softirq() run happens after a nondeterministic amount
+   of time.
+ - the tasklet design re-enables their driving softirq occasionally, which
+   makes 'complete' softirq processing impossible.
+the patch (tries to) solve all these problems. The changes:
+ - all softirqs are guaranteed to be handled after do_softirq()  returns
+   (even those which are activated during softirq run)
+ - softirq handling is immediately restarted if bhs are re-enabled again.
+ - the tasklet code got rewritten (but externally visible semantics are
+   kept) to not rely on marking the softirq busy. The new code is a bit
+   tricky, but it should be correct.
+ - some code got a bit slower, some code got a bit faster. I believe most
+   of the changes made the softirq/tasklet implementation clearer.
+ - some minor uninlining of too big inline functions, and other cleanup
+   was done as well.
+ - no global serialization was added to any part of the softirq or tasklet
+   code, so scalability is not impacted.
+the patch is stable under every workload i tried, handles softirqs and
+tasklets with the minimum possible latency, thus it maximizes cache
+locality. The patch has no known bug, and the kernel has no known
+lost-wakeup, lost-softirq problem i know of. TCP latencies and TCP
+throughput is picture-perfect.
+Comments?
+	Ingo
+--- linux/kernel/softirq.c.orig	Fri Dec 29 23:07:24 2000
++++ linux/kernel/softirq.c	Tue May 29 17:41:14 2001
+@@ -52,12 +52,12 @@
+ 	int cpu = smp_processor_id();
+ 	__u32 active, mask;
+ 
++	local_irq_disable();
+ 	if (in_interrupt())
+-		return;
++		goto out;
+ 
+ 	local_bh_disable();
+ 
+-	local_irq_disable();
+ 	mask = softirq_mask(cpu);
+ 	active = softirq_active(cpu) & mask;
+ 
+@@ -71,7 +71,6 @@
+ 		local_irq_enable();
+ 
+ 		h = softirq_vec;
+-		mask &= ~active;
+ 
+ 		do {
+ 			if (active & 1)
+@@ -82,12 +81,13 @@
+ 
+ 		local_irq_disable();
+ 
+-		active = softirq_active(cpu);
+-		if ((active &= mask) != 0)
++		active = softirq_active(cpu) & mask;
++		if (active)
+ 			goto retry;
+ 	}
+ 
+-	local_bh_enable();
++	__local_bh_enable();
++out:
+ 
+ 	/* Leave with locally disabled hard irqs. It is critical to close
+ 	 * window for infinite recursion, while we help local bh count,
+@@ -121,6 +121,45 @@
+ 
+ struct tasklet_head tasklet_vec[NR_CPUS] __cacheline_aligned;
+ 
++void tasklet_schedule(struct tasklet_struct *t)
++{
++	unsigned long flags;
++	int cpu;
++
++	cpu = smp_processor_id();
++	local_irq_save(flags);
++	/*
++	 * If nobody is running it then add it to this CPU's
++	 * tasklet queue.
++	 */
++	if (!test_and_set_bit(TASKLET_STATE_SCHED, &t->state) &&
++						tasklet_trylock(t)) {
++		t->next = tasklet_vec[cpu].list;
++		tasklet_vec[cpu].list = t;
++		__cpu_raise_softirq(cpu, TASKLET_SOFTIRQ);
++		tasklet_unlock(t);
++	}
++	local_irq_restore(flags);
++}
++
++void tasklet_hi_schedule(struct tasklet_struct *t)
++{
++	unsigned long flags;
++	int cpu;
++
++	cpu = smp_processor_id();
++	local_irq_save(flags);
++
++	if (!test_and_set_bit(TASKLET_STATE_SCHED, &t->state) &&
++						tasklet_trylock(t)) {
++		t->next = tasklet_hi_vec[cpu].list;
++		tasklet_hi_vec[cpu].list = t;
++		__cpu_raise_softirq(cpu, HI_SOFTIRQ);
++		tasklet_unlock(t);
++	}
++	local_irq_restore(flags);
++}
++
+ static void tasklet_action(struct softirq_action *a)
+ {
+ 	int cpu = smp_processor_id();
+@@ -129,37 +168,37 @@
+ 	local_irq_disable();
+ 	list = tasklet_vec[cpu].list;
+ 	tasklet_vec[cpu].list = NULL;
+-	local_irq_enable();
+ 
+-	while (list != NULL) {
++	while (list) {
+ 		struct tasklet_struct *t = list;
+ 
+ 		list = list->next;
+ 
+-		if (tasklet_trylock(t)) {
+-			if (atomic_read(&t->count) == 0) {
+-				clear_bit(TASKLET_STATE_SCHED, &t->state);
+-
+-				t->func(t->data);
+-				/*
+-				 * talklet_trylock() uses test_and_set_bit that imply
+-				 * an mb when it returns zero, thus we need the explicit
+-				 * mb only here: while closing the critical section.
+-				 */
+-#ifdef CONFIG_SMP
+-				smp_mb__before_clear_bit();
+-#endif
+-				tasklet_unlock(t);
+-				continue;
+-			}
+-			tasklet_unlock(t);
++		/*
++		 * A tasklet is only added to the queue while it's
++		 * locked, so no other CPU can have this tasklet
++		 * pending:
++		 */
++		if (!tasklet_trylock(t))
++			BUG();
++repeat:
++		if (!test_and_clear_bit(TASKLET_STATE_SCHED, &t->state))
++			BUG();
++		if (!atomic_read(&t->count)) {
++			local_irq_enable();
++			t->func(t->data);
++			local_irq_disable();
++			/*
++			 * One more run if the tasklet got reactivated:
++			 */
++			if (test_bit(TASKLET_STATE_SCHED, &t->state))
++				goto repeat;
+ 		}
+-		local_irq_disable();
+-		t->next = tasklet_vec[cpu].list;
+-		tasklet_vec[cpu].list = t;
+-		__cpu_raise_softirq(cpu, TASKLET_SOFTIRQ);
+-		local_irq_enable();
++		tasklet_unlock(t);
++		if (test_bit(TASKLET_STATE_SCHED, &t->state))
++			tasklet_schedule(t);
+ 	}
++	local_irq_enable();
+ }
+ 
+ 
+@@ -174,39 +213,40 @@
+ 	local_irq_disable();
+ 	list = tasklet_hi_vec[cpu].list;
+ 	tasklet_hi_vec[cpu].list = NULL;
+-	local_irq_enable();
+ 
+-	while (list != NULL) {
++	while (list) {
+ 		struct tasklet_struct *t = list;
+ 
+ 		list = list->next;
+ 
+-		if (tasklet_trylock(t)) {
+-			if (atomic_read(&t->count) == 0) {
+-				clear_bit(TASKLET_STATE_SCHED, &t->state);
+-
+-				t->func(t->data);
+-				tasklet_unlock(t);
+-				continue;
+-			}
+-			tasklet_unlock(t);
++		if (!tasklet_trylock(t))
++			BUG();
++repeat:
++		if (!test_and_clear_bit(TASKLET_STATE_SCHED, &t->state))
++			BUG();
++		if (!atomic_read(&t->count)) {
++			local_irq_enable();
++			t->func(t->data);
++			local_irq_disable();
++			if (test_bit(TASKLET_STATE_SCHED, &t->state))
++				goto repeat;
+ 		}
+-		local_irq_disable();
+-		t->next = tasklet_hi_vec[cpu].list;
+-		tasklet_hi_vec[cpu].list = t;
+-		__cpu_raise_softirq(cpu, HI_SOFTIRQ);
+-		local_irq_enable();
++		tasklet_unlock(t);
++		if (test_bit(TASKLET_STATE_SCHED, &t->state))
++			tasklet_hi_schedule(t);
+ 	}
++	local_irq_enable();
+ }
+ 
+ 
+ void tasklet_init(struct tasklet_struct *t,
+ 		  void (*func)(unsigned long), unsigned long data)
+ {
+-	t->func = func;
+-	t->data = data;
++	t->next = NULL;
+ 	t->state = 0;
+ 	atomic_set(&t->count, 0);
++	t->func = func;
++	t->data = data;
+ }
+ 
+ void tasklet_kill(struct tasklet_struct *t)
+--- linux/include/linux/interrupt.h.orig	Tue May 29 12:55:29 2001
++++ linux/include/linux/interrupt.h	Tue May 29 17:41:46 2001
+@@ -74,20 +74,15 @@
+ asmlinkage void do_softirq(void);
+ extern void open_softirq(int nr, void (*action)(struct softirq_action*), void *data);
+ 
++/* Locally cached atomic variables are cheaper than cli/sti */
+ static inline void __cpu_raise_softirq(int cpu, int nr)
+ {
+-	softirq_active(cpu) |= (1<<nr);
++	set_bit(nr, &softirq_active(cpu));
+ }
+ 
+-
+-/* I do not want to use atomic variables now, so that cli/sti */
+ static inline void raise_softirq(int nr)
+ {
+-	unsigned long flags;
+-
+-	local_irq_save(flags);
+ 	__cpu_raise_softirq(smp_processor_id(), nr);
+-	local_irq_restore(flags);
+ }
+ 
+ extern void softirq_init(void);
+@@ -154,34 +149,8 @@
+ #define tasklet_unlock(t) do { } while (0)
+ #endif
+ 
+-static inline void tasklet_schedule(struct tasklet_struct *t)
+-{
+-	if (!test_and_set_bit(TASKLET_STATE_SCHED, &t->state)) {
+-		int cpu = smp_processor_id();
+-		unsigned long flags;
+-
+-		local_irq_save(flags);
+-		t->next = tasklet_vec[cpu].list;
+-		tasklet_vec[cpu].list = t;
+-		__cpu_raise_softirq(cpu, TASKLET_SOFTIRQ);
+-		local_irq_restore(flags);
+-	}
+-}
+-
+-static inline void tasklet_hi_schedule(struct tasklet_struct *t)
+-{
+-	if (!test_and_set_bit(TASKLET_STATE_SCHED, &t->state)) {
+-		int cpu = smp_processor_id();
+-		unsigned long flags;
+-
+-		local_irq_save(flags);
+-		t->next = tasklet_hi_vec[cpu].list;
+-		tasklet_hi_vec[cpu].list = t;
+-		__cpu_raise_softirq(cpu, HI_SOFTIRQ);
+-		local_irq_restore(flags);
+-	}
+-}
+-
++extern void tasklet_schedule(struct tasklet_struct *t);
++extern void tasklet_hi_schedule(struct tasklet_struct *t);
+ 
+ static inline void tasklet_disable_nosync(struct tasklet_struct *t)
+ {
+@@ -196,7 +165,14 @@
+ 
+ static inline void tasklet_enable(struct tasklet_struct *t)
+ {
+-	atomic_dec(&t->count);
++	if (atomic_dec_and_test(&t->count))
++		tasklet_schedule(t);
++}
++
++static inline void tasklet_hi_enable(struct tasklet_struct *t)
++{
++	if (atomic_dec_and_test(&t->count))
++		tasklet_hi_schedule(t);
+ }
+ 
+ extern void tasklet_kill(struct tasklet_struct *t);
+--- linux/include/asm-i386/softirq.h.orig	Sun Dec 31 20:10:17 2000
++++ linux/include/asm-i386/softirq.h	Tue May 29 17:37:11 2001
+@@ -4,11 +4,16 @@
+ #include <asm/atomic.h>
+ #include <asm/hardirq.h>
+ 
+-#define cpu_bh_disable(cpu)	do { local_bh_count(cpu)++; barrier(); } while (0)
+-#define cpu_bh_enable(cpu)	do { barrier(); local_bh_count(cpu)--; } while (0)
++#define __cpu_bh_enable(cpu) \
++		do { barrier(); local_bh_count(cpu)--; } while (0)
++#define cpu_bh_disable(cpu) \
++		do { local_bh_count(cpu)++; barrier(); } while (0)
++
++extern void cpu_bh_enable (unsigned int cpu);
+ 
+ #define local_bh_disable()	cpu_bh_disable(smp_processor_id())
+ #define local_bh_enable()	cpu_bh_enable(smp_processor_id())
++#define __local_bh_enable()	__cpu_bh_enable(smp_processor_id())
+ 
+ #define in_softirq() (local_bh_count(smp_processor_id()) != 0)
+ 
+--- linux/net/core/dev.c.orig	Tue May 29 16:41:27 2001
++++ linux/net/core/dev.c	Tue May 29 17:00:57 2001
+@@ -1278,7 +1278,7 @@
+ 
+ 	ret = pt->func(skb, skb->dev, pt);
+ 
+-	tasklet_enable(bh_task_vec+TIMER_BH);
++	tasklet_hi_enable(bh_task_vec+TIMER_BH);
+ 	spin_unlock(&net_bh_lock);
+ 	return ret;
+ }
+--- linux/arch/i386/kernel/irq.c.orig	Tue May 29 12:55:38 2001
++++ linux/arch/i386/kernel/irq.c	Tue May 29 17:37:14 2001
+@@ -636,9 +636,39 @@
+ 	desc->handler->end(irq);
+ 	spin_unlock(&desc->lock);
+ 
+-	if (softirq_active(cpu) & softirq_mask(cpu))
++	if (!in_interrupt() && (softirq_active(cpu) & softirq_mask(cpu)))
+ 		do_softirq();
+ 	return 1;
++}
++
++/*
++ * A bh-atomic section might have blocked the exection of softirqs.
++ * re-run them if appropriate.
++ *
++ * NOTE: do_softirq() will re-enable interrupts, so bh_enable should not
++ * be used within IRQ-atomic sections.
++ */
++void cpu_bh_enable (unsigned int cpu)
++{
++	unsigned long flags, local_enabled;
++
++	barrier();
++	if (local_irq_count(cpu))
++		BUG();
++	__save_flags(flags);
++	local_enabled = (flags >> EFLAGS_IF_SHIFT) & 1;
++	if (!local_enabled)
++		BUG();
++	if (!--local_bh_count(cpu) &&
++			(softirq_active(cpu) & softirq_mask(cpu))) {
++		do_softirq();
++	}
++	/*
++	 * We have to do this only after calling do_softirq(), but
++	 * i moved it here so we see all the places that break much
++	 * faster.
++	 */
++	__sti();
+ }
+ 
+ /**
+--- linux/arch/i386/kernel/smp.c.orig	Tue May 29 12:55:38 2001
++++ linux/arch/i386/kernel/smp.c	Tue May 29 12:56:02 2001
+@@ -492,7 +492,7 @@
+ 	if (wait)
+ 		while (atomic_read(&data->finished) != cpus)
+ 			barrier();
+-	local_bh_enable();
++	__local_bh_enable();
+ 
+ 	return 0;
+ }
+--- linux/arch/i386/kernel/entry.S.orig	Thu Nov  9 02:09:50 2000
++++ linux/arch/i386/kernel/entry.S	Tue May 29 12:56:02 2001
+@@ -133,6 +133,18 @@
+ 	movl $-8192, reg; \
+ 	andl %esp, reg
+ 
++#ifdef CONFIG_SMP
++#define CHECK_SOFTIRQ \
++	movl processor(%ebx),%eax; \
++	shll $CONFIG_X86_L1_CACHE_SHIFT,%eax; \
++	movl SYMBOL_NAME(irq_stat)(,%eax),%ecx; \
++	testl SYMBOL_NAME(irq_stat)+4(,%eax),%ecx
++#else
++#define CHECK_SOFTIRQ \
++	movl SYMBOL_NAME(irq_stat),%ecx; \
++	testl SYMBOL_NAME(irq_stat)+4,%ecx
++#endif
++
+ ENTRY(lcall7)
+ 	pushfl			# We get a different stack layout with call gates,
+ 	pushl %eax		# which has to be cleaned up later..
+@@ -203,18 +215,9 @@
+ 	call *SYMBOL_NAME(sys_call_table)(,%eax,4)
+ 	movl %eax,EAX(%esp)		# save the return value
+ ENTRY(ret_from_sys_call)
+-#ifdef CONFIG_SMP
+-	movl processor(%ebx),%eax
+-	shll $CONFIG_X86_L1_CACHE_SHIFT,%eax
+-	movl SYMBOL_NAME(irq_stat)(,%eax),%ecx		# softirq_active
+-	testl SYMBOL_NAME(irq_stat)+4(,%eax),%ecx	# softirq_mask
+-#else
+-	movl SYMBOL_NAME(irq_stat),%ecx		# softirq_active
+-	testl SYMBOL_NAME(irq_stat)+4,%ecx	# softirq_mask
+-#endif
+-	jne   handle_softirq
+-	
+-ret_with_reschedule:
++	cli
++	CHECK_SOFTIRQ
++	jne handle_softirq
+ 	cmpl $0,need_resched(%ebx)
+ 	jne reschedule
+ 	cmpl $0,sigpending(%ebx)
+@@ -230,6 +233,13 @@
+ 	jne v86_signal_return
+ 	xorl %edx,%edx
+ 	call SYMBOL_NAME(do_signal)
++#ifdef CONFIG_SMP
++	GET_CURRENT(%ebx)
++#endif
++	cli
++	CHECK_SOFTIRQ
++	je restore_all
++	call SYMBOL_NAME(do_softirq)
+ 	jmp restore_all
+ 
+ 	ALIGN
+@@ -238,6 +248,13 @@
+ 	movl %eax,%esp
+ 	xorl %edx,%edx
+ 	call SYMBOL_NAME(do_signal)
++#ifdef CONFIG_SMP
++	GET_CURRENT(%ebx)
++#endif
++	cli
++	CHECK_SOFTIRQ
++	je restore_all
++	call SYMBOL_NAME(do_softirq)
+ 	jmp restore_all
+ 
+ 	ALIGN
+@@ -258,24 +275,21 @@
+ 
+ 	ALIGN
+ ret_from_exception:
+-#ifdef CONFIG_SMP
+-	GET_CURRENT(%ebx)
+-	movl processor(%ebx),%eax
+-	shll $CONFIG_X86_L1_CACHE_SHIFT,%eax
+-	movl SYMBOL_NAME(irq_stat)(,%eax),%ecx		# softirq_active
+-	testl SYMBOL_NAME(irq_stat)+4(,%eax),%ecx	# softirq_mask
+-#else
+-	movl SYMBOL_NAME(irq_stat),%ecx		# softirq_active
+-	testl SYMBOL_NAME(irq_stat)+4,%ecx	# softirq_mask
+-#endif
+-	jne   handle_softirq
++	cli
++	CHECK_SOFTIRQ
++	jne handle_softirq
++	cmpl $0,need_resched(%ebx)
++	jne reschedule
++	cmpl $0,sigpending(%ebx)
++	jne signal_return
++	jmp restore_all
+ 
+ ENTRY(ret_from_intr)
+ 	GET_CURRENT(%ebx)
+ 	movl EFLAGS(%esp),%eax		# mix EFLAGS and CS
+ 	movb CS(%esp),%al
+ 	testl $(VM_MASK | 3),%eax	# return to VM86 mode or non-supervisor?
+-	jne ret_with_reschedule
++	jne ret_from_sys_call
+ 	jmp restore_all
+ 
+ 	ALIGN
+--- linux/arch/i386/kernel/apic.c.orig	Tue May 29 12:55:38 2001
++++ linux/arch/i386/kernel/apic.c	Tue May 29 13:00:09 2001
+@@ -1010,6 +1010,9 @@
+ 	irq_enter(cpu, 0);
+ 	smp_local_timer_interrupt(regs);
+ 	irq_exit(cpu, 0);
++
++	if (softirq_active(cpu) & softirq_mask(cpu))
++		do_softirq();
+ }
+ 
+ /*

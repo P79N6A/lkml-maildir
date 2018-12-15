@@ -1,0 +1,143 @@
+Date: Sat, 12 Aug 2000 18:34:32 -0400 (EDT)
+From: Alexander Viro <>
+Subject: Re: NTFS-like streams?
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/8/12/117
+
+On Sat, 12 Aug 2000, Linus Torvalds wrote:
+> I think the above are non-VFS issues to a large degree, and will depend on
+> how the low-level filesystem handles things.
+Umm... I don't think so. Check d_invalidate() for some examples. It cares
+for files vs. directories. Has to.
+> The _interesting_ thing is what the filesystem does with the "struct
+> inode", for example.
+> 
+> I suspect that a filesystem that supports resource forks will just have
+> the same inode for the whole thing. In effect, they would look somewhat
+> like hard links to a normal UNIX application. But the filesystem would
+> save the resource-specific informaiton in the "dentry->d_private" field.
+You know what tar(1) will do with you for that, don't you? Same ->st_ino
+with different contents... And unlike procfs, here tar is a Reasonable
+Thing(tm).
+> We've had similar issues with the MS-DOS filesystem just because it
+> doesn't have some of the attributes at all. You can think of resource
+So we did. I also remember the hell we had there due to the weird aliases
+mess.
+> forks as having the same kind of "incomplete" file semantics. This is not
+> a new problem in that sense.
+> Basically, the VFS layer cannot handle all of these issues 100% right now.
+> However, none of them look like fundamental problems, and they seem to
+> fall into the category of "we've never done that before, so we don't have
+> the support for it yet, but it's a SMOP".
+> 
+> Famous last words.
+Oh, yes. Linus, I would _really_ ask you to postpone the activity in that
+direction until
+	a) ->revalidate() interface (along with its races) is sorted out
+	b) ->getattr() will be in place and used by VFS
+	c) icache hashing by ->i_dev issue is sorted out, quite possibly
+along with the ->st_fstype thing
+Otherwise we are in for PITA and I have some idea which A it will be ;-/
+ObPlan9: what do you think about the following
+-----------------------------------------------------------------
+FD2PATH(2)                                             FD2PATH(2)
+NAME
+       fd2path - return file name associated with file descriptor
+SYNOPSIS
+       #include <u.h>
+       #include <libc.h>
+       int fd2path(int fd, char *buf, int nbuf)
+DESCRIPTION
+       As described in intro(2), the kernel stores a rooted  path
+       name  with  every open file or directory; typically, it is
+       the name used in the original access of the file.  Fd2path
+       returns the path name associated with open file descriptor
+       fd.  Up to nbuf bytes of the name are stored  in  buf;  if
+       the  name  is too long, it will be silently truncated at a
+       UTF-8 character boundary.  The name is always  null-termi-
+       nated.  The return value of fd2path will be zero unless an
+       error occurs.
+       Changes to the underlying name space  do  not  update  the
+       path name stored with the file descriptor.  Therefore, the
+       path returned by fd2path may no longer refer to  the  same
+       file  (or  indeed any file) after some component directory
+       or file in the path has been removed, renamed or  rebound.
+       As  an  example, getwd(2) is implemented by opening .  and
+       executing fd2path on the resulting file descriptor.
+-----------------------------------------------------------------
+Now, unlike Plan 9 we _do_ update the path, so fixing the problem
+mentioned above is easy (we will need to deal with unlinked files,
+but that's trivial - return -ENOENT to distinguish that from the
+normal case).
+Basically, it's about exposing d_path() to userland. Patch below should do
+the job, modulo actual adding sys_fd2path into the tables. BTW, I suspect
+that we really ought to stop this " (removed)" thing, even in procfs
+symlinks - too ambiguos and can be done better (e.g. something in ->i_mode
+of the link). Comments?
+diff -urN linux-2.4.0-test7-pre2/fs/dcache.c
+linux-2.4.0-test7-pre2-fixes/fs/dcache.c
+--- linux-2.4.0-test7-pre2/fs/dcache.c  Sat Aug 12 17:40:44 2000
++++ linux-2.4.0-test7-pre2-fixes/fs/dcache.c    Sat Aug 12 18:21:54 2000
+@@ -1060,6 +1060,55 @@
+        return error;
+ }
++asmlinkage long sys_fd2path(int fd, char *buf, unsigned long size)
++{
++       int error;
++       struct vfsmount *mnt, *rootmnt;
++       struct dentry *dentry, *root;
++       struct file *file;
++       char *page = (char *) __get_free_page(GFP_USER);
++
++       if (!page)
++               return -ENOMEM;
++
++       file = fget(fd);
++       if (!file)
++               return -EBADF;
++       mnt = mntget(file->f_vfsmnt);
++       dentry = dget(file->f_dentry);
++       fput(file);
++       read_lock(&current->fs->lock);
++       rootmnt = mntget(current->fs->rootmnt);
++       root = dget(current->fs->root);
++       read_unlock(&current->fs->lock);
++
++       error = -ENOENT;
++       /* Has the file been unlinked? */
++       spin_lock(&dcache_lock);
++       if (dentry->d_parent == dentry || !list_empty(&dentry->d_hash)) {
++               unsigned long len;
++               char * cwd;
++
++               cwd = __d_path(dentry, mnt, root, rootmnt, page, PAGE_SIZE);
++               spin_unlock(&dcache_lock);
++
++               error = -ERANGE;
++               len = PAGE_SIZE + page - cwd;
++               if (len <= size) {
++                       error = len;
++                       if (copy_to_user(buf, cwd, len))
++                               error = -EFAULT;
++               }
++       } else
++               spin_unlock(&dcache_lock);
++       dput(dentry);
++       mntput(mnt);
++       dput(root);
++       mntput(rootmnt);
++       free_page((unsigned long) page);
++       return error;
++}
++
+ /*
+  * Test whether new_dentry is a subdirectory of old_dentry.
+  *
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

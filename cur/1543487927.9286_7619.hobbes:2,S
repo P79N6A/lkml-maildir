@@ -1,0 +1,240 @@
+Date: Mon, 1 Mar 1999 07:39:55 -0500 (EST)
+From: Alexander Viro <>
+Subject: Re: [Real fix] Re: Kernel panic: can't push onto full stack
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/3/1/19
+
+On Mon, 1 Mar 1999, Andrea Arcangeli wrote:
+> On Mon, 1 Mar 1999, Alexander Viro wrote:
+> 
+> >Michael sent me the lis of oopsen for the second patch. All of them
+> >are in the same place and it looks, uhm, interesting. Fragment in
+> >question:
+[snip the proc stuff - it's a different story]
+> >ISTR that there were problems in proc/array.c. Andrea, could you comment
+> >on that? I don't think that it's the cause of problem - it rather looks
+> 
+> I really dubit it's the cause of the problem. I instead thing that some
+> (SMP) race in af_unix.c or garbage.c is corrupting memory (or that Michael
+	Methink I found the sucker - we have one place where the unix_socket
+is freed without kernel_lock hold. It is in unix_destroy_timer(). I'm
+adding a semaphore (unix_gc_marking). unix_gc() holds it during the mark
+phase. unix_destroy_timer() tries to get it, if it fails it postpones
+removal even more, otherwise it holds the semaphore while doing sk_free().
+I hate voodoo programming and it's pretty likely to be only a bandaid, but
+if it will reduce breakage we'll get at least some hints on the nature of
+sucker. So there... It's *not* a final fix, but I'ld really like to see if
+it reduces the race window. Folks, could you try it out? 
+diff -urN linux.vanilla/include/net/af_unix.h linux.bird-unix_gc/include/net/af_unix.h
+--- linux.vanilla/include/net/af_unix.h	Mon Apr 14 19:28:26 1997
++++ linux.bird-unix_gc/include/net/af_unix.h	Mon Mar  1 07:28:14 1999
+@@ -10,6 +10,7 @@
+ #define UNIX_HASH_SIZE	16
+ 
+ extern unix_socket *unix_socket_table[UNIX_HASH_SIZE+1];
++extern struct semaphore unix_gc_marking;
+ 
+ #define forall_unix_sockets(i, s) for (i=0; i<=UNIX_HASH_SIZE; i++) \
+                                     for (s=unix_socket_table[i]; s; s=s->next)
+diff -urN linux.vanilla/include/net/sock.h linux.bird-unix_gc/include/net/sock.h
+--- linux.vanilla/include/net/sock.h	Tue Feb 23 15:59:28 1999
++++ linux.bird-unix_gc/include/net/sock.h	Mon Mar  1 07:07:51 1999
+@@ -99,8 +99,7 @@
+ 	struct semaphore	readsem;
+ 	struct sock *		other;
+ 	struct sock **		list;
+-	int 			marksweep;
+-#define MARKED			1
++	struct sock *		gc_tree;
+ 	int			inflight;
+ };
+ 
+diff -urN linux.vanilla/net/unix/af_unix.c linux.bird-unix_gc/net/unix/af_unix.c
+--- linux.vanilla/net/unix/af_unix.c	Sat Jan 23 04:54:56 1999
++++ linux.bird-unix_gc/net/unix/af_unix.c	Mon Mar  1 07:33:39 1999
+@@ -261,19 +261,23 @@
+ static void unix_destroy_timer(unsigned long data)
+ {
+ 	unix_socket *sk=(unix_socket *)data;
++	if (!down_trylock(&unix_gc_marking))
++		goto delay_more;
+ 	if(!unix_locked(sk) && atomic_read(&sk->wmem_alloc) == 0)
+ 	{
+ 		sk_free(sk);
++		up(&unix_gc_marking);
+ 	
+ 		/* socket destroyed, decrement count		      */
+ 		MOD_DEC_USE_COUNT;
+ 		return;
+ 	}
++	up(&unix_gc_marking);
+ 	
+ 	/*
+ 	 *	Retry;
+ 	 */
+-	 
++delay_more:
+ 	sk->timer.expires=jiffies+sysctl_unix_destroy_delay;	/* No real hurry try it every 10 seconds or so */
+ 	add_timer(&sk->timer);
+ }
+diff -urN linux.vanilla/net/unix/garbage.c linux.bird-unix_gc/net/unix/garbage.c
+--- linux.vanilla/net/unix/garbage.c	Fri Nov 13 18:02:09 1998
++++ linux.bird-unix_gc/net/unix/garbage.c	Mon Mar  1 07:30:12 1999
+@@ -17,11 +17,12 @@
+  *
+  *  - explicit stack instead of recursion
+  *  - tail recurse on first born instead of immediate push/pop
++ *  - we gather the stuff that should not be killed into tree
++ *    and stack is just a path from root to the current pointer.
+  *
+  *  Future optimizations:
+  *
+  *  - don't just push entire root set; process in place
+- *  - use linked list for internal stack
+  *
+  *	This program is free software; you can redistribute it and/or
+  *	modify it under the terms of the GNU General Public License
+@@ -51,6 +52,14 @@
+  *		That might be the reason of random oopses on close_fp() in
+  *		unrelated processes.
+  *
++ *	AV		28 Feb 1999
++ *		Kill the explicit allocation of stack. Now we keep the tree
++ *		with root in dummy + pointer (gc_current) to one of the nodes.
++ *		Stack is represented as path from gc_current to dummy. Unmark
++ *		now means "add to tree". Push == "make it a son of gc_current".
++ *		Pop == "move gc_current to parent". We keep only pointers to
++ *		parents (->gc_tree).
++ *
+  */
+  
+ #include <linux/kernel.h>
+@@ -65,7 +74,6 @@
+ #include <linux/netdevice.h>
+ #include <linux/file.h>
+ #include <linux/proc_fs.h>
+-#include <linux/vmalloc.h>
+ 
+ #include <net/sock.h>
+ #include <net/tcp.h>
+@@ -74,9 +82,9 @@
+ 
+ /* Internal data structures and random procedures: */
+ 
+-static unix_socket **stack;	/* stack of objects to mark */
+-static int in_stack = 0;	/* first free entry in stack */
+-static int max_stack;		/* Top of stack */
++static unix_socket dummy;
++static unix_socket *gc_current=&dummy;	/* stack of objects to mark */
++struct semaphore unix_gc_marking = MUTEX;
+ 
+ extern inline unix_socket *unix_get_socket(struct file *filp)
+ {
+@@ -122,32 +130,25 @@
+ /*
+  *	Garbage Collector Support Functions
+  */
+- 
+-extern inline void push_stack(unix_socket *x)
+-{
+-	if (in_stack == max_stack)
+-		panic("can't push onto full stack");
+-	stack[in_stack++] = x;
+-}
+ 
+ extern inline unix_socket *pop_stack(void)
+ {
+-	if (in_stack == 0)
+-		panic("can't pop empty gc stack");
+-	return stack[--in_stack];
++	unix_socket *p=gc_current;
++	gc_current = p->protinfo.af_unix.gc_tree;
++	return p;
+ }
+ 
+ extern inline int empty_stack(void)
+ {
+-	return in_stack == 0;
++	return gc_current == &dummy;
+ }
+ 
+ extern inline void maybe_unmark_and_push(unix_socket *x)
+ {
+-	if (!(x->protinfo.af_unix.marksweep&MARKED))
++	if (x->protinfo.af_unix.gc_tree)
+ 		return;
+-	x->protinfo.af_unix.marksweep&=~MARKED;
+-	push_stack(x);
++	x->protinfo.af_unix.gc_tree = gc_current;
++	gc_current = x;
+ }
+ 
+ 
+@@ -168,24 +169,15 @@
+ 	if(in_unix_gc)
+ 		return;
+ 	in_unix_gc=1;
+-	
+-	if(stack==NULL || max_files>max_stack)
+-	{
+-		if(stack)
+-			vfree(stack);
+-		stack=(unix_socket **)vmalloc(max_files*sizeof(struct unix_socket *));
+-		if(stack==NULL)
+-		{
+-			printk(KERN_NOTICE "unix_gc: deferred due to low memory.\n");
+-			in_unix_gc=0;
+-			return;
+-		}
+-		max_stack=max_files;
+-	}
++
++	/*
++	 *	No unix_destroy_timer(), please.
++	 */
++	down(&unix_gc_marking);
+ 	
+ 	forall_unix_sockets(i, s)
+ 	{
+-		s->protinfo.af_unix.marksweep|=MARKED;
++		s->protinfo.af_unix.gc_tree=NULL;
+ 	}
+ 	/*
+ 	 *	Everything is now marked 
+@@ -276,9 +268,9 @@
+ 
+ 		if (f) 
+ 		{
+-			if ((f->protinfo.af_unix.marksweep&MARKED))
++			if (!f->protinfo.af_unix.gc_tree)
+ 			{
+-				f->protinfo.af_unix.marksweep&=~MARKED;
++				f->protinfo.af_unix.gc_tree=&dummy;
+ 				x=f;
+ 				f=NULL;
+ 				goto tail;
+@@ -290,7 +282,7 @@
+ 
+ 	forall_unix_sockets(i, s)
+ 	{
+-		if (s->protinfo.af_unix.marksweep&MARKED)
++		if (!s->protinfo.af_unix.gc_tree)
+ 		{
+ 			struct sk_buff *nextsk;
+ 			skb=skb_peek(&s->receive_queue);
+@@ -309,6 +301,7 @@
+ 			}
+ 		}
+ 	}
++	up(&unix_gc_marking);
+ 
+ 	/*
+ 	 *	Here we are. Hitlist is filled. Die.
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

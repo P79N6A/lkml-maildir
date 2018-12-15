@@ -1,0 +1,483 @@
+Date: Sun, 14 Feb 1999 16:41:10 +0100 (CET)
+From: Andrea Arcangeli <>
+Subject: [patch] fixed down_interruptible() race and implemented a newsemi-trivial down_trylock() [Re: race condition in down_interruptible ]
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/2/14/24
+
+On Sat, 13 Feb 1999, Ulrich Schmid wrote:
+>1. A signal is pending for Process B
+>2. Process B runs  waking_non_zero before A calls up
+>3. Process A calls up before B calls atomic_inc
+	task A			task B(signal_pending)	count	waking
+	-----------		-----------------	-----	------
+							1	0
+	down()						0	0
+	CS
+				down()			-1	0
+				waking_non_zero()	-1	0
+				signal_pending() == 1	-1	0
+	up()						0	1
+				atomic_inc(count)	1	1 boom!
+Cool, you discovered a really subtle bug ;). Who knows how many random
+crazy bug-report are been due this race?!? BTW, I think that also some
+2.2.1 bug report/hang/lockups could be due recursive semaphores used as
+no-recursive semaphores... maybe not... 
+Well I thought a bit about your race and I think to have fixed it well
+now. Note I also killed the recursive semaphores that are no longer needed
+since 2.2.2-pre2 (thanks to kpiod). 
+I also implemented a down_trylock() that looks OK to me, but I don't have
+time to try it. Since now I am running with the patch applyed.
+Here my patch that will fix your race and implements down_trylock(). It's
+against 2.2.2-pre2 clean.
+--- linux/include/asm-i386/semaphore.h	Mon Jan 18 14:39:43 1999
++++ linux/include/asm-i386/semaphore.h	Sun Feb 14 16:10:22 1999
+@@ -12,6 +12,11 @@
+  *                     the original code and to make semaphore waits
+  *                     interruptible so that processes waiting on
+  *                     semaphores can be killed.
++ * Modified 1999-02-14 by Andrea Arcangeli, split the sched.c helper
++ *		       functions in asm/sempahore-helper.h while fixing a
++ *		       potential and subtle race discovered by Ulrich Schmidin
++ *		       in down_interruptible(). Since I started to play here I
++ *		       also implemented the `trylock' semaphore operation.
+  *
+  * If you would like to see an analysis of this implementation, please
+  * ftp to gcom.com and download the file
+@@ -23,56 +28,23 @@
+ #include <asm/atomic.h>
+ #include <asm/spinlock.h>
+ 
+-/*
+- * Semaphores are recursive: we allow the holder process
+- * to recursively do down() operations on a semaphore that
+- * the process already owns. In order to do that, we need
+- * to keep a semaphore-local copy of the owner and the
+- * "depth of ownership".
+- *
+- * NOTE! Nasty memory ordering rules:
+- *  - "owner" and "owner_count" may only be modified once you hold the
+- *    lock. 
+- *  - "owner_count" must be written _after_ modifying owner, and
+- *    must be read _before_ reading owner. There must be appropriate
+- *    write and read barriers to enforce this.
+- *
+- * On an x86, writes are always ordered, so the only enformcement
+- * necessary is to make sure that the owner_depth is written after
+- * the owner value in program order.
+- *
+- * For read ordering guarantees, the semaphore wake_lock spinlock
+- * is already giving us ordering guarantees.
+- *
+- * Other (saner) architectures would use "wmb()" and "rmb()" to
+- * do this in a more obvious manner.
+- */
+ struct semaphore {
+ 	atomic_t count;
+-	unsigned long owner, owner_depth;
+ 	int waking;
+ 	struct wait_queue * wait;
+ };
+ 
+-/*
+- * Because we want the non-contention case to be
+- * fast, we save the stack pointer into the "owner"
+- * field, and to get the true task pointer we have
+- * to do the bit masking. That moves the masking
+- * operation into the slow path.
+- */
+-#define semaphore_owner(sem) \
+-	((struct task_struct *)((2*PAGE_MASK) & (sem)->owner))
+-
+-#define MUTEX ((struct semaphore) { ATOMIC_INIT(1), 0, 0, 0, NULL })
+-#define MUTEX_LOCKED ((struct semaphore) { ATOMIC_INIT(0), 0, 1, 0, NULL })
++#define MUTEX ((struct semaphore) { ATOMIC_INIT(1), 0, NULL })
++#define MUTEX_LOCKED ((struct semaphore) { ATOMIC_INIT(0), 0, NULL })
+ 
+ asmlinkage void __down_failed(void /* special register calling convention */);
+ asmlinkage int  __down_failed_interruptible(void  /* params in registers */);
++asmlinkage int  __down_failed_trylock(void  /* params in registers */);
+ asmlinkage void __up_wakeup(void /* special register calling convention */);
+ 
+ asmlinkage void __down(struct semaphore * sem);
+ asmlinkage int  __down_interruptible(struct semaphore * sem);
++asmlinkage int  __down_trylock(struct semaphore * sem);
+ asmlinkage void __up(struct semaphore * sem);
+ 
+ extern spinlock_t semaphore_wake_lock;
+@@ -80,75 +52,6 @@
+ #define sema_init(sem, val)	atomic_set(&((sem)->count), (val))
+ 
+ /*
+- * These two _must_ execute atomically wrt each other.
+- *
+- * This is trivially done with load_locked/store_cond,
+- * but on the x86 we need an external synchronizer.
+- */
+-static inline void wake_one_more(struct semaphore * sem)
+-{
+-	unsigned long flags;
+-
+-	spin_lock_irqsave(&semaphore_wake_lock, flags);
+-	sem->waking++;
+-	spin_unlock_irqrestore(&semaphore_wake_lock, flags);
+-}
+-
+-/*
+- * NOTE NOTE NOTE!
+- *
+- * We read owner-count _before_ getting the semaphore. This
+- * is important, because the semaphore also acts as a memory
+- * ordering point between reading owner_depth and reading
+- * the owner.
+- *
+- * Why is this necessary? The "owner_depth" essentially protects
+- * us from using stale owner information - in the case that this
+- * process was the previous owner but somebody else is racing to
+- * aquire the semaphore, the only way we can see ourselves as an
+- * owner is with "owner_depth" of zero (so that we know to avoid
+- * the stale value).
+- *
+- * In the non-race case (where we really _are_ the owner), there
+- * is not going to be any question about what owner_depth is.
+- *
+- * In the race case, the race winner will not even get here, because
+- * it will have successfully gotten the semaphore with the locked
+- * decrement operation.
+- *
+- * Basically, we have two values, and we cannot guarantee that either
+- * is really up-to-date until we have aquired the semaphore. But we
+- * _can_ depend on a ordering between the two values, so we can use
+- * one of them to determine whether we can trust the other:
+- *
+- * Cases:
+- *  - owner_depth == zero: ignore the semaphore owner, because it
+- *    cannot possibly be us. Somebody else may be in the process
+- *    of modifying it and the zero may be "stale", but it sure isn't
+- *    going to say that "we" are the owner anyway, so who cares?
+- *  - owner_depth is non-zero. That means that even if somebody
+- *    else wrote the non-zero count value, the write ordering requriement
+- *    means that they will have written themselves as the owner, so
+- *    if we now see ourselves as an owner we can trust it to be true.
+- */
+-static inline int waking_non_zero(struct semaphore *sem, struct task_struct *tsk)
+-{
+-	unsigned long flags;
+-	unsigned long owner_depth = sem->owner_depth;
+-	int ret = 0;
+-
+-	spin_lock_irqsave(&semaphore_wake_lock, flags);
+-	if (sem->waking > 0 || (owner_depth && semaphore_owner(sem) == tsk)) {
+-		sem->owner = (unsigned long) tsk;
+-		sem->owner_depth++;	/* Don't use the possibly stale value */
+-		sem->waking--;
+-		ret = 1;
+-	}
+-	spin_unlock_irqrestore(&semaphore_wake_lock, flags);
+-	return ret;
+-}
+-
+-/*
+  * This is ugly, but we want the default case to fall through.
+  * "down_failed" is a special asm handler that calls the C
+  * routine that actually waits. See arch/i386/lib/semaphore.S
+@@ -161,9 +64,7 @@
+ 		"lock ; "
+ #endif
+ 		"decl 0(%0)\n\t"
+-		"js 2f\n\t"
+-		"movl %%esp,4(%0)\n"
+-		"movl $1,8(%0)\n\t"
++		"js 2f\n"
+ 		"1:\n"
+ 		".section .text.lock,\"ax\"\n"
+ 		"2:\tpushl $1b\n\t"
+@@ -185,8 +86,6 @@
+ #endif
+ 		"decl 0(%1)\n\t"
+ 		"js 2f\n\t"
+-		"movl %%esp,4(%1)\n\t"
+-		"movl $1,8(%1)\n\t"
+ 		"xorl %0,%0\n"
+ 		"1:\n"
+ 		".section .text.lock,\"ax\"\n"
+@@ -199,6 +98,28 @@
+ 	return result;
+ }
+ 
++extern inline int down_trylock(struct semaphore * sem)
++{
++	int result;
++
++	__asm__ __volatile__(
++		"# atomic interruptible down operation\n\t"
++#ifdef __SMP__
++		"lock ; "
++#endif
++		"decl 0(%1)\n\t"
++		"js 2f\n\t"
++		"xorl %0,%0\n"
++		"1:\n"
++		".section .text.lock,\"ax\"\n"
++		"2:\tpushl $1b\n\t"
++		"jmp __down_failed_trylock\n"
++		".previous"
++		:"=a" (result)
++		:"c" (sem)
++		:"memory");
++	return result;
++}
+ 
+ /*
+  * Note! This is subtle. We jump to wake people up only if
+@@ -210,7 +131,6 @@
+ {
+ 	__asm__ __volatile__(
+ 		"# atomic up operation\n\t"
+-		"decl 8(%0)\n\t"
+ #ifdef __SMP__
+ 		"lock ; "
+ #endif
+--- /dev/null	Tue May  6 02:10:56 1997
++++ linux/include/asm-i386/semaphore-helper.h	Sun Feb 14 16:00:52 1999
+@@ -0,0 +1,93 @@
++#ifndef _I386_SEMAPHORE_HELPER_H
++#define _I386_SEMAPHORE_HELPER_H
++
++/*
++ * SMP- and interrupt-safe semaphores helper functions.
++ *
++ * (C) Copyright 1996 Linus Torvalds
++ * (C) Copyright 1999 Andrea Arcangeli
++ */
++
++/*
++ * These two _must_ execute atomically wrt each other.
++ *
++ * This is trivially done with load_locked/store_cond,
++ * but on the x86 we need an external synchronizer.
++ */
++static inline void wake_one_more(struct semaphore * sem)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&semaphore_wake_lock, flags);
++	if (atomic_read(&sem->count) <= 0)
++		sem->waking++;
++	spin_unlock_irqrestore(&semaphore_wake_lock, flags);
++}
++
++static inline int waking_non_zero(struct semaphore *sem)
++{
++	unsigned long flags;
++	int ret = 0;
++
++	spin_lock_irqsave(&semaphore_wake_lock, flags);
++	if (sem->waking > 0) {
++		sem->waking--;
++		ret = 1;
++	}
++	spin_unlock_irqrestore(&semaphore_wake_lock, flags);
++	return ret;
++}
++
++/*
++ * waking_non_zero_interruptible:
++ *	1	got the lock
++ *	0	go to sleep
++ *	-EINTR	interrupted
++ *
++ * We must undo the sem->count down_interruptible() increment while we are
++ * protected by the spinlock in order to make atomic this atomic_inc() with the
++ * atomic_read() in wake_one_more(), otherwise we can race. -arca
++ */
++static inline int waking_non_zero_interruptible(struct semaphore *sem,
++						struct task_struct *tsk)
++{
++	unsigned long flags;
++	int ret = 0;
++
++	spin_lock_irqsave(&semaphore_wake_lock, flags);
++	if (sem->waking > 0) {
++		sem->waking--;
++		ret = 1;
++	} else if (signal_pending(tsk)) {
++		atomic_inc(&sem->count);
++		ret = -EINTR;
++	}
++	spin_unlock_irqrestore(&semaphore_wake_lock, flags);
++	return ret;
++}
++
++/*
++ * waking_non_zero_trylock:
++ *	1	failed to lock
++ *	0	got the lock
++ *
++ * We must undo the sem->count down_trylock() increment while we are
++ * protected by the spinlock in order to make atomic this atomic_inc() with the
++ * atomic_read() in wake_one_more(), otherwise we can race. -arca
++ */
++static inline int waking_non_zero_trylock(struct semaphore *sem)
++{
++	unsigned long flags;
++	int ret = 1;
++
++	spin_lock_irqsave(&semaphore_wake_lock, flags);
++	if (sem->waking > 0) {
++		sem->waking--;
++		ret = 0;
++	} else
++		atomic_inc(&sem->count);
++	spin_unlock_irqrestore(&semaphore_wake_lock, flags);
++	return ret;
++}
++
++#endif
+--- linux/arch/i386/lib/semaphore.S	Mon Jan 18 02:28:57 1999
++++ linux/arch/i386/lib/semaphore.S	Sun Feb 14 13:02:05 1999
+@@ -31,6 +31,15 @@
+ 	popl %edx	/* restore %edx */
+ 	ret
+ 
++/* Don't save/restore %eax, because that will be our return value */
++ENTRY(__down_failed_trylock)
++	pushl %edx	/* save %edx */
++	pushl %ecx	/* save %ecx (and argument) */
++	call SYMBOL_NAME(__down_trylock)
++	popl %ecx	/* restore %ecx (count on __down_trylock not changing it) */
++	popl %edx	/* restore %edx */
++	ret
++
+ ENTRY(__up_wakeup)
+ 	pushl %eax	/* save %eax */
+ 	pushl %edx	/* save %edx */
+--- linux/kernel/ksyms.c	Sat Feb  6 14:22:05 1999
++++ linux/kernel/ksyms.c	Sun Feb 14 13:02:34 1999
+@@ -370,6 +370,7 @@
+ EXPORT_SYMBOL(event);
+ EXPORT_SYMBOL(__down);
+ EXPORT_SYMBOL(__down_interruptible);
++EXPORT_SYMBOL(__down_trylock);
+ EXPORT_SYMBOL(__up);
+ EXPORT_SYMBOL(brw_page);
+ 
+--- linux/kernel/sched.c	Sat Feb  6 14:22:06 1999
++++ linux/kernel/sched.c	Sun Feb 14 16:13:48 1999
+@@ -36,6 +36,7 @@
+ #include <asm/uaccess.h>
+ #include <asm/pgtable.h>
+ #include <asm/mmu_context.h>
++#include <asm/semaphore-helper.h>
+ 
+ #include <linux/timex.h>
+ 
+@@ -862,30 +869,28 @@
+ 	struct task_struct *tsk = current;	\
+ 	struct wait_queue wait = { tsk, NULL };
+ 
+-#define DOWN_HEAD(task_state)						 \
+-									 \
+-									 \
+-	tsk->state = (task_state);					 \
+-	add_wait_queue(&sem->wait, &wait);				 \
+-									 \
+-	/*								 \
+-	 * Ok, we're set up.  sem->count is known to be less than zero	 \
+-	 * so we must wait.						 \
+-	 *								 \
+-	 * We can let go the lock for purposes of waiting.		 \
+-	 * We re-acquire it after awaking so as to protect		 \
+-	 * all semaphore operations.					 \
+-	 *								 \
+-	 * If "up()" is called before we call waking_non_zero() then	 \
+-	 * we will catch it right away.  If it is called later then	 \
+-	 * we will have to go through a wakeup cycle to catch it.	 \
+-	 *								 \
+-	 * Multiple waiters contend for the semaphore lock to see	 \
+-	 * who gets to gate through and who has to wait some more.	 \
+-	 */								 \
+-	for (;;) {							 \
+-		if (waking_non_zero(sem, tsk))	/* are we waking up?  */ \
+-			break;			/* yes, exit loop */
++#define DOWN_HEAD(task_state)						\
++									\
++									\
++	tsk->state = (task_state);					\
++	add_wait_queue(&sem->wait, &wait);				\
++									\
++	/*								\
++	 * Ok, we're set up.  sem->count is known to be less than zero	\
++	 * so we must wait.						\
++	 *								\
++	 * We can let go the lock for purposes of waiting.		\
++	 * We re-acquire it after awaking so as to protect		\
++	 * all semaphore operations.					\
++	 *								\
++	 * If "up()" is called before we call waking_non_zero() then	\
++	 * we will catch it right away.  If it is called later then	\
++	 * we will have to go through a wakeup cycle to catch it.	\
++	 *								\
++	 * Multiple waiters contend for the semaphore lock to see	\
++	 * who gets to gate through and who has to wait some more.	\
++	 */								\
++	for (;;) {
+ 
+ #define DOWN_TAIL(task_state)			\
+ 		tsk->state = (task_state);	\
+@@ -897,6 +902,8 @@
+ {
+ 	DOWN_VAR
+ 	DOWN_HEAD(TASK_UNINTERRUPTIBLE)
++	if (waking_non_zero(sem))
++		break;
+ 	schedule();
+ 	DOWN_TAIL(TASK_UNINTERRUPTIBLE)
+ }
+@@ -906,10 +913,13 @@
+ 	DOWN_VAR
+ 	int ret = 0;
+ 	DOWN_HEAD(TASK_INTERRUPTIBLE)
+-	if (signal_pending(tsk))
++
++	ret = waking_non_zero_interruptible(sem, tsk);
++	if (ret)
+ 	{
+-		ret = -EINTR;			/* interrupted */
+-		atomic_inc(&sem->count);	/* give up on down operation */
++		if (ret == 1)
++			/* ret != 0 only if we get interrupted -arca */
++			ret = 0;
+ 		break;
+ 	}
+ 	schedule();
+@@ -917,6 +927,11 @@
+ 	return ret;
+ }
+ 
++int __down_trylock(struct semaphore * sem)
++{
++	return waking_non_zero_trylock(sem);
++}
++
+ #define	SLEEP_ON_VAR				\
+ 	unsigned long flags;			\
+ 	struct wait_queue wait;
+--- scsi_error.c	1999/02/04 14:50:38	1.1.2.2
++++ linux/drivers/scsi/scsi_error.c	1999/02/06 14:31:21
+@@ -1972,7 +1972,6 @@
+ 	     */
+             SCSI_LOG_ERROR_RECOVERY(1,printk("Error handler sleeping\n"));
+ 	    down_interruptible (&sem);
+-	    sem.owner = 0;
+ 
+ 	    if (signal_pending(current) )
+ 	      break;
+Andrea Arcangeli
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

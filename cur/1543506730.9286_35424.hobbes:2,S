@@ -1,0 +1,424 @@
+Date: Mon, 23 Aug 1999 19:40:05 +0200 (CEST)
+From: Andrea Arcangeli <>
+Subject: Re: [patch] fix for pagecache fs corruption (2.3.15-pre2) [Re: [patch] ramdisk blocksize]
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/8/23/75
+
+On Mon, 23 Aug 1999, Linus Torvalds wrote:
+>On Mon, 23 Aug 1999, Andrea Arcangeli wrote:
+>> 
+>> Chih-Chung Chang pointed me out that in 2.3.x it's been added a test in
+>> the CAN_UNUSE(inode) macro exactly to avoid freeing inodes with i_nrpages
+>> != 0. I didn't noticed such change, sorry (so no FS corruption could
+>> happen).
+>> 
+>> But IMO such check is a dirty hack that can lead to a DoS. It seems to me
+>> that it's possible to leak inodes by simply allocating lots of inodes with
+>> only one page queued in them. The inode memory is not freeable.
+>> 
+>> Now that truncate_inode_pages()/flushpage are capable of dealing with
+>> dirty/protected data we don't need such hack anymore to avoid
+>> fs-corruption. This patch goes on the top of my two previous
+>> page-cache patches:
+>
+>You are wrong. This will cause "truncate_inode_pages()" to be called on
+>such an inode, which will in turn flush the dirty state without ever
+>writing it back to disk.
+NOTENOTE: the patch was the third patch of a set of page-cache incremental
+patches (you can find the other patches in thread with this subject that
+started with the "ramdisk blocksize" subject). Sorry to post things
+fragmented but as I said I noticed only now that the current 2.3.x code
+was safe.
+>In short, major filesystem corruption and general disaster. 
+That is _exactly_ what I thought it was just happening in 2.3.x because I
+didn't noticed the CAN_UNUSE difference between 2.2.x and 2.3.x.
+But before noticing CAN_UNUSE I fixed the problem properly (not with an
+hack that can be exploited). Also because I need to be able to convert
+page-cache-overlapped-buffers to regular buffers and the reverse to handle
+the ramdisk device. A ramdisk page-cache will never be freed with
+shrink_mmap so I need to be able to run flushpage even on dirty/protected
+pages and let flushpage to convert them in regular buffers.
+So basically now that truncate_inode_pages/flushpage are smart we can drop
+the dirty-hack and apply my last patch that remove the i_nrpages check
+from CAN_UNUSE.
+Just to avoid further confusion with incremental patches, here it is the
+whole patch against clean 2.3.15-pre2. This patch will fix also the
+ramdisk driver.
+diff -urN 2.3.15-pre2/fs/buffer.c 2.3.15-pre2-pagecache3/fs/buffer.c
+--- 2.3.15-pre2/fs/buffer.c	Thu Aug 12 02:53:23 1999
++++ 2.3.15-pre2-pagecache3/fs/buffer.c	Mon Aug 23 15:15:44 1999
+@@ -793,6 +793,10 @@
+ repeat:
+ 	bh = get_hash_table(dev, block, size);
+ 	if (bh) {
++		/* we may have found a orhpaned-hashed buffer, and so it
++		   may have a end_io handler different than the io_sync one. */
++		bh->b_end_io = end_buffer_io_sync;
++		mb();
+ 		if (!buffer_dirty(bh)) {
+ 			bh->b_flushtime = 0;
+ 		}
+@@ -1232,6 +1236,34 @@
+ 	return 0;
+ }
+ 
++static void hash_orphaned_buffers(struct page * page)
++{
++	struct buffer_head * bh = page->buffers, * first = bh;
++
++	do {
++		struct buffer_head ** head;
++		if (buffer_mapped(bh))
++		{
++			head = &hash(bh->b_dev, bh->b_blocknr);
++			write_lock(&hash_table_lock);
++			__hash_link(bh, head);
++			write_unlock(&hash_table_lock);
++		}
++		bh = bh->b_this_page;
++	} while (bh != first);
++}
++
++static void trash_buffer(struct buffer_head * bh)
++{
++	wait_on_buffer(bh);
++	mark_buffer_clean(bh);
++	clear_bit(BH_Uptodate, &bh->b_state);
++	clear_bit(BH_Mapped, &bh->b_state);
++	clear_bit(BH_Req, &bh->b_state);
++	clear_bit(BH_Protected, &bh->b_state);
++	bh->b_blocknr = -1;
++}
++
+ /*
+  * We don't have to release all buffers here, but
+  * we have to be sure that no dirty buffer is left
+@@ -1239,7 +1271,7 @@
+  * we have truncated the file and are going to free the
+  * blocks on-disk..
+  */
+-int block_flushpage(struct inode *inode, struct page *page, unsigned long offset)
++int block_flushpage(struct inode *inode, struct page *page, unsigned long offset, int forget)
+ {
+ 	struct buffer_head *head, *bh, *next;
+ 	unsigned int curr_off = 0;
+@@ -1260,16 +1292,14 @@
+ 		 */
+ 		if (offset <= curr_off) {
+ 			if (buffer_mapped(bh)) {
+-				atomic_inc(&bh->b_count);
+-				wait_on_buffer(bh);
+ 				if (bh->b_dev == B_FREE)
+ 					BUG();
+-				mark_buffer_clean(bh);
+-				clear_bit(BH_Uptodate, &bh->b_state);
+-				clear_bit(BH_Mapped, &bh->b_state);
+-				clear_bit(BH_Req, &bh->b_state);
+-				bh->b_blocknr = 0;
+-				atomic_dec(&bh->b_count);
++				if (forget)
++					/* the page can't be freed while we are
++					   working on it since we hold the
++					   page-lock and so shrink_mmap
++					   won't race with us. */
++					trash_buffer(bh);
+ 			}
+ 		}
+ 		curr_off = next_off;
+@@ -1288,7 +1318,13 @@
+ 	 */
+ 	if (!offset) {
+ 		if (!try_to_free_buffers(page))
++		{
+ 			atomic_add(PAGE_CACHE_SIZE, &buffermem);
++			if (!forget)
++				/* this must become a regular buffer so
++				   we'll find it then. */
++				hash_orphaned_buffers(page);
++		}
+ 	}
+ 
+ 	return 0;
+@@ -1455,11 +1491,39 @@
+ 			if (buffer_new(bh)) {
+ 				memset(bh->b_data, 0, bh->b_size);
+ 			} else {
+-				ll_rw_block(READ, 1, &bh);
+-				wait_on_buffer(bh);
+-				err = -EIO;
+-				if (!buffer_uptodate(bh))
+-					goto out;
++				struct buffer_head * bh_old;
++
++				bh_old = get_hash_table(bh->b_dev,
++							bh->b_blocknr,
++							bh->b_size);
++				if (!bh_old || !buffer_uptodate(bh_old))
++				{
++					if (bh_old)
++					{
++						trash_buffer(bh_old);
++						__remove_from_queues(bh_old);
++						atomic_dec(&bh_old->b_count);
++					}
++					ll_rw_block(READ, 1, &bh);
++					wait_on_buffer(bh);
++					err = -EIO;
++					if (!buffer_uptodate(bh))
++						goto out;
++				}
++				else
++				{
++					memcpy(bh->b_data, bh_old->b_data,
++					       bh->b_size);
++					/* move the protected bit from
++					   the old buffer to the new buffer. */
++					if (atomic_expose_buffer(bh_old))
++						atomic_protect_buffer(bh);
++
++					/* now trash the old regular buffer */
++					trash_buffer(bh_old);
++					__remove_from_queues(bh_old);
++					atomic_dec(&bh_old->b_count);
++				}	
+ 			}
+ 		}
+ 
+@@ -1617,11 +1681,39 @@
+ 			if (buffer_new(bh)) {
+ 				memset(bh->b_data, 0, bh->b_size);
+ 			} else {
+-				ll_rw_block(READ, 1, &bh);
+-				wait_on_buffer(bh);
+-				err = -EIO;
+-				if (!buffer_uptodate(bh))
+-					goto out;
++				struct buffer_head * bh_old;
++
++				bh_old = get_hash_table(bh->b_dev,
++							bh->b_blocknr,
++							bh->b_size);
++				if (!bh_old || !buffer_uptodate(bh_old))
++				{
++					if (bh_old)
++					{
++						trash_buffer(bh_old);
++						__remove_from_queues(bh_old);
++						atomic_dec(&bh_old->b_count);
++					}
++					ll_rw_block(READ, 1, &bh);
++					wait_on_buffer(bh);
++					err = -EIO;
++					if (!buffer_uptodate(bh))
++						goto out;
++				}
++				else
++				{
++					memcpy(bh->b_data, bh_old->b_data,
++					       bh->b_size);
++					/* move the protected bit from
++					   the old buffer to the new buffer. */
++					if (atomic_expose_buffer(bh_old))
++						atomic_protect_buffer(bh);
++
++					/* now trash the old regular buffer */
++					trash_buffer(bh_old);
++					__remove_from_queues(bh_old);
++					atomic_dec(&bh_old->b_count);
++				}
+ 			}
+ 		}
+ 
+@@ -2036,7 +2128,54 @@
+ 				memset(bh->b_data, 0, blocksize);
+ 				set_bit(BH_Uptodate, &bh->b_state);
+ 				continue;
+-			}
++			} else {
++				struct buffer_head * bh_old;
++
++				bh_old = get_hash_table(bh->b_dev,
++							bh->b_blocknr,
++							bh->b_size);
++				if (bh_old && buffer_uptodate(bh_old))
++				{
++					memcpy(bh->b_data, bh_old->b_data,
++					       bh->b_size);
++					set_bit(BH_Uptodate, &bh->b_state);
++					/* move the protected bit from
++					   the old buffer to the new buffer. */
++					if (atomic_expose_buffer(bh_old))
++						atomic_protect_buffer(bh);
++					if (atomic_set_buffer_clean(bh_old))
++					{
++						/* the buffer will do IO
++						   so it must have a valid
++						   end_io handler before
++						   setting it dirty. */
++						bh->b_end_io = end_buffer_io_sync;
++						/* even if to refile the buffer
++						   will run a spin_lock(), here
++						   is more robust to enforce
++						   a SMP memory barrier by hand
++						   because a buffer is writable
++						   only in function of the
++						   dirty bit and not in
++						   function of where it's
++						   placed in the lru lists. */
++						mb();
++						mark_buffer_dirty(bh, 0);
++					}
++
++					/* now trash the old regular buffer */
++					trash_buffer(bh_old);
++					__remove_from_queues(bh_old);
++					atomic_dec(&bh_old->b_count);
++					continue;
++				}
++				if (bh_old)
++				{
++					trash_buffer(bh_old);
++					__remove_from_queues(bh_old);
++					atomic_dec(&bh_old->b_count);
++				}
++			}				
+ 		}
+ 
+ 		init_buffer(bh, end_buffer_io_async, NULL);
+diff -urN 2.3.15-pre2/fs/inode.c 2.3.15-pre2-pagecache3/fs/inode.c
+--- 2.3.15-pre2/fs/inode.c	Tue Jul 13 02:02:40 1999
++++ 2.3.15-pre2-pagecache3/fs/inode.c	Mon Aug 23 15:44:45 1999
+@@ -263,7 +263,7 @@
+ 			break;
+ 		inode = list_entry(tmp, struct inode, i_list);
+ 		if (inode->i_nrpages)
+-			truncate_inode_pages(inode, 0);
++			truncate_inode_pages(inode, 0, 0);
+ 		clear_inode(inode);
+ 		count++;
+ 	}
+@@ -339,7 +339,7 @@
+  *      dispose_list.
+  */
+ #define CAN_UNUSE(inode) \
+-	(((inode)->i_count | (inode)->i_state | (inode)->i_nrpages) == 0)
++	(((inode)->i_count | (inode)->i_state) == 0)
+ #define INODE(entry)	(list_entry(entry, struct inode, i_list))
+ 
+ static int free_inodes(void)
+@@ -739,7 +739,7 @@
+ 					void (*delete)(struct inode *) = op->delete_inode;
+ 					spin_unlock(&inode_lock);
+ 					if (inode->i_nrpages)
+-						truncate_inode_pages(inode, 0);
++						truncate_inode_pages(inode, 0, 1);
+ 					delete(inode);
+ 					spin_lock(&inode_lock);
+ 				}
+diff -urN 2.3.15-pre2/include/linux/fs.h 2.3.15-pre2-pagecache3/include/linux/fs.h
+--- 2.3.15-pre2/include/linux/fs.h	Sat Aug 21 16:45:36 1999
++++ 2.3.15-pre2-pagecache3/include/linux/fs.h	Mon Aug 23 15:50:55 1999
+@@ -627,7 +627,7 @@
+ 
+ 	int (*readpage) (struct file *, struct page *);
+ 	int (*writepage) (struct file *, struct page *);
+-	int (*flushpage) (struct inode *, struct page *, unsigned long);
++	int (*flushpage) (struct inode *, struct page *, unsigned long, int);
+ 
+ 	void (*truncate) (struct inode *);
+ 	int (*permission) (struct inode *, int);
+@@ -780,6 +780,9 @@
+ 		clear_bit(BH_Uptodate, &bh->b_state);
+ }
+ 
++#define atomic_expose_buffer(bh) test_and_clear_bit(BH_Protected, &(bh)->b_state)
++#define atomic_protect_buffer(bh) test_and_set_bit(BH_Protected, &(bh)->b_state)
++
+ #define atomic_set_buffer_clean(bh) test_and_clear_bit(BH_Dirty, &(bh)->b_state)
+ 
+ extern inline void __mark_buffer_clean(struct buffer_head *bh)
+@@ -899,7 +902,7 @@
+ extern int block_write_full_page (struct file *, struct page *);
+ extern int block_write_partial_page (struct file *, struct page *, unsigned long, unsigned long, const char *);
+ extern int block_write_cont_page (struct file *, struct page *, unsigned long, unsigned long, const char *);
+-extern int block_flushpage(struct inode *, struct page *, unsigned long);
++extern int block_flushpage(struct inode *, struct page *, unsigned long, int);
+ 
+ extern int generic_file_mmap(struct file *, struct vm_area_struct *);
+ extern ssize_t generic_file_read(struct file *, char *, size_t, loff_t *);
+diff -urN 2.3.15-pre2/include/linux/mm.h 2.3.15-pre2-pagecache3/include/linux/mm.h
+--- 2.3.15-pre2/include/linux/mm.h	Sat Aug 21 16:45:36 1999
++++ 2.3.15-pre2-pagecache3/include/linux/mm.h	Mon Aug 23 15:50:55 1999
+@@ -344,7 +344,7 @@
+ extern void remove_inode_page(struct page *);
+ extern unsigned long page_unuse(struct page *);
+ extern int shrink_mmap(int, int);
+-extern void truncate_inode_pages(struct inode *, unsigned long);
++extern void truncate_inode_pages(struct inode *, unsigned long, int);
+ extern unsigned long get_cached_page(struct inode *, unsigned long, int);
+ extern void put_cached_page(unsigned long);
+ 
+diff -urN 2.3.15-pre2/mm/filemap.c 2.3.15-pre2-pagecache3/mm/filemap.c
+--- 2.3.15-pre2/mm/filemap.c	Sun Aug 22 14:33:47 1999
++++ 2.3.15-pre2-pagecache3/mm/filemap.c	Mon Aug 23 15:15:44 1999
+@@ -132,7 +132,8 @@
+  * Truncate the page cache at a set offset, removing the pages
+  * that are beyond that offset (and zeroing out partial pages).
+  */
+-void truncate_inode_pages(struct inode * inode, unsigned long start)
++void truncate_inode_pages(struct inode * inode, unsigned long start,
++			  int forget)
+ {
+ 	struct page ** p;
+ 	struct page * page;
+@@ -152,7 +153,7 @@
+ 			lock_page(page);
+ 
+ 			if (inode->i_op->flushpage)
+-				inode->i_op->flushpage(inode, page, 0);
++				inode->i_op->flushpage(inode, page, 0, forget);
+ 
+ 			/*
+ 			 * We remove the page from the page cache
+@@ -199,7 +200,7 @@
+ 			flush_page_to_ram(address);
+ 
+ 			if (inode->i_op->flushpage)
+-				inode->i_op->flushpage(inode, page, offset);
++				inode->i_op->flushpage(inode, page, offset, forget);
+ 			/*
+ 			 * we have dropped the spinlock so we have to
+ 			 * restart.
+diff -urN 2.3.15-pre2/mm/memory.c 2.3.15-pre2-pagecache3/mm/memory.c
+--- 2.3.15-pre2/mm/memory.c	Sun Aug 22 14:33:47 1999
++++ 2.3.15-pre2-pagecache3/mm/memory.c	Mon Aug 23 15:15:44 1999
+@@ -890,7 +890,7 @@
+ {
+ 	struct vm_area_struct * mpnt;
+ 
+-	truncate_inode_pages(inode, offset);
++	truncate_inode_pages(inode, offset, 1);
+ 	spin_lock(&inode->i_shared_lock);
+ 	if (!inode->i_mmap)
+ 		goto out_unlock;
+diff -urN 2.3.15-pre2/mm/swap_state.c 2.3.15-pre2-pagecache3/mm/swap_state.c
+--- 2.3.15-pre2/mm/swap_state.c	Thu Aug 12 02:53:25 1999
++++ 2.3.15-pre2-pagecache3/mm/swap_state.c	Mon Aug 23 15:15:44 1999
+@@ -215,7 +215,7 @@
+ #endif
+ 	PageClearSwapCache(page);
+ 	if (inode->i_op->flushpage)
+-		inode->i_op->flushpage(inode, page, 0);
++		inode->i_op->flushpage(inode, page, 0, 1);
+ 	remove_inode_page(page);
+ }
+ 
+Andrea
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

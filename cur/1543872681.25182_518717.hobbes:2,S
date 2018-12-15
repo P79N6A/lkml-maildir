@@ -1,0 +1,116 @@
+Date: Sun, 11 Mar 2007 15:02:42 +0300
+From: Oleg Nesterov <>
+Subject: Re: [patch 2/9] signalfd/timerfd - signalfd core ...
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2007/3/11/55
+
+On 03/10, Davide Libenzi wrote:
+>
+> +static void signalfd_put_sighand(struct signalfd_ctx *ctx,
+> +				 struct sighand_struct *sighand,
+> +				 unsigned long *flags)
+> +{
+> +	unlock_task_sighand(ctx->tsk, flags);
+> +}
+Note that signalfd_put_sighand() doesn't need "sighand" parameter, please
+see below.
+> +int signalfd_deliver(struct sighand_struct *sighand, int sig,
+> +		     struct siginfo *info)
+> +{
+> +	int nsig = 0;
+> +	struct signalfd_ctx *ctx, *tmp;
+> +
+> +	list_for_each_entry_safe(ctx, tmp, &sighand->sfdlist, lnk) {
+> +		/*
+> +		 * We use a negative signal value as a way to broadcast that the
+> +		 * sighand has been orphaned, so that we can notify all the
+> +		 * listeners about this. Remeber the ctx->sigmask is inverted,
+> +		 * so if the user is interested in a signal, that corresponding
+> +		 * bit will be zero.
+> +		 */
+> +		if (sig < 0)
+> +			list_del_init(&ctx->lnk);
+I'm afraid this is not right. This should be per-thread.
+Suppose we have threads T1 and T2 from the same thread group. sighand->sfdlist
+contains ctx1 and ctx2 "linked" to T1 and T2. Now, T1 exits, __exit_signal()
+does signalfd_notify(sighand, -1), and "unlinks" all threads, not just T1.
+IOW, we should do
+	if (ctx->tsk == current) {
+		list_del_init(&ctx->lnk);
+		wake_up(&ctx->wqh);
+	}
+Perhaps it makes sense to not re-use signalfd_deliver(), but introduce
+a new signalfd_xxx(sighand, tsk) helper for de_thread/exit_signal.
+Btw, signalfd_deliver() doesn't use "info" parameter.
+> +		if (sig < 0 || !sigismember(&ctx->sigmask, sig)) {
+> +			wake_up(&ctx->wqh);
+Minor nit. Perhaps it makes sense to do
+	void signalfd_deliver(struct task_struct *tsk, int sig, struct sigpending *pending)
+	{
+		struct sighand_struct *sighand = tsk->sighand;
+		int private = (tsk->pending == pending);
+		list_for_each_entry_safe(ctx, tmp, &sighand->sfdlist, lnk) {
+			if (private && ctx->tsk != tsk)
+				continue;
+			if (!sigismember(&ctx->sigmask, sig))
+				wake_up(&ctx->wqh);
+		}
+	}
+Even better: signalfd_deliver(struct task_struct *tsk, int sig, int private).
+This way specific_send_sig_info/send_sigqueue won't do a "false" wakeup.
+> +asmlinkage long sys_signalfd(int ufd, sigset_t __user *user_mask, size_t sizemask)
+> +{
+> ...
+> +		if ((sighand = signalfd_get_sighand(ctx, &flags)) != NULL) {
+> +			ctx->sigmask = sigmask;
+> +			signalfd_put_sighand(ctx, sighand, &flags);
+> +		}
+This looks like unneeded complication to me, I'd suggest
+		if (signalfd_get_sighand(ctx, &flags)) {
+			ctx->sigmask = sigmask;
+			signalfd_put_sighand(ctx, flags);
+		}
+unlock_task_sighand() (and thus signalfd_put_sighand) doesn't need "sighand"
+parameter. signalfd_get_sighand() is in fact boolean. It makes sense to return
+sighand, it may be useful, but this patch only needs != NULL.
+Every usage of signalfd_get_sighand() could be simplified accordingly.
+> --- linux-2.6.20.ep2.orig/fs/exec.c	2007-03-10 15:57:00.000000000 -0800
+> +++ linux-2.6.20.ep2/fs/exec.c	2007-03-10 15:57:51.000000000 -0800
+> @@ -50,6 +50,7 @@
+>  #include <linux/tsacct_kern.h>
+>  #include <linux/cn_proc.h>
+>  #include <linux/audit.h>
+> +#include <linux/signalfd.h>
+>  
+>  #include <asm/uaccess.h>
+>  #include <asm/mmu_context.h>
+> @@ -583,6 +584,17 @@
+>  	int count;
+>  
+>  	/*
+> +	 * Tell all the sighand listeners that this sighand has
+> +	 * been detached. Needs to be called with the sighand lock
+> +	 * held.
+> +	 */
+> +	if (unlikely(!list_empty(&oldsighand->sfdlist))) {
+> +		spin_lock_irq(&oldsighand->siglock);
+> +		signalfd_notify(oldsighand, -1, NULL);
+> +		spin_unlock_irq(&oldsighand->siglock);
+> +	}
+Very minor nit. I'd suggest to make a new helper and put it in signalfd.h
+(like signalfd_notify()). This will help CONFIG_SIGNALFD.
+I still think that we should do this only for suid-exec. If application
+passes a signalfd to another process with unix socket, it should know
+what it does. But yes, I agree, we can change this later if needed.
+(in that case the caller of the above helper should be flush_old_exec).
+Oleg.
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+More majordomo info at  
+http://vger.kernel.org/majordomo-info.html
+Please read the FAQ at  
+http://www.tux.org/lkml/

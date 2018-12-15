@@ -1,0 +1,185 @@
+Date: Fri, 27 Aug 2004 22:35:57 -0700
+From: William Lee Irwin III <>
+Subject: [2/4] consolidate bit waiting code patterns
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2004/8/28/9
+
+On Fri, Aug 27, 2004 at 10:31:12PM -0700, William Lee Irwin III wrote:
+> Eliminate specialized page and bh waitqueue hashing structures in favor
+> of a standardized structure, using wake_up_bit() to wake waiters using
+> the standardized wait_bit_key structure.
+Consolidate bit waiting code patterns for page waitqueues using
+__wait_on_bit() and __wait_on_bit_lock().
+Index: mm1-2.6.9-rc1/kernel/fork.c
+===================================================================
+--- mm1-2.6.9-rc1.orig/kernel/fork.c	2004-08-27 22:02:13.647509296 -0700
++++ mm1-2.6.9-rc1/kernel/fork.c	2004-08-27 22:15:35.543602560 -0700
+@@ -250,6 +250,40 @@
+ }
+ EXPORT_SYMBOL(__wake_up_bit);
+ 
++int __sched __wait_on_bit(wait_queue_head_t *wq, struct wait_bit_queue *q,
++			unsigned long *word,
++			int bit, int (*wait)(unsigned long *), unsigned mode)
++{
++	int ret;
++
++	prepare_to_wait(wq, &q->wait, mode);
++	if (test_bit(bit, word)) {
++		if ((ret = (*wait)(word)))
++			return ret;
++	}
++	finish_wait(wq, &q->wait);
++	return 0;
++}
++EXPORT_SYMBOL(__wait_on_bit);
++
++int __sched __wait_on_bit_lock(wait_queue_head_t *wq, struct wait_bit_queue *q,
++			unsigned long *word, int bit,
++			int (*wait)(unsigned long *), unsigned mode)
++{
++	int ret;
++
++	while (test_and_set_bit(bit, word)) {
++		prepare_to_wait_exclusive(wq, &q->wait, mode);
++		if (test_bit(bit, word)) {
++			if ((ret = (*wait)(word)))
++				return ret;
++		}
++	}
++	finish_wait(wq, &q->wait);
++	return 0;
++}
++EXPORT_SYMBOL(__wait_on_bit_lock);
++
+ void __init fork_init(unsigned long mempages)
+ {
+ #ifndef __HAVE_ARCH_TASK_STRUCT_ALLOCATOR
+Index: mm1-2.6.9-rc1/mm/filemap.c
+===================================================================
+--- mm1-2.6.9-rc1.orig/mm/filemap.c	2004-08-27 22:02:05.772706448 -0700
++++ mm1-2.6.9-rc1/mm/filemap.c	2004-08-27 22:15:35.551601344 -0700
+@@ -132,9 +132,11 @@
+ }
+ EXPORT_SYMBOL(remove_from_page_cache);
+ 
+-static inline int sync_page(struct page *page)
++static int sync_page(unsigned long *word)
+ {
+ 	struct address_space *mapping;
++	struct page *page
++		= container_of((page_flags_t *)word, struct page, flags);
+ 
+ 	/*
+ 	 * FIXME, fercrissake.  What is this barrier here for?
+@@ -142,7 +144,8 @@
+ 	smp_mb();
+ 	mapping = page_mapping(page);
+ 	if (mapping && mapping->a_ops && mapping->a_ops->sync_page)
+-		return mapping->a_ops->sync_page(page);
++		mapping->a_ops->sync_page(page);
++	io_schedule();
+ 	return 0;
+ }
+ 
+@@ -362,19 +365,18 @@
+ 	return &zone->wait_table[hash_ptr(page, zone->wait_table_bits)];
+ }
+ 
++static inline void wake_up_page(struct page *page, int bit)
++{
++	__wake_up_bit(page_waitqueue(page), (unsigned long *)&page->flags, bit);
++}
++
+ void fastcall wait_on_page_bit(struct page *page, int bit_nr)
+ {
+-	wait_queue_head_t *waitqueue = page_waitqueue(page);
+ 	DEFINE_WAIT_BIT(wait, (unsigned long *)&page->flags, bit_nr);
+ 
+-	prepare_to_wait(waitqueue, &wait.wait, TASK_UNINTERRUPTIBLE);
+-	if (test_bit(bit_nr, &page->flags)) {
+-		sync_page(page);
+-		io_schedule();
+-	}
+-	finish_wait(waitqueue, &wait.wait);
++	__wait_on_bit(page_waitqueue(page), &wait, wait.key.flags,
++				bit_nr, sync_page, TASK_UNINTERRUPTIBLE);
+ }
+-
+ EXPORT_SYMBOL(wait_on_page_bit);
+ 
+ /**
+@@ -394,12 +396,11 @@
+  */
+ void fastcall unlock_page(struct page *page)
+ {
+-	unsigned long *word = (unsigned long *)&page->flags;
+ 	smp_mb__before_clear_bit();
+ 	if (!TestClearPageLocked(page))
+ 		BUG();
+ 	smp_mb__after_clear_bit(); 
+-	__wake_up_bit(page_waitqueue(page), word, PG_locked);
++	wake_up_page(page, PG_locked);
+ }
+ 
+ EXPORT_SYMBOL(unlock_page);
+@@ -410,13 +411,12 @@
+  */
+ void end_page_writeback(struct page *page)
+ {
+-	unsigned long *word = (unsigned long *)&page->flags;
+ 	if (!TestClearPageReclaim(page) || rotate_reclaimable_page(page)) {
+ 		if (!test_clear_page_writeback(page))
+ 			BUG();
+ 		smp_mb__after_clear_bit();
+ 	}
+-	__wake_up_bit(page_waitqueue(page), word, PG_writeback);
++	wake_up_page(page, PG_writeback);
+ }
+ 
+ EXPORT_SYMBOL(end_page_writeback);
+@@ -431,19 +431,11 @@
+  */
+ void fastcall __lock_page(struct page *page)
+ {
+-	wait_queue_head_t *wqh = page_waitqueue(page);
+ 	DEFINE_WAIT_BIT(wait, (unsigned long *)&page->flags, PG_locked);
+ 
+-	while (TestSetPageLocked(page)) {
+-		prepare_to_wait_exclusive(wqh, &wait.wait, TASK_UNINTERRUPTIBLE);
+-		if (PageLocked(page)) {
+-			sync_page(page);
+-			io_schedule();
+-		}
+-	}
+-	finish_wait(wqh, &wait.wait);
++	__wait_on_bit_lock(page_waitqueue(page), &wait, wait.key.flags,
++				PG_locked, sync_page, TASK_UNINTERRUPTIBLE);
+ }
+-
+ EXPORT_SYMBOL(__lock_page);
+ 
+ /*
+Index: mm1-2.6.9-rc1/include/linux/wait.h
+===================================================================
+--- mm1-2.6.9-rc1.orig/include/linux/wait.h	2004-08-27 22:02:21.778273232 -0700
++++ mm1-2.6.9-rc1/include/linux/wait.h	2004-08-27 22:15:35.554600888 -0700
+@@ -139,6 +139,8 @@
+ extern void FASTCALL(__wake_up_locked(wait_queue_head_t *q, unsigned int mode));
+ extern void FASTCALL(__wake_up_sync(wait_queue_head_t *q, unsigned int mode, int nr));
+ void FASTCALL(__wake_up_bit(wait_queue_head_t *, unsigned long *, int));
++int FASTCALL(__wait_on_bit(wait_queue_head_t *, struct wait_bit_queue *, unsigned long *, int, int (*)(unsigned long *), unsigned));
++int FASTCALL(__wait_on_bit_lock(wait_queue_head_t *, struct wait_bit_queue *, unsigned long *, int, int (*)(unsigned long *), unsigned));
+ 
+ #define wake_up(x)			__wake_up(x, TASK_UNINTERRUPTIBLE | TASK_INTERRUPTIBLE, 1, NULL)
+ #define wake_up_nr(x, nr)		__wake_up(x, TASK_UNINTERRUPTIBLE | TASK_INTERRUPTIBLE, nr, NULL)
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+More majordomo info at  
+http://vger.kernel.org/majordomo-info.html
+Please read the FAQ at  
+http://www.tux.org/lkml/

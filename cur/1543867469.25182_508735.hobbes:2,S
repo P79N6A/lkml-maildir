@@ -1,0 +1,101 @@
+Date: Wed, 14 Feb 2007 23:09:04 +0300
+From: Oleg Nesterov <>
+Subject: Re: [RFC PATCH(Experimental) 2/4] Revert changes to workqueue.c
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2007/2/14/196
+
+On 02/14, Gautham R Shenoy wrote:
+>
+> This patch reverts all the recent workqueue hacks added to make it 
+> hotplug safe. 
+In my opinion these hacks are cleanups :)
+Ok. If we use freezer then yes, we can remove cpu_populated_map and just
+use for_each_online_cpu(). This is easy and good.
+What else you don't like? Why do you want to remove cwq_should_stop() and
+restore an ugly (ugly for workqueue.c) kthread_stop/kthread_should_stop() ?
+We can restore take_over_works(), although I don't see why this is needed.
+But cwq_should_stop() will just work regardless, why do you want to add
+this "wait_to_die" ... well, hack :)
+> -static DEFINE_MUTEX(workqueue_mutex);
+> +static DEFINE_SPINLOCK(workqueue_lock);
+No. We can't do this. see below.
+>  struct workqueue_struct *__create_workqueue(const char *name,
+>  					    int singlethread, int freezeable)
+>  {
+> @@ -798,17 +756,20 @@ struct workqueue_struct *__create_workqu
+>  		INIT_LIST_HEAD(&wq->list);
+>  		cwq = init_cpu_workqueue(wq, singlethread_cpu);
+>  		err = create_workqueue_thread(cwq, singlethread_cpu);
+> +		if (!err)
+> +			wake_up_process(cwq->thread);
+>  	} else {
+> -		mutex_lock(&workqueue_mutex);
+> +		spin_lock(&workqueue_lock);
+>  		list_add(&wq->list, &workqueues);
+> -
+> -		for_each_possible_cpu(cpu) {
+> +		spin_unlock(&workqueue_lock);
+> +		for_each_online_cpu(cpu) {
+>  			cwq = init_cpu_workqueue(wq, cpu);
+> -			if (err || !(cpu_online(cpu) || cpu == embryonic_cpu))
+> -				continue;
+>  			err = create_workqueue_thread(cwq, cpu);
+> +			if (err)
+> +				break;
+No, we can't break. We are going to execute destroy_workqueue(), it will
+iterate over all cwqs.
+> +static void take_over_work(struct workqueue_struct *wq, unsigned int cpu)
+> +{
+> +	struct cpu_workqueue_struct *cwq = per_cpu_ptr(wq->cpu_wq, cpu);
+> +	struct list_head list;
+> +	struct work_struct *work;
+> +
+> +	spin_lock_irq(&cwq->lock);
+> +	list_replace_init(&cwq->worklist, &list);
+> +
+> +	while (!list_empty(&list)) {
+> +		work = list_entry(list.next,struct work_struct,entry);
+> +		list_del(&work->entry);
+> +		__queue_work(per_cpu_ptr(wq->cpu_wq, smp_processor_id()), work);
+> +	}
+> +
+> +	spin_unlock_irq(&cwq->lock);
+> +}
+I think this is unneeded complication, but ok, should work.
+>  static int __devinit workqueue_cpu_callback(struct notifier_block *nfb,
+>  						unsigned long action,
+>  						void *hcpu)
+> +	case CPU_UP_CANCELED:
+> +		list_for_each_entry(wq, &workqueues, list) {
+> +			if (!per_cpu_ptr(wq->cpu_wq, hotcpu)->thread)
+> +				continue;
+> +			/* Unbind so it can run. */
+> +			kthread_bind(per_cpu_ptr(wq->cpu_wq, hotcpu)->thread,
+> +				any_online_cpu(cpu_online_map));
+> +			cleanup_workqueue_thread(wq, hotcpu);
+>  		}
+> +		break;
+> +
+> +	case CPU_DEAD:
+> +		list_for_each_entry(wq, &workqueues, list)
+> +			take_over_work(wq, hotcpu);
+> +		break;
+> +
+> +	case CPU_DEAD_KILL_THREADS:
+> +		list_for_each_entry(wq, &workqueues, list)
+> +			cleanup_workqueue_thread(wq, hotcpu);
+>  	}
+Both CPU_UP_CANCELED and CPU_DEAD_KILL_THREADS runs after thaw_processes(),
+this means that workqueue_cpu_callback() is racy wrt create/destroy workqueue,
+we should take the mutex, and it can't be spinlock_t.
+Oleg.
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+More majordomo info at  
+http://vger.kernel.org/majordomo-info.html
+Please read the FAQ at  
+http://www.tux.org/lkml/

@@ -1,0 +1,155 @@
+Date: Thu, 18 Oct 2007 05:32:11 -0400
+From: Jeff Garzik <>
+Subject: Re: [bug] ata subsystem related crash with latest -git
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2007/10/18/105
+
+Jens Axboe wrote:
+> The sata_mv construct looks a bit odd. Does this work? That last
+The sata_mv construct worked just fine before sg chaining :)
+> end_mv_sg test should always be true, just being paranoid...
+> 
+> diff --git a/drivers/ata/sata_mv.c b/drivers/ata/sata_mv.c
+> index 4df8311..5397eea 100644
+> --- a/drivers/ata/sata_mv.c
+> +++ b/drivers/ata/sata_mv.c
+> @@ -1138,8 +1138,9 @@ static void mv_fill_sg(struct ata_queued_cmd *qc)
+>  {
+>  	struct mv_port_priv *pp = qc->ap->private_data;
+>  	struct scatterlist *sg;
+> -	struct mv_sg *mv_sg;
+> +	struct mv_sg *mv_sg, *end_mv_sg;
+> 
+> +	end_mv_sg = NULL;
+>  	mv_sg = pp->sg_tbl;
+>  	ata_for_each_sg(sg, qc) {
+>  		dma_addr_t addr = sg_dma_address(sg);
+> @@ -1158,14 +1159,12 @@ static void mv_fill_sg(struct ata_queued_cmd *qc)
+> 
+>  			sg_len -= len;
+>  			addr += len;
+> -
+> -			if (!sg_len && ata_sg_is_last(sg, qc))
+> -				mv_sg->flags_size |= cpu_to_le32(EPRD_FLAG_END_OF_TBL);
+> -
+> +			end_mv_sg = mv_sg;
+>  			mv_sg++;
+>  		}
+> -
+>  	}
+> +	if (end_mv_sg)
+> +		end_mv_sg->flags_size |= cpu_to_le32(EPRD_FLAG_END_OF_TBL);
+>  }
+> 
+I'm testing a similar patch based on ata_fill_sg()'s method, which 
+basically does something similar to what you've done here (see 
+attached).  I had noticed that ata_fill_sg() did not call ata_sg_is_last().
+If this fixes the problem, I think the best solution would be to delete 
+ata_sg_is_last().  In the few users that exist, we should be able to 
+eliminate the test programmatically as you and ata_fill_sg() have done 
+-- thereby eliminating a branch per loop in a hotpath.
+Off to test the attached...  if that doesn't work I'll try your version, 
+though there shouldn't be much difference.
+	Jeff
+diff --git a/drivers/ata/sata_mv.c b/drivers/ata/sata_mv.c
+index 4df8311..42b5a9e 100644
+--- a/drivers/ata/sata_mv.c
++++ b/drivers/ata/sata_mv.c
+@@ -421,7 +421,6 @@ static void mv_error_handler(struct ata_port *ap);
+ static void mv_post_int_cmd(struct ata_queued_cmd *qc);
+ static void mv_eh_freeze(struct ata_port *ap);
+ static void mv_eh_thaw(struct ata_port *ap);
+-static int mv_slave_config(struct scsi_device *sdev);
+ static int mv_init_one(struct pci_dev *pdev, const struct pci_device_id *ent);
+ 
+ static void mv5_phy_errata(struct mv_host_priv *hpriv, void __iomem *mmio,
+@@ -459,7 +458,7 @@ static struct scsi_host_template mv5_sht = {
+ 	.use_clustering		= 1,
+ 	.proc_name		= DRV_NAME,
+ 	.dma_boundary		= MV_DMA_BOUNDARY,
+-	.slave_configure	= mv_slave_config,
++	.slave_configure	= ata_scsi_slave_config,
+ 	.slave_destroy		= ata_scsi_slave_destroy,
+ 	.bios_param		= ata_std_bios_param,
+ };
+@@ -477,7 +476,7 @@ static struct scsi_host_template mv6_sht = {
+ 	.use_clustering		= 1,
+ 	.proc_name		= DRV_NAME,
+ 	.dma_boundary		= MV_DMA_BOUNDARY,
+-	.slave_configure	= mv_slave_config,
++	.slave_configure	= ata_scsi_slave_config,
+ 	.slave_destroy		= ata_scsi_slave_destroy,
+ 	.bios_param		= ata_std_bios_param,
+ };
+@@ -756,17 +755,6 @@ static void mv_irq_clear(struct ata_port *ap)
+ {
+ }
+ 
+-static int mv_slave_config(struct scsi_device *sdev)
+-{
+-	int rc = ata_scsi_slave_config(sdev);
+-	if (rc)
+-		return rc;
+-
+-	blk_queue_max_phys_segments(sdev->request_queue, MV_MAX_SG_CT / 2);
+-
+-	return 0;	/* scsi layer doesn't check return value, sigh */
+-}
+-
+ static void mv_set_edma_ptrs(void __iomem *port_mmio,
+ 			     struct mv_host_priv *hpriv,
+ 			     struct mv_port_priv *pp)
+@@ -1138,34 +1126,35 @@ static void mv_fill_sg(struct ata_queued_cmd *qc)
+ {
+ 	struct mv_port_priv *pp = qc->ap->private_data;
+ 	struct scatterlist *sg;
+-	struct mv_sg *mv_sg;
++	struct mv_sg *mv_sg = pp->sg_tbl;
++	unsigned int idx = 0;
+ 
+-	mv_sg = pp->sg_tbl;
+ 	ata_for_each_sg(sg, qc) {
+-		dma_addr_t addr = sg_dma_address(sg);
+-		u32 sg_len = sg_dma_len(sg);
++		u64 addr;
++		u32 offset, sg_len, len;
++
++		addr = sg_dma_address(sg);
++		sg_len = sg_dma_len(sg);
+ 
+ 		while (sg_len) {
+-			u32 offset = addr & 0xffff;
+-			u32 len = sg_len;
++			offset = addr & 0xffff;
++			len = sg_len;
+ 
+ 			if ((offset + sg_len > 0x10000))
+ 				len = 0x10000 - offset;
+ 
+-			mv_sg->addr = cpu_to_le32(addr & 0xffffffff);
+-			mv_sg->addr_hi = cpu_to_le32((addr >> 16) >> 16);
+-			mv_sg->flags_size = cpu_to_le32(len & 0xffff);
++			mv_sg[idx].addr = cpu_to_le32(addr & 0xffffffff);
++			mv_sg[idx].addr_hi = cpu_to_le32(addr >> 32);
++			mv_sg[idx].flags_size = cpu_to_le32(len & 0xffff);
+ 
++			idx++;
+ 			sg_len -= len;
+ 			addr += len;
+-
+-			if (!sg_len && ata_sg_is_last(sg, qc))
+-				mv_sg->flags_size |= cpu_to_le32(EPRD_FLAG_END_OF_TBL);
+-
+-			mv_sg++;
+ 		}
+-
+ 	}
++
++	if (idx)
++		mv_sg[idx - 1].flags_size |= cpu_to_le32(EPRD_FLAG_END_OF_TBL);
+ }
+ 
+ static inline void mv_crqb_pack_cmd(__le16 *cmdw, u8 data, u8 addr, unsigned last)

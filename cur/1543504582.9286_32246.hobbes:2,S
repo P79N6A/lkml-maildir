@@ -1,0 +1,179 @@
+Date: Sun, 1 Aug 1999 23:13:00 -0700
+From: "David S. Miller" <>
+Subject: Re: PATCH for 2.3.12: swap-related deadlock
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/8/2/43
+
+   From: buhr@stat.wisc.edu (Kevin Buhr)
+   Date:   02 Aug 1999 00:50:49 -0500
+   I hypothesized a race condition: to enter lazy TLB mode, the
+   "sys_bdflush()" function set "current->mm" to NULL.  If this
+   happened immediately after "swap_out()" had checked its validity,
+   then "swap_out()"'s helper functions would dereference a NULL
+   pointer.  Since "swap_out()" was running with the kernel lock held,
+   I added a "lock_kernel()/unlock_kernel()" pair around the
+   "current->mm = NULL" statement, and that stopped the reboots.
+   However, I wasn't able to duplicate the reboot problem under
+   2.3.12, so perhaps my hypothesis was incorrect.
+I believe your hypotheses is correct, since bdflush runs without the
+kernel lock, the setting of current->mm to NULL is asynchronous to
+vmscan activity even though the latter runs with the kernel lock
+held.
+I have fixed this problem with the following patch, want to test
+it out for me?
+--- mm/vmscan.c.~1~	Fri Jul 30 13:23:08 1999
++++ mm/vmscan.c	Sat Jul 31 23:51:14 1999
+@@ -47,7 +47,7 @@
+ 		goto out_failed;
+ 
+ 	page = mem_map + MAP_NR(page_addr);
+-	spin_lock(&tsk->mm->page_table_lock);
++	spin_lock(&vma->vm_mm->page_table_lock);
+ 	if (pte_val(pte) != pte_val(*page_table))
+ 		goto out_failed_unlock;
+ 
+@@ -138,7 +138,7 @@
+ 	if (vma->vm_ops && vma->vm_ops->swapout) {
+ 		pid_t pid = tsk->pid;
+ 		pte_clear(page_table);
+-		spin_unlock(&tsk->mm->page_table_lock);
++		spin_unlock(&vma->vm_mm->page_table_lock);
+ 		flush_tlb_page(vma, address);
+ 		vma->vm_mm->rss--;
+ 		
+@@ -160,7 +160,7 @@
+ 	vma->vm_mm->rss--;
+ 	tsk->nswap++;
+ 	set_pte(page_table, __pte(entry));
+-	spin_unlock(&tsk->mm->page_table_lock);
++	spin_unlock(&vma->vm_mm->page_table_lock);
+ 
+ 	flush_tlb_page(vma, address);
+ 	swap_duplicate(entry);	/* One for the process, one for the swap cache */
+@@ -175,7 +175,7 @@
+ 	__free_page(page);
+ 	return 1;
+ out_failed_unlock:
+-	spin_unlock(&tsk->mm->page_table_lock);
++	spin_unlock(&vma->vm_mm->page_table_lock);
+ out_failed:
+ 	return 0;
+ }
+@@ -216,7 +216,7 @@
+ 
+ 	do {
+ 		int result;
+-		tsk->mm->swap_address = address + PAGE_SIZE;
++		vma->vm_mm->swap_address = address + PAGE_SIZE;
+ 		result = try_to_swap_out(tsk, vma, address, pte, gfp_mask);
+ 		if (result)
+ 			return result;
+@@ -266,7 +266,7 @@
+ 	if (vma->vm_flags & VM_LOCKED)
+ 		return 0;
+ 
+-	pgdir = pgd_offset(tsk->mm, address);
++	pgdir = pgd_offset(vma->vm_mm, address);
+ 
+ 	end = vma->vm_end;
+ 	while (address < end) {
+@@ -279,7 +279,7 @@
+ 	return 0;
+ }
+ 
+-static int swap_out_process(struct task_struct * p, int gfp_mask)
++static int swap_out_process(struct task_struct * p, struct mm_struct * mm, int gfp_mask)
+ {
+ 	unsigned long address;
+ 	struct vm_area_struct* vma;
+@@ -287,12 +287,12 @@
+ 	/*
+ 	 * Go through process' page directory.
+ 	 */
+-	address = p->mm->swap_address;
++	address = mm->swap_address;
+ 
+ 	/*
+ 	 * Find the proper vm-area
+ 	 */
+-	vma = find_vma(p->mm, address);
++	vma = find_vma(mm, address);
+ 	if (vma) {
+ 		if (address < vma->vm_start)
+ 			address = vma->vm_start;
+@@ -309,8 +309,8 @@
+ 	}
+ 
+ 	/* We didn't find anything for the process */
+-	p->mm->swap_cnt = 0;
+-	p->mm->swap_address = 0;
++	mm->swap_cnt = 0;
++	mm->swap_address = 0;
+ 	return 0;
+ }
+ 
+@@ -322,6 +322,7 @@
+ static int swap_out(unsigned int priority, int gfp_mask)
+ {
+ 	struct task_struct * p, * pbest;
++	struct mm_struct * mmbest;
+ 	int counter, assign, max_cnt;
+ 
+ 	/* 
+@@ -348,20 +349,23 @@
+ 		assign = 0;
+ 		max_cnt = 0;
+ 		pbest = NULL;
++		mmbest = NULL;
+ 	select:
+ 		read_lock(&tasklist_lock);
+ 		p = init_task.next_task;
+ 		for (; p != &init_task; p = p->next_task) {
+-			if (!p->swappable || !p->mm)
++			struct mm_struct *mm = p->mm;
++			if (!p->swappable || !mm)
+ 				continue;
+-	 		if (p->mm->rss <= 0)
++	 		if (mm->rss <= 0)
+ 				continue;
+ 			/* Refresh swap_cnt? */
+ 			if (assign)
+-				p->mm->swap_cnt = p->mm->rss;
+-			if (p->mm->swap_cnt > max_cnt) {
+-				max_cnt = p->mm->swap_cnt;
++				mm->swap_cnt = mm->rss;
++			if (mm->swap_cnt > max_cnt) {
++				max_cnt = mm->swap_cnt;
+ 				pbest = p;
++				mmbest = mm;
+ 			}
+ 		}
+ 		read_unlock(&tasklist_lock);
+@@ -371,10 +375,16 @@
+ 				goto select;
+ 			}
+ 			goto out;
+-		}
++		} else {
++			int ret;
++
++			atomic_inc(&mmbest->mm_count);
++			ret = swap_out_process(pbest, mmbest, gfp_mask);
++			mmdrop(mmbest);
+ 
+-		if (swap_out_process(pbest, gfp_mask))
+-			return 1;
++			if (ret)
++				return 1;
++		}
+ 	}
+ out:
+ 	return 0;
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

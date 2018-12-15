@@ -1,0 +1,106 @@
+Date: Mon, 21 Nov 2005 17:09:48 -0800
+From: George Anzinger <>
+Subject: Thread group exec race -> null pointer... HELP
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2005/11/21/397
+
+George Anzinger wrote:
+> While rooting aroung in the signal code trying to understand how to
+> fix the SIG_IGN    ploy (set sig handler to SIG_IGN and flood system with
+> high speed repeating timers) I came across what, I think, is a problem
+> in sigaction() in that when processing a SIG_IGN request it flushes
+> signals from 1 to SIGRTMIN and leaves the rest.  
+Still rooting around in the above.  The test program is attached.  It 
+creates and arms a repeating timer and then clones a thread which does 
+an exec() call.
+If I run the test with top (only two programs running) I quickly get 
+an OOPS on trying to derefence a NULL pointer.  It is comming from a 
+call the posix timer code is making to deliver a timer.  Call is to 
+send_group_sigqueue() at ~445 in posix-timers.c.  The process being 
+passed in is DEAD with current->signal ==NULL, thus the OOPS.  In the 
+first instance of this, we see that the thread-group leader is dead 
+and the exec code at line ~718 is setting the old leaders group-leader 
+to him self.  The failure then happens when the IRQ release is done on 
+the write_unlock_irq() at ~732 thus allowing the timer interrupt.
+Thinking that it makes no real sense to set the group leader to a dead 
+process, I did the following:
+--- linux-2.6.15-rc.orig/fs/exec.c
++++ linux-2.6.15-rc/fs/exec.c
+@@ -715,7 +715,7 @@ static inline int de_thread(struct task_
+  		current->parent = current->real_parent = leader->real_parent;
+  		leader->parent = leader->real_parent = child_reaper;
+  		current->group_leader = current;
+-		leader->group_leader = leader;
++		leader->group_leader = current;
+  		add_parent(current, current->parent);
+  		add_parent(leader, leader->parent);
+This also fails as there is still a window where the group leader is 
+dead with a null signal pointer, i.e. the interrupt happens (this time 
+on another cpu) before the above changed code is executed.
+It seems to me that the group leader needs to change prior to setting 
+the signal pointer to NULL, but I don't really know this code very well.
+Help !
+-- 
+George Anzinger   george@mvista.com
+HRT (High-res-timers):  
+http://sourceforge.net/projects/high-res-timers/
+#include <errno.h>
+#include <stdio.h>
+#include <signal.h>
+#include <string.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <sys/wait.h>
+#include <time.h>
+void die(const char* msg)
+{
+	fprintf(stderr, "ERR!! %s: %s\n", msg, strerror(errno));
+	exit(-1);
+}
+char thread_stack[4096];
+int thread_func(void *arg)
+{
+	execl("/bin/true", NULL);
+	die("exec");
+	return 0;
+}
+void proc_func(void)
+{
+	int pid;
+	for (;;)
+		if ((pid = fork())) {
+			if (pid != waitpid(pid, NULL, 0))
+				die("wait4");
+		} else {
+			struct sigevent sigev = {};
+			struct itimerspec itsp = {};
+			timer_t tid;
+			sigev.sigev_signo = SIGRTMIN;
+			sigev.sigev_notify = SIGEV_SIGNAL;
+			if (timer_create(CLOCK_MONOTONIC, &sigev, &tid) == -1)
+				die("timer_create");
+			itsp.it_value.    tv_nsec = 1;
+			itsp.it_interval. tv_nsec = 1;
+			if (timer_settime(tid, 0, &itsp, NULL))
+				die("timer_settime");
+			if (clone(thread_func, thread_stack + 2048,
+					CLONE_THREAD|CLONE_SIGHAND|CLONE_VM|CLONE_FILES,
+					NULL) < 0)
+				die("clone");
+			pause();
+		}
+}
+int main(void)
+{
+	int pn;
+	signal(SIGRTMIN, SIG_IGN);
+	for (pn = 0; pn < 16; ++pn)
+		if (!fork())
+			proc_func();
+	pause();
+	return 0;
+}

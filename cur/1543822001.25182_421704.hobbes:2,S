@@ -1,0 +1,195 @@
+Date: Sun, 7 May 2006 17:03:20 +0400
+From: Sergey Vlasov <>
+Subject: Re: [patch 2/6] New Generic HW RNG
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2006/5/7/41
+
+On Sun, 07 May 2006 13:35:15 +0200 Michael Buesch wrote:
+> Add a new generic H/W RNG core.
+> 
+> Signed-off-by: Michael Buesch <mb@bu3sch.de>
+[skip]
+> Index: hwrng/drivers/char/hw_random/core.c
+> ===================================================================
+> --- /dev/null	1970-01-01 00:00:00.000000000 +0000
+> +++ hwrng/drivers/char/hw_random/core.c	2006-05-07 01:04:42.000000000 +0200
+> @@ -0,0 +1,324 @@
+> +/*
+> +        Added support for the AMD Geode LX RNG
+> +	(c) Copyright 2004-2005 Advanced Micro Devices, Inc.
+> +
+> +	derived from
+> +
+> + 	Hardware driver for the Intel/AMD/VIA Random Number Generators (RNG)
+> +	(c) Copyright 2003 Red Hat Inc <jgarzik@redhat.com>
+> +
+> + 	derived from
+> +
+> +        Hardware driver for the AMD 768 Random Number Generator (RNG)
+> +        (c) Copyright 2001 Red Hat Inc <alan@redhat.com>
+> +
+> + 	derived from
+> +
+> +	Hardware driver for Intel i810 Random Number Generator (RNG)
+> +	Copyright 2000,2001 Jeff Garzik <jgarzik@pobox.com>
+> +	Copyright 2000,2001 Philipp Rumpf <prumpf@mandrakesoft.com>
+> +
+> +	Added generic RNG API
+> +	Copyright 2006 Michael Buesch <mbuesch@freenet.de>
+> +	Copyright 2005 (c) MontaVista Software, Inc.
+> +
+> +	Please read Documentation/hw_random.txt for details on use.
+> +
+> +	----------------------------------------------------------
+> +	This software may be used and distributed according to the terms
+> +        of the GNU General Public License, incorporated herein by reference.
+> +
+> + */
+> +
+> +
+> +#include <linux/device.h>
+> +#include <linux/hw_random.h>
+> +#include <linux/module.h>
+> +#include <linux/kernel.h>
+> +#include <linux/fs.h>
+> +#include <linux/init.h>
+> +#include <linux/miscdevice.h>
+> +#include <linux/delay.h>
+> +#include <asm/uaccess.h>
+> +
+> +
+> +#define RNG_MODULE_NAME		"hw_random"
+> +#define PFX RNG_MODULE_NAME	": "
+> +#define RNG_MISCDEV_MINOR		183 /* official */
+> +
+> +
+> +static struct hwrng *current_rng;
+> +static LIST_HEAD(rng_list);
+> +static DEFINE_MUTEX(rng_mutex);
+> +
+> +
+> +static int rng_dev_open(struct inode *inode, struct file *filp)
+> +{
+> +	/* enforce read-only access to this chrdev */
+> +	if ((filp->f_mode & FMODE_READ) == 0)
+> +		return -EINVAL;
+> +	if (filp->f_mode & FMODE_WRITE)
+> +		return -EINVAL;
+> +	return 0;
+> +}
+> +
+> +static ssize_t rng_dev_read(struct file *filp, char __user *buf,
+> +			    size_t size, loff_t *offp)
+> +{
+> +	unsigned int have_data;
+> +	u32 data = 0;
+> +	ssize_t ret = 0;
+> +	int i, err;
+> +
+> +	while (size) {
+> +		err = mutex_lock_interruptible(&rng_mutex);
+> +		if (err)
+> +			return err;
+This does not handle the case of partial read correctly - the code
+should be
+			return ret ? : -ERESTARTSYS;
+> +		if (!current_rng) {
+> +			mutex_unlock(&rng_mutex);
+> +			return -ENODEV;
+The same problem here (although finding the RNG suddenly missing after
+we heve just read something from it is pretty unlikely).
+> +		}
+> +		have_data = 0;
+> +		if (current_rng->data_present == NULL ||
+> +		    current_rng->data_present(current_rng))
+> +			have_data = current_rng->data_read(current_rng, &data);
+> +		mutex_unlock(&rng_mutex);
+> +
+> +		while (have_data && size) {
+> +			if (put_user((u8)data, buf++)) {
+> +				ret = ret ? : -EFAULT;
+> +				break;
+> +			}
+> +			size--;
+> +			ret++;
+> +			have_data--;
+> +			data>>=8;
+> +		}
+> +
+> +		if (filp->f_flags & O_NONBLOCK)
+> +			return ret ? : -EAGAIN;
+> +
+> +		if (need_resched()) {
+> +			schedule_timeout_interruptible(1);
+> +		} else {
+> +			err = mutex_lock_interruptible(&rng_mutex);
+> +			if (err)
+> +				return err;
+And here...
+> +			if (!current_rng) {
+> +				mutex_unlock(&rng_mutex);
+> +				return -ENODEV;
+And here too.
+> +			}
+> +			for (i = 0; i < 20; i++) {
+> +				if (current_rng->data_present == NULL ||
+> +				    current_rng->data_present(current_rng))
+> +					break;
+> +				udelay(10);
+> +			}
+> +			mutex_unlock(&rng_mutex);
+> +		}
+> +
+> +		if (signal_pending(current))
+> +			return ret ? : -ERESTARTSYS;
+> +	}
+> +	return ret;
+> +}
+> +
+> +
+> +static struct file_operations rng_chrdev_ops = {
+> +	.owner		= THIS_MODULE,
+> +	.open		= rng_dev_open,
+> +	.read		= rng_dev_read,
+> +};
+> +
+> +static struct miscdevice rng_miscdev = {
+> +	.minor		= RNG_MISCDEV_MINOR,
+> +	.name		= RNG_MODULE_NAME,
+> +	.fops		= &rng_chrdev_ops,
+> +};
+> +
+> +
+> +static ssize_t hwrng_attr_current_store(struct class_device *class,
+> +					const char *buf, size_t len)
+> +{
+> +	int err;
+> +	struct hwrng *rng;
+> +
+> +	if (!capable(CAP_SYS_ADMIN))
+> +		return -EPERM;
+> +
+> +	err = mutex_lock_interruptible(&rng_mutex);
+> +	if (err)
+> +		return err;
+> +	err = -ENODEV;
+> +	list_for_each_entry(rng, &rng_list, list) {
+> +		if (strncmp(rng->name, buf, len) == 0) {
+This will match if the passed string is just a prefix of rng->name.
+Apparently sysfs guarantees that the buffer passed to ->store will be
+NUL-terminated, so this should be just a strcmp().
+> +			if (rng->init) {
+> +				err = rng->init(rng);
+> +				if (err)
+> +					break;
+> +			}
+> +			if (current_rng && current_rng->cleanup)
+> +				current_rng->cleanup(current_rng);
+What if rng == current_rng here (someone has written the same RNG name
+to the "store" attribute)?  The lowlevel RNG driver should not have to
+handle nested init/cleanup calls.
+[skip]
+[unhandled content-type:application/pgp-signature]

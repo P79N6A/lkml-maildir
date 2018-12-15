@@ -1,0 +1,250 @@
+Date: Sat, 21 May 2005 15:00:39 +1000
+From: Con Kolivas <>
+Subject: [PATCH] SCHED: Implement nice support across physical cpus on SMP
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2005/5/21/1
+
+Ok I've respun the smp nice support for the cpu scheduler modifications that 
+are in current -mm. Tested on 2.6.12-rc4-mm2 on 4x and seems to work fine.
+Con
+---
+This patch implements 'nice' support across physical cpus on SMP.
+It introduces an extra runqueue variable prio_bias which is the sum of the
+(inverted) static priorities of all the tasks on the runqueue. This is then used
+to bias busy rebalancing between runqueues to obtain good distribution of tasks
+of different nice values. By biasing the balancing only during busy rebalancing
+we can avoid having any significant loss of throughput by not affecting the
+carefully tuned idle balancing already in place. If all tasks are running at the
+same nice level this code should also have minimal effect. The code is optimised
+out in the !CONFIG_SMP case.
+Signed-off-by: Con Kolivas <kernel@kolivas.org>
+Index: linux-2.6.12-rc4-mm2/kernel/sched.c
+===================================================================
+--- linux-2.6.12-rc4-mm2.orig/kernel/sched.c	2005-05-21 11:14:49.000000000 +1000
++++ linux-2.6.12-rc4-mm2/kernel/sched.c	2005-05-21 14:25:07.000000000 +1000
+@@ -208,6 +208,7 @@ struct runqueue {
+ 	 */
+ 	unsigned long nr_running;
+ #ifdef CONFIG_SMP
++	unsigned long prio_bias;
+ 	unsigned long cpu_load[3];
+ #endif
+ 	unsigned long long nr_switches;
+@@ -657,13 +658,45 @@ static int effective_prio(task_t *p)
+ 	return prio;
+ }
+ 
++#ifdef CONFIG_SMP
++static inline void inc_prio_bias(runqueue_t *rq, int static_prio)
++{
++	rq->prio_bias += MAX_PRIO - static_prio;
++}
++
++static inline void dec_prio_bias(runqueue_t *rq, int static_prio)
++{
++	rq->prio_bias -= MAX_PRIO - static_prio;
++}
++#else
++static inline void inc_prio_bias(runqueue_t *rq, int static_prio)
++{
++}
++
++static inline void dec_prio_bias(runqueue_t *rq, int static_prio)
++{
++}
++#endif
++
++static inline void inc_nr_running(task_t *p, runqueue_t *rq)
++{
++	rq->nr_running++;
++	inc_prio_bias(rq, p->static_prio);
++}
++
++static inline void dec_nr_running(task_t *p, runqueue_t *rq)
++{
++	rq->nr_running--;
++	dec_prio_bias(rq, p->static_prio);
++}
++
+ /*
+  * __activate_task - move a task to the runqueue.
+  */
+ static inline void __activate_task(task_t *p, runqueue_t *rq)
+ {
+ 	enqueue_task(p, rq->active);
+-	rq->nr_running++;
++	inc_nr_running(p, rq);
+ }
+ 
+ /*
+@@ -672,7 +705,7 @@ static inline void __activate_task(task_
+ static inline void __activate_idle_task(task_t *p, runqueue_t *rq)
+ {
+ 	enqueue_task_head(p, rq->active);
+-	rq->nr_running++;
++	inc_nr_running(p, rq);
+ }
+ 
+ static void recalc_task_prio(task_t *p, unsigned long long now)
+@@ -791,7 +824,7 @@ static void activate_task(task_t *p, run
+  */
+ static void deactivate_task(struct task_struct *p, runqueue_t *rq)
+ {
+-	rq->nr_running--;
++	dec_nr_running(p, rq);
+ 	dequeue_task(p, p->array);
+ 	p->array = NULL;
+ }
+@@ -928,27 +961,54 @@ void kick_process(task_t *p)
+  * We want to under-estimate the load of migration sources, to
+  * balance conservatively.
+  */
+-static inline unsigned long source_load(int cpu, int type)
++static inline unsigned long __source_load(int cpu, int type, enum idle_type idle)
+ {
+ 	runqueue_t *rq = cpu_rq(cpu);
+-	unsigned long load_now = rq->nr_running * SCHED_LOAD_SCALE;
++	unsigned long cpu_load = rq->cpu_load[type-1],
++		load_now = rq->nr_running * SCHED_LOAD_SCALE;
++
++	if (idle == NOT_IDLE) {
++		/*
++		 * If we are balancing busy runqueues the load is biased by
++		 * priority to create 'nice' support across cpus.
++		 */
++		cpu_load *= rq->prio_bias;
++		load_now *= rq->prio_bias;
++	}
++
+ 	if (type == 0)
+ 		return load_now;
+ 
+-	return min(rq->cpu_load[type-1], load_now);
++	return min(cpu_load, load_now);
++}
++
++static inline unsigned long source_load(int cpu, int type)
++{
++	return __source_load(cpu, type, NOT_IDLE);
+ }
+ 
+ /*
+  * Return a high guess at the load of a migration-target cpu
+  */
+-static inline unsigned long target_load(int cpu, int type)
++static inline unsigned long __target_load(int cpu, int type, enum idle_type idle)
+ {
+ 	runqueue_t *rq = cpu_rq(cpu);
+-	unsigned long load_now = rq->nr_running * SCHED_LOAD_SCALE;
++	unsigned long cpu_load = rq->cpu_load[type-1],
++		load_now = rq->nr_running * SCHED_LOAD_SCALE;
++
+ 	if (type == 0)
+ 		return load_now;
+ 
+-	return max(rq->cpu_load[type-1], load_now);
++	if (idle == NOT_IDLE) {
++		cpu_load *= rq->prio_bias;
++		load_now *= rq->prio_bias;
++	}
++	return max(cpu_load, load_now);
++}
++
++static inline unsigned long target_load(int cpu, int type)
++{
++	return __target_load(cpu, type, NOT_IDLE);
+ }
+ 
+ /*
+@@ -1389,7 +1449,7 @@ void fastcall wake_up_new_task(task_t * 
+ 				list_add_tail(&p->run_list, &current->run_list);
+ 				p->array = current->array;
+ 				p->array->nr_active++;
+-				rq->nr_running++;
++				inc_nr_running(p, rq);
+ 			}
+ 			set_need_resched();
+ 		} else
+@@ -1733,9 +1793,9 @@ void pull_task(runqueue_t *src_rq, prio_
+ 	       runqueue_t *this_rq, prio_array_t *this_array, int this_cpu)
+ {
+ 	dequeue_task(p, src_array);
+-	src_rq->nr_running--;
++	dec_nr_running(p, src_rq);
+ 	set_task_cpu(p, this_cpu);
+-	this_rq->nr_running++;
++	inc_nr_running(p, this_rq);
+ 	enqueue_task(p, this_array);
+ 	p->timestamp = (p->timestamp - src_rq->timestamp_last_tick)
+ 				+ this_rq->timestamp_last_tick;
+@@ -1909,9 +1969,9 @@ find_busiest_group(struct sched_domain *
+ 		for_each_cpu_mask(i, group->cpumask) {
+ 			/* Bias balancing toward cpus of our domain */
+ 			if (local_group)
+-				load = target_load(i, load_idx);
++				load = __target_load(i, load_idx, idle);
+ 			else
+-				load = source_load(i, load_idx);
++				load = __source_load(i, load_idx, idle);
+ 
+ 			avg_load += load;
+ 		}
+@@ -2012,14 +2072,15 @@ out_balanced:
+ /*
+  * find_busiest_queue - find the busiest runqueue among the cpus in group.
+  */
+-static runqueue_t *find_busiest_queue(struct sched_group *group)
++static runqueue_t *find_busiest_queue(struct sched_group *group,
++	enum idle_type idle)
+ {
+ 	unsigned long load, max_load = 0;
+ 	runqueue_t *busiest = NULL;
+ 	int i;
+ 
+ 	for_each_cpu_mask(i, group->cpumask) {
+-		load = source_load(i, 0);
++		load = __source_load(i, 0, idle);
+ 
+ 		if (load > max_load) {
+ 			max_load = load;
+@@ -2060,7 +2121,7 @@ static int load_balance(int this_cpu, ru
+ 		goto out_balanced;
+ 	}
+ 
+-	busiest = find_busiest_queue(group);
++	busiest = find_busiest_queue(group, idle);
+ 	if (!busiest) {
+ 		schedstat_inc(sd, lb_nobusyq[idle]);
+ 		goto out_balanced;
+@@ -2168,7 +2229,7 @@ static int load_balance_newidle(int this
+ 		goto out_balanced;
+ 	}
+ 
+-	busiest = find_busiest_queue(group);
++	busiest = find_busiest_queue(group, NEWLY_IDLE);
+ 	if (!busiest) {
+ 		schedstat_inc(sd, lb_nobusyq[NEWLY_IDLE]);
+ 		goto out_balanced;
+@@ -3338,7 +3399,9 @@ void set_user_nice(task_t *p, long nice)
+ 	 * not SCHED_NORMAL:
+ 	 */
+ 	if (rt_task(p)) {
++		dec_prio_bias(rq, p->static_prio);
+ 		p->static_prio = NICE_TO_PRIO(nice);
++		inc_prio_bias(rq, p->static_prio);
+ 		goto out_unlock;
+ 	}
+ 	array = p->array;
+@@ -3348,7 +3411,9 @@ void set_user_nice(task_t *p, long nice)
+ 	old_prio = p->prio;
+ 	new_prio = NICE_TO_PRIO(nice);
+ 	delta = new_prio - old_prio;
++	dec_prio_bias(rq, p->static_prio);
+ 	p->static_prio = NICE_TO_PRIO(nice);
++	inc_prio_bias(rq, p->static_prio);
+ 	p->prio += delta;
+ 
+ 	if (array) {[unhandled content-type:application/pgp-signature]

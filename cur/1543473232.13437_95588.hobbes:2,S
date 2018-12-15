@@ -1,0 +1,956 @@
+Date: Mon, 28 Dec 1998 13:32:52 -0600 (EST)
+From: Bob McElrath <>
+Subject: Re: [2.1.132] Modularized sound oops, OPL3-SA1
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1998/12/28/93
+
+I have fixed this for the pas card (modified pas2_card.c attached).  There
+are three usage counts for IRQ, DMA, and I/O port.  The attached file fixes
+it so that you can insmod and rmmod and usage gets updated correctly.  The
+correction is all in the unload_pas function.  <Linus/Alan: Please don't
+incorporate this into official sources yet>
+I don't know what to do with the pas2 i/o port allocation though.  It uses
+harmonics of 4-bit wide port space starting at 0x388 all the way up to
+0x9788.  (See thread "proper ioport space allocation" on this list)
+Currently it blocks off *all* portspace used by the pas2 card.  (Before I
+modified it, it didin't allocate ANY portspace)  But it's a lot.  I'm also
+afraid that the pas2 uses the harmonics (0x388 + n*0x400 where n is an
+integer) that are *not* documented, but haven't been able to prove this yet.
+Ideally, we could reserve all the port space the pas uses (documented or
+not) to avoid conflict.
+There is also a documented memory leak in soundcore.  (Grep for "FIXME") If
+you're testing changes to sound drivers, insmod sound, soundcore, and pas2,
+then rmmod all three of them.  The problem is a fixed length array of
+devices, IIRC, but it never re-uses elements of the array when stuff is
+removed.
+Unfortunately, I'm 1000 miles away from my box with the pas2 in it, so this
+is all the help I can be until sometime around 15 Jan.  :(
+On Sun, 27 Dec 1998, Alex Stewart wrote:
+> (I picked this up while browsing through a kernel archive for last week)
+> 
+> > With a modularized opl3sa1 sound card setup, it looks like soundcore.o's
+> > MOD_USE_COUNT is never fully decremented, even when all it's child modules
+> > are (auto or manually) unloaded, and the next attempt at autoloading the
+> > sound modules causes an oops.
+> 
+> I just wanted to note that I've seen the same behavior with 2.1.131 and
+> my (fixed) pas2 driver, though I haven't yet had it oops on me.  The
+> symptoms are as follows:
+> 
+> (using Kernel 2.1.131 (with linux-2.1.131-pas.patch posted to this list
+> earlier) with modutils 2.1.121 on a Pentium 75 (32MB RAM, 1.5GB HD))
+> 
+>   [root@mondas /]# insmod soundcore
+>   [root@mondas /]# lsmod
+>   Module                  Size  Used by
+>   soundcore               1968   0  (unused)
+>   [root@mondas /]# insmod sound
+>   [root@mondas /]# lsmod
+>   Module                  Size  Used by
+>   sound                  57084   0  (unused)
+>   soundcore               1968   3  [sound]
+>   [root@mondas /]# insmod pas2 io=0x388 irq=11 dma=7
+>   [root@mondas /]# lsmod
+>   Module                  Size  Used by
+>   pas2                   11376   0  (unused)
+>   sound                  57084   0  [pas2]
+>   soundcore               1968   6  [sound]
+>   [root@mondas /]# rmmod pas2
+>   [root@mondas /]# lsmod
+>   Module                  Size  Used by
+>   sound                  57084   0
+>   soundcore               1968   6  [sound]
+>   [root@mondas /]# insmod pas2 io=0x388 irq=11 dma=7
+>   [root@mondas /]# lsmod
+>   Module                  Size  Used by
+>   pas2                   11376   0  (unused)
+>   sound                  57084   0  [pas2]
+>   soundcore               1968   9  [sound]
+>   [root@mondas /]# rmmod pas2
+>   [root@mondas /]# lsmod
+>   Module                  Size  Used by
+>   sound                  57084   0
+>   soundcore               1968   9  [sound]
+>   [root@mondas /]# rmmod sound
+>   [root@mondas /]# lsmod
+>   Module                  Size  Used by
+>   soundcore               1968   6
+> 
+> (equivalent behavior when using 'modprobe pas2' or demand-loading/etc.)
+> 
+> I note that the soundcore use count goes up by 3 when the sound module
+> is loaded, which gets decremented properly when it's unloaded, but when
+> the pas2 module is loaded it gets incremented by the same amount (3)
+> which doesn't ever get decremented.  Could the loading of the pas2
+> module be erroneously causing the sound module's use of soundcore to be
+> counted again?
+> 
+> I don't know a lot about this aspect of the kernel stuff (just recently
+> started looking into module stuff) but one wonders if this might be a
+> problem with three(plus)-module chains (most other things I've seen
+> don't have dependencies deeper than 2 levels).  I don't know off hand of
+> any 4-deep chains I could try with my hardware or I would..
+> 
+> Anyway, just some speculations..  I'll post more if I come up with
+> anything more revealing.
+> 
+> Please CC any relevant questions/comments to me directly, as I am not
+> currently subscribed to the linux-kernel maillist.
+-- Bob
+Bob McElrath (mcelrath@draal.physics.wisc.edu) Univ. of Wisconsin at Madison
+/*
+ * sound/pas2_card.c
+ *
+ * Detection routine for the Pro Audio Spectrum cards.
+ */
+#include <linux/config.h>
+#include <linux/module.h>
+#include <linux/delay.h>
+#include "sound_config.h"
+#include "soundmodule.h"
+#include "pas2.h"
+#ifdef CONFIG_PAS
+#define DISABLE_SB_EMULATION
+#define DEBUG(BLOCK)	BLOCK
+static unsigned char dma_bits[] = {
+	4, 1, 2, 3, 0, 5, 6, 7
+};
+static unsigned char irq_bits[] = {
+	0, 0, 1, 2, 3, 4, 5, 6, 0, 1, 7, 8, 9, 0, 10, 11
+};
+static unsigned char sb_irq_bits[] = {
+	0x00, 0x00, 0x08, 0x10, 0x00, 0x18, 0x00, 0x20, 
+	0x00, 0x08, 0x28, 0x30, 0x38, 0, 0
+};
+static unsigned char sb_dma_bits[] = {
+	0x00, 0x40, 0x80, 0xC0, 0, 0, 0, 0
+};
+/*
+ * The Address Translation code is used to convert I/O register addresses to
+ * be relative to the given base -register
+ */
+int             translate_code = 0;
+static int      pas_intr_mask = 0;
+static int      pas_irq = 0;
+static int      pas_sb_base = 0;
+#ifndef CONFIG_PAS_JOYSTICK
+static int	joystick = 0;
+#else
+static int 	joystick = 1;
+#endif
+#ifdef SYMPHONY_PAS
+static int 	symphony = 1;
+#else
+static int 	symphony = 0;
+#endif
+#ifdef BROKEN_BUS_CLOCK
+static int	broken_bus_clock = 1;
+#else
+static int	broken_bus_clock = 0;
+#endif
+char            pas_model = 0;
+static char    *pas_model_names[] = {
+	"", 
+	"Pro AudioSpectrum+", 
+	"CDPC", 
+	"Pro AudioSpectrum 16", 
+	"Pro AudioSpectrum 16D"
+};
+/*
+ * pas_read() and pas_write() are equivalents of inb and outb 
+ * These routines perform the I/O address translation required
+ * to support other than the default base address
+ */
+extern void     mix_write(unsigned char data, int ioaddr);
+unsigned char pas_read(int ioaddr)
+{
+	return inb(ioaddr ^ translate_code);
+}
+void pas_write(unsigned char data, int ioaddr)
+{
+	udelay(20);
+	outb((data), ioaddr ^ translate_code);
+}
+/******************* Begin of the Interrupt Handler ********************/
+static void pasintr(int irq, void *dev_id, struct pt_regs *dummy)
+{
+	int             status;
+	status = pas_read(INTERRUPT_STATUS);
+	pas_write(status, INTERRUPT_STATUS);	/* Clear interrupt */
+	if (status & 0x08)
+	{
+#ifdef CONFIG_AUDIO
+		  pas_pcm_interrupt(status, 1);
+#endif
+		  status &= ~0x08;
+	}
+	if (status & 0x10)
+	{
+#ifdef CONFIG_MIDI
+		  pas_midi_interrupt();
+#endif
+		  status &= ~0x10;
+	}
+}
+int pas_set_intr(int mask)
+{
+	if (!mask)
+		return 0;
+	pas_intr_mask |= mask;
+	pas_write(pas_intr_mask, INTERRUPT_CONTROL);
+	return 0;
+}
+int pas_remove_intr(int mask)
+{
+	if (!mask)
+		return 0;
+	pas_intr_mask &= ~mask;
+	pas_write(pas_intr_mask, 0x0B8B);
+	return 0;
+}
+/******************* End of the Interrupt handler **********************/
+/******************* Begin of the Initialization Code ******************/
+extern struct address_info sbhw_config;
+extern int pas_audiodev;
+extern int pas2_midi_dev;
+static int config_pas_hw(struct address_info *hw_config)
+{
+	char            ok = 1;
+	unsigned        int_ptrs;	/* scsi/sound interrupt pointers */
+	pas_irq = hw_config->irq;
+        pas_write(I_C_1_BOOT_RESET_ENABLE, IO_CONFIGURATION_1); /* reset card */
+	pas_write(0x01, FAKE_WARM_BOOT);	/* fake a warm boot */
+	udelay(140);
+//	pas_write(0x00, INTERRUPT_CONTROL);
+	pas_write(I_C_PCM_BUFFER_IRQ_ENABLE | I_C_PCM_RATE_IRQ_ENABLE, INTERRUPT_CONTROL);
+	pas_write(0x36, TIMER_CONTROL);
+	pas_write(0x36, SAMPLE_RATE_TIMER);
+	pas_write(0, SAMPLE_RATE_TIMER);
+	pas_write(0x74, TIMER_CONTROL);
+	pas_write(0x74, SAMPLE_COUNT);
+	pas_write(0, SAMPLE_COUNT);
+        pas_write(A_F_PCM_BUFFER_COUNTER | A_F_PCM_RATE_TIMER | 
+                A_F_MIXER_UNMUTE | 1, AUDIO_FILTER);
+        pas_write(C_C_DMA_ENABLE | C_C_MONO | C_C_DAC_MODE |
+                  C_C_MIXER_L2L | C_C_MIXER_R2R,
+                  CROSS_CHANNEL);
+        pas_write(A_M_PCM_RESET | A_M_FM_RESET |
+                  A_M_SB_RESET | A_M_MIXER_RESET, AUDIO_MIXER);
+	/*pas_write(0x01 | 0x02 | 0x04 | 0x10	
+						 * |
+						 * 0x80
+						 , SERIAL_MIXER); */
+        pas_write(I_C_1_BOOT_RESET_ENABLE, IO_CONFIGURATION_1);
+	/*pas_write(0x80
+		  | joystick?0x40:0 
+		  ,0xF388);*/
+	if (pas_irq < 0 || pas_irq > 15)
+	{
+		printk(KERN_ERR "PAS16: Invalid IRQ %d\n", pas_irq);
+		ok = 0;
+	}
+	else
+	{
+		int_ptrs = pas_read(IO_CONFIGURATION_3);
+		int_ptrs |= irq_bits[pas_irq] & 0xf;
+		pas_write(int_ptrs, IO_CONFIGURATION_3);
+		int_ptrs = pas_read(IO_CONFIGURATION_3);
+		if (!irq_bits[pas_irq])
+		{
+			printk(KERN_ERR "PAS16: Invalid IRQ %d\n", pas_irq);
+			ok = 0;
+		}
+		else
+		{
+			if (request_irq(pas_irq, pasintr, 0, pas_model_names[(int) pas_model],NULL) < 0)
+				ok = 0;
+		}
+	}
+	if (hw_config->dma < 0 || hw_config->dma > 7)
+	{
+		printk(KERN_ERR "PAS16: Invalid DMA selection %d\n", hw_config->dma);
+		ok = 0;
+	}
+	else
+	{
+		pas_write(dma_bits[hw_config->dma], IO_CONFIGURATION_2);
+		if (!dma_bits[hw_config->dma])
+		{
+			printk(KERN_ERR "PAS16: Invalid DMA selection %d\n", hw_config->dma);
+			ok = 0;
+		}
+		else
+		{
+			if (sound_alloc_dma(hw_config->dma, pas_model_names[(int)pas_model]))
+			{
+				printk(KERN_ERR "pas2_card.c: Can't allocate DMA channel\n");
+				ok = 0;
+			}
+		}
+	}
+	/*
+	 * This fixes the timing problems of the PAS due to the Symphony chipset
+	 * as per Media Vision.  Only define this if your PAS doesn't work correctly.
+	 */
+	if(symphony)
+	{
+		outb((0x05), 0xa8);
+		outb((0x60), 0xa9);
+	}
+        pas_write(S_C_1_PC_SPKR_ENABLE | S_C_1_PC_SPKR_STEREO | S_C_1_PC_SPKR_REALSOUND |
+		  broken_bus_clock?S_C_1_FM_EMULATE_CLOCK:0x00,
+                  SYSTEM_CONFIG_1);     
+        pas_write(S_C_3_INVERT_BCLK | S_C_3_SYNC_PULSE, SYSTEM_CONFIG_3);
+        pas_write(A_F_MIXER_UNMUTE | 0x01, AUDIO_FILTER);
+        pas_write(8, OVER_SAMPLE_PRESCALE);
+        pas_write(P_M_MIXER_ADDRESS | 0x05, PARALLEL_AUDIO_MIXER);
+	/*	?????		      ^^^^ P_M_MV508_PCM ??? */
+        pas_write(5, PARALLEL_AUDIO_MIXER);
+#if !defined(DISABLE_SB_EMULATION) && defined(CONFIG_SB)
+	{
+		struct address_info *sb_config;
+#ifndef MODULE
+		if ((sb_config = sound_getconf(SNDCARD_SB)))
+#else
+		sb_config = &sbhw_config;
+		if (sb_config->io_base)
+#endif
+		{
+			unsigned char   irq_dma;
+			/*
+			 * Turn on Sound Blaster compatibility
+			 * bit 1 = SB emulation
+			 * bit 0 = MPU401 emulation (CDPC only :-( )
+			 */
+			
+			pas_write(0x02, 0xF788);
+			/*
+			 * "Emulation address"
+			 */
+			
+			pas_write((sb_config->io_base >> 4) & 0x0f, 0xF789);
+			pas_sb_base = sb_config->io_base;
+			if (!sb_dma_bits[sb_config->dma])
+				printk(KERN_ERR "PAS16 Warning: Invalid SB DMA %d\n\n", sb_config->dma);
+			if (!sb_irq_bits[sb_config->irq])
+				printk(KERN_ERR "PAS16 Warning: Invalid SB IRQ %d\n\n", sb_config->irq);
+			irq_dma = sb_dma_bits[sb_config->dma] |
+				sb_irq_bits[sb_config->irq];
+			pas_write(irq_dma, 0xFB8A);
+		}
+		else
+			pas_write(0x00, 0xF788);
+	}
+#else
+	pas_write(0x00, 0xF788);
+#endif
+	if (!ok)
+		printk(KERN_WARNING "PAS16: Driver not enabled\n");
+	return ok;
+}
+static int detect_pas_hw(struct address_info *hw_config)
+{
+	unsigned char   board_id, foo;
+	/* PAS16 uses a BOATLOAD of IO space... */
+        if (check_region(hw_config->io_base, 4) ||          /* 0x388 */
+	    check_region(hw_config->io_base + 0x400, 4) ||  /* 0x788 */
+	    check_region(hw_config->io_base + 0x800, 4) ||  /* 0xb88 */
+	    check_region(hw_config->io_base + 0xc00, 4) ||  /* 0xf88 */
+	    check_region(hw_config->io_base + 0x1000, 4) || /* 0x1388 */
+	    check_region(hw_config->io_base + 0x1400, 4) || /* 0x1788 */
+	    check_region(hw_config->io_base + 0x1800, 4) || /* 0x1b88 */
+	    check_region(hw_config->io_base + 0x2000, 4) || /* 0x2388 */
+	    check_region(hw_config->io_base + 0x4300, 4) || /* 0x4388 */
+	    check_region(hw_config->io_base + 0x7400, 4) || /* 0x7788 */
+	    check_region(hw_config->io_base + 0x7c00, 4) || /* 0x7f88 */
+	    check_region(hw_config->io_base + 0x8000, 4) || /* 0x8388 */
+	    check_region(hw_config->io_base + 0xbc00, 4) || /* 0xbf88 */
+	    check_region(hw_config->io_base + 0xe000, 4) || /* 0xe388 */
+	    check_region(hw_config->io_base + 0xe800, 4) || /* 0xeb88 */
+	    check_region(hw_config->io_base + 0xec00, 4) || /* 0xef88 */
+	    check_region(hw_config->io_base + 0xf000, 4) || /* 0xf388 */
+	    check_region(hw_config->io_base + 0xf400, 4) || /* 0xf788 */
+	    check_region(hw_config->io_base + 0xf800, 4) || /* 0xfb88 */
+	    check_region(hw_config->io_base + 0xfc00, 4) || /* 0xff88 */
+	    check_region(MASTER_ADDRESS, 1)    /* 0x9A01 */
+	   )
+        {
+#ifdef MODULE
+                printk(KERN_INFO "PAS16: I/O region at %x is in use.\n", hw_config->io_base);
+#endif
+                return 0;
+        }
+	/* Check to see if there is a PAS at the requested base */
+	if(pas_read(INTERRUPT_CONTROL) == 0xff) {
+		printk("PAS16: hardware not found at I/O address %x.\n", hw_config->io_base);
+		return 0;
+	}
+	/*
+	 * WARNING: Setting an option like W:1 or so that disables warm boot reset
+	 * of the card will screw up this detect code something fierce. Adding code
+	 * to handle this means possibly interfering with other cards on the bus if
+	 * you have something on base port 0x388. SO be forewarned.
+	 */
+	outb((0xBC), MASTER_ADDRESS);	/* Activate first board ?? will this fuck it?*/
+	outb((hw_config->io_base >> 2), MASTER_ADDRESS);	/* Set base address */
+	translate_code = 0x388 ^ hw_config->io_base;
+	pas_write(1, WAIT_STATE);	/* Select one wait states */
+	board_id = pas_read(INTERRUPT_CONTROL);
+	if (board_id == 0xff)
+		return 0;
+	/*
+	 * We probably have a PAS-series board, now check for a PAS16-series board
+	 * by trying to change the board revision bits. PAS16-series hardware won't
+	 * let you do this - the bits are read-only.
+	 */
+	foo = board_id ^ 0xe0;
+	pas_write(foo, INTERRUPT_CONTROL);
+	foo = pas_read(INTERRUPT_CONTROL);
+	pas_write(board_id, INTERRUPT_CONTROL);
+	if (board_id != foo)
+		return 0;
+// ?????? pas_read(BOARD_REV_ID)
+	pas_model = pas_read(0xFF88);
+	return pas_model;
+}
+void attach_pas_card(struct address_info *hw_config)
+{
+	pas_irq = hw_config->irq;
+	if (detect_pas_hw(hw_config))
+	{
+		/* Can you say obnoxious? let's just hope no-one types cat /proc/ioports */
+		request_region(hw_config->io_base, 4, pas_model_names[(int) pas_model]);
+        	request_region(hw_config->io_base, 4, pas_model_names[(int) pas_model]);
+		request_region(hw_config->io_base + 0x400, 4, pas_model_names[(int) pas_model]);
+		request_region(hw_config->io_base + 0x800, 4, pas_model_names[(int) pas_model]);
+		request_region(hw_config->io_base + 0xc00, 4, pas_model_names[(int) pas_model]);
+		request_region(hw_config->io_base + 0x1000, 4, pas_model_names[(int) pas_model]);
+		request_region(hw_config->io_base + 0x1400, 4, pas_model_names[(int) pas_model]);
+		request_region(hw_config->io_base + 0x1800, 4, pas_model_names[(int) pas_model]);
+		request_region(hw_config->io_base + 0x2000, 4, pas_model_names[(int) pas_model]);
+		request_region(hw_config->io_base + 0x4300, 4, pas_model_names[(int) pas_model]);
+		request_region(hw_config->io_base + 0x7400, 4, pas_model_names[(int) pas_model]);
+		request_region(hw_config->io_base + 0x7c00, 4, pas_model_names[(int) pas_model]);
+		request_region(hw_config->io_base + 0x8000, 4, pas_model_names[(int) pas_model]);
+		request_region(hw_config->io_base + 0xbc00, 4, pas_model_names[(int) pas_model]);
+		request_region(hw_config->io_base + 0xe000, 4, pas_model_names[(int) pas_model]);
+		request_region(hw_config->io_base + 0xe800, 4, pas_model_names[(int) pas_model]);
+		request_region(hw_config->io_base + 0xec00, 4, pas_model_names[(int) pas_model]);
+		request_region(hw_config->io_base + 0xf000, 4, pas_model_names[(int) pas_model]);
+		request_region(hw_config->io_base + 0xf400, 4, pas_model_names[(int) pas_model]);
+		request_region(hw_config->io_base + 0xf800, 4, pas_model_names[(int) pas_model]);
+		request_region(hw_config->io_base + 0xfc00, 4, pas_model_names[(int) pas_model]);
+		request_region(MASTER_ADDRESS, 1, pas_model_names[(int) pas_model]);
+		if ((pas_model = pas_read(0xFF88)))
+		{
+			char            temp[100];
+			sprintf(temp,
+			    "%s rev %d", pas_model_names[(int) pas_model],
+				    pas_read(0x2789));
+			conf_printf(temp, hw_config);
+		}
+		if (config_pas_hw(hw_config))
+		{
+#ifdef CONFIG_AUDIO
+			pas_pcm_init(hw_config);
+#endif
+#if !defined(DISABLE_SB_EMULATION) && defined(CONFIG_SB)
+			sb_dsp_disable_midi(pas_sb_base);	/* No MIDI capability */
+#endif
+#ifdef CONFIG_MIDI
+			pas_midi_init();
+#endif
+			pas_init_mixer();
+		}
+	}
+}
+int probe_pas(struct address_info *hw_config)
+{
+	return detect_pas_hw(hw_config);
+}
+void unload_pas(struct address_info *hw_config)
+{
+	free_irq(hw_config->irq, NULL);
+	sound_free_dma(hw_config->dma);
+	release_region(hw_config->io_base, 4);
+        release_region(hw_config->io_base, 4);
+	release_region(hw_config->io_base + 0x400, 4);
+	release_region(hw_config->io_base + 0x800, 4);
+	release_region(hw_config->io_base + 0xc00, 4);
+	release_region(hw_config->io_base + 0x1000, 4);
+	release_region(hw_config->io_base + 0x1400, 4);
+	release_region(hw_config->io_base + 0x1800, 4);
+	release_region(hw_config->io_base + 0x2000, 4);
+	release_region(hw_config->io_base + 0x4300, 4);
+	release_region(hw_config->io_base + 0x7400, 4);
+	release_region(hw_config->io_base + 0x7c00, 4);
+	release_region(hw_config->io_base + 0x8000, 4);
+	release_region(hw_config->io_base + 0xbc00, 4);
+	release_region(hw_config->io_base + 0xe000, 4);
+	release_region(hw_config->io_base + 0xe800, 4);
+	release_region(hw_config->io_base + 0xec00, 4);
+	release_region(hw_config->io_base + 0xf000, 4);
+	release_region(hw_config->io_base + 0xf400, 4);
+	release_region(hw_config->io_base + 0xf800, 4);
+	release_region(hw_config->io_base + 0xfc00, 4);
+	release_region(MASTER_ADDRESS, 1);
+	sound_unload_mixerdev(audio_devs[pas_audiodev]->mixer_dev);
+	sound_unload_mididev(pas2_midi_dev);
+	sound_unload_audiodev(pas_audiodev);
+}
+#ifdef MODULE
+int             io = -1;
+int             irq = -1;
+int             dma = -1;
+int             dma16 = -1;	/* Set this for modules that need it */
+int             sb_io = 0;
+int             sb_irq = -1;
+int             sb_dma = -1;
+int             sb_dma16 = -1;
+MODULE_PARM(io,"i");
+MODULE_PARM(irq,"i");
+MODULE_PARM(dma,"i");
+MODULE_PARM(dma16,"i");
+MODULE_PARM(sb_io,"i");
+MODULE_PARM(sb_irq,"i");
+MODULE_PARM(sb_dma,"i");
+MODULE_PARM(sb_dma16,"i");
+MODULE_PARM(joystick,"i");
+MODULE_PARM(symphony,"i");
+MODULE_PARM(broken_bus_clock,"i");
+struct address_info config;
+struct address_info sbhw_config;
+int init_module(void)
+{
+	printk(KERN_INFO "Pro Audio Spectrum driver Copyright (C) by Hannu Savolainen 1993-1996\n");
+	if (io == -1 || dma == -1 || irq == -1)
+	{
+		  printk(KERN_INFO "PAS16: I/O, IRQ, DMA and type are mandatory\n");
+		  return -EINVAL;
+	}
+	config.io_base = io;
+	config.irq = irq;
+	config.dma = dma;
+	config.dma2 = dma16;
+	sbhw_config.io_base = sb_io;
+	sbhw_config.irq = sb_irq;
+	sbhw_config.dma = sb_dma;
+	sbhw_config.dma2 = sb_dma16;
+	if (!probe_pas(&config))
+		return -ENODEV;
+	attach_pas_card(&config);
+	SOUND_LOCK;
+	return 0;
+}
+void cleanup_module(void)
+{
+	unload_pas(&config);
+	SOUND_LOCK_END;
+}
+#endif
+#endif
+/*
+ * pas2.h
+ *
+ * Port definitions and structures relevant to the Pro Audio Spectrum
+ * family of cards.
+ *
+ * Bob McElrath
+ */
+/* Port definitions: */
+#define SYSTEM_SPEAKER_TIMER     0x0042    /* System Speaker Timer Address         */
+#define SYSTEM_TIMER_CONTROL     0x0043    /* System Timer Control Register        */
+#define SYSTEM_SPEAKER           0x0061    /* System Speaker Register              */
+#define JOYSTICK                 0x0201    /* Joystick Register                    */
+#define L_FM_ADDRESS             0x0388    /* Left  FM Address Register            */
+#define L_FM_DATA                0x0389    /* Left  FM Data Register               */
+#define R_FM_ADDRESS             0x038A    /* Right FM Address Register            */
+#define R_FM_DATA                0x038B    /* Right FM Data Register               */
+#define AUX_ADDRESS              0x0788    /* Auxiliary Register                   */
+#define AUX_DATA                 0x0789    /* Auxiliary Register                   */
+#define DUAL_FM_ADDRESS          0x0788    /* Dual  FM Address Register            */
+#define DUAL_FM_DATA             0x0789    /* Dual  FM Data Register               */
+#define PARALLEL_AUDIO_MIXER     0x078B    /* Parallel interface Audio Mixer Reg   */
+/*	output control								*/
+	#define P_M_MIXER_ADDRESS 0x80	/* Parallel mixer addr select		*/
+	#define pmDATASELECT	0x00		/* Parallel mixer data select		*/
+/*	mixer channel programming selection					*/
+	#define pmCHANNELLR	0x00		/* Left/Right channel select		*/
+	#define pmCHANNELL	0x20		/* Left  channel only select		*/
+	#define pmCHANNELR	0x40		/* Right channel only select		*/
+/*	device select								*/
+	#define pmMIXERSELECT	0x10		/* Parallel Mixer device select 	*/
+	#define pmVOLUMESELECT	0x00		/* Parallel Volume device select	*/
+/*	Volume Device selects							*/
+	#define pmVOLUMEA	0x01		/* Left/Right channel select		*/
+	#define pmVOLUMEB	0x02		/* Left/Right channel select		*/
+	#define pmVOLUMEBASS	0x03		/* Left/Right channel select		*/
+	#define pmVOLUMETREB	0x04		/* Left/Right channel select		*/
+	#define pmVOLUMEMODE	0x05		/* Left/Right channel select		*/
+/*	mixer selection 							*/
+	#define pmINPUTMIXER	0x00		/* Mixer-A selection			*/
+	#define pmOUTPUTMIXER	0x20		/* Mixer-B selection			*/
+/*	mixer channel swap							*/
+	#define pmCHSWAP	0x40		/* Mixer channel reroute		*/
+#define AUDIO_MIXER              0x0B88    /* Audio Mixer Control Register         */
+	#define fMImixerbits	0x17		/* mixer control bit fields		*/
+	#define fMIspkrbits	0x40		/* speaker integrator field bits	*/
+	#define bMIdata 	0x01		/* data bit				*/
+	#define bMIclock	0x02		/* clock strobe 			*/
+	#define bMImistrb	0x04		/* mixer output strobe			*/
+	#define bMIna1		0x08		/* not used				*/
+	#define bMIvol		0x10		/* total volume enabled 		*/
+	#define bMIna2		0x20		/* not used				*/
+	#define bMIspkrint	0x40		/* speaker integrator			*/
+	#define bMImonofm	0x80		/* make both FMs mono			*/
+	#define A_M_FM_RESET	0x01 	/* OPL3 FM chip reset			*/
+	#define A_M_PCM_RESET	0x02	/* CODEC (DAC, PCM) reset			*/
+	#define A_M_SB_RESET	0x04	/* SB microprocessor reset		*/
+	#define A_M_MIXER_RESET	0x10	/* MVA508 reset (mixer)			*/
+#define AUDIO_FILTER             0x0B8A    /* Audio Filter Control Register        */
+	#define fFIdatabits	0x1f	/* filter select and decode field bits	*/
+	#define fFImutebits	0x20	/* filter mute field bits		*/
+	#define fFIpcmbits	0xc0	/* filter sample rate field bits	*/
+	#define A_F_MIXER_UNMUTE 	0x20	/* filter mute bit			*/
+	#define A_F_PCM_RATE_TIMER	0x40	/* filter sample rate timer mask	*/
+	#define A_F_PCM_BUFFER_COUNTER	0x80	/* filter sample buffer counter mask	*/
+	#define FILTERMAX	   6	/* six possible settings		*/
+#define INTERRUPT_STATUS         0x0B89    /* Interrupt Control Register           */
+	#define fISints 	0x1f		/* Interrupt bit field			*/
+	#define bISleftfm	0x01		/* Left FM interrupt active		*/
+	#define bISritfm	0x02		/* Right FM interrupt active		*/
+	#define I_S_PCM_RATE_IRQ_PENDING 0x04	/* Sample Rate timer interrupt active	*/
+	#define bISsampbuff	0x08		/* Sample buffer timer interrupt active */
+	#define bISmidi 	0x10		/* MIDI interrupt active		*/
+	#define bISPCMlr	0x20		/* PCM left/right active		*/
+	#define bISActive	0x40		/* Hardware is active (not in reset)	*/
+	#define bISClip 	0x80		/* Sample Clipping has occured		*/
+#define INTERRUPT_CONTROL        0x0B8B    /* Interrupt Control Register           */
+	#define I_C_INTERRUPT_MASK	0x1f	/* interrupt mask field bits		*/
+	#define I_C_REVISION_MASK	0xe0	/* revision mask field bits		*/
+	#define I_C_BOARD_ID_MASK	0xe0	/* Board revision ID field bits 	*/
+	#define I_C_FM_LEFT_IRQ_ENABLE	0x01	/* Left FM interrupt enable		*/
+	#define I_C_FM_RIGHT_IRQ_ENABLE	0x02	/* Right FM interrupt enable		*/
+	#define I_C_PCM_RATE_IRQ_ENABLE	0x04	/* Sample Rate timer interrupt enable	*/
+	#define I_C_PCM_BUFFER_IRQ_ENABLE 0x08	/* Sample buffer timer interrupt enable */
+	#define I_C_MIDI_IRQ_ENABLE 	0x10	/* MIDI interrupt enable		*/
+	#define fICrevrol	0x05		/* rotate rev bits to lsb		*/
+#define PCM_DATA_LO              0x0F88    /* PCM data I/O register                */
+#define PCM_DATA_HI              0x0F89    /* PCM data I/O register                */
+#define CROSS_CHANNEL            0x0F8A    /* Cross Channel Register               */
+	#define fCCcrossbits	0x0f		/* cross channel bit field		*/
+	#define fCCpcmbits	0xf0		/* pcm/dma control bit field		*/
+	#define C_C_MIXER_R2R		0x01	/* CROSSCHANNEL Right to Right		*/
+	#define C_C_MIXER_L2R		0x02	/* CROSSCHANNEL Left  to Right		*/
+	#define C_C_MIXER_R2L		0x04	/* CROSSCHANNEL Right to Left		*/
+	#define C_C_MIXER_L2L		0x08	/* CROSSCHANNEL Left  to Left		*/
+	#define C_C_DAC_MODE		0x10	/* DAC/ADC Control			*/
+	#define C_C_ADC_MODE		0x00	/* DAC/ADC Control			*/
+	#define C_C_MONO	 	0x20	/* PCM Monaural Enable			*/
+	#define bCCenapcm	0x40		/* Enable PCM state machine		*/
+	#define C_C_DMA_ENABLE		0x80	/* Enable DRQ bit			*/
+#define SAMPLE_RATE_TIMER        0x1388    /* (t0) Sample Rate Timer Register      */
+#define SAMPLE_COUNT             0x1389    /* (t1) Sample Count Register           */
+#define SPEAKER_TIMER            0x138A    /* (t2) Local Speaker Timer Address     */
+#define TIMER_CONTROL            0x138B    /* Local Timer Control Register         */
+#define MIDI_IRQR                0x1788    /* MIDI IRQ Vector Register             */
+#define MIDI_SYSTEM_CONTROL      0x1789    /* MIDI System Control Register         */
+#define MIDI_IRQ_STATUS          0x178A    /* MIDI IRQ Status Register             */
+#define MIDI_IRQ_CLEAR           0x178B    /* MIDI IRQ Clear Register              */
+#define MIDI_GROUP4              0x1B88    /* MIDI Group #1 Register (MDGROUP1)    */
+#define MIDI_GROUP5              0x1B89    /* MIDI Group #2 Register (MDGROUP2)    */
+#define MIDI_GROUP6              0x1B8A    /* MIDI Group #3 Register (MDGROUP3)    */
+#define MIDI_GROUP7              0x1B8B    /* MIDI Group #4 Register (MDGROUP4)    */
+	/* Hardware associated with the product 				*/
+#define DEFAULT_BASE	0x0388		/* default base I/O address		*/
+#define ALT_BASE_1	0x0384		/* first alternate address		*/
+#define ALT_BASE_2	0x038C		/* second alternate address		*/
+#define ALT_BASE_3	0x0288		/* third alternate address		*/
+#define USE_ACTIVE_ADDR 0x0000		/* uses what is currently active	*/
+#define DUALFM		1		/* Dual FM chips			*/
+#define DUALMIXER	1		/* Dual mixers				*/
+#define FILTER		1		/* Has filter after input mixer 	*/
+#define VOLUME		1		/* Has total volume control		*/
+#define TEXTVERSIONHI	'01'            /* VERSION 01.00                        */
+#define TEXTVERSIONLO	'00'
+/*										*/
+/* Factory Default Settings							*/
+/*										*/
+#define DEFAULTDMA	0x01		/* DMA channel 1			*/
+#define DEFAULTIRQ	0x07		/* IRQ channel 7			*/
+#define DEFAULTINT	0x65		/* Interrupt # for software interface	*/
+/*										*/
+/* mixer select 								*/
+/*										*/
+#define OUTPUTMIXER	0x00		/* output mixer H/W select		*/
+#define INPUTMIXER	0x40		/* input mixer select			*/
+#define DEFMIXER	-1		/* use last mixer selected		*/
+#define MIXERMAX	0x1f		/* maximum mixer setting		*/
+#define MVVOLUMEMAX	0x3f		/* MVA508 maximum mixer setting 	*/
+#define NSVOLUMEMAX	0x28		/* National maximum mixer setting	*/
+#define EQUALIZERMAX	0x0c		/* maximum equalizer setting		*/
+#define EQUALIZERMID	0x06		/* maximum mid setting			*/
+/*										*/
+/*	 cross channel channel #s						*/
+/*										*/
+#define RIGHT2RIGHT	0x00		/* right to right			*/
+#define LEFT2RIGHT	0x01		/* left  to right			*/
+#define RIGHT2LEFT	0x02		/* right to left			*/
+#define LEFT2LEFT	0x03		/* left  to left			*/
+/*										*/
+/* left/right mixer channel selection						*/
+/*										*/
+/*	left channel values							*/
+#define L_LEFTFM	0x01
+#define L_IMIXER	0x02
+#define L_EXT		0x03
+#define L_INT		0x04
+#define L_MIC		0x05
+#define L_PCM		0x06
+#define L_SPEAKER	0x07
+#define L_FREE		0x00
+#define L_SBDAC         0x00
+/*	right channel values							*/
+#define R_RIGHTFM	0x08
+#define R_IMIXER	0x09
+#define R_EXT		0x0A
+#define R_INT		0x0B
+#define R_MIC		0x0C
+#define R_PCM		0x0D
+#define R_SPEAKER	0x0E
+#define R_FREE		0x0F
+#define R_SBDAC 	0x0F
+/*	Volume control channel #s						*/
+#define VOLMUTE 	0x40		/* MUTE button				*/
+#define VOLLOUDENH	0x41		/* LOUDNESS and ENHANCED STEREO switch	*/
+#define VOLBASS 	0x42		/* BASS level setting			*/
+#define VOLTREBLE	0x43		/* TREBLE level setting 		*/
+#define VOLLEFT 	0x44		/* MASTER LEFT LEVEL settting		*/
+#define VOLRIGHT	0x45		/* MASTER RIGHT LEVEL settting		*/
+#define VOLMODE 	0x46		/* Model Select Left/Stereo/Right	*/
+#define bVOLEbass	0x01		/* enhanced bass bit			*/
+#define bVOLEstereo	0x02		/* enhanced stereo bit			*/
+/*	int 2F application ID codes						*/
+#define INT2FCODE1	0x00BC		/* Bryan's initials                     */
+/*	int 2F ID (func 0) return register values				*/
+#define INT2FREGBX	0x6D00		/* 'm '                                 */
+#define INT2FREGCX	0x0076		/* ' v'                                 */
+#define INT2FREGDX	0x2020		/* UPPERCASE XOR MASK			*/
+/* hardware specific equates for the PAS2/CDPC (digital ASIC)			*/
+#define MASTER_ADDRESS	0x9A01		/* Master Address Pointer    (w)	*/
+#define MIDIPRESCALE	0x1788		/* MIDI prescale	     (r/w)	*/
+#define MIDITIMER	0x1789		/* MIDI Timer		     (r/w)	*/
+#define MIDIDATA	0x178A		/* MIDI Data		     (r/w)	*/
+#define MIDICONTROL	0x178B		/* MIDI Control 	     (r/w)	*/
+#define MIDISTATUS	0x1B88		/* MIDI Status		     (r/w)	*/
+#define MIDIFIFOS	0x1B89		/* MIDI Fifo Status	     (r/w)	*/
+#define MIDICOMPARE	0x1B8A		/* MIDI Compare Time	     (r/w)	*/
+#define MIDITEST	0x1B8B		/* MIDI Test		     (w)	*/
+#define MASTERCHIPR	0xFF88		/* Master Chip Rev	     (r)	*/
+#define SLAVECHIPR	0xEF88		/* Slave Chip Rev	     (r)	*/
+#define FAKE_WARM_BOOT	0x7789		/* Get the card to fake a warm boot (w) */
+#define ENHANCEDSCSI	0x7f89		/* Enhanced SCSI detect port		*/
+#define SYSTEM_CONFIG_1      0x8388          /* System Config 1           (r/w)      */
+	#define S_C_1_PC_SPKR_ENABLE 0x01	/* shadow enable			*/
+	#define bSC1pcmemu	0x02		/* PCM Emulation of PAS1		*/
+	#define S_C_1_FM_EMULATE_CLOCK 0x04	/* 28mhz clock divisor			*/
+	#define bSC1invcom	0x08		/* invert COM port interrupt input	*/
+	#define S_C_1_PC_SPKR_STEREO 0x10	/* stereoize pc speaker 		*/
+	#define S_C_1_PC_SPKR_REALSOUND	0x20	/* smart real sound emulatio		*/
+	#define bSC1d6		0x40
+	#define bSC1mstrst	0x80		/* master chip reset			*/
+#define SYSTEM_CONFIG_2	0x8389		/* System Config 2	     (r/w)	*/
+	#define bSC2ovrsmp	0x03		/* oversampling 0,1,2,4 		*/
+	#define bSC216bit	0x04		/* 16 bit audio 			*/
+	#define bSC212bit	0x08		/* 12 bit interleaving (d2 must be set) */
+	#define bSC2msbinv	0x10		/* invert MSB from standard method	*/
+	#define bSC2slavport	0x60		/* slave port bits			*/
+	#define bSC2vcolock	0x80		/* VCO locked (Sample Rate Clock Valid) */
+#define SYSTEM_CONFIG_3	0x838A		/* System Config 3	     (r/w)	*/
+	#define bSC328mhzfil	0x01		/* PCM Rate uses 28mhz			*/
+	#define bSC31mhzsb	0x02		/* 1mhz timer for SB sample rate	*/
+	#define bSC3vcoinv	0x04		/* invert VCO output			*/
+	#define S_C_3_INVERT_BCLK	0x08	/* invert BCLK form 16 bit DAC		*/
+	#define S_C_3_SYNC_PULSE	0x10	/* 0=L/R, 1 = Sync Pulse		*/
+	#define bSC3d5		0x20
+	#define bSC3d6		0x40
+	#define bSC3d7		0x80
+#define SYSTEM_CONFIG_4	0x838B		/* System Config 4	     (r/w)	*/
+#define IO_CONFIGURATION_1	0xF388		/* I/O Config 1 	     (r/w)	*/
+	#define I_C_1_PS2_ENABLE	0x01	/* Enable Chip (PS2 only)		*/
+	#define bIC1comdcd	0x06		/* COM port decode pointer		*/
+	#define bIC1comint	0x38		/* COM port interrupt pointer		*/
+	#define bIC1joyena	0x40		/* Enable joystick read 		*/
+	#define I_C_1_BOOT_RESET_ENABLE	0x80	/* Enable warm boot reset		*/
+#define IO_CONFIGURATION_2	0xF389		/* I/O Config 2 	     (r/w)	*/
+	#define bIC2dmaptr	0x03		/* DMA channel select			*/
+	#define bIC28dmaptr	0x0f		/*  8 bit DMA channel select		*/
+	#define bIC216dmaptr	0xf0		/* 16 bit DMA channel select		*/
+#define IO_CONFIGURATION_3	0xF38A		/* I/O Config 3 	     (r/w)	*/
+	#define I_C_3_PCM_IRQ_MASK	0x0f	/* pcm IRQ channel select		*/
+	#define I_C_3_CD_IRQ_MASK	0xf0	/* cd  IRQ channel select		*/
+#define IO_CONFIGURATION_4	0xF38B		/* I/O Config 4 	     (r/w)	*/
+#define COMPATREGE	0xF788		/* Compatible Rgister Enable (r/w)	*/
+#define EMULADDRP	0xF789		/* Emulation Address Pointer (r/w)	*/
+#define WAIT_STATE	0xBF88		/* Wait State		     (r/w)	*/
+#define PUSHBUTTON	0xE388		/* Push Button (slave)	     (???)	*/
+#define AXUINTSTAT	0xE38A		/* Aux Int Status	     (???)	*/
+#define AUXINTENA	0xE38B		/* Aux Int Enable	     (???)	*/
+#define OVER_SAMPLE_PRESCALE	0xBF8A	/* Over Sample Prescale      (r/w)	*/
+#define ANALSERD	0xBF89		/* Analog Chip Serial Data   (w)	*/
+#define MASTERMODRD	0xFF8B		/* Master Mode Read	     (r)	*/
+#define SLAVEMODRD	0xEF8B		/* Slave Mode Read	     (r)	*/
+#define INTWATCHDOG	0xFB8B		/* Interrupt Watch Dog	     (???)	*/
+#define MASTERuPDATA	0xFB88		/* Master uP Data	     (???)	*/
+#define MASTERuPCMD	0xFB89		/* Master uP Command/Status  (???)	*/
+#define MASTERuPRST	0xFB8A		/* Master uP Restart	     (???)	*/
+#define SLAVEuPDATA	0xEB88		/* Slave uP Data	     (???)	*/
+#define SLAVEuPCMD	0xEB88		/* Slave uP Command/Status   (???)	*/
+#define SLAVEuPRST	0xEB88		/* Slave uP Restart	     (???)	*/
+#define CDTOCOUNTER	0x4388		/* CD-ROM timeout counter    (r/w)	*/
+#define CDTOSTAT	0x4389		/* CD-ROM timeout status     (r/w)	*/
+#define LEFTVURD	0x2388		/* Left VU Read 	     (r)	*/
+#define RITVURD 	0x2389		/* Right VU Read	     (r)	*/
+#define SBRST		0x0206		/* SB Reset		     (w)	*/
+#define SBDATA		0x020A		/* SB Data Read 	     (r)	*/
+#define SBCMD		0x020C		/* SB CMD Write/Status Read  (r/w)	*/
+#define SBSTAT		0x020E		/* SB Data Status	     (r)	*/
+#define MPUDATA 	0x0300		/* MPU-401 data reg	     (r/w)	*/
+#define MPUCMD		0x0301		/* MPU-401 command reg	     (r/w)	*/
+/* Sys Config 4 								*/
+#define bSC4drqahi	0x01		/* DRQ from drive active high		*/
+#define bSC4dackahi	0x02		/* DRQ from drive active high		*/
+#define bSC4intahi	0x04		/* INT from drive active high		*/
+#define bSC4drqvalid	0x08		/* DRQ line valid from drive		*/
+#define bSC4comena	0x10		/* enable COM interrupt 		*/
+#define bSC4enascsi	0x20		/* enable SCSI interrupt		*/
+#define bSC4drqptr	0xc0		/* DRQ timing pointer bits		*/
+/* Compatibility Register							*/
+#define cpMPUEmulation	0x01		/* MPU emuation is on bit		*/
+#define cpSBEmulation	0x02		/* SB emuation is on bit		*/
+/* Emulation Address Pointer							*/
+#define epSBptr 	0x0F		/* bit field for SB emulation		*/
+#define epMPUptr	0xF0		/* bit field for MPU emulation		*/
+/* Slave Mode Read								*/
+#define bSMRDdrvtyp	0x03		/* drive interface type 		*/
+#define bSMRDfmtyp	0x04		/* FM chip type 			*/
+#define bSMRDdactyp	0x08		/* 16 bit dac (1) or 8 bit dac (0)	*/
+#define bSMRDimidi	0x10		/* use internal MIDI			*/
+#define bSMRDswrep	0x80		/* switch is auto repeating		*/
+/* Master Mode Read								*/
+#define bMMRDatps2	0x01		/* AT(1) or PS2(0) bus			*/
+#define bMMRDtmremu	0x02		/* timer emulation enabled		*/
+#define bMMRDmsmd	0x04		/* master/slave mode			*/
+#define bMMRDslave	0x08		/* slave power on or device present	*/
+#define bMMRDattim	0x10		/* xt/at timing 			*/
+#define bMMRDmstrev	0xe0		/* master  rev level			*/
+/* MIDI Control Register							*/
+#define bMCRenatstmp	0x01		/* MIDI enable time stamp interrupt	*/
+#define bMCRenacmptm	0x02		/* MIDI enable compare time interrupt	*/
+#define bMCRenafifoi	0x04		/* MIDI enable FIFO input interrupt	*/
+#define bMCRenafifoo	0x08		/* MIDI enable FIFO output interrupt	*/
+#define bMCRenafifooh	0x10		/* MIDI enable FIFO output half int	*/
+#define bMCRrstfifoi	0x20		/* MIDI reset Input FIFO pointer	*/
+#define bMCRrstfifoo	0x40		/* MIDI reset Output FIFO pointer	*/
+#define bMCRechoio	0x80		/* MIDI echo input to output (THRU)	*/
+/* MIDI Status Register 							*/
+#define bMSRtimstamp	0x01		/* MIDI time stamp interrupt		*/
+#define bMSRcmptime	0x02		/* MIDI compare time interrupt		*/
+#define bMSRififo	0x04		/* MIDI input FIFO data avail interrupt */
+#define bMSRofifo	0x08		/* MIDI output FIFO empty interrupt	*/
+#define bMSRofifohalf	0x10		/* MIDI output FIFO half empty interrupt*/
+#define bMSRififoovr	0x20		/* MIDI input FIFO overrun error	*/
+#define bMSRofifoovr	0x40		/* MIDI output FIFO overrun error	*/
+#define bMSRframeerr	0x80		/* MIDI frame error			*/
+/* MIDI FIFO count								*/
+#define bMFCififo	0x0F		/* MIDI input FIFO count		*/
+#define bMFCofifo	0xF0		/* MIDI output FIFO count		*/
+/* Aux interrupt status/enable                                                  */
+#define bAUfmrit	0x01		/* FM right interrupt			*/
+#define bAUpushb	0x02		/* push button active			*/
+#define bAUslavecpu	0x04		/* slave coprocessor			*/
+#define bAUaux0int	0x08		/* aux 0 interrupt			*/
+#define bAUaux1int	0x10		/* aux 1 interrupt			*/
+#define bAUaux2int	0x20		/* aux 2 interrupt			*/
+#define bAUaux3int	0x40		/* aux 3 interrupt			*/
+#define bAUmastrcpu	0x80		/* master coprocessor or emulation activ*/
+/* Push Buttons on the Front Panel						*/
+#define bPSHuparrow	0x01		/* up arrow on the front panel		*/
+#define bPSHdnarrow	0x02		/* down arrow on the front panel	*/
+#define bPSHmute	0x04		/* mute on the front panel		*/
+#define bPSauxbit1	0x08		/* unused bit...			*/
+#define bPSauxbit2	0x10		/* unused bit...			*/
+#define bPSauxbit3	0x20		/* unused bit...			*/
+#define bPSauxbit4	0x40		/* unused bit...			*/
+#define bPSauxbit5	0x80		/* unused bit...			*/
+/*--------------------------====< PC HARDWARE >====--------------------------*/
+/* Interrupt Controller #1 Port Addresses and Interrupt Masks			*/
+#define IRQ1MASKREG	0x21		/* 8259 mask register			*/
+#define IRQ1ACKREG	0x20		/* 8259 INT acknowledge register	*/
+#define INT0MSK 	0x01		/* interrupt 0 mask			*/
+#define INT1MSK 	0x02		/* interrupt 1 mask			*/
+#define INT2MSK 	0x04		/* interrupt 2 mask			*/
+#define INT3MSK 	0x08		/* interrupt 3 mask			*/
+#define INT4MSK 	0x10		/* interrupt 4 mask			*/
+#define INT5MSK 	0x20		/* interrupt 5 mask			*/
+#define INT6MSK 	0x40		/* interrupt 6 mask			*/
+#define INT7MSK 	0x80		/* interrupt 7 mask			*/
+/* Interrupt Controller #2 Port Addresses and Interrupt Masks			*/
+#define IRQ2MASKREG	0xA1		/* 8259 mask register			*/
+#define IRQ2ACKREG	0xA0		/* 8259 INT acknowledge register	*/
+#define INT8MSK 	0x01		/* interrupt 8 mask			*/
+#define INT9MSK 	0x02		/* interrupt 9 mask			*/
+#define INTAMSK 	0x04		/* interrupt A mask			*/
+#define INTBMSK 	0x08		/* interrupt B mask			*/
+#define INTCMSK 	0x10		/* interrupt C mask			*/
+#define INTDMSK 	0x20		/* interrupt D mask			*/
+#define INTEMSK 	0x40		/* interrupt E mask			*/
+#define INTFMSK 	0x80		/* interrupt F mask			*/
+#define EOI		020h		/* non specific end of interrupt	*/
+/* dma controller #1 port addresses						*/
+#define DMAC0ADDR	0x00		/* DMA channel 0 Base & Address 	*/
+#define DMAC0COUNT	0x01		/* DMA channel 0 Base & Count		*/
+#define DMAC1ADDR	0x02		/* DMA channel 1 Base & Address 	*/
+#define DMAC1COUNT	0x03		/* DMA channel 1 Base & Count		*/
+#define DMAC2ADDR	0x04		/* DMA channel 2 Base & Address 	*/
+#define DMAC2COUNT	0x05		/* DMA channel 2 Base & Count		*/
+#define DMAC3ADDR	0x06		/* DMA channel 3 Base & Address 	*/
+#define DMAC3COUNT	0x07		/* DMA channel 3 Base & Count		*/
+#define DMA2C4ADDR	0xC0		/* DMA channel 4 Base & Current Address */
+#define DMA2C4COUNT	0xC2		/* DMA channel 4 Base & Current Count	*/
+#define DMA2C5ADDR	0xC4		/* DMA channel 5 Base & Current Address */
+#define DMA2C5COUNT	0xC6		/* DMA channel 5 Base & Current Count	*/
+#define DMA2C6ADDR	0xC8		/* DMA channel 6 Base & Current Address */
+#define DMA2C6COUNT	0xCA		/* DMA channel 6 Base & Current Count	*/
+#define DMA2C7ADDR	0xCC		/* DMA channel 7 Base & Current Address */
+#define DMA2C7COUNT	0xCE		/* DMA channel 7 Base & Current Count	*/
+#define DMARDSTAT	0x08		/* DMA read status			*/
+#define DMAWRCNTRL	0x08		/* DMA write command register		*/
+#define DMAWREQ 	0x09		/* DMA write request register		*/
+#define DMAWRSMR	0x0A		/* DMA write single mask reg.		*/
+#define DMAWRMODE	0x0B		/* DMA write mode register		*/
+#define DMACLEAR	0x0C		/* DMA clear low/high flip-flop 	*/
+#define DMARDTEMP	0x0D		/* DMA read temp register		*/
+#define DMAWRCLR	0x0D		/* DMA write master clear		*/
+#define DMACLRMSK	0x0E		/* DMA clear mask register		*/
+#define DMAWRALL	0x0F		/* DMA write all mask reg. bits 	*/
+#define DMA2RDSTAT	0xD0		/* DMA read status			*/
+#define DMA2WRCNTRL	0xD0		/* DMA write command register		*/
+#define DMA2WREQ	0xD2		/* DMA write request register		*/
+#define DMA2WRSMR	0xD4		/* DMA write single mask register	*/
+#define DMA2WRMODE	0xD6		/* DMA write mode register		*/
+#define DMA2CLEAR	0xD8		/* DMA clear low/high flip-flop 	*/
+#define DMA2RDTEMP	0xDA		/* DMA read temp register		*/
+#define DMA2WRCLR	0xDA		/* DMA write master clear		*/
+#define DMA2CLRMSK	0xDC		/* DMA clear mask register		*/
+#define DMA2WRALL	0xDE		/* DMA write all mask register bits	*/
+#define CH0PAGEREG	0x87		/* Channel 0 Page Register		*/
+#define CH1PAGEREG	0x83		/* Channel 1 Page Register		*/
+#define CH2PAGEREG	0x81		/* Channel 2 Page Register		*/
+#define CH3PAGEREG	0x82		/* Channel 3 Page Register		*/
+#define CH5PAGEREG	0x8B		/* Channel 5 Page Register		*/
+#define CH6PAGEREG	0x89		/* Channel 6 Page Register		*/
+#define CH7PAGEREG	0x8A		/* Channel 7 Page Register		*/

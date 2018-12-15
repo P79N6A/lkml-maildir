@@ -1,0 +1,391 @@
+Date: Sun, 26 Jan 2003 15:58:31 -0500
+From: Willem Riede <>
+Subject: [PATCH] Update to ide-scsi error handling
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2003/1/26/62
+
+One of my ATAPI drives developed a real dislike to 2.5.55 and above, which gave
+me plenty of opportunity to improve ide-scsi's error handling :-) .
+To handle ide device resets and be able to wait for them in the scsi context, I 
+have changed ide_do_reset and friends in drivers/ide/ide-iops.c to set the busy 
+flag on the hwgroup while the reset is in progress.
+I noticed, that ide-scsi didn't consistently use the printk priorities, so I
+touched that up while I was at it.
+The resulting changes (also attached as two separate files - I expect different
+owners will have to apply them - ide-iops is a prerequisite for the ide-scsi 
+patch to work):
+--- drivers/ide/ide-iops.c.l2559	2003-01-16 21:22:00.000000000 -0500
++++ drivers/ide/ide-iops.c	2003-01-25 08:50:29.000000000 -0500
+@@ -986,6 +986,7 @@
+ 	}
+ 	/* done polling */
+ 	hwgroup->poll_timeout = 0;
++	hwgroup->busy--;
+ 	return ide_stopped;
+ }
+ 
+@@ -1005,6 +1006,7 @@
+ 		if (hwif->reset_poll(drive)) {
+ 			printk(KERN_ERR "%s: host reset_poll failure for %s.\n",
+ 				hwif->name, drive->name);
++			hwgroup->busy--;
+ 			return ide_stopped;
+ 		}
+ 	}
+@@ -1050,6 +1052,7 @@
+ 		}
+ 	}
+ 	hwgroup->poll_timeout = 0;	/* done polling */
++	hwgroup->busy--;
+ 	return ide_stopped;
+ }
+ 
+@@ -1135,6 +1138,7 @@
+ #if OK_TO_RESET_CONTROLLER
+ 	if (!IDE_CONTROL_REG) {
+ 		local_irq_restore(flags);
++		hwgroup->busy--;
+ 		return ide_stopped;
+ 	}
+ 
+@@ -1217,6 +1221,7 @@
+ 	u8 unmask	= drive->unmask;
+ # endif
+ 
++	HWGROUP(drive)->busy++;
+ 	if (HWGROUP(drive)->handler != NULL) {
+ 		unsigned long flags;
+ 		spin_lock_irqsave(&ide_lock, flags);
+--- drivers/scsi/ide-scsi.c.l2559	2003-01-16 21:22:22.000000000 -0500
++++ drivers/scsi/ide-scsi.c	2003-01-26 10:55:08.000000000 -0500
+@@ -29,9 +29,10 @@
+  * Ver 0.9   Jul 04 99   Fix a bug in SG_SET_TRANSFORM.
+  * Ver 0.91  Jun 10 02   Fix "off by one" error in transforms
+  * Ver 0.92  Dec 31 02   Implement new SCSI mid level API
++ * Ver 0.93  Jan 26 03   Improved error handler.
+  */
+ 
+-#define IDESCSI_VERSION "0.92"
++#define IDESCSI_VERSION "0.93"
+ 
+ #include <linux/module.h>
+ #include <linux/config.h>
+@@ -54,7 +55,9 @@
+ #include "hosts.h"
+ #include <scsi/sg.h>
+ 
+-#define IDESCSI_DEBUG_LOG		0
++#define IDESCSI_DEBUG_LOG	0
++#define IDESCSI_DEBUG		KERN_NOTICE
++#define IDESCSI_LOG		KERN_INFO
+ 
+ typedef struct idescsi_pc_s {
+ 	u8 c[12];				/* Actual packet bytes */
+@@ -260,7 +263,7 @@
+ 	printk("]\n");
+ }
+ 
+-static int idescsi_check_condition(ide_drive_t *drive, struct request *failed_command)
++static int idescsi_check_condition(ide_drive_t *drive, idescsi_pc_t *failed_command)
+ {
+ 	idescsi_scsi_t *scsi = drive->driver_data;
+ 	idescsi_pc_t   *pc;
+@@ -288,10 +291,10 @@
+ 	rq->flags = REQ_SENSE;
+ 	pc->timeout = jiffies + WAIT_READY;
+ 	/* NOTE! Save the failed packet command in "rq->buffer" */
+-	rq->buffer = (void *) failed_command->special;
+-	pc->scsi_cmd = ((idescsi_pc_t *) failed_command->special)->scsi_cmd;
++	rq->buffer = (void *) failed_command;
++	pc->scsi_cmd = failed_command->scsi_cmd;
+ 	if (test_bit(IDESCSI_LOG_CMD, &scsi->log)) {
+-		printk ("ide-scsi: %s: queue cmd = ", drive->name);
++		printk (IDESCSI_LOG "ide-scsi: %s: queue cmd = ", drive->name);
+ 		hexdump(pc->c, 6);
+ 	}
+ 	return ide_do_drive_cmd(drive, rq, ide_preempt);
+@@ -302,7 +305,11 @@
+ 	idescsi_scsi_t *scsi = drive->driver_data;
+ 	struct request *rq = HWGROUP(drive)->rq;
+ 	idescsi_pc_t *pc = (idescsi_pc_t *) rq->special;
++#if IDESCSI_DEBUG_LOG
++	int log = 1;
++#else
+ 	int log = test_bit(IDESCSI_LOG_CMD, &scsi->log);
++#endif
+ 	struct Scsi_Host *host;
+ 	u8 *scsi_buf;
+ 	unsigned long flags;
+@@ -315,7 +322,8 @@
+ 	if (rq->flags & REQ_SENSE) {
+ 		idescsi_pc_t *opc = (idescsi_pc_t *) rq->buffer;
+ 		if (log) {
+-			printk ("ide-scsi: %s: wrap up check %lu, rst = ", drive->name, opc->scsi_cmd->serial_number);
++			printk (IDESCSI_LOG "ide-scsi: %s: wrap up check %lu, rst = ",
++				       	drive->name, opc->scsi_cmd->serial_number);
+ 			hexdump(pc->buffer,16);
+ 		}
+ 		memcpy((void *) opc->scsi_cmd->sense_buffer, pc->buffer, SCSI_SENSE_BUFFERSIZE);
+@@ -328,11 +336,13 @@
+ 	} else if (rq->errors >= ERROR_MAX) {
+ 		pc->scsi_cmd->result = DID_ERROR << 16;
+ 		if (log)
+-			printk ("ide-scsi: %s: I/O error for %lu\n", drive->name, pc->scsi_cmd->serial_number);
++			printk (IDESCSI_LOG "ide-scsi: %s: I/O error for %lu\n",
++				       	drive->name, pc->scsi_cmd->serial_number);
+ 	} else if (rq->errors) {
+ 		if (log)
+-			printk ("ide-scsi: %s: check condition for %lu\n", drive->name, pc->scsi_cmd->serial_number);
+-		if (!idescsi_check_condition(drive, rq))
++			printk (IDESCSI_LOG "ide-scsi: %s: check condition for %lu\n",
++				       	drive->name, pc->scsi_cmd->serial_number);
++		if (!idescsi_check_condition(drive, pc))
+ 			/* we started a request sense, so we'll be back, exit for now */
+ 			return 0;
+ 		pc->scsi_cmd->result = (CHECK_CONDITION << 1) | (DID_OK << 16);
+@@ -340,7 +350,7 @@
+ 		pc->scsi_cmd->result = DID_OK << 16;
+ 		idescsi_transform_pc2 (drive, pc);
+ 		if (log) {
+-			printk ("ide-scsi: %s: suc %lu", drive->name, pc->scsi_cmd->serial_number);
++			printk (IDESCSI_LOG "ide-scsi: %s: suc %lu", drive->name, pc->scsi_cmd->serial_number);
+ 			if (!test_bit(PC_WRITING, &pc->flags) && pc->actually_transferred && pc->actually_transferred <= 1024 && pc->buffer) {
+ 				printk(", rst = ");
+ 				scsi_buf = pc->scsi_cmd->request_buffer;
+@@ -380,12 +390,12 @@
+ 	unsigned int temp;
+ 
+ #if IDESCSI_DEBUG_LOG
+-	printk (KERN_INFO "ide-scsi: Reached idescsi_pc_intr interrupt handler\n");
++	printk (IDESCSI_DEBUG "ide-scsi: Reached idescsi_pc_intr interrupt handler\n");
+ #endif /* IDESCSI_DEBUG_LOG */
+ 
+ 	if (test_and_clear_bit (PC_DMA_IN_PROGRESS, &pc->flags)) {
+ #if IDESCSI_DEBUG_LOG
+-		printk ("ide-scsi: %s: DMA complete\n", drive->name);
++		printk (IDESCSI_DEBUG "ide-scsi: %s: DMA complete\n", drive->name);
+ #endif /* IDESCSI_DEBUG_LOG */
+ 		pc->actually_transferred=pc->request_transfer;
+ 		(void) HWIF(drive)->ide_dma_end(drive);
+@@ -398,7 +408,7 @@
+ 	if (!status.b.drq) {
+ 		/* No more interrupts */
+ 		if (test_bit(IDESCSI_LOG_CMD, &scsi->log))
+-			printk (KERN_INFO "Packet command completed, %d bytes transferred\n", pc->actually_transferred);
++			printk (IDESCSI_LOG "Packet command completed, %d bytes transferred\n", pc->actually_transferred);
+ 		local_irq_enable();
+ 		if (status.b.check)
+ 			rq->errors++;
+@@ -436,7 +446,7 @@
+ 				return ide_started;
+ 			}
+ #if IDESCSI_DEBUG_LOG
+-			printk (KERN_NOTICE "ide-scsi: The scsi wants to send us more data than expected - allowing transfer\n");
++			printk (IDESCSI_DEBUG "ide-scsi: The scsi wants to send us more data than expected - allowing transfer\n");
+ #endif /* IDESCSI_DEBUG_LOG */
+ 		}
+ 	}
+@@ -543,8 +553,10 @@
+ static ide_startstop_t idescsi_do_request (ide_drive_t *drive, struct request *rq, sector_t block)
+ {
+ #if IDESCSI_DEBUG_LOG
+-	printk (KERN_INFO "rq_status: %d, dev: %s, cmd: %x, errors: %d\n",rq->rq_status, rq->rq_disk->disk_name,rq->cmd[0],rq->errors);
+-	printk (KERN_INFO "sector: %ld, nr_sectors: %ld, current_nr_sectors: %d\n",rq->sector,rq->nr_sectors,rq->current_nr_sectors);
++	printk (IDESCSI_DEBUG "rq_status: %d, dev: %s, cmd: %x, errors: %d\n",
++			rq->rq_status, rq->rq_disk->disk_name,rq->cmd[0],rq->errors);
++	printk (IDESCSI_DEBUG "sector: %ld, nr_sectors: %ld, current_nr_sectors: %d\n",
++			rq->sector,rq->nr_sectors,rq->current_nr_sectors);
+ #endif /* IDESCSI_DEBUG_LOG */
+ 
+ 	if (rq->flags & (REQ_SPECIAL|REQ_SENSE)) {
+@@ -763,7 +775,8 @@
+ 		if ((first_bh = bh = idescsi_kmalloc_bio (segments)) == NULL)
+ 			return NULL;
+ #if IDESCSI_DEBUG_LOG
+-		printk ("ide-scsi: %s: building DMA table, %d segments, %dkB total\n", drive->name, segments, pc->request_transfer >> 10);
++		printk (IDESCSI_DEBUG "ide-scsi: %s: building DMA table, %d segments, %dkB total\n",
++			       	drive->name, segments, pc->request_transfer >> 10);
+ #endif /* IDESCSI_DEBUG_LOG */
+ 		while (segments--) {
+ 			bh->bi_io_vec[0].bv_page = sg->page;
+@@ -777,7 +790,8 @@
+ 		if ((first_bh = bh = idescsi_kmalloc_bio (1)) == NULL)
+ 			return NULL;
+ #if IDESCSI_DEBUG_LOG
+-		printk ("ide-scsi: %s: building DMA table for a single buffer (%dkB)\n", drive->name, pc->request_transfer >> 10);
++		printk (IDESCSI_DEBUG "ide-scsi: %s: building DMA table for a single buffer (%dkB)\n",
++			       	drive->name, pc->request_transfer >> 10);
+ #endif /* IDESCSI_DEBUG_LOG */
+ 		bh->bi_io_vec[0].bv_page = virt_to_page(pc->scsi_cmd->request_buffer);
+ 		bh->bi_io_vec[0].bv_len = pc->request_transfer;
+@@ -841,10 +855,10 @@
+ 	idescsi_transform_pc1 (drive, pc);
+ 
+ 	if (test_bit(IDESCSI_LOG_CMD, &scsi->log)) {
+-		printk ("ide-scsi: %s: que %lu, cmd = ", drive->name, cmd->serial_number);
++		printk (IDESCSI_LOG "ide-scsi: %s: que %lu, cmd = ", drive->name, cmd->serial_number);
+ 		hexdump(cmd->cmnd, cmd->cmd_len);
+ 		if (memcmp(pc->c, cmd->cmnd, cmd->cmd_len)) {
+-			printk ("ide-scsi: %s: que %lu, tsl = ", drive->name, cmd->serial_number);
++			printk (IDESCSI_LOG "ide-scsi: %s: que %lu, tsl = ", drive->name, cmd->serial_number);
+ 			hexdump(pc->c, 12);
+ 		}
+ 	}
+@@ -867,62 +881,115 @@
+ 
+ int idescsi_abort (Scsi_Cmnd *cmd)
+ {
+-	int countdown = 8;
++	int countdown = 120;	/* maximum is 12 seconds because ide interrupt timeout is 10 sec. */
+ 	unsigned long flags;
+ 	ide_drive_t *drive = idescsi_drives[cmd->target];
+ 	idescsi_scsi_t *scsi;
+ 
+-	printk (KERN_ERR "ide-scsi: abort called for %lu\n", cmd->serial_number);
+-	if (drive && (scsi = drive->driver_data))
+-		while (countdown--) {
+-			/* is cmd active?
+-			 *  need to lock so this stuff doesn't change under us */
+-			spin_lock_irqsave(&ide_lock, flags);
+-			if (scsi->pc && scsi->pc->scsi_cmd && 
+-					scsi->pc->scsi_cmd->serial_number == cmd->serial_number) {
+-				/* yep - let's give it some more time - 
+-				 * we can do that, we're in _our_ error kernel thread */
+-				spin_unlock_irqrestore(&ide_lock, flags);
+-				scsi_sleep(HZ);
+-				continue;
+-			}
+-			/* no, but is it queued in the ide subsystem? */
+-			if (elv_queue_empty(&drive->queue)) {
+-				spin_unlock_irqrestore(&ide_lock, flags);
+-				return SUCCESS;
+-			}
++	if (!drive || !(scsi = drive->driver_data))
++		return FAILED;
++#if IDESCSI_DEBUG_LOG
++	if (1)
++#else
++	if (test_bit(IDESCSI_LOG_CMD, &scsi->log))
++#endif
++		printk (IDESCSI_LOG "ide-scsi: abort called for %lu\n", cmd->serial_number);
++
++	spin_unlock_irq(cmd->host->host_lock);
++	while (countdown--) {
++		/* is cmd active?
++		 * need to lock so this stuff doesn't change under us */
++		spin_lock_irqsave(&ide_lock, flags);
++		if (scsi->pc && scsi->pc->scsi_cmd && 
++				scsi->pc->scsi_cmd->serial_number == cmd->serial_number) {
++			/* yep - let's give it some more time - 
++			 * we can do that, we're in _our_ error kernel thread */
+ 			spin_unlock_irqrestore(&ide_lock, flags);
++			set_current_state(TASK_INTERRUPTIBLE);
+ 			schedule_timeout(HZ/10);
++			continue;
+ 		}
++		/* no, but is it queued in the ide subsystem? */
++		if (elv_queue_empty(&drive->queue)) {
++			spin_unlock_irqrestore(&ide_lock, flags);
++			spin_lock_irq(cmd->host->host_lock);
++			return SUCCESS;
++		}
++		spin_unlock_irqrestore(&ide_lock, flags);
++		set_current_state(TASK_INTERRUPTIBLE);
++		schedule_timeout(HZ/10);
++	}
++	spin_lock_irq(cmd->host->host_lock);
+ 	return FAILED;
+ }
+ 
+ int idescsi_reset (Scsi_Cmnd *cmd)
+ {
++	int countdown = 8; 
+ 	unsigned long flags;
+ 	struct request *req;
+ 	ide_drive_t *drive = idescsi_drives[cmd->target];
+-
+-	printk (KERN_ERR "ide-scsi: reset called for %lu\n", cmd->serial_number);
++	idescsi_scsi_t *scsi;
++#if IDESCSI_DEBUG_LOG
++	int log = 1;
++#else
++	int log = 0;
++#endif
++
++	if (!drive || !(scsi = drive->driver_data))
++		return FAILED;
++	log |= test_bit(IDESCSI_LOG_CMD, &scsi->log);
++	if (log)
++		printk (IDESCSI_LOG "ide-scsi: reset called for %lu\n", cmd->serial_number);
+ 	/* first null the handler for the drive and let any process
+ 	 * doing IO (on another CPU) run to (partial) completion
+-	 * the lock prevents processing new requests */
++	 * the lock prevents processing new requests 
++	 * we countdown to avoid deadlock */
++	spin_unlock_irq(cmd->host->host_lock);
+ 	spin_lock_irqsave(&ide_lock, flags);
+-	while (HWGROUP(drive)->handler) {
++	while ((HWGROUP(drive)->busy || HWGROUP(drive)->handler) && countdown--) {
+ 		HWGROUP(drive)->handler = NULL;
++		del_timer(&HWGROUP(drive)->timer);
++		set_current_state(TASK_INTERRUPTIBLE);
+ 		schedule_timeout(1);
+ 	}
++	if (HWGROUP(drive)->handler) {
++		if (log)
++			printk (IDESCSI_LOG "ide-scsi: handler did not finish\n");
++		HWGROUP(drive)->handler = NULL;
++		HWGROUP(drive)->busy = 0;
++		del_timer(&HWGROUP(drive)->timer);
++	}
+ 	/* now nuke the drive queue */
+ 	while ((req = elv_next_request(&drive->queue))) {
+ 		blkdev_dequeue_request(req);
+ 		end_that_request_last(req);
+ 	}
+ 	/* FIXME - this will probably leak memory */
+-	HWGROUP(drive)->rq = NULL;
+ 	if (drive->driver_data) ((idescsi_scsi_t *)drive->driver_data)->pc = NULL;
++	HWGROUP(drive)->rq = NULL;
++	/* we use the busy flag to reserve the hwgroup for ourselves without
++	 * holding the ide lock for a long time during the reset */
++	HWGROUP(drive)->busy++;
+ 	spin_unlock_irqrestore(&ide_lock, flags);
+-	/* finally, reset the drive (and its partner on the bus...) */
+-	ide_do_reset (drive);	
++	/* finally, reset the drive (and possibly its partner on the bus...) */
++	ide_do_reset (drive);
++	HWGROUP(drive)->busy--;
++	/* in theory, this can take 30 seconds, but ide_spin_wait_hwgroup waits only 3,
++	 * usually, that is enough, but we call repeatedly, just to be covered */
++	countdown = 10;
++	while (ide_spin_wait_hwgroup(drive) && countdown--)
++		if (log)
++			printk (IDESCSI_LOG "ide-scsi: waiting for reset drive to complete\n");
++	/* for some reason when successful ide_spin_wait_hwgroup exits with ide_lock taken */
++	if (countdown) spin_unlock_irq(&ide_lock);
++	spin_lock_irq(cmd->host->host_lock);
++	if (HWGROUP(drive)->handler) {
++		printk (KERN_CRIT "ide-scsi: reset drive did not complete in time\n");
++		HWGROUP(drive)->handler = NULL;
++		del_timer(&HWGROUP(drive)->timer);
++		return FAILED;
++	}
+ 	return SUCCESS;
+ }
+ 
+@@ -948,6 +1015,8 @@
+ 	.queuecommand		= idescsi_queue,
+ 	.eh_abort_handler	= idescsi_abort,
+ 	.eh_device_reset_handler = idescsi_reset,
++	.eh_bus_reset_handler   = idescsi_reset,
++	.eh_host_reset_handler  = idescsi_reset,
+ 	.bios_param		= idescsi_bios,
+ 	.can_queue		= 40,
+ 	.this_id		= -1,
+Works well for me now, though with some of the timeouts being substantial it can 
+appear slow. Feedback welcome.
+Thanks, Willem Riede.[unhandled content-type:application/x-gzip][unhandled content-type:application/x-gzip]

@@ -1,0 +1,100 @@
+Date: Mon, 28 Aug 2000 15:19:56 +0200 (CEST)
+From: Ingo Molnar <>
+Subject: [patch] scheduler bugfix, SMP, 2.4.0-test7
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/8/28/23
+
+the attached sched-2.4.0-test7-C1 patch fixes a 'missed wakeup'
+SMP-scheduler bug. If an IRQ wakes up a process that has just been
+scheduled away, the next process is executing __schedule_tail(), is past
+the 'prev->state == TASK_RUNNING' test but prev->has_cpu is not yet set to
+0, then we miss to reconsider scheduler state and often miss the wakeup if
+the next process is the idle process.
+reschedule_idle() will not consider this process for preemption, because
+can_schedule() is 0. I've seen this bug in test7-final, during TUX
+testruns.
+the 'prev->state == TASK_RUNNING' test and the 'prev->has_cpu = 0' write
+has to happen atomically wrt. interrupts, because 'has_cpu == 0' prevents
+the process from being considered by the scheduler.
+i've also added a test to schedule() itself to restart the schedule if
+current->need_resched is 1. While this is not strictly necessery (if we
+return to user-space then we re-check need_resched anyway), but it helps
+latencies if schedule() is called by kernel-space, and is more consistent
+because reschedule_idle() might have preempted the current process.
+the patch is tested on test7, it runs just fine, fixes the bug and all
+aspects of the scheduler appear to work here just fine.
+	Ingo
+--- linux/kernel/sched.c.orig	Mon Aug 28 12:19:51 2000
++++ linux/kernel/sched.c	Mon Aug 28 13:49:17 2000
+@@ -455,17 +462,35 @@
+ static inline void __schedule_tail(struct task_struct *prev)
+ {
+ #ifdef CONFIG_SMP
+-	if ((prev->state == TASK_RUNNING) &&
+-			(prev != idle_task(smp_processor_id()))) {
+-		unsigned long flags;
+-
+-		spin_lock_irqsave(&runqueue_lock, flags);
+-		prev->has_cpu = 0;
+-		reschedule_idle(prev, flags); // spin_unlocks runqueue
+-	} else {
+-		wmb();
+-		prev->has_cpu = 0;
+-	}
++	unsigned long flags;
++
++	/*
++	 * fast path falls through. We have to take the runqueue lock
++	 * unconditionally to make sure that the test of prev->state
++	 * and setting has_cpu is atomic wrt. interrupts. It's not
++	 * a big problem in the common case because we recently took
++	 * the runqueue lock so it's likely to be in this processor's
++	 * cache.
++	 */
++	spin_lock_irqsave(&runqueue_lock, flags);
++	prev->has_cpu = 0;
++	if (prev->state == TASK_RUNNING)
++		goto running_again;
++out_unlock:
++	spin_unlock_irqrestore(&runqueue_lock, flags);
++	return;
++
++	/*
++	 * Slow path - we 'push' the previous process and
++	 * reschedule_idle() will attempt to find a new
++	 * processor for it. (but it might preempt the
++	 * current process as well.)
++	 */
++running_again:
++	if (prev == idle_task(smp_processor_id()))
++		goto out_unlock;
++	reschedule_idle(prev, flags); // spin_unlocks runqueue
++	return;
+ #endif /* CONFIG_SMP */
+ }
+ 
+@@ -491,10 +516,12 @@
+ 	struct list_head *tmp;
+ 	int this_cpu, c;
+ 
++schedule_again:
+ 	if (!current->active_mm) BUG();
+ 	if (tq_scheduler)
+ 		goto handle_tq_scheduler;
+ tq_scheduler_back:
++	run_task_queue(&tq_disk);
+ 
+ 	prev = current;
+ 	this_cpu = prev->processor;
+@@ -638,6 +665,8 @@
+ 
+ same_process:
+ 	reacquire_kernel_lock(current);
++	if (current->need_resched)
++		goto schedule_again;
+ 	return;
+ 
+ recalculate:

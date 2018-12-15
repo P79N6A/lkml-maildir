@@ -1,0 +1,272 @@
+Date: Tue, 21 Dec 1999 09:28:19 +0000 (GMT)
+From: Tigran Aivazian <>
+Subject: [patch-2.3.34-4review] vmalloc/vfree/ioremap made SMP-safe.
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/12/21/29
+
+Hi,
+This is the first attempt at this specific task so please be gentle.
+The thing I am unhappy about is the extra vmalloc/copy in read_kmem().
+Ultimately, it is not a problem because /dev/kmem access is not
+performance critical whilst the use of vmalloc/vfree/ioremap (esp in
+drivers) may be very critical. But if you see how my patch can be
+improved, please let me know before I send it to Linus.
+A copy of the patch is on:
+http://www.ocston.org/~tigran/patches/vmalloc-2.3.34.patch
+regards,
+Tigran.
+PS. Btw, the patch also contains the page->index doc in <linux/mm.h> and
+optimized sys_sync/fsync which I was going to send to Linus
+anyway - hope it is not too much strain on your eyes...
+diff -urN -X dontdiff linux/drivers/char/mem.c work/drivers/char/mem.c
+--- linux/drivers/char/mem.c	Thu Dec 16 21:59:38 1999
++++ work/drivers/char/mem.c	Tue Dec 21 09:10:25 1999
+@@ -227,6 +227,7 @@
+ 	unsigned long p = *ppos;
+ 	ssize_t read = 0;
+ 	ssize_t virtr;
++	char * kbuf; /* k-addr because vread() takes vmlist_lock spinlock */
+ 		
+ 	if (p < (unsigned long) high_memory) { 
+ 		read = count;
+@@ -238,22 +239,34 @@
+ 		if (p < PAGE_SIZE && read > 0) {
+ 			size_t tmp = PAGE_SIZE - p;
+ 			if (tmp > read) tmp = read;
+-			clear_user(buf, tmp);
++			if (clear_user(buf, tmp))
++				return -EFAULT;
+ 			buf += tmp;
+ 			p += tmp;
+ 			read -= tmp;
+ 			count -= tmp;
+ 		}
+ #endif
+-		copy_to_user(buf, (char *)p, read);
++		if(copy_to_user(buf, (char *)p, read))
++			return -EFAULT;
+ 		p += read;
+ 		buf += read;
+ 		count -= read;
+ 	}
+ 
+-	virtr = vread(buf, (char *)p, count);
+-	if (virtr < 0)
++	kbuf = vmalloc(count);
++	if (kbuf == NULL)
++		return -ENOMEM;
++	virtr = vread(kbuf, (char *)p, count);
++	if (virtr < 0) {
++		vfree(kbuf);
+ 		return virtr;
++	}
++	if (copy_to_user(buf, kbuf, virtr)) {
++		vfree(kbuf);
++		return -EFAULT;
++	}
++	vfree(kbuf);
+ 	*ppos += p + virtr;
+ 	return virtr + read;
+ }
+diff -urN -X dontdiff linux/fs/buffer.c work/fs/buffer.c
+--- linux/fs/buffer.c	Mon Dec 20 22:52:57 1999
++++ work/fs/buffer.c	Tue Dec 21 08:14:50 1999
+@@ -345,7 +345,6 @@
+ 	struct inode * inode;
+ 	int err;
+ 
+-	lock_kernel();
+ 	err = -EBADF;
+ 	file = fget(fd);
+ 	if (!file)
+@@ -365,13 +364,14 @@
+ 
+ 	/* We need to protect against concurrent writers.. */
+ 	down(&inode->i_sem);
++	lock_kernel();
+ 	err = file->f_op->fsync(file, dentry);
++	unlock_kernel();
+ 	up(&inode->i_sem);
+ 
+ out_putf:
+ 	fput(file);
+ out:
+-	unlock_kernel();
+ 	return err;
+ }
+ 
+@@ -382,7 +382,6 @@
+ 	struct inode * inode;
+ 	int err;
+ 
+-	lock_kernel();
+ 	err = -EBADF;
+ 	file = fget(fd);
+ 	if (!file)
+@@ -402,13 +401,14 @@
+ 
+ 	/* this needs further work, at the moment it is identical to fsync() */
+ 	down(&inode->i_sem);
++	lock_kernel();
+ 	err = file->f_op->fsync(file, dentry);
++	unlock_kernel();
+ 	up(&inode->i_sem);
+ 
+ out_putf:
+ 	fput(file);
+ out:
+-	unlock_kernel();
+ 	return err;
+ }
+ 
+diff -urN -X dontdiff linux/include/linux/mm.h work/include/linux/mm.h
+--- linux/include/linux/mm.h	Tue Dec 21 00:01:14 1999
++++ work/include/linux/mm.h	Tue Dec 21 08:13:57 1999
+@@ -244,8 +244,14 @@
+  * The following discussion applies only to them.
+  *
+  * A page may belong to an inode's memory mapping. In this case,
+- * page->inode is the pointer to the inode, and page->offset is the
+- * file offset of the page (not necessarily a multiple of PAGE_SIZE).
++ * page->inode is the pointer to the inode, and page->index is the
++ * file offset of the page in PAGE_CACHE_SIZE (not PAGE_SIZE!) units.
++ * Although currently (2.3.34) PAGE_SIZE == PAGE_CACHE_SIZE, i.e. there
++ * happens to be one page per page cache entry and MM code can't hanlde
++ * anything else, this may well change. The link to the old page->offset
++ * is given by:
++ *
++ *         page->index == (page->offset >> PAGE_CACHE_SHIFT);
+  *
+  * A page may have buffers allocated to it. In this case,
+  * page->buffers is a circular list of these buffer heads. Else,
+diff -urN -X dontdiff linux/ipc/util.c work/ipc/util.c
+--- linux/ipc/util.c	Tue Dec 14 18:01:21 1999
++++ work/ipc/util.c	Tue Dec 21 09:15:44 1999
+@@ -161,13 +161,10 @@
+ void* ipc_alloc(int size)
+ {
+ 	void* out;
+-	if(size > PAGE_SIZE) {
+-		lock_kernel();
++	if(size > PAGE_SIZE)
+ 		out = vmalloc(size);
+-		unlock_kernel();
+-	} else {
++	else
+ 		out = kmalloc(size, GFP_KERNEL);
+-	}
+ 	return out;
+ }
+ 
+diff -urN -X dontdiff linux/mm/vmalloc.c work/mm/vmalloc.c
+--- linux/mm/vmalloc.c	Sat Nov 20 18:09:05 1999
++++ work/mm/vmalloc.c	Tue Dec 21 09:12:12 1999
+@@ -7,10 +7,12 @@
+ 
+ #include <linux/malloc.h>
+ #include <linux/vmalloc.h>
++#include <linux/spinlock.h>
+ 
+ #include <asm/uaccess.h>
+ #include <asm/pgalloc.h>
+ 
++spinlock_t vmlist_lock = SPIN_LOCK_UNLOCKED;
+ struct vm_struct * vmlist = NULL;
+ 
+ static inline void free_area_pte(pmd_t * pmd, unsigned long address, unsigned long size)
+@@ -162,11 +164,13 @@
+ 	if (!area)
+ 		return NULL;
+ 	addr = VMALLOC_START;
++	spin_lock(&vmlist_lock);
+ 	for (p = &vmlist; (tmp = *p) ; p = &tmp->next) {
+ 		if (size + addr < (unsigned long) tmp->addr)
+ 			break;
+ 		addr = tmp->size + (unsigned long) tmp->addr;
+ 		if (addr > VMALLOC_END-size) {
++			spin_unlock(&vmlist_lock);
+ 			kfree(area);
+ 			return NULL;
+ 		}
+@@ -176,6 +180,7 @@
+ 	area->size = size + PAGE_SIZE;
+ 	area->next = *p;
+ 	*p = area;
++	spin_unlock(&vmlist_lock);
+ 	return area;
+ }
+ 
+@@ -189,14 +194,17 @@
+ 		printk(KERN_ERR "Trying to vfree() bad address (%p)\n", addr);
+ 		return;
+ 	}
++	spin_lock(&vmlist_lock);
+ 	for (p = &vmlist ; (tmp = *p) ; p = &tmp->next) {
+ 		if (tmp->addr == addr) {
+ 			*p = tmp->next;
+ 			vmfree_area_pages(VMALLOC_VMADDR(tmp->addr), tmp->size);
++			spin_unlock(&vmlist_lock);
+ 			kfree(tmp);
+ 			return;
+ 		}
+ 	}
++	spin_unlock(&vmlist_lock);
+ 	printk(KERN_ERR "Trying to vfree() nonexistent vm area (%p)\n", addr);
+ }
+ 
+@@ -224,16 +232,17 @@
+ 	return addr;
+ }
+ 
+-long vread(char *buf, char *addr, unsigned long count)
++long vread(char *kbuf, char *addr, unsigned long count)
+ {
+ 	struct vm_struct *tmp;
+-	char *vaddr, *buf_start = buf;
++	char *vaddr, *buf_start = kbuf;
+ 	unsigned long n;
+ 
+ 	/* Don't allow overflow */
+ 	if ((unsigned long) addr + count < count)
+ 		count = -(unsigned long) addr;
+ 
++	spin_lock(&vmlist_lock);
+ 	for (tmp = vmlist; tmp; tmp = tmp->next) {
+ 		vaddr = (char *) tmp->addr;
+ 		if (addr >= vaddr + tmp->size - PAGE_SIZE)
+@@ -241,8 +250,8 @@
+ 		while (addr < vaddr) {
+ 			if (count == 0)
+ 				goto finished;
+-			put_user('\0', buf);
+-			buf++;
++			*kbuf = '\0';
++			kbuf++;
+ 			addr++;
+ 			count--;
+ 		}
+@@ -250,12 +259,13 @@
+ 		do {
+ 			if (count == 0)
+ 				goto finished;
+-			put_user(*addr, buf);
+-			buf++;
++			*kbuf = *addr;
++			kbuf++;
+ 			addr++;
+ 			count--;
+ 		} while (--n > 0);
+ 	}
+ finished:
+-	return buf - buf_start;
++	spin_unlock(&vmlist_lock);
++	return kbuf - buf_start;
+ }
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

@@ -1,0 +1,109 @@
+Date: Mon, 10 Jan 2000 16:11:28 +0100 (CET)
+From: Andrea Arcangeli <>
+Subject: Re: [2.2.13aa6 (bugfix release II) ]
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/1/10/53
+
+On Sun, 9 Jan 2000, David S. Miller wrote:
+>   Date:   Sun, 9 Jan 2000 21:43:01 +0100 (CET)
+>   From: Andrea Arcangeli <andrea@suse.de>
+>
+>   I think I spotted and fixed the bug that is soft-deadlocking your
+>   2.2.x compaq cluster (all seems to make sense :). Could you try the
+>   below patch against 2.2.14 (or 2.2.14aa1 or 2.2.13 or 2.2.13aa6)?
+>
+>Wrong, all callers of tcp_send_delayed_ack _guarentee_ that the
+>quickack bit is clear.  Your patch does nothing, put an assert
+tcp_delack_timer doesn't really guarantee that, see:
+void tcp_delack_timer(unsigned long data)
+{
+	struct sock *sk = (struct sock*)data;
+	if(!sk->zapped &&
+	   sk->tp_pinfo.af_tcp.delayed_acks &&
+	   sk->state != TCP_CLOSE) {
+		/* If socket is currently locked, defer the ACK. */
+		if (!atomic_read(&sk->sock_readers))
+			tcp_send_ack(sk);
+		else
+			tcp_send_delayed_ack(&(sk->tp_pinfo.af_tcp), HZ/10);
+	}
+}
+You should as well guarantee by design that none timer is pending after
+you turn on the quickack bit and before dropping the bh or sock lock. It
+seems to me you are guaranteeing that by always sending an ack on the wire
+after you set up the quickack bit but it's not trivial to prove and right
+now the only explanation for the deadlock reported by urban and that other
+people is experiencing is that a delack timer triggers while delayed_acks
+is > 0 and the quickack bit is set.
+If the quickack bit is set while calling tcp_send_delayed_ack the kernel
+will lockup immediatly in a way that matches the reports from ursus.
+The reason for the deadlock is that the expired field of the timer will be
+set in the past and so the timer will reinsert inself in the first heap
+slot and so it will continue to reinsert and rexecute it in an infinite
+loop -> soft deadlock. I'd like to also make the timer code robust against
+these kind of subsystem bugs later but actually I am only focused to fix
+the offending code in TCP.
+I have to admit that I can't yet see exactly the path that sets the
+quickack bit without sending data on the wire but you agree with me that
+the tcp_send_delayed_ack function is not interested about the quickack bit
+and it's interested only about the real "ato" information, so my patch is
+obviously correct and in the worst case it won't change anything. I
+believe it will as well fix the lockup fine, and that it's the right
+approch to avoid these kind of subtle mistakes. It makes more sense than
+destroying the quickack information before reinserting the the delack
+timer from the delack timer, no?
+BTW, while reading the code I found a lockup-unrelated bug in the delack
+handling:
+--- 2.2.14/net/ipv4/tcp_input.c	Fri Jan  7 18:19:25 2000
++++ /tmp/tcp_input.c	Mon Jan 10 03:41:10 2000
+@@ -1428,6 +1428,7 @@
+ 	if (!after(TCP_SKB_CB(skb)->end_seq, tp->rcv_nxt)) {
+ 		/* A retransmit, 2nd most common case.  Force an imediate ack. */
+ 		SOCK_DEBUG(sk, "retransmit received: seq %X\n", TCP_SKB_CB(skb)->seq);
++		tp->delayed_acks++;
+ 		tcp_enter_quickack_mode(tp);
+ 		kfree_skb(skb);
+ 		return;
+Anyway the above fix is not interesting for real world because it seems
+impossible to me to reach such path in the TCP code (so basically such
+check is useless but after all I like it for completeness of the
+function). This because we call tcp_data only when we know the packet is
+in our receive window (otherwise we force an ack by hand prior calling
+tcp_queue).
+And really tp->delayed_acks is meaningless as far I can tell and the right
+thing to do is to remove the delayed_acks field completly (this must be
+done at least in 2.3.x). Removing it will avoid wasting time in the TCP
+code and will decrease half of the the delacks code braindamage :).
+Ursus, please apply also this patch on the top of my fix in the previous
+email as for David correct suggestion of putting an assert there. If
+you'll see a printk with the below patch applyed we'll have the proof my
+theory about the source of your deadlocks is correct and that my fix
+made the difference for you. Without the below patch applyed you could
+think you are not deadlocking anymore because of luck :).
+--- 2.2.14/net/ipv4/tcp_timer.c	Fri Jan  7 18:19:25 2000
++++ /tmp/tcp_timer.c	Mon Jan 10 16:02:14 2000
+@@ -173,7 +173,12 @@
+ 		if (!atomic_read(&sk->sock_readers))
+ 			tcp_send_ack(sk);
+ 		else
++		{
++			struct tcp_opt *tp = &(sk->tp_pinfo.af_tcp);
++			if (tcp_in_quickack_mode(tp))
++				printk(KERN_ERR "quickack bit set!!!!\n");
+ 			tcp_send_delayed_ack(&(sk->tp_pinfo.af_tcp), HZ/10);
++		}
+ 	}
+ }
+ 
+If my fix doesn't fix the deadlock completly I have really no other
+rasonable ideas on what can be going wrong right now. Thinking thinking...
+Comments?
+Andrea
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

@@ -1,0 +1,613 @@
+Date: Wed, 13 Oct 1999 04:33:13 -0400
+From: Jeff Garzik <>
+Subject: [patch] dynamic char and block devices
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/10/13/13
+
+Linus and other penguins--
+The attached patch against 2.3.21 updates fs/devices.c to be dynamic,
+instead of using two static arrays indexed by major number.
+This shrinks the code, and gets rid of something indexed by major/minor
+-- helpful on the road to a better kdev_t.
+Tests ok on local system after a few days.  HFS was only tested to
+compile, not actually run-time tested, due to its experimental (a.k.a.
+probably broken) nature.
+The only other comment is that STATIC_ENT_POOL_MAX could probably be
+made smaller, as it is only needed during boot time.
+Full changelog below.
+Regards,
+	Jeff
+fs/devices.c:
+* replace chrdevs[], blkdevs[] static arrays with sorted linked list of
+devices.  This saves some space by eliminating two static, pre-init'd
+arrays and some duplicate code.
+* const-ify [kbc]devname return values.  All callers checked.
+include/linux/fs.h:
+* update [kbc]devname prototypes
+include/linux/kdev_t.h:
+* update kdevname prototype
+include/linux/hfs_sysdep.h:
+* update for new kdevname return type
+-- 
+Custom driver development	|    Never worry about theory as long
+Open source programming		|    as the machinery does what it's
+				|    supposed to do.  -- R. A. HeinleinIndex: fs/devices.c
+===================================================================
+RCS file: /g/cvslan/linux_2_3/fs/devices.c,v
+retrieving revision 1.1.1.1
+diff -u -r1.1.1.1 devices.c
+--- fs/devices.c	1999/10/07 07:42:42	1.1.1.1
++++ fs/devices.c	1999/10/13 08:25:26
+@@ -7,6 +7,10 @@
+  *
+  *  Added kerneld support: Jacques Gelinas and Bjorn Ekwall
+  *  (changed to kmod)
++ *
++ *  Ditched static array indexed by major number, and updated
++ *  to use a linked list:  Jeff Garzik, 13 Oct 1999
++ *
+  */
+ 
+ #include <linux/config.h>
+@@ -15,49 +19,83 @@
+ #include <linux/string.h>
+ #include <linux/sched.h>
+ #include <linux/stat.h>
++#include <linux/slab.h>
+ #include <linux/fcntl.h>
++#include <linux/init.h>
+ #include <linux/errno.h>
++
+ #ifdef CONFIG_KMOD
+ #include <linux/kmod.h>
+-
+ #include <linux/tty.h>
+ 
+ /* serial module kmod load support */
+ struct tty_driver *get_tty_driver(kdev_t device);
+ #define isa_tty_dev(ma)	(ma == TTY_MAJOR || ma == TTYAUX_MAJOR)
+ #define need_serial(ma,mi) (get_tty_driver(MKDEV(ma,mi)) == NULL)
+-#endif
++#endif /* CONFIG_KMOD */
+ 
++typedef enum {
++	CHRDEV,
++	BLKDEV
++} devtype_t;
++	
++struct device_struct;
+ struct device_struct {
++	devtype_t devtype;
++	int major;
+ 	const char * name;
+ 	struct file_operations * fops;
++	struct device_struct *next;
+ };
+ 
+-static struct device_struct chrdevs[MAX_CHRDEV] = {
+-	{ NULL, NULL },
+-};
++/* static array used during initialization, when kmalloc is absent */
++#define STATIC_ENT_POOL_MAX 512
++static struct device_struct __initdata static_ent_pool[STATIC_ENT_POOL_MAX];
++static unsigned int __initdata static_ent_pool_len = 0;
+ 
+-static struct device_struct blkdevs[MAX_BLKDEV] = {
+-	{ NULL, NULL },
+-};
++/* linked list of registered char and block devices */
++static struct device_struct *devlist = NULL;
++
++/* is it safe to use kmalloc? */
++static int use_kmalloc = 0;
++
++static struct device_struct *ent_from_major(devtype_t devtype, int major)
++{
++	struct device_struct *tmp;
++	
++	for (tmp = devlist; tmp; tmp = tmp->next)
++		if (tmp->devtype == devtype && tmp->major == major)
++			return tmp;
++
++	return NULL;
++}
++
++extern inline struct device_struct * chrdev_from_major (int major) {
++	return ent_from_major (CHRDEV, major);
++}
++
++extern inline struct device_struct * blkdev_from_major (int major) {
++	return ent_from_major (BLKDEV, major);
++}
+ 
++/* generate /proc/devices output */
+ int get_device_list(char * page)
+ {
+-	int i;
+ 	int len;
+-
++	struct device_struct *tmp;
++	
+ 	len = sprintf(page, "Character devices:\n");
+-	for (i = 0; i < MAX_CHRDEV ; i++) {
+-		if (chrdevs[i].fops) {
+-			len += sprintf(page+len, "%3d %s\n", i, chrdevs[i].name);
+-		}
+-	}
++
++	for (tmp = devlist; tmp; tmp = tmp->next)
++		if (tmp->devtype == CHRDEV)
++			len += sprintf(page+len, "%3d %s\n", tmp->major, tmp->name);
++
+ 	len += sprintf(page+len, "\nBlock devices:\n");
+-	for (i = 0; i < MAX_BLKDEV ; i++) {
+-		if (blkdevs[i].fops) {
+-			len += sprintf(page+len, "%3d %s\n", i, blkdevs[i].name);
+-		}
+-	}
++
++	for (tmp = devlist; tmp; tmp = tmp->next)
++		if (tmp->devtype == BLKDEV)
++			len += sprintf(page+len, "%3d %s\n", tmp->major, tmp->name);
++
+ 	return len;
+ }
+ 
+@@ -66,41 +104,44 @@
+ 	Load the driver if needed.
+ */
+ static struct file_operations * get_fops(
++	devtype_t devtype,
+ 	unsigned int major,
+ 	unsigned int minor,
+ 	unsigned int maxdev,
+-	const char *mangle,		/* String to use to build the module name */
+-	struct device_struct tb[])
++	const char *mangle)	/* String to use to build the module name */
+ {
+-	struct file_operations *ret = NULL;
++	struct device_struct *ent = ent_from_major (devtype, major);
++	
++	/*
++	 * I do get request for device 0. I have no idea why. It happen
++	 * at shutdown time for one. Without the following test, the
++	 * kernel will happily trigger a request_module() which will
++	 * trigger kmod and modprobe for nothing (since there
++	 * is no device with major number == 0. And furthermore
++	 * it locks the reboot process :-(
++	 *
++	 * Jacques Gelinas (jacques@solucorp.qc.ca)
++	 */
++	if (major == 0 || major >= maxdev)
++		return NULL;
+ 
+-	if (major < maxdev){
+ #ifdef CONFIG_KMOD
+-		/*
+-		 * I do get request for device 0. I have no idea why. It happen
+-		 * at shutdown time for one. Without the following test, the
+-		 * kernel will happily trigger a request_module() which will
+-		 * trigger kmod and modprobe for nothing (since there
+-		 * is no device with major number == 0. And furthermore
+-		 * it locks the reboot process :-(
+-		 *
+-		 * Jacques Gelinas (jacques@solucorp.qc.ca)
+-		 *
+-		 * A. Haritsis <ah@doc.ic.ac.uk>: fix for serial module
+-		 *  though we need the minor here to check if serial dev,
+-		 *  we pass only the normal major char dev to kmod 
+-		 *  as there is no other loadable dev on these majors
+-		 */
+-		if ((isa_tty_dev(major) && need_serial(major,minor)) ||
+-		    (major != 0 && !tb[major].fops)) {
+-			char name[20];
+-			sprintf(name, mangle, major);
+-			request_module(name);
+-		}
+-#endif
+-		ret = tb[major].fops;
++	/*
++	 * A. Haritsis <ah@doc.ic.ac.uk>: fix for serial module
++	 *  though we need the minor here to check if serial dev,
++	 *  we pass only the normal major char dev to kmod 
++	 *  as there is no other loadable dev on these majors
++	 */
++	if ((isa_tty_dev(major) && need_serial(major,minor)) || !ent) {
++		char name[20];
++		sprintf(name, mangle, major);
++		request_module(name);
++
++		ent = ent_from_major (devtype, major);
+ 	}
+-	return ret;
++#endif
++
++	return ent ? ent->fops : NULL;
+ }
+ 
+ 
+@@ -110,82 +151,164 @@
+ */
+ struct file_operations * get_blkfops(unsigned int major)
+ {
+-	return get_fops (major,0,MAX_BLKDEV,"block-major-%d",blkdevs);
++	return get_fops (BLKDEV, major, 0, MAX_BLKDEV, "block-major-%d");
+ }
+ 
+ struct file_operations * get_chrfops(unsigned int major, unsigned int minor)
+ {
+-	return get_fops (major,minor,MAX_CHRDEV,"char-major-%d",chrdevs);
++	return get_fops (CHRDEV, major, minor, MAX_CHRDEV, "char-major-%d");
+ }
+ 
+-int register_chrdev(unsigned int major, const char * name, struct file_operations *fops)
++static struct device_struct * __init new_static_device (void)
++{
++	if (static_ent_pool_len < STATIC_ENT_POOL_MAX) {
++		static_ent_pool_len++;
++		return &static_ent_pool[static_ent_pool_len - 1];
++	}
++	return NULL;
++}
++
++static struct device_struct *new_device_struct
++			   (devtype_t devtype,
++			    unsigned int major,
++			    const char * name,
++			    struct file_operations *fops)
+ {
++	struct device_struct *last, *tmp, *ent;
++
++	if (use_kmalloc)
++		ent = kmalloc (sizeof (*ent), GFP_KERNEL);
++	else
++		ent = new_static_device ();
++
++	if (!ent)
++		return NULL;
++	
++	ent->devtype = devtype;
++	ent->major = major;
++	ent->name = name;
++	ent->fops = fops;
++	ent->next = NULL;
++	
++	if (!devlist) {
++		devlist = ent;
++		return ent;
++	}
++	
++	tmp = devlist;
++	last = NULL;
++	while (tmp && tmp->major < major) {
++		last = tmp;
++		tmp = tmp->next;
++	}
++	
++	if (!last) {
++		ent->next = devlist;
++		devlist = ent;
++	} else {
++		ent->next = last->next;
++		last->next = ent;
++	}
++
++	return ent;
++}
++
++/*
++ * note - fops==NULL must succeed -jgarzik
++ */
++static int register_anydev(unsigned int maxdev,
++			   devtype_t devtype,
++			   unsigned int major,
++			   const char * name,
++			   struct file_operations *fops)
++{
++	struct device_struct *ent;
++	
++	if (major >= maxdev)
++		return -EINVAL;
++
+ 	if (major == 0) {
+-		for (major = MAX_CHRDEV-1; major > 0; major--) {
+-			if (chrdevs[major].fops == NULL) {
+-				chrdevs[major].name = name;
+-				chrdevs[major].fops = fops;
++		for (major = maxdev-1; major > 0; major--) {
++			ent = ent_from_major(devtype, major);
++			if (!ent) {
++				ent = new_device_struct (devtype, major, name, fops);
++				if (!ent) return -ENOMEM;
+ 				return major;
+ 			}
++			else if (ent && !ent->fops) {
++				ent->name = name;
++				ent->fops = fops;
++				return major;
++			}
+ 		}
+ 		return -EBUSY;
+ 	}
+-	if (major >= MAX_CHRDEV)
+-		return -EINVAL;
+-	if (chrdevs[major].fops && chrdevs[major].fops != fops)
+-		return -EBUSY;
+-	chrdevs[major].name = name;
+-	chrdevs[major].fops = fops;
++
++	ent = ent_from_major(devtype, major);
++
++	if (!ent) {
++		ent = new_device_struct (devtype, major, name, fops);
++		if (!ent) return -ENOMEM;
++	} else {
++		ent->name = name;
++		ent->fops = fops;
++	}
++
+ 	return 0;
+ }
+ 
++
++
++int register_chrdev(unsigned int major, const char * name, struct file_operations *fops)
++{
++	return register_anydev (MAX_CHRDEV, CHRDEV, major, name, fops);
++}
++
+ int register_blkdev(unsigned int major, const char * name, struct file_operations *fops)
+ {
+-	if (major == 0) {
+-		for (major = MAX_BLKDEV-1; major > 0; major--) {
+-			if (blkdevs[major].fops == NULL) {
+-				blkdevs[major].name = name;
+-				blkdevs[major].fops = fops;
+-				return major;
+-			}
+-		}
+-		return -EBUSY;
++	return register_anydev (MAX_BLKDEV, BLKDEV, major, name, fops);
++}
++
++static int unregister_anydev(devtype_t devtype,
++			     unsigned int major,
++			     const char * name)
++{
++	struct device_struct *tmp, *last;
++
++	if (!devlist)
++		return -EINVAL;
++
++	tmp = devlist;
++	last = NULL;
++	while (tmp && tmp->major != major) {
++		last = tmp;
++		tmp = tmp->next;
+ 	}
+-	if (major >= MAX_BLKDEV)
++	if (!tmp || strcmp(tmp->name, name))
+ 		return -EINVAL;
+-	if (blkdevs[major].fops && blkdevs[major].fops != fops)
+-		return -EBUSY;
+-	blkdevs[major].name = name;
+-	blkdevs[major].fops = fops;
++
++	if (!last)
++		devlist = devlist->next;
++	else
++		last->next = tmp->next;
++
++	if (use_kmalloc)
++		kfree (tmp);
++
+ 	return 0;
+ }
+ 
+ int unregister_chrdev(unsigned int major, const char * name)
+ {
+-	if (major >= MAX_CHRDEV)
+-		return -EINVAL;
+-	if (!chrdevs[major].fops)
+-		return -EINVAL;
+-	if (strcmp(chrdevs[major].name, name))
+-		return -EINVAL;
+-	chrdevs[major].name = NULL;
+-	chrdevs[major].fops = NULL;
+-	return 0;
++	return unregister_anydev (CHRDEV, major, name);
+ }
+ 
+ int unregister_blkdev(unsigned int major, const char * name)
+ {
+-	if (major >= MAX_BLKDEV)
+-		return -EINVAL;
+-	if (!blkdevs[major].fops)
+-		return -EINVAL;
+-	if (strcmp(blkdevs[major].name, name))
+-		return -EINVAL;
+-	blkdevs[major].name = NULL;
+-	blkdevs[major].fops = NULL;
+-	return 0;
++	return unregister_anydev (BLKDEV, major, name);
+ }
+ 
++
+ /*
+  * This routine checks whether a removable media has been changed,
+  * and invalidates all buffer-cache-entries in that case. This
+@@ -197,16 +320,17 @@
+  */
+ int check_disk_change(kdev_t dev)
+ {
+-	int i;
+ 	struct file_operations * fops;
+ 	struct super_block * sb;
++	struct device_struct *ent;
+ 
+-	i = MAJOR(dev);
+-	if (i >= MAX_BLKDEV || (fops = blkdevs[i].fops) == NULL)
+-		return 0;
+-	if (fops->check_media_change == NULL)
++	ent = blkdev_from_major(MAJOR(dev));
++	if (!ent || !ent->fops)
+ 		return 0;
+-	if (!fops->check_media_change(dev))
++
++	fops = ent->fops;
++	if (!fops->check_media_change ||
++	    !fops->check_media_change(dev))
+ 		return 0;
+ 
+ 	printk(KERN_DEBUG "VFS: Disk change detected on device %s\n",
+@@ -349,34 +473,40 @@
+  * Print device name (in decimal, hexadecimal or symbolic)
+  * Note: returns pointer to static data!
+  */
+-char * kdevname(kdev_t dev)
++const char * kdevname(kdev_t dev)
+ {
+ 	static char buffer[32];
+ 	sprintf(buffer, "%02x:%02x", MAJOR(dev), MINOR(dev));
+ 	return buffer;
+ }
+ 
+-char * bdevname(kdev_t dev)
++static const char *anydevname (devtype_t devtype, kdev_t dev)
+ {
+ 	static char buffer[32];
+-	const char * name = blkdevs[MAJOR(dev)].name;
++	const char * name;
++	struct device_struct *ent = ent_from_major(devtype, MAJOR(dev));
+ 
+-	if (!name)
+-		name = "unknown-block";
++	if (ent)
++		name = ent->name;
++	else
++		switch (devtype) {
++		case CHRDEV:	name = "unknown-char"; break;
++		case BLKDEV:	name = "unknown-block"; break;
++		default:	name = "unknown"; break;
++		}
+ 
+ 	sprintf(buffer, "%s(%d,%d)", name, MAJOR(dev), MINOR(dev));
+ 	return buffer;
+ }
+ 
+-char * cdevname(kdev_t dev)
++const char * bdevname(kdev_t dev)
+ {
+-	static char buffer[32];
+-	const char * name = chrdevs[MAJOR(dev)].name;
++	return anydevname (BLKDEV, dev);
++}
+ 
+-	if (!name)
+-		name = "unknown-char";
+-	sprintf(buffer, "%s(%d,%d)", name, MAJOR(dev), MINOR(dev));
+-	return buffer;
++const char * cdevname(kdev_t dev)
++{
++	return anydevname (CHRDEV, dev);
+ }
+ 
+ void init_special_inode(struct inode *inode, umode_t mode, int rdev)
+@@ -396,3 +526,38 @@
+ 	else
+ 		printk(KERN_DEBUG "init_special_inode: bogus imode (%o)\n", mode);
+ }
++
++
++/*
++ * copy device list from static, __initdata'd vector into dynamic RAM
++ */
++
++static int __init devices_copy_init_list (void)
++{
++	struct device_struct *ent, *tmp, *last;
++	
++	tmp = devlist;
++	last = NULL;
++	while (tmp != NULL) {
++		ent = kmalloc (sizeof (*ent), GFP_KERNEL);
++		if (!ent)
++			panic("kmalloc failed: Cannot init devices subsystem");
++		memcpy (ent, tmp, sizeof (*ent));
++		
++		if (last == NULL) {
++			devlist = tmp = ent;
++		} else {
++			last->next = tmp = ent;
++		}
++		
++		last = tmp;
++		tmp = tmp->next;
++	}
++	
++	use_kmalloc = 1;
++	
++	return 0;
++}
++
++/* cheap way to get something done "sometime after kmalloc works" */
++module_init(devices_copy_init_list); 
+Index: include/linux/fs.h
+===================================================================
+RCS file: /g/cvslan/linux_2_3/include/linux/fs.h,v
+retrieving revision 1.1.1.5
+retrieving revision 1.1.1.5.2.1
+diff -u -r1.1.1.5 -r1.1.1.5.2.1
+--- include/linux/fs.h	1999/10/12 01:24:41	1.1.1.5
++++ include/linux/fs.h	1999/10/12 10:23:54	1.1.1.5.2.1
+@@ -741,9 +741,9 @@
+ extern int chrdev_open(struct inode *, struct file *);
+ extern struct file_operations def_chr_fops;
+ extern struct inode_operations chrdev_inode_operations;
+-extern char * bdevname(kdev_t);
+-extern char * cdevname(kdev_t);
+-extern char * kdevname(kdev_t);
++extern const char * bdevname(kdev_t);
++extern const char * cdevname(kdev_t);
++extern const char * kdevname(kdev_t);
+ extern void init_special_inode(struct inode *, umode_t, int);
+ 
+ extern void init_fifo(struct inode *);
+Index: include/linux/hfs_sysdep.h
+===================================================================
+RCS file: /g/cvslan/linux_2_3/include/linux/hfs_sysdep.h,v
+retrieving revision 1.1.1.1
+retrieving revision 1.1.1.1.18.1
+diff -u -r1.1.1.1 -r1.1.1.1.18.1
+--- include/linux/hfs_sysdep.h	1999/10/07 07:42:52	1.1.1.1
++++ include/linux/hfs_sysdep.h	1999/10/12 10:23:54	1.1.1.1.18.1
+@@ -121,7 +121,7 @@
+ 	sys_mdb->s_dirt = 1;
+ }
+ 
+-extern inline char *hfs_mdb_name(hfs_sysmdb sys_mdb) {
++extern inline const char *hfs_mdb_name(hfs_sysmdb sys_mdb) {
+ 	return kdevname(sys_mdb->s_dev);
+ }
+ 
+Index: include/linux/kdev_t.h
+===================================================================
+RCS file: /g/cvslan/linux_2_3/include/linux/kdev_t.h,v
+retrieving revision 1.1.1.1
+retrieving revision 1.1.1.1.18.1
+diff -u -r1.1.1.1 -r1.1.1.1.18.1
+--- include/linux/kdev_t.h	1999/10/07 07:42:51	1.1.1.1
++++ include/linux/kdev_t.h	1999/10/12 10:23:54	1.1.1.1.18.1
+@@ -73,7 +73,8 @@
+ #define MKDEV(ma,mi)	(((ma) << MINORBITS) | (mi))
+ #define B_FREE		0xffff		/* yuk */
+ 
+-extern char * kdevname(kdev_t);	/* note: returns pointer to static data! */
++/* note: returns pointer to static data! */
++extern const char * kdevname(kdev_t);
+ 
+ /*
+ As long as device numbers in the outside world have 16 bits only,

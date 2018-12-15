@@ -1,0 +1,168 @@
+Date: Mon, 07 Feb 2000 19:25:08 -0800
+From: Chris Sears <>
+Subject: [PATCH-2.3.42] cacheline prefetching in the scheduler loop
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/2/7/161
+
+Recently, task_struct was reorganized, based on work by IBM,
+to place the elements used by the scheduler loop into
+a single cacheline.
+So I thought that if all of the information is available in
+a single cacheline, why not prefetch the relevant cacheline
+of the next task_struct on the run queue while working
+on the current one?
+Attached is a simple patch against 2.3.42  to do just that:
+    PREFETCH_CACHELINE is defined in cache.h
+    task_struct gets reorganized again, slightly
+    schedule() prefetches if CONFIG'd
+I get a 10% win on a 686 using lmbench for 16p/16k context switches.
+The assembly is also a little shorter even in the CONFIG'd out case
+because I moved tmp = tmp->next from the bottom of the loop
+into the straight line body of the loop.
+PREFETCH_CACHELINE is clever: machine-independent assembly!
+The macro works as is, but it can be redefined in asm-xxx/cache.h
+for different architectures that have special prefetch instructions.
+I've contacted the IBM people to ask them to test this against
+their Volano benchmark.
+thanks,
+Chris Sears
+cbsears@ix.netcom.com
+--- cache.h.orig	Sun Feb  6 15:06:45 2000
++++ cache.h	Mon Feb  7 17:12:55 2000
+@@ -1,6 +1,51 @@
+ #ifndef __LINUX_CACHE_H
+ #define __LINUX_CACHE_H
+ 
++/* for now */
++#if defined(CONFIG_X86) && (defined(CONFIG_M686) || defined(CONFIG_MK6) || defined(CONFIG_MK7))
++#define CONFIG_PREFETCH_CACHELINE
++#endif
++
++/*
++ * PREFETCH_CACHELINE uses a non-blocking load into a temporary register.
++ *
++ * While the CPU is doing its business with L1, L1 is getting
++ * the new cacheline from L2 in parallel, unless of course,
++ * the requested cacheline is already in L1.  And if it isn't in L1 or L2,
++ * well then you lose, it's in memory and this won't help much
++ * because memory is really slow.  However, it won't hurt at all.
++ *
++ * Below, "volatile" means don't move this.  The "r" means load
++ * the operand into a temporary register of GCC's choosing.
++ * The statement has no output value and GCC knows that "r" was clobbered.
++ * This macro can be used unchanged on other architectures although some
++ * (e.g. Alpha, Katmai, AltiVec) have special cache prefetch instructions.
++ *
++ * Requirements:
++ *   usage:
++ *     there is enough work to keep the CPU busy during the prefetch.
++ *     data is entirely in a cacheline
++ *     addr points to the beginning -- not strictly necessary but helps
++ *     first touch is at addr -- not strictly necessary but helps
++ *   configuration:
++ *     two level cache and L1 is two way set associative.
++ *     The CPU can execute instructions out of order and has register renaming.
++ *     Two way means the cache won't thrash because of the prefetch.
++ *     According to Fog, Pentium Pro or better meet these criteria.
++ *
++ * As an example, in the schedule() loop, GCC 2.95.1/x86 generates:
++ *
++ *     movl (%ebx),%eax
++ *
++ * Chris Sears
++ */
++#if defined(CONFIG_PREFETCH_CACHELINE)
++#define PREFETCH_CACHELINE(addr)				\
++	do {							\
++		asm volatile("" : : "r" (addr));		\
++	} while (0)
++#endif
++
+ #include <asm/cache.h>
+ 
+ #ifndef L1_CACHE_ALIGN
+@@ -24,5 +69,12 @@
+ 		 __section__(".data.cacheline_aligned")))
+ #endif
+ #endif /* __cacheline_aligned */
++
++/*
++ * If it wasn't defined above or in asm/cache.h ...
++ */
++#ifndef PREFETCH_CACHELINE
++#define PREFETCH_CACHELINE(addr) do { } while (0)
++#endif
+ 
+ #endif /* __LINUX_CACHE_H */--- sched.h.orig	Mon Feb  7 11:28:22 2000
++++ sched.h	Mon Feb  7 15:07:12 2000
+@@ -273,14 +273,16 @@
+ 	cycles_t avg_slice;
+ 	int lock_depth;		/* Lock depth. We can context switch in and out of holding a syscall kernel lock... */	
+ /* begin intel cache line */
++	struct list_head run_list;
+ 	long counter;
+ 	long priority;
+ 	unsigned long policy;
+ /* memory management info */
+-	struct mm_struct *mm, *active_mm;
++	struct mm_struct *mm;
+ 	int has_cpu;
+ 	int processor;
+-	struct list_head run_list;
++/* end intel cache line */
++	struct mm_struct *active_mm;
+ 	struct task_struct *next_task, *prev_task;
+ 	int last_processor;
+ 
+@@ -393,10 +395,13 @@
+ #define INIT_TASK(name) \
+ /* state etc */	{ 0,0,0,KERNEL_DS,&default_exec_domain,0, \
+ /* avg_slice */	0, -1, \
++/* begin intel cache line */ \
++/* run_list */	LIST_HEAD_INIT(init_task.run_list), \
+ /* counter */	DEF_PRIORITY,DEF_PRIORITY,SCHED_OTHER, \
+-/* mm */	NULL, &init_mm, \
++/* mm */	NULL, \
+ /* has_cpu */	0,0, \
+-/* run_list */	LIST_HEAD_INIT(init_task.run_list), \
++/* end intel cache line */ \
++/* active_mm */ &init_mm, \
+ /* next_task */	&init_task,&init_task, \
+ /* last_proc */	0, \
+ /* binfmt */	NULL, \--- sched.c.orig	Sun Feb  6 15:06:33 2000
++++ sched.c	Mon Feb  7 17:18:19 2000
+@@ -506,12 +506,30 @@
+ 	tmp = runqueue_head.next;
+ 	while (tmp != &runqueue_head) {
+ 		p = list_entry(tmp, struct task_struct, run_list);
++		/*
++		 * Prefetch the relevant cacheline of the next task_struct
++		 * in the run_list.
++		 *
++		 * All of the task_struct elements referenced by the
++		 * scheduler loop fit into a single cacheline.  Thank you, IBM.
++		 * task_struct.counter.run_list.next is at the very start
++		 * of the cacheline and it is the first element of the
++		 * task_struct actually referenced.  list_entry() above
++		 * is just address arithmetic.
++		 *
++		 * Using lmbench on a 686, there is about a 10% decrease
++		 * in context switch time for the 16p/16K case.
++		 *
++		 * Chris Sears
++		 */
++		tmp = tmp->next;
++		PREFETCH_CACHELINE(tmp->next);
++
+ 		if (can_schedule(p)) {
+ 			int weight = goodness(p, this_cpu, prev->active_mm);
+ 			if (weight > c)
+ 				c = weight, next = p;
+ 		}
+-		tmp = tmp->next;
+ 	}
+ 
+ 	/* Do we need to re-calculate counters? */

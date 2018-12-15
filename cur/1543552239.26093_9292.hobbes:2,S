@@ -1,0 +1,350 @@
+Date: Sun, 22 Oct 2000 03:01:11 -0700
+From: Jeremy Fitzhardinge <>
+Subject: Update to autofs4 for new(-ish) VFS stuff
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/10/22/30
+
+Ever since the addition of struct vfs_mount, autofs4 has got the "is this
+filesystem busy" test wrong.  This patch against 2.4.0-test9 makes it
+smarter.
+	J
+--- linux.orig/CREDITS	Tue Oct  3 17:30:15 2000
++++ linux/CREDITS	Tue Oct  3 17:56:04 2000
+@@ -795,13 +795,16 @@
+ S: Germany
+ 
+ N: Jeremy Fitzhardinge
+-E: jeremy@zip.com.au
++E: jeremy@goop.org
++W: 
+http://www.goop.org/~jeremy
++D: author of userfs filesystem
+ D: Improved mmap and munmap handling
+ D: General mm minor tidyups
+-S: 67 Surrey St.
+-S: Darlinghurst, Sydney
+-S: New South Wales 2010
+-S: Australia
++D: autofs v4 filesystem rework
++S: 987 Alabama St
++S: San Francisco
++S: SA, 94110
++S: USA
+ 
+ N: Ralf Flaxa
+ E: rfflaxa@immd4.informatik.uni-erlangen.de
+diff -x *.o -x *~ -x *.flags -x .depend -x .hdepend -u 2.3/fs/autofs4/expire.c local-2.3/fs/autofs4/expire.c
+--- linux.orig/fs/autofs4/expire.c	Wed Sep  6 18:02:29 2000
++++ linux/fs/autofs4/expire.c	Sat Oct 21 19:07:24 2000
+@@ -3,7 +3,7 @@
+  * linux/fs/autofs/expire.c
+  *
+  *  Copyright 1997-1998 Transmeta Corporation -- All Rights Reserved
+- *  Copyright 1999 Jeremy Fitzhardinge <jeremy@goop.org>
++ *  Copyright 1999-2000 Jeremy Fitzhardinge <jeremy@goop.org>
+  *
+  * This file is part of the Linux kernel and is made available under
+  * the terms of the GNU General Public License, version 2, or at your
+@@ -15,46 +15,139 @@
+ 
+ /*
+  * Determine if a subtree of the namespace is busy.
++ *
++ * mnt is the mount tree under the autofs mountpoint
+  */
+-static int is_tree_busy(struct vfsmount *mnt)
++static inline int is_vfsmnt_tree_busy(struct vfsmount *mnt)
+ {
+ 	struct vfsmount *this_parent = mnt;
+ 	struct list_head *next;
+ 	int count;
+ 
+-	spin_lock(&dcache_lock);
+-	count = atomic_read(&mnt->mnt_count) - 2;
+-	if (!is_autofs4_dentry(mnt->mnt_mountpoint))
+-		count--;
++	count = atomic_read(&mnt->mnt_count) - 1;
++
+ repeat:
+ 	next = this_parent->mnt_mounts.next;
++	DPRINTK(("is_vfsmnt_tree_busy: mnt=%p, this_parent=%p, next=%p\n",
++		 mnt, this_parent, next));
+ resume:
+-	while (next != &this_parent->mnt_mounts) {
+-		struct list_head *tmp = next;
+-		struct vfsmount *p = list_entry(tmp, struct vfsmount,
++	for( ; next != &this_parent->mnt_mounts; next = next->next) {
++		struct vfsmount *p = list_entry(next, struct vfsmount,
+ 						mnt_child);
+-		next = tmp->next;
+-		/* Decrement count for unused children */
+-		count += atomic_read(&p->mnt_count) - 2;
++
++		/* -1 for struct vfs_mount's normal count, 
++		   -1 to compensate for child's reference to parent */
++		count += atomic_read(&p->mnt_count) - 1 - 1;
++
++		DPRINTK(("is_vfsmnt_tree_busy: p=%p, count now %d\n",
++			 p, count));
++
+ 		if (!list_empty(&p->mnt_mounts)) {
+ 			this_parent = p;
+ 			goto repeat;
+ 		}
+ 		/* root is busy if any leaf is busy */
+-		if (atomic_read(&p->mnt_count) > 1) {
+-			spin_unlock(&dcache_lock);
++		if (atomic_read(&p->mnt_count) > 1)
+ 			return 1;
+-		}
+ 	}
+-	/*
+-	 * All done at this level ... ascend and resume the search.
+-	 */
++
++	/* All done at this level ... ascend and resume the search. */
+ 	if (this_parent != mnt) {
+ 		next = this_parent->mnt_child.next; 
+ 		this_parent = this_parent->mnt_parent;
+ 		goto resume;
+ 	}
+-	spin_unlock(&dcache_lock);
++
++	DPRINTK(("is_vfsmnt_tree_busy: count=%d\n", count));
++	return count != 0; /* remaining users? */
++}
++
++/* Traverse a dentry's list of vfsmounts and return the number of
++   non-busy mounts */
++static int check_vfsmnt(struct vfsmount *mnt, struct dentry *dentry)
++{
++	int ret = 0;
++	struct list_head *tmp;
++
++	list_for_each(tmp, &dentry->d_vfsmnt) {
++		struct vfsmount *vfs = list_entry(tmp, struct vfsmount, 
++						  mnt_clash);
++		DPRINTK(("check_vfsmnt: mnt=%p, dentry=%p, tmp=%p, vfs=%p\n",
++			 mnt, dentry, tmp, vfs));
++		if (vfs->mnt_parent != mnt || /* don't care about busy-ness of other namespaces */
++		    !is_vfsmnt_tree_busy(vfs))
++			ret++;
++	}
++
++	DPRINTK(("check_vfsmnt: ret=%d\n", ret));
++	return ret;
++}
++
++/* Check dentry tree for busyness.  If a dentry appears to be busy
++   because it is a mountpoint, check to see if the mounted
++   filesystem is busy. */
++static int is_tree_busy(struct vfsmount *topmnt, struct dentry *top)
++{
++	struct dentry *this_parent;
++	struct list_head *next;
++	int count;
++
++	count = atomic_read(&top->d_count);
++	
++	DPRINTK(("is_tree_busy: top=%p initial count=%d\n", 
++		 top, count));
++	this_parent = top;
++
++	count--;	/* top is passed in after being dgot */
++
++	if (is_autofs4_dentry(top)) {
++		count--;
++		DPRINTK(("is_tree_busy: autofs; count=%d\n", count));
++	}
++
++	if (d_mountpoint(top))
++		count -= check_vfsmnt(topmnt, top);
++
++ repeat:
++	next = this_parent->d_subdirs.next;
++ resume:
++	while (next != &this_parent->d_subdirs) {
++		int adj = 0;
++		struct dentry *dentry = list_entry(next, struct dentry,
++						   d_child);
++		next = next->next;
++
++		count += atomic_read(&dentry->d_count) - 1;
++
++		if (d_mountpoint(dentry))
++			adj += check_vfsmnt(topmnt, dentry);
++
++		if (is_autofs4_dentry(dentry)) {
++			adj++;
++			DPRINTK(("is_tree_busy: autofs; adj=%d\n",
++				 adj));
++		}
++
++		count -= adj;
++
++		if (!list_empty(&dentry->d_subdirs)) {
++			this_parent = dentry;
++			goto repeat;
++		}
++
++		if (atomic_read(&dentry->d_count) != adj) {
++			DPRINTK(("is_tree_busy: busy leaf (d_count=%d adj=%d)\n",
++				 atomic_read(&dentry->d_count), adj));
++			return 1;
++		}
++	}
++
++	/* All done at this level ... ascend and resume the search. */
++	if (this_parent != top) {
++		next = this_parent->d_child.next; 
++		this_parent = this_parent->d_parent;
++		goto resume;
++	}
+ 
+ 	DPRINTK(("is_tree_busy: count=%d\n", count));
+ 	return count != 0; /* remaining users? */
+@@ -67,11 +160,11 @@
+  *  - it has been unused for exp_timeout time
+  */
+ static struct dentry *autofs4_expire(struct super_block *sb,
+-				    struct vfsmount *mnt,
+-				    struct autofs_sb_info *sbi,
+-				    int do_now)
++				     struct vfsmount *mnt,
++				     struct autofs_sb_info *sbi,
++				     int do_now)
+ {
+-	unsigned long now = jiffies; /* snapshot of now */
++	unsigned long now = jiffies;
+ 	unsigned long timeout;
+ 	struct dentry *root = sb->s_root;
+ 	struct list_head *tmp;
+@@ -106,36 +199,32 @@
+ 
+ 		if (!do_now) {
+ 			/* Too young to die */
+-			if (time_after(ino->last_used+timeout, now))
++			if (time_after(ino->last_used + timeout, now))
+ 				continue;
+ 		
+ 			/* update last_used here :- 
+ 			   - obviously makes sense if it is in use now
+ 			   - less obviously, prevents rapid-fire expire
+-			   attempts if expire fails the first time */
++			     attempts if expire fails the first time */
+ 			ino->last_used = now;
+ 		}
+ 		p = mntget(mnt);
+-		d = dget(dentry);
+-		spin_unlock(&dcache_lock);
+-		while(d_mountpoint(d) && follow_down(&p, &d))
+-			;
++		d = dget_locked(dentry);
+ 
+-		if (!is_tree_busy(p)) {
+-			dput(d);
+-			mntput(p);
++		if (!is_tree_busy(p, d)) {
+ 			DPRINTK(("autofs_expire: returning %p %.*s\n",
+-				 dentry, dentry->d_name.len, dentry->d_name.name));
++				 dentry, (int)dentry->d_name.len, dentry->d_name.name));
+ 			/* Start from here next time */
+-			spin_lock(&dcache_lock);
+ 			list_del(&root->d_subdirs);
+ 			list_add(&root->d_subdirs, &dentry->d_child);
+ 			spin_unlock(&dcache_lock);
++
++			dput(d);
++			mntput(p);
+ 			return dentry;
+ 		}
+ 		dput(d);
+ 		mntput(p);
+-		spin_lock(&dcache_lock);
+ 	}
+ 	spin_unlock(&dcache_lock);
+ 
+diff -x *.o -x *~ -x *.flags -x .depend -x .hdepend -u 2.3/fs/autofs4/root.c local-2.3/fs/autofs4/root.c
+--- linux.orig/fs/autofs4/root.c	Wed Sep  6 17:59:54 2000
++++ linux/fs/autofs4/root.c	Sat Oct 21 19:07:38 2000
+@@ -3,7 +3,7 @@
+  * linux/fs/autofs/root.c
+  *
+  *  Copyright 1997-1998 Transmeta Corporation -- All Rights Reserved
+- *  Copyright 1999 Jeremy Fitzhardinge <jeremy@goop.org>
++ *  Copyright 1999-2000 Jeremy Fitzhardinge <jeremy@goop.org>
+  *
+  * This file is part of the Linux kernel and is made available under
+  * the terms of the GNU General Public License, version 2, or at your
+@@ -115,7 +115,6 @@
+ 			/* Return a negative dentry, but leave it "pending" */
+ 			return 1;
+ 		}
+-		/* status = autofs4_wait(sbi, &dentry->d_name, NFY_MOUNT); */
+ 	}
+ 
+ 	/* If this is an unused directory that isn't a mount point,
+@@ -201,30 +200,34 @@
+ 
+ static void autofs4_dentry_release(struct dentry *de)
+ {
+-	struct autofs_info *inf = autofs4_dentry_ino(de);
++	struct autofs_info *inf;
++
++	lock_kernel();
+ 
+ 	DPRINTK(("autofs4_dentry_release: releasing %p\n", de));
+ 
+-	lock_kernel();
++	inf = autofs4_dentry_ino(de);
+ 	de->d_fsdata = NULL;
++
+ 	if (inf) {
+ 		inf->dentry = NULL;
+ 		inf->inode = NULL;
+ 
+ 		autofs4_free_ino(inf);
+ 	}
++
+ 	unlock_kernel();
+ }
+ 
+ /* For dentries of directories in the root dir */
+ static struct dentry_operations autofs4_root_dentry_operations = {
+-	d_revalidate:	autofs4_root_revalidate,	/* d_revalidate */
++	d_revalidate:	autofs4_root_revalidate,
+ 	d_release:	autofs4_dentry_release,
+ };
+ 
+ /* For other dentries */
+ static struct dentry_operations autofs4_dentry_operations = {
+-	d_revalidate:	autofs4_revalidate,	/* d_revalidate */
++	d_revalidate:	autofs4_revalidate,
+ 	d_release:	autofs4_dentry_release,
+ };
+ 
+@@ -521,11 +524,11 @@
+ 	/* return a single thing to expire */
+ 	case AUTOFS_IOC_EXPIRE:
+ 		return autofs4_expire_run(inode->i_sb,filp->f_vfsmnt,sbi,
+-					 (struct autofs_packet_expire *)arg);
++					  (struct autofs_packet_expire *)arg);
+ 	/* same as above, but can send multiple expires through pipe */
+ 	case AUTOFS_IOC_EXPIRE_MULTI:
+ 		return autofs4_expire_multi(inode->i_sb,filp->f_vfsmnt,sbi,
+-					(int *)arg);
++					    (int *)arg);
+ 
+ 	default:
+ 		return -ENOSYS;
+--- linux.orig/include/linux/auto_fs4.h	Mon May 15 11:34:19 2000
++++ linux/include/linux/auto_fs4.h	Sat Oct 21 19:07:39 2000
+@@ -1,4 +1,4 @@
+-/* -*- c-mode -*-
++/* -*- c -*-
+  * linux/include/linux/auto_fs4.h
+  *
+  * Copyright 1999-2000 Jeremy Fitzhardinge <jeremy@goop.org>[unhandled content-type:application/pgp-signature]

@@ -1,0 +1,141 @@
+Date: Mon, 11 Jan 1999 22:01:57 +0100 (MET)
+From: "Peter T. Breuer" <>
+Subject: Re: MM deadlock [was: Re: arca-vm-8...]
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/1/11/409
+
+If you want help with correctness here, you'll have to do a bit more
+explaining and abstraction.
+In general nobody would try and prove things about unstructured C and
+assembler! - we need to know the exact semantics of the machine code for
+starters if you do that, and that's never been done. 
+> Does anybody know semaphores by heart? I've got code that may well work,
+> but the race conditions for semaphores are nasty. As mentioned, this only
+> adds a single instruction to the common non-contended case, and I really
+> do believe it should be correct, but it is completely untested (so it
+> might not work at all), and it would be good to have somebody with some
+> theory go through this.. 
+> 
+> Basically, these simple changes should make it ok to do recursive
+Not sure what you mean by recursive here. A semaphore is a semaphore is a
+semaphore. I.e. on read it does
+     block until resource count > 0, then decrement resource count and return.
+On write it does
+     increment resource count and return.
+> semaphore grabs, so
+> 
+> 	down(&sem);
+> 	down(&sem);
+> 	up(&sem);
+> 	up(&sem);
+> 
+> should work and leave the semaphore unlocked.
+grab grab release release? That only works if the semaphore guarded two
+resources. Can you be meaning release release grab grab instead? Which?
+> Anybody? Semaphore theory used to be really popular at Universities, so
+> there must be somebody who has some automated proving program somewhere..
+For C and assembler in the context of a dual ix86? :-)
+>  struct semaphore {
+>  	atomic_t count;
+> +	unsigned long owner;
+>  	int waking;
+>  	struct wait_queue * wait;
+>  };
+The semaphore belongs to someone or some process id. OK.  The count is the
+available resource count, I suppose. What's "waking"?
+> -#define MUTEX ((struct semaphore) { ATOMIC_INIT(1), 0, NULL })
+> -#define MUTEX_LOCKED ((struct semaphore) { ATOMIC_INIT(0), 0, NULL })
+Well, that was a 1 resource or 0 resource init, respectively.  I doubt
+that's atomic. Does it matter?
+> +/*
+> + * Because we want the non-contention case to be
+> + * fast, we save the stack pointer into the "owner"
+> + * field, and to get the true task pointer we have
+> + * to do the bit masking. That moves the masking
+> + * operation into the slow path.
+Uh ..  the owner is a task.  Do you care?  Ahhh ..  I think you are
+trying to make the semaphore only unlockable by the task that locked it.
+> + */
+> +#define semaphore_owner(sem) \
+> +	((struct task_struct *)((2*PAGE_MASK) & (sem)->owner))
+What?? Beg 'pardon. This may be the way of wheedling its owner task
+out of the semaphore? Probably.
+> +
+> +#define MUTEX ((struct semaphore) { ATOMIC_INIT(1), 0, 0, NULL })
+> +#define MUTEX_LOCKED ((struct semaphore) { ATOMIC_INIT(0), 0, 0, NULL })
+>  
+>  asmlinkage void __down_failed(void /* special register calling convention */);
+Oh great.  I guess that means it's a subroutine that doesn't really
+shift the stack frame.  Useful to know.  It must want everything it
+needs setup in registers beforehand.  It still saves the return address
+on the stack, though?  So the stack pointer does shift by 4.
+>  asmlinkage int  __down_failed_interruptible(void  /* params in registers */);
+> @@ -64,13 +75,14 @@
+>  	spin_unlock_irqrestore(&semaphore_wake_lock, flags);
+>  }
+Some variant? I need to know what that does. What is a spinlock anyway?
+I'd have guessed at some sort of loop that does a yield and lowers the
+priority of the current thread, but that's just grasping (at threads).
+> -static inline int waking_non_zero(struct semaphore *sem)
+> +static inline int waking_non_zero(struct semaphore *sem, struct task_struct *tsk)
+>  {
+>  	unsigned long flags;
+>  	int ret = 0;
+>  
+>  	spin_lock_irqsave(&semaphore_wake_lock, flags);
+> -	if (sem->waking > 0) {
+> +	if (sem->waking > 0 || semaphore_owner(sem) == tsk) {
+> +		sem->owner = (unsigned long) tsk;
+>  		sem->waking--;
+>  		ret = 1;
+Uh, pass. What IS waking supposed to represent? What does this whole
+function want to do? It's not wait nor signal nor init, and since those
+are the only specified functionalities of a semaphore, I need info.
+This function seems to set the owner field - I'll assume the spinlock is for
+atomicity. Doesn't it need to be lifted afterwards?
+Anway, it decrements waiting. If that were the priority indicator that
+the spinlock were looking at (and the spinlock does what I imagine
+in terms of yielding), this might make some sense. Spec needed.
+>  	}
+> @@ -91,7 +103,8 @@
+>  		"lock ; "
+>  #endif
+>  		"decl 0(%0)\n\t"
+> -		"js 2f\n"
+> +		"js 2f\n\t"
+> +		"movl %%esp,4(%0)\n"
+I don't read assembler. Need spec. I see a decrement and a jump?
+>  		"1:\n"
+>  		".section .text.lock,\"ax\"\n"
+>  		"2:\tpushl $1b\n\t"
+> @@ -113,6 +126,7 @@
+>  #endif
+>  		"decl 0(%1)\n\t"
+>  		"js 2f\n\t"
+> +		"movl %%esp,4(%1)\n\t"
+>  		"xorl %0,%0\n"
+>  		"1:\n"
+>  		".section .text.lock,\"ax\"\n"
+> diff -u --recursive --new-file penguin/linux/kernel/sched.c linux/kernel/sched.c
+> --- penguin/linux/kernel/sched.c	Mon Jan  4 23:15:49 1999
+> +++ linux/kernel/sched.c	Sat Jan  9 13:37:16 1999
+> @@ -883,7 +883,7 @@
+>  	 * who gets to gate through and who has to wait some more.	 \
+>  	 */								 \
+>  	for (;;) {							 \
+> -		if (waking_non_zero(sem))	/* are we waking up?  */ \
+> +		if (waking_non_zero(sem, tsk))	/* are we waking up?  */ \
+>  			break;			/* yes, exit loop */
+Mmm.  Not enough info.  I need a list of the code, with assertions made
+about it every so often and intespersed between the lines.  Just the
+overall spec would be nice.  I can interpolate from there.
+>  #define DOWN_TAIL(task_state)			\
+Peter
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

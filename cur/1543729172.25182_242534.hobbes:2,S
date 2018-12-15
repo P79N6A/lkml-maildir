@@ -1,0 +1,155 @@
+Date: Mon, 16 Aug 2004 13:30:06 -0700 (PDT)
+From: Ram Pai <>
+Subject: [PATCH] Re: Fast patch for Severe I/O performance regression 2.6.6 to 2.6.7 or 2.6.8-rc3
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2004/8/16/260
+
+On Sun, 8 Aug 2004, Ram Pai wrote:
+> On Fri, 6 Aug 2004, Mr. Berkley Shands wrote:
+> 
+> > in 2.6.8-rc3/mm/readahead.c line 475 (about label do_io:)
+> > #if 0
+> >             ra->next_size = min(average , (unsigned long)max);
+> > #endif
+> > 
+> > the comment for the above is here after an lseek. The lseek IS inside 
+> > the window, but the code will always
+> > destroy the window and start again. The above patch corrects the 
+> > performance problem,
+> > but it would be better to do nothing if the lseek is still within the 
+> > read ahead window.
+> 
+> Ok. I can see your point. I did introduce a subtle change in behavior
+> in 2.6.8-rc3. The change in behavior is: the current window got populated
+> based on the average number of contiguous pages accessed  in the past.
+> Earlier to that patch, the current window got populated based on the
+> amount of locality in the current window, seen in the past.
+> 
+> Try this patch and see if things get back to normal. This patch 
+> populates the current window based on the average amount of locality 
+> noticed in the current window. It should help your case, but who knows
+> which other benchmark will scream :( . Its hard to keep every workload happy.
+> 
+> In any case try and see if this helps your case atleast. Meanwhile I will
+> run my set of benchmarks and see what gets effected. 
+Andrew,
+	Here is a consolidated readahead patch against mm tree that takes care
+of the performance regression seen with multiple threaded writes to the same
+file descriptor. 
+	The patch does the following:
+	1. Instead of calculating the average count of sequential
+		access in the read patterns, it calculates the
+		average amount of hits in the current window.
+	2. This average is used to guide the size of the next current
+		window.
+	3. Since the field serial_cnt in the ra structure does not
+	 	make sense with the introduction of the new logic,
+		I have renamed that field as currnt_wnd_hit.
+	This patch will help the read patterns that are not neccessarily
+sequential but have sufficient locality. However it may regress random
+workload. 
+	Results:
+	1. Berkley Shands has reported great performance with this
+		patch.
+	2. iozone showed negligible effect on various read patterns.
+	3. DSS workload saw neglible change.
+	4. Sysbench saw a small improvement.
+	I am not sure what good/bad effects this patch will cause
+	on other workloads. So can we keep this patch in your tree
+	for a while and see which benchmarks scream.
+	I have generated this patch w.r.t to 2.6.8-rc4-mm1.
+RP
+diff -pruN ram/linux-2.6.8-rc4/include/linux/fs.h linux-2.6.8-rc4/include/linux/fs.h
+--- ram/linux-2.6.8-rc4/include/linux/fs.h	2004-08-16 19:55:53.753441464 -0700
++++ linux-2.6.8-rc4/include/linux/fs.h	2004-08-16 20:01:45.996892320 -0700
+@@ -556,8 +556,8 @@ struct file_ra_state {
+ 	unsigned long prev_page;	/* Cache last read() position */
+ 	unsigned long ahead_start;	/* Ahead window */
+ 	unsigned long ahead_size;
+-	unsigned long serial_cnt;	/* measure of sequentiality */
+-	unsigned long average;		/* another measure of sequentiality */
++	unsigned long currnt_wnd_hit;	/* locality in the current window */
++	unsigned long average;		/* size of next current window */
+ 	unsigned long ra_pages;		/* Maximum readahead window */
+ 	unsigned long mmap_hit;		/* Cache hit stat for mmap accesses */
+ 	unsigned long mmap_miss;	/* Cache miss stat for mmap accesses */
+diff -pruN ram/linux-2.6.8-rc4/mm/readahead.c linux-2.6.8-rc4/mm/readahead.c
+--- ram/linux-2.6.8-rc4/mm/readahead.c	2004-08-16 19:55:54.243366984 -0700
++++ linux-2.6.8-rc4/mm/readahead.c	2004-08-16 20:01:46.554807504 -0700
+@@ -384,25 +384,10 @@ page_cache_readahead(struct address_spac
+ 		first_access=1;
+ 		ra->next_size = max / 2;
+ 		ra->prev_page = offset;
+-		ra->serial_cnt++;
++		ra->currnt_wnd_hit++;
+ 		goto do_io;
+ 	}
+ 
+-	if (offset == ra->prev_page + 1) {
+-		if (ra->serial_cnt <= (max * 2))
+-			ra->serial_cnt++;
+-	} else {
+-		/*
+-		 * to avoid rounding errors, ensure that 'average'
+-		 * tends towards the value of ra->serial_cnt.
+-		 */
+-		average = ra->average;
+-		if (average < ra->serial_cnt) {
+-			average++;
+-		}
+-		ra->average = (average + ra->serial_cnt) / 2;
+-		ra->serial_cnt = 1;
+-	}
+ 	ra->prev_page = offset;
+ 
+ 	if (offset >= ra->start && offset <= (ra->start + ra->size)) {
+@@ -411,12 +396,22 @@ page_cache_readahead(struct address_spac
+ 		 * page beyond the end.  Expand the next readahead size.
+ 		 */
+ 		ra->next_size += 2;
++
++		if (ra->currnt_wnd_hit <= (max * 2))
++			ra->currnt_wnd_hit++;
+ 	} else {
+ 		/*
+ 		 * A miss - lseek, pagefault, pread, etc.  Shrink the readahead
+ 		 * window.
+ 		 */
+ 		ra->next_size -= 2;
++
++		average = ra->average;
++		if (average < ra->currnt_wnd_hit) {
++			average++;
++		}
++		ra->average = (average + ra->currnt_wnd_hit) / 2;
++		ra->currnt_wnd_hit = 1;
+ 	}
+ 
+ 	if ((long)ra->next_size > (long)max)
+@@ -468,7 +463,11 @@ do_io:
+ 			  * pages shall be accessed in the next
+ 			  * current window.
+ 			  */
+-			ra->next_size = min(ra->average , (unsigned long)max);
++			average = ra->average;
++			if (ra->currnt_wnd_hit > average)
++				average = (ra->currnt_wnd_hit + ra->average + 1) / 2;
++
++			ra->next_size = min(average , (unsigned long)max);
+ 		}
+ 		ra->start = offset;
+ 		ra->size = ra->next_size;
+@@ -501,8 +500,8 @@ do_io:
+ 			 * random. Hence don't bother to readahead.
+ 			 */
+ 			average = ra->average;
+-			if (ra->serial_cnt > average)
+-				average = (ra->serial_cnt + ra->average + 1) / 2;
++			if (ra->currnt_wnd_hit > average)
++				average = (ra->currnt_wnd_hit + ra->average + 1) / 2;
+ 
+ 			if (average > max) {
+ 				ra->ahead_start = ra->start + ra->size;

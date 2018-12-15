@@ -1,0 +1,175 @@
+Date: Wed, 17 Feb 1999 13:50:52 -0800
+From: <>
+Subject: Re: TCP/IP Kernel Code modifications
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/2/17/138
+
+For amusement, here's a patch to tulip.c (in 2.0.36) that delays
+incoming packets.  It should be quite similar for other drivers.
+Can reconfigure on the fly, as shown below; note the poor TCP
+performance with the default window.  I suppose this qualifies
+as timer abuse (one add_timer() per packet).
+Cheers,
+Peter Monta   pmonta@imedia.com
+Imedia Corp.
+------------------------------
+ncp1:/# ping 206.3.97.123
+PING 206.3.97.123 (206.3.97.123): 56 data bytes
+64 bytes from 206.3.97.123: icmp_seq=0 ttl=254 time=0.4 ms
+64 bytes from 206.3.97.123: icmp_seq=1 ttl=254 time=0.4 ms
+64 bytes from 206.3.97.123: icmp_seq=2 ttl=254 time=0.4 ms
+64 bytes from 206.3.97.123: icmp_seq=3 ttl=254 time=0.4 ms
+64 bytes from 206.3.97.123: icmp_seq=4 ttl=254 time=0.4 ms
+--- 206.3.97.123 ping statistics ---
+5 packets transmitted, 5 packets received, 0% packet loss
+round-trip min/avg/max = 0.4/0.4/0.4 ms
+ncp1:/# defer_config eth0 45
+setting eth0 defer 45
+ncp1:/# ping 206.3.97.123
+PING 206.3.97.123 (206.3.97.123): 56 data bytes
+64 bytes from 206.3.97.123: icmp_seq=0 ttl=254 time=445.0 ms
+64 bytes from 206.3.97.123: icmp_seq=1 ttl=254 time=449.8 ms
+64 bytes from 206.3.97.123: icmp_seq=2 ttl=254 time=449.8 ms
+64 bytes from 206.3.97.123: icmp_seq=3 ttl=254 time=449.8 ms
+64 bytes from 206.3.97.123: icmp_seq=4 ttl=254 time=449.8 ms
+--- 206.3.97.123 ping statistics ---
+5 packets transmitted, 5 packets received, 0% packet loss
+round-trip min/avg/max = 445.0/448.8/449.8 ms
+ncp1:/# ftp 206.3.97.123
+Connected to 206.3.97.123.
+220 halibut.imedia.com FTP server (Version wu-2.4.2-academ[BETA-18](1) Mon Aug 3 19:17:20 EDT 1998) ready.
+Name (206.3.97.123:root): pmonta
+331 Password required for pmonta.
+Password:
+230 User pmonta logged in.
+Remote system type is UNIX.
+Using binary mode to transfer files.
+ftp> put vmlinuz xxx
+local: vmlinuz remote: xxx
+200 PORT command successful.
+150 Opening BINARY mode data connection for xxx.
+226 Transfer complete.
+371513 bytes sent in 6.85 secs (53 Kbytes/sec)
+ftp> quit
+221 Goodbye.
+ncp1:/# 
+------------------------------
+patch to tulip.c:
+--- /usr/src/linux-2.0.36/drivers/net/tulip.c	Tue Oct 13 19:15:43 1998
++++ ./tulip.c	Wed Feb 17 13:17:34 1999
+@@ -17,6 +17,8 @@
+ 	
+http://cesdis.gsfc.nasa.gov/linux/drivers/tulip.html
+ */
+ 
++#define HAVE_PRIVATE_IOCTL
++
+ #define SMP_CHECK
+ static const char version[] = "tulip.c:v0.89H 5/23/98 becker@cesdis.gsfc.nasa.gov\n";
+ 
+@@ -163,6 +165,9 @@
+ int tulip_debug = 1;
+ #endif
+ 
++static int defer_jiffies = 0;
++void defer_netif_rx(struct sk_buff* skb, unsigned long when);
++
+ /*
+ 				Theory of Operation
+ 
+@@ -2452,7 +2457,10 @@
+ #else
+ 			skb->len = pkt_len;
+ #endif
+-			netif_rx(skb);
++			if (defer_jiffies==0)
++				netif_rx(skb);
++			else
++				defer_netif_rx(skb,jiffies+defer_jiffies);
+ 			dev->last_rx = jiffies;
+ 			tp->stats.rx_packets++;
+ #if LINUX_VERSION_CODE > 0x20127
+@@ -2484,6 +2492,27 @@
+ 	return work_done;
+ }
+ 
++struct defer_entry {
++  struct sk_buff* skb;
++  struct timer_list timer;
++};
++
++static void defer_timer(unsigned long data)
++{ struct defer_entry* e = (struct defer_entry*)data;
++  netif_rx(e->skb);
++  kfree((void*)e->timer.data); }
++
++void defer_netif_rx(struct sk_buff* skb, unsigned long when)
++{ struct defer_entry* e;
++  e = (struct defer_entry*)kmalloc(sizeof(struct defer_entry), GFP_ATOMIC);
++  e->skb = skb;
++  e->timer.next = NULL;
++  e->timer.prev = NULL;
++  e->timer.expires = when;
++  e->timer.data = (unsigned long)e;
++  e->timer.function = &defer_timer;
++  add_timer(&e->timer); }
++
+ static int
+ tulip_close(struct device *dev)
+ {
+@@ -2619,6 +2648,9 @@
+ 			mdio_write(dev, data[0] & 0x1f, data[1] & 0x1f, data[2]);
+ 			restore_flags(flags);
+ 		}
++		return 0;
++	case SIOCDEVPRIVATE+3:
++		defer_jiffies = *((u32*)data);
+ 		return 0;
+ 	default:
+ 		return -EOPNOTSUPP;
+------------------------------
+configuration tool:
+(usage:  defer_config <interface-name> <time in jiffies>)
+#include <stdio.h>
+#include <fcntl.h>
+#include <net/if.h>
+#include <ioctls.h>
+main(int argc, char* argv[])
+{ int r;
+  int len;
+  struct ifconf ifc;
+  unsigned char buf[100*sizeof(struct ifreq)];
+  struct ifreq *ifr;
+  unsigned char* ptr;
+  int sockfd;
+  int defer_jiffies;
+  defer_jiffies = atoi(argv[2]);
+  sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+  if (sockfd<0) {
+    fprintf(stderr,"couldn't open socket\n");
+    exit(1); }
+  ifc.ifc_len = 100*sizeof(struct ifreq);
+  ifc.ifc_buf = buf;
+  r = ioctl(sockfd,SIOCGIFCONF,&ifc);
+  if (r<0) {
+    fprintf(stderr,"SIOCGIFCONF failed\n");
+    exit(1); }
+  for (ptr=buf; ptr<buf+ifc.ifc_len; ) {
+    ifr = (struct ifreq *)ptr;
+    len = sizeof(struct sockaddr);
+    ptr += sizeof(ifr->ifr_name) + len;
+    if (strcmp(argv[1],ifr->ifr_name)==0) {
+      ifr->ifr_data = defer_jiffies;
+      fprintf(stderr,"setting %s defer %d\n",ifr->ifr_name,ifr->ifr_data);
+      r = ioctl(sockfd, SIOCDEVPRIVATE+3, ifr);
+      if (r<0) {
+        fprintf(stderr,"socket ioctl failed\n");
+        exit(1); } } } }
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

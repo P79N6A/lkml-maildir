@@ -1,0 +1,184 @@
+Date: Sun, 17 Dec 2000 13:06:10 +0100
+From: Daniel Phillips <>
+Subject: [RFC] Semaphores used for daemon wakeup
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/12/17/94
+
+This patch illustrates an alternative approach to waking and waiting on
+daemons using semaphores instead of direct operations on wait queues.
+The idea of using semaphores to regulate the cycling of a daemon was
+suggested to me by Arjan Vos.  The basic idea is simple: on each cycle
+a daemon down's a semaphore, and is reactivated when some other task
+up's the semaphore.
+Sometimes an activating task wants to wait until the daemon completes
+whatever it's supposed to do - flushing memory in this case.  I
+generalized the above idea by adding another semaphore for wakers to
+sleep on, and a count variable to let the daemon know how many
+sleepers it needs to activate.  This patch updates bdflush and
+wakeup_bdflush to use that mechanism.
+The implementation uses two semaphores and a counter:
+	DECLARE_MUTEX_LOCKED(bdflush_request);
+	DECLARE_MUTEX_LOCKED(bdflush_waiter);
+	atomic_t bdflush_waiters /*= 0*/;
+A task wanting to activate bdflush does:
+	up(&bdflush_request);
+A task wanting to activate bdflush and wait does:
+	atomic_inc(&bdflush_waiters);
+	up(&bdflush_request);
+	down(&bdflush_waiter);
+When bdflush has finished its work it does:
+	waiters = atomic_read(&bdflush_waiters);
+	atomic_sub(waiters, &bdflush_waiters);
+	while (waiters--)
+		up(&bdflush_waiter);
+	down(&bdflush_request);
+Since I wasn't sure whether the side effect in the existing code of
+setting the current task RUNNING was really wanted, I wrote this in
+explicitly in the places where the side effect was noted, with the
+obligatory comment.
+I've done some fairly heavy stress-testing and this new scheme (but
+not on non-x86 or SMP) and it does seem to work much the same as the
+existing one.  I doubt that there is a measureable difference in
+execution overhead, nor is there a difference in correctness as far as
+I can see.  But for me at least, it's considerably easier to verify
+that the semaphore approach is correct.
+OK, there it is.  Is this better, worse, or lateral?
+-- 
+Daniel
+--- ../2.4.0-test10.clean/fs/buffer.c	Thu Oct 12 23:19:32 2000
++++ ./fs/buffer.c	Mon Dec 18 03:03:01 2000
+@@ -708,7 +708,8 @@
+ static void refill_freelist(int size)
+ {
+ 	if (!grow_buffers(size)) {
+-		wakeup_bdflush(1);  /* Sets task->state to TASK_RUNNING */
++		wakeup_bdflush(1);
++		__set_current_state(TASK_RUNNING); /* needed?? */
+ 		current->policy |= SCHED_YIELD;
+ 		schedule();
+ 	}
+@@ -2469,33 +2470,28 @@
+  * response to dirty buffers.  Once this process is activated, we write back
+  * a limited number of buffers to the disks and then go back to sleep again.
+  */
+-static DECLARE_WAIT_QUEUE_HEAD(bdflush_done);
++
++/* Semaphore wakeups, Daniel Phillips, phillips@innominate.de, 2000/12 */
++
+ struct task_struct *bdflush_tsk = 0;
++DECLARE_MUTEX_LOCKED(bdflush_request);
++DECLARE_MUTEX_LOCKED(bdflush_waiter);
++atomic_t bdflush_waiters /*= 0*/;
+ 
+ void wakeup_bdflush(int block)
+ {
+-	DECLARE_WAITQUEUE(wait, current);
+-
+ 	if (current == bdflush_tsk)
+ 		return;
+ 
+-	if (!block) {
+-		wake_up_process(bdflush_tsk);
++	if (!block)
++	{
++		up(&bdflush_request);
+ 		return;
+ 	}
+ 
+-	/* kflushd can wakeup us before we have a chance to
+-	   go to sleep so we must be smart in handling
+-	   this wakeup event from kflushd to avoid deadlocking in SMP
+-	   (we are not holding any lock anymore in these two paths). */
+-	__set_current_state(TASK_UNINTERRUPTIBLE);
+-	add_wait_queue(&bdflush_done, &wait);
+-
+-	wake_up_process(bdflush_tsk);
+-	schedule();
+-
+-	remove_wait_queue(&bdflush_done, &wait);
+-	__set_current_state(TASK_RUNNING);
++	atomic_inc(&bdflush_waiters);
++	up(&bdflush_request);
++	down(&bdflush_waiter);
+ }
+ 
+ /* This is the _only_ function that deals with flushing async writes
+@@ -2640,7 +2636,7 @@
+ int bdflush(void *sem)
+ {
+ 	struct task_struct *tsk = current;
+-	int flushed;
++	int flushed, waiters;
+ 	/*
+ 	 *	We have a bare-bones task_struct, and really should fill
+ 	 *	in a few more things so "top" and /proc/2/{exe,root,cwd}
+@@ -2660,6 +2656,7 @@
+ 	spin_unlock_irq(&tsk->sigmask_lock);
+ 
+ 	up((struct semaphore *)sem);
++	printk("Testing semwake bdflush synchronization.\n");
+ 
+ 	for (;;) {
+ 		CHECK_EMERGENCY_SYNC
+@@ -2668,28 +2665,16 @@
+ 		if (free_shortage())
+ 			flushed += page_launder(GFP_BUFFER, 0);
+ 
+-		/* If wakeup_bdflush will wakeup us
+-		   after our bdflush_done wakeup, then
+-		   we must make sure to not sleep
+-		   in schedule_timeout otherwise
+-		   wakeup_bdflush may wait for our
+-		   bdflush_done wakeup that would never arrive
+-		   (as we would be sleeping) and so it would
+-		   deadlock in SMP. */
+-		__set_current_state(TASK_INTERRUPTIBLE);
+-		wake_up_all(&bdflush_done);
+-		/*
+-		 * If there are still a lot of dirty buffers around,
+-		 * skip the sleep and flush some more. Otherwise, we
+-		 * go to sleep waiting a wakeup.
+-		 */
+-		if (!flushed || balance_dirty_state(NODEV) < 0) {
++		waiters = atomic_read(&bdflush_waiters);
++		atomic_sub(waiters, &bdflush_waiters);
++		while (waiters--)
++			up(&bdflush_waiter);
++
++		if (!flushed || balance_dirty_state(NODEV) < 0) 
++		{
+ 			run_task_queue(&tq_disk);
+-			schedule();
++			down(&bdflush_request);
+ 		}
+-		/* Remember to mark us as running otherwise
+-		   the next schedule will block. */
+-		__set_current_state(TASK_RUNNING);
+ 	}
+ }
+ 
+--- ../2.4.0-test10.clean/mm/highmem.c	Wed Oct 18 23:25:46 2000
++++ ./mm/highmem.c	Mon Dec 18 02:24:45 2000
+@@ -309,7 +309,8 @@
+ repeat_bh:
+ 	bh = kmem_cache_alloc(bh_cachep, SLAB_BUFFER);
+ 	if (!bh) {
+-		wakeup_bdflush(1);  /* Sets task->state to TASK_RUNNING */
++		wakeup_bdflush(1);
++		__set_current_state(TASK_RUNNING); /* needed?? */
+ 		current->policy |= SCHED_YIELD;
+ 		schedule();
+ 		goto repeat_bh;
+@@ -323,7 +324,8 @@
+ repeat_page:
+ 	page = alloc_page(GFP_BUFFER);
+ 	if (!page) {
+-		wakeup_bdflush(1);  /* Sets task->state to TASK_RUNNING */
++		wakeup_bdflush(1);
++		__set_current_state(TASK_RUNNING); /* needed?? */
+ 		current->policy |= SCHED_YIELD;
+ 		schedule();
+ 		goto repeat_page;

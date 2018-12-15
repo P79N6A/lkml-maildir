@@ -1,0 +1,174 @@
+Date: Mon, 24 Jul 2000 15:22:32 +1000 (EST)
+From: Neil Brown <>
+Subject: Re: Bug in Linux 2.4.0-test4 re:  NFS quotas
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/7/24/4
+
+On Friday July 21, dan.jones@uksolutions.co.uk wrote:
+> 
+> Summary-of-problem:
+> Local quotas work for users, however for NIS authenticated users on the remote
+> machines quota is not enforced at all.
+Thanks for that.  You are indeed right, quota are not imposed over NFS
+at all.
+Between 2.2 and 2.4 there was a change:
+  in 2.2 quotas are not enforced for fsuid == 0
+  in 2.4 quotas are not enforced for CAP_SYS_RESOURCE
+nfsd changed fsuid but didn't drop CAP_SYS_RESOURCE
+Also, ext2fs did not return EDQUOT when exeeding quota - it returned
+ENOSPC!  This is new with 2.4 ?!?!?!
+The following patch:
+  - causes knfsd to drop CAP_SYS_RESOURCE if uid != 0
+  - removed a lot of capability stuff from vfs.c which isn't needed.
+  - fixes ext2 so that it returns correct error for allocation
+    failure.
+NeilBrown
+--- ./fs/ext2/inode.c	2000/07/24 04:59:19	1.1
++++ ./fs/ext2/inode.c	2000/07/24 05:00:31
+@@ -259,10 +259,9 @@
+ 	ext2_debug ("goal = %d.\n", goal);
+ 
+ 	tmp = ext2_alloc_block (inode, goal, err);
+-	if (!tmp) {
+-		*err = -ENOSPC;
++	if (!tmp)
+ 		return NULL;
+-	}
++
+ 	if (metadata) {
+ 		result = getblk (inode->i_dev, tmp, blocksize);
+ 		if (!buffer_uptodate(result))
+--- ./fs/nfsd/auth.c	2000/07/24 04:04:21	1.1
++++ ./fs/nfsd/auth.c	2000/07/24 04:30:24
+@@ -10,6 +10,7 @@
+ #include <linux/sunrpc/svcauth.h>
+ #include <linux/nfsd/nfsd.h>
+ 
++#define	CAP_NFSD_MASK (CAP_FS_MASK|CAP_TO_MASK(CAP_SYS_RESOURCE))
+ void
+ nfsd_setuser(struct svc_rqst *rqstp, struct svc_export *exp)
+ {
+@@ -50,10 +51,10 @@
+ 	current->ngroups = i;
+ 
+ 	if ((cred->cr_uid)) {
+-		cap_t(current->cap_effective) &= ~CAP_FS_MASK;
++		cap_t(current->cap_effective) &= ~CAP_NFSD_MASK;
+ 	} else {
+-		cap_t(current->cap_effective) |= (CAP_FS_MASK &
+-		                                  current->cap_permitted);
++		cap_t(current->cap_effective) |= (CAP_NFSD_MASK &
++						  current->cap_permitted);
+ 	}
+ 
+ 	rqstp->rq_userset = 1;
+--- ./fs/nfsd/vfs.c	2000/07/24 04:11:26	1.1
++++ ./fs/nfsd/vfs.c	2000/07/24 04:17:59
+@@ -196,7 +196,6 @@
+ 	int		ftype = 0;
+ 	int		imode;
+ 	int		err;
+-	kernel_cap_t	saved_cap = 0;
+ 	int		size_change = 0;
+ 
+ 	if (iap->ia_valid & (ATTR_ATIME | ATTR_MTIME | ATTR_SIZE))
+@@ -283,10 +282,6 @@
+ 
+ 
+ 	iap->ia_valid |= ATTR_CTIME;
+-	if (current->fsuid != 0) {
+-		saved_cap = current->cap_effective;
+-		cap_clear(current->cap_effective);
+-	}
+ #ifdef CONFIG_QUOTA
+ 	/* DQUOT_TRANSFER needs both ia_uid and ia_gid defined */
+ 	if (iap->ia_valid & (ATTR_UID|ATTR_GID)) {
+@@ -312,8 +307,6 @@
+ 		fh_unlock(fhp);
+ 		put_write_access(inode);
+ 	}
+-	if (current->fsuid != 0)
+-		current->cap_effective = saved_cap;
+ 	if (err)
+ 		goto out_nfserr;
+ 	if (EX_ISSYNC(fhp->fh_export))
+@@ -640,9 +633,6 @@
+ 	mm_segment_t		oldfs;
+ 	int			err = 0;
+ 	int			stable = *stablep;
+-#ifdef CONFIG_QUOTA
+-	uid_t			saved_euid;
+-#endif
+ 
+ 	err = nfsd_open(rqstp, fhp, S_IFREG, MAY_WRITE, &file);
+ 	if (err)
+@@ -680,15 +670,7 @@
+ 
+ 	/* Write the data. */
+ 	oldfs = get_fs(); set_fs(KERNEL_DS);
+-#ifdef CONFIG_QUOTA
+-	/* This is for disk quota. */
+-	saved_euid = current->euid;
+-	current->euid = current->fsuid;
+-	err = file.f_op->write(&file, buf, cnt, &file.f_pos);
+-	current->euid = saved_euid;
+-#else
+ 	err = file.f_op->write(&file, buf, cnt, &file.f_pos);
+-#endif
+ 	if (err >= 0)
+ 		nfsdstats.io_write += cnt;
+ 	set_fs(oldfs);
+@@ -696,17 +678,10 @@
+ 	/* clear setuid/setgid flag after write */
+ 	if (err >= 0 && (inode->i_mode & (S_ISUID | S_ISGID))) {
+ 		struct iattr	ia;
+-		kernel_cap_t	saved_cap = 0;
+ 
+ 		ia.ia_valid = ATTR_MODE;
+ 		ia.ia_mode  = inode->i_mode & ~(S_ISUID | S_ISGID);
+-		if (current->fsuid != 0) {
+-			saved_cap = current->cap_effective;
+-			cap_clear(current->cap_effective);
+-		}
+ 		notify_change(dentry, &ia);
+-		if (current->fsuid != 0)
+-			current->cap_effective = saved_cap;
+ 	}
+ 
+ 	if (err >= 0 && stable) {
+@@ -1463,7 +1438,6 @@
+ {
+ 	struct inode	*inode = dentry->d_inode;
+ 	int		err;
+-	kernel_cap_t	saved_cap = 0;
+ 
+ 	if (acc == MAY_NOP)
+ 		return 0;
+@@ -1522,19 +1496,12 @@
+ 	    inode->i_uid == current->fsuid)
+ 		return 0;
+ 
+-	if (current->fsuid != 0) {
+-		saved_cap = current->cap_effective;
+-		cap_clear(current->cap_effective);
+-	}
+ 
+ 	err = permission(inode, acc & (MAY_READ|MAY_WRITE|MAY_EXEC));
+ 
+ 	/* Allow read access to binaries even when mode 111 */
+ 	if (err == -EACCES && S_ISREG(inode->i_mode) && acc == MAY_READ)
+ 		err = permission(inode, MAY_EXEC);
+-
+-	if (current->fsuid != 0)
+-		current->cap_effective = saved_cap;
+ 
+ 	return err? nfserrno(err) : 0;
+ }
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

@@ -1,0 +1,387 @@
+Date: Mon, 7 Jun 1999 18:36:01 +0200 (CEST)
+From: Andrea Arcangeli <>
+Subject: [patch] fix for SMP stuck on IPI-TLB-flush [Re: 2.2.9-ac2 locks solid]
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/6/7/108
+
+On Mon, 7 Jun 1999, Ingo Molnar wrote:
+>> to use GFP_ATOMIC instead and let me know
+>
+>this might as well explain the 'stuck on TLB IPI wait' bugs?
+Yes. You catched the culprit. The IPI lockup currently may happen if
+somebody does a:
+	CPU1					CPU2
+	spin_lock_irq() -> __cli()
+	/* irq locally disabled */
+						lock_kernel() (kernel_flag
+						acquired)
+						flush_tlb_page()
+	lock_kernel();
+	/* spin on the lock with irq
+	   disabled */
+						send IPI
+	/* never execute
+	   smp_invalidate irq */
+						/* deadlock */
+Right now to avoid this scenario we must simply never call lock_kernel()
+with irq disabled.
+The signal code was buggy also because it wasn't releasing the spinlock
+before going to sleep. We must change GFP_KERNEL to GFP_ATOMIC in signal.c
+also because we have the spinlock held and if somebody will send a signal
+to the same task while we are sleeping in freeing memory we'll get stuck
+over the spinlock.
+It must be fixed also the do_wp_page that is doing a flush_tlb_page()
+without helding the big kernel lock.
+I changed also a bit also the way we send the tlb flush. I resolved the
+locking quite easily since I am delivering an NMI to all other CPUS.  The
+only necessary enforcement is that all calls to smp_flush_tlb _must_ be
+serialized by some kind of lock, currently the big kernel lock.
+I would ask people that is getting TLB-flush-IPI deadlock to try out this
+patch against 2.2.9. It does:
+o	s/GFP_KERNEL/GFP_ATOMIC/ in signal.c
+o	fixes potential SMP race between do_wp_page and swap_out
+o	fix the releasing of the big kernel lock in the end_wp_page path
+o	avoid all locking/deadlock troubles of the tlb flushing by using 
+	NMI
+o	grab the kernel lock before calling flush_tlb_page()
+o	remove two not needed check in do_wp_page
+o	no need of check_tlb_flush
+With this patch applyed a piece of code with irq disabled can also call
+lock_kernel() without risk to deadlock (the NMI won't care about the irq
+disabled :). (take a look at /proc/interrupts too to get some fun :)
+Index: linux//arch/i386/kernel/irq.c
+===================================================================
+RCS file: /var/cvs/linux/arch/i386/kernel/irq.c,v
+retrieving revision 1.1.1.7
+diff -u -r1.1.1.7 irq.c
+--- linux//arch/i386/kernel/irq.c	1999/05/12 11:30:47	1.1.1.7
++++ linux//arch/i386/kernel/irq.c	1999/06/07 15:57:51
+@@ -320,7 +320,6 @@
+  * through the ICC by us (IPIs)
+  */
+ BUILD_SMP_INTERRUPT(reschedule_interrupt)
+-BUILD_SMP_INTERRUPT(invalidate_interrupt)
+ BUILD_SMP_INTERRUPT(stop_cpu_interrupt)
+ BUILD_SMP_INTERRUPT(call_function_interrupt)
+ BUILD_SMP_INTERRUPT(spurious_interrupt)
+@@ -450,22 +449,6 @@
+ atomic_t global_bh_count;
+ atomic_t global_bh_lock;
+ 
+-/*
+- * "global_cli()" is a special case, in that it can hold the
+- * interrupts disabled for a longish time, and also because
+- * we may be doing TLB invalidates when holding the global
+- * IRQ lock for historical reasons. Thus we may need to check
+- * SMP invalidate events specially by hand here (but not in
+- * any normal spinlocks)
+- */
+-static inline void check_smp_invalidate(int cpu)
+-{
+-	if (test_bit(cpu, &smp_invalidate_needed)) {
+-		clear_bit(cpu, &smp_invalidate_needed);
+-		local_flush_tlb();
+-	}
+-}
+-
+ static void show(char * str)
+ {
+ 	int i;
+@@ -555,7 +538,6 @@
+ 			__sti();
+ 			SYNC_OTHER_CORES(cpu);
+ 			__cli();
+-			check_smp_invalidate(cpu);
+ 			if (atomic_read(&global_irq_count))
+ 				continue;
+ 			if (global_irq_lock)
+@@ -606,9 +588,7 @@
+ 			return;
+ 		/* Uhhuh.. Somebody else got it. Wait.. */
+ 		do {
+-			do {
+-				check_smp_invalidate(cpu);
+-			} while (test_bit(0,&global_irq_lock));
++			while (test_bit(0,&global_irq_lock));
+ 		} while (test_and_set_bit(0,&global_irq_lock));		
+ 	}
+ 	/* 
+@@ -1084,9 +1064,6 @@
+ 	 * IPI, driven by wakeup.
+ 	 */
+ 	set_intr_gate(RESCHEDULE_VECTOR, reschedule_interrupt);
+-
+-	/* IPI for invalidation */
+-	set_intr_gate(INVALIDATE_TLB_VECTOR, invalidate_interrupt);
+ 
+ 	/* IPI for CPU halt */
+ 	set_intr_gate(STOP_CPU_VECTOR, stop_cpu_interrupt);
+Index: linux//arch/i386/kernel/smp.c
+===================================================================
+RCS file: /var/cvs/linux/arch/i386/kernel/smp.c,v
+retrieving revision 1.1.1.10
+diff -u -r1.1.1.10 smp.c
+--- linux//arch/i386/kernel/smp.c	1999/05/12 11:30:48	1.1.1.10
++++ linux//arch/i386/kernel/smp.c	1999/06/07 16:13:58
+@@ -1478,6 +1478,16 @@
+ 	return cfg;
+ }
+ 
++static inline int __prepare_ICR_NMI (unsigned int shortcut)
++{
++	unsigned int cfg;
++
++	cfg = __get_ICR();
++	cfg |= APIC_DEST_DM_NMI|shortcut;
++
++	return cfg;
++}
++
+ static inline int __prepare_ICR2 (unsigned int dest)
+ {
+ 	unsigned int cfg;
+@@ -1518,11 +1528,46 @@
+ #endif
+ }
+ 
++static inline void __send_IPI_shortcut_NMI(unsigned int shortcut)
++{
++	unsigned int cfg;
++/*
++ * Subtle. In the case of the 'never do double writes' workaround we
++ * have to lock out interrupts to be safe. Otherwise it's just one
++ * single atomic write to the APIC, no need for cli/sti.
++ */
++#if FORCE_APIC_SERIALIZATION
++	unsigned long flags;
++
++	__save_flags(flags);
++	__cli();
++#endif
++
++	/*
++	 * No need to touch the target chip field
++	 */
++
++	cfg = __prepare_ICR_NMI(shortcut);
++
++	/*
++	 * Send the IPI. The write to APIC_ICR fires this off.
++	 */
++	apic_write(APIC_ICR, cfg);
++#if FORCE_APIC_SERIALIZATION
++	__restore_flags(flags);
++#endif
++}
++
+ static inline void send_IPI_allbutself(int vector)
+ {
+ 	__send_IPI_shortcut(APIC_DEST_ALLBUT, vector);
+ }
+ 
++static inline void send_IPI_allbutself_NMI(void)
++{
++	__send_IPI_shortcut_NMI(APIC_DEST_ALLBUT);
++}
++
+ static inline void send_IPI_all(int vector)
+ {
+ 	__send_IPI_shortcut(APIC_DEST_ALLINC, vector);
+@@ -1574,13 +1619,13 @@
+ {
+ 	int cpu = smp_processor_id();
+ 	int stuck;
+-	unsigned long flags;
++	unsigned long other_online_cpus = cpu_online_map & ~(1<<cpu);
+ 
+ 	/*
+ 	 * it's important that we do not generate any APIC traffic
+ 	 * until the AP CPUs have booted up!
+ 	 */
+-	if (cpu_online_map) {
++	if (other_online_cpus) {
+ 		/*
+ 		 * The assignment is safe because it's volatile so the
+ 		 * compiler cannot reorder it, because the i586 has
+@@ -1590,38 +1635,31 @@
+ 		 * locked or.
+ 		 */
+ 
+-		smp_invalidate_needed = cpu_online_map;
++		smp_invalidate_needed = other_online_cpus;
+ 
+ 		/*
+-		 * Processors spinning on some lock with IRQs disabled
+-		 * will see this IRQ late. The smp_invalidate_needed
+-		 * map will ensure they don't do a spurious flush tlb
+-		 * or miss one.
++		 * Send NMI to all other CPUs to flush their TLB. We can
++		 * loop without care here then, since an NMI will arrive
++		 * for sure even if irqs was disabled on all the other cpus.
++		 * The only _important_ thing is that we are the only
++		 * cpu running smp_flush_tlb in the system and this is enforced
++		 * by helding the big kernel lock before calling
++		 * smp_flush_tlb(). -Andrea
+ 		 */
+-	
+-		__save_flags(flags);
+-		__cli();
++		send_IPI_allbutself_NMI();
+ 
+-		send_IPI_allbutself(INVALIDATE_TLB_VECTOR);
+-
+ 		/*
+ 		 * Spin waiting for completion
+ 		 */
+ 
+ 		stuck = 50000000;
+ 		while (smp_invalidate_needed) {
+-			/*
+-			 * Take care of "crossing" invalidates
+-			 */
+-			if (test_bit(cpu, &smp_invalidate_needed))
+-			clear_bit(cpu, &smp_invalidate_needed);
+ 			--stuck;
+ 			if (!stuck) {
+ 				printk("stuck on TLB IPI wait (CPU#%d)\n",cpu);
+ 				break;
+ 			}
+ 		}
+-		__restore_flags(flags);
+ 	}
+ 
+ 	/*
+@@ -1835,18 +1873,6 @@
+ asmlinkage void smp_reschedule_interrupt(void)
+ {
+ 	ack_APIC_irq();
+-}
+-
+-/*
+- * Invalidate call-back
+- */
+-asmlinkage void smp_invalidate_interrupt(void)
+-{
+-	if (test_and_clear_bit(smp_processor_id(), &smp_invalidate_needed))
+-		local_flush_tlb();
+-
+-	ack_APIC_irq();
+-
+ }
+ 
+ static void stop_this_cpu (void)
+Index: linux//arch/i386/kernel/traps.c
+===================================================================
+RCS file: /var/cvs/linux/arch/i386/kernel/traps.c,v
+retrieving revision 1.1.1.3
+diff -u -r1.1.1.3 traps.c
+--- linux//arch/i386/kernel/traps.c	1999/02/20 15:38:05	1.1.1.3
++++ linux//arch/i386/kernel/traps.c	1999/06/07 15:57:51
+@@ -324,16 +324,24 @@
+ 
+ asmlinkage void do_nmi(struct pt_regs * regs, long error_code)
+ {
+-	unsigned char reason = inb(0x61);
+ 	extern atomic_t nmi_counter;
++	extern unsigned long smp_invalidate_needed;
+ 
+ 	atomic_inc(&nmi_counter);
++	if (test_and_clear_bit(smp_processor_id(), &smp_invalidate_needed))
++	{
++		local_flush_tlb();
++		return;
++	}
++{
++	unsigned char reason = inb(0x61);
+ 	if (reason & 0x80)
+ 		mem_parity_error(reason, regs);
+ 	if (reason & 0x40)
+ 		io_check_error(reason, regs);
+ 	if (!(reason & 0xc0))
+ 		unknown_nmi_error(reason, regs);
++}
+ }
+ 
+ /*
+Index: linux//kernel/signal.c
+===================================================================
+RCS file: /var/cvs/linux/kernel/signal.c,v
+retrieving revision 1.1.1.5
+diff -u -r1.1.1.5 signal.c
+--- linux//kernel/signal.c	1999/05/14 18:25:04	1.1.1.5
++++ linux//kernel/signal.c	1999/06/07 16:12:49
+@@ -324,7 +324,7 @@
+ 
+ 		if (nr_queued_signals < max_queued_signals) {
+ 			q = (struct signal_queue *)
+-			    kmem_cache_alloc(signal_queue_cachep, GFP_KERNEL);
++			    kmem_cache_alloc(signal_queue_cachep, SLAB_ATOMIC);
+ 		}
+ 		
+ 		if (q) {
+Index: linux//mm/memory.c
+===================================================================
+RCS file: /var/cvs/linux/mm/memory.c,v
+retrieving revision 1.1.1.4
+diff -u -r1.1.1.4 memory.c
+--- linux//mm/memory.c	1999/04/17 14:27:30	1.1.1.4
++++ linux//mm/memory.c	1999/06/07 15:58:06
+@@ -652,36 +652,42 @@
+ 		delete_from_swap_cache(page_map);
+ 		/* FallThrough */
+ 	case 1:
+-		/* We can release the kernel lock now.. */
+-		unlock_kernel();
+-
+ 		flush_cache_page(vma, address);
+ 		set_pte(page_table, pte_mkdirty(pte_mkwrite(pte)));
+ 		flush_tlb_page(vma, address);
+ end_wp_page:
++		/*
++		 * We can release the kernel lock now.. Now swap_out will see
++		 * a dirty page and so won't get confused and flush_tlb_page
++		 * won't SMP race. -Andrea
++		 */
++		unlock_kernel();
++
+ 		if (new_page)
+ 			free_page(new_page);
+ 		return 1;
+ 	}
+ 		
+-	unlock_kernel();
+ 	if (!new_page)
+-		return 0;
++		goto no_new_page;
+ 
+-	if (PageReserved(mem_map + MAP_NR(old_page)))
++	if (PageReserved(page_map))
+ 		++vma->vm_mm->rss;
+ 	copy_cow_page(old_page,new_page);
+ 	flush_page_to_ram(old_page);
+ 	flush_page_to_ram(new_page);
+ 	flush_cache_page(vma, address);
+ 	set_pte(page_table, pte_mkwrite(pte_mkdirty(mk_pte(new_page, vma->vm_page_prot))));
+-	free_page(old_page);
+ 	flush_tlb_page(vma, address);
++	unlock_kernel();
++	__free_page(page_map);
+ 	return 1;
+ 
+ bad_wp_page:
+ 	printk("do_wp_page: bogus page at address %08lx (%08lx)\n",address,old_page);
+ 	send_sig(SIGKILL, tsk, 1);
++no_new_page:
++	unlock_kernel();
+ 	if (new_page)
+ 		free_page(new_page);
+ 	return 0;
+Andrea Arcangeli
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

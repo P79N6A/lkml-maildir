@@ -1,0 +1,147 @@
+Date: Wed, 3 Mar 1999 11:03:36 +0100 (MET)
+From: Gabriel Paubert <>
+Subject: Re: [patch] PIII/Katmai & FXSAVE support, disable serial-#, 2.2.2
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/3/3/30
+
+On Tue, 2 Mar 1999, Ingo Molnar wrote:
+> 
+> this is a new version of the Katmai patch. Changes:
+> 
+> 	- disables PIII serial# on all CPUs (Doug Ledford)
+> 	  [we might make this configurable in the future for Wine
+> 	   compatibility]
+> 
+> 	- more correct tagword conversion (Gabriel Paubert)
+Nitpicking again :-)
+[trimmed]
+> --- linux/include/asm-i386/processor.h.orig	Tue Jan 26 10:47:10 1999
+> +++ linux/include/asm-i386/processor.h	Tue Mar  2 21:47:41 1999
+> @@ -164,6 +214,27 @@
+>   */
+>  #define IO_BITMAP_SIZE	32
+> 
+> +/*
+> + * We have two (incompatible) floating-point state 'hard' layouts:
+> + *
+> + *  - the new MMX2-ready layout used by newer PII/Xeon/PIII(Katmai) CPUs
+> + *  - the 'old' i387 FPU layout used by everything else
+> + *
+> + * we use the one apropriate for the CPU picked at kernel compilation time.
+> + *
+> + * to keep the FPU code a bit more transparent, we define the same
+> + * structure in both cases, the parameter names are identical too.
+> + * for cases where we cannot make this transparent, we define access
+> + * functions.
+> + *
+> + * we also have two FPU formats visible in APIs, 'hard format' and
+> + * 'user-format'. The user-format is decoupled from the actual hard
+> + * format (which can be i387 or KNI) and conversion routines are
+> + * provided. user-format is currently i387, which we cannot change
+> + * (only extend) due to external APIs (iBCS2, ELF coredumps, ptrace API).
+> + */
+> +
+> +#ifndef CONFIG_X86_FX
+>  struct i387_hard_struct {
+>  	long	cwd;
+>  	long	swd;
+> @@ -176,6 +247,84 @@
+>  	long	status;		/* software status information */
+>  };
+> 
+> +/*
+> + * Fill out the reserved bits
+> + */
+> +#define i387_set_cwd(x,v) do { (x).cwd = ((long)(v) | 0xffff0000); } while (0)
+> +#define i387_set_swd(x,v) do { (x).swd = ((long)(v) | 0xffff0000); } while (0)
+> +#define i387_set_twd(x,v) do { (x).twd = ((long)(v) | 0xffff0000); } while (0)
+> +
+> +#define i387_save_hard(x) \
+> +	 do { __asm__("fnsave %0; fwait;": "=m" (x)); } while (0)
+> +
+> +#define i387_restore_hard(x) \
+> +	 do { __asm__("frstor %0": :"m" (x)); } while (0)
+> +
+> +#else
+> +
+> +/*
+> + * has to be 128-bit aligned
+> + */
+> +struct i387_hard_struct {
+> +	unsigned short cwd;
+> +	unsigned short swd;
+> +	unsigned char twd;
+> +	unsigned char __reserved_01;
+> +	unsigned short fopcode;
+> +	long	fip;
+> +	long	fcs;
+> +	long	foo;
+> +	long	fos;
+> +	long __reserved_02, __reserved_03;
+> +	long	st_space[32];	/* 8*16 bytes for each FP/MMX-reg = 128 bytes */
+> +	long __reserved_04 [22*16]; /* 22 cachelines for MMX2 registers */
+> +} __attribute__ ((aligned (16)));
+Actually __reserved_02 is now defined as mxcsr. And unless I'm mistaken
+sizeof(i387_hard_struct) here is around 1568 bytes while intel only
+requires 512. The last element should be split into long xmmregs[32] and
+a reserved area of 224 bytes (56 long). 
+> +
+> +/*
+> + * tag word conversion (thanks to Gabriel Paubert for noticing the
+> + * subtle format difference and implementing these functions)
+> + *
+> + * there are several erratas wrt. the tag word in the i387, thus
+> + * any software relying on it's value is questionable, but we
+> + * definitely want to be as close as possible.
+> + */
+> +static inline unsigned short fputag_KNIto387(unsigned char tb) {
+> +	unsigned short tw = tb;
+> +	tw = ((tw<<4) | tw) &0x0f0f; /* zzzz7654zzzz3210 */
+> +	tw = ((tw<<2) | tw) &0x3333; /* zz76zz54zz32zz10 */
+> +	tw = ((tw<<1) | tw) &0x5555; /* z7z6z5z4z3z2z1z0 */
+> +	return ~(tw*3);
+> +}
+> +
+> +static inline unsigned char fputag_387toKNI(unsigned short tw) {
+> +	tw = ~tw;
+> +	tw = (tw | (tw>>1)) & 0x5555; /* z7z6z5z4z3z2z1z0 */
+> +	tw = (tw | (tw>>1)) & 0x3333; /* zz76zz54zz32zz10 */
+> +	tw = (tw | (tw>>3)) & 0x0f0f; /* zzzz7654zzzz3210 */
+                        ^
+typo here:    should be 2, my fault :-(
+> +	return (tw|(tw>>4)) & 0x00ff; /* zzzzzzzz76543210 */
+> +}
+> +
+> +#define i387_set_cwd(x,v) do { (x).cwd = (short)(v); } while (0)
+> +#define i387_set_swd(x,v) do { (x).swd = (short)(v); } while (0)
+> +#define i387_set_twd(x,v) do { (x).twd = fputag_387toKNI(v); } while (0)
+> +
+> +/*
+> + * GAS is not ready yet, so we encode the FXSAVE/FXRSTOR
+> + * opcodes directly:
+> + */
+> +#define i387_save_hard(x) \
+> +do { __asm__ __volatile__(".byte 0x0f, 0xae, 0x06": :"S" (&(x))); } while (0)
+> +
+> +#define i387_restore_hard(x) \
+> +do { __asm__ __volatile__(".byte 0x0f, 0xae, 0x4f, 0x00": :"D" (&(x))); } while (0)
+> +
+> +#endif
+> +
+> +extern int i387_hard_to_user ( struct user_i387_struct * user,
+> +			struct i387_hard_struct * hard);
+> +extern int i387_user_to_hard (struct i387_hard_struct * hard,
+> +			struct user_i387_struct * user);
+> +
+>  struct i387_soft_struct {
+>  	long	cwd;
+>  	long	swd;
+	Gabriel. 
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

@@ -1,0 +1,360 @@
+Date: Sat, 6 Mar 1999 04:23:31 +0200 (EET)
+From: Jukka Tapani Santala <>
+Subject: FAT speedup patch revisited for 2.2.1
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/3/5/142
+
+Sometimes, operations on the old FAT based filesystems (VFAT, MSDOS etc.)
+on Linux appear almost draggingly slow. There's no magic bullet to solve
+this (Or if there is, let me know;) but after performing extensive
+profiling on the 2.1.x series of kernels I pinpointed some places of the
+code that are crucial during high filesystem-load times, and embarked on
+optimizing them. I have now revisited that patch, making sure it applies
+and works for 2.2.x series kernels, fixed things up and performed some
+further benchmarking. Now, the catch is that this patch is assuming:
+ - the cluster_size will always be a full power of two
+ - filenames and extensions are always padded with spaces
+It seems to me these two conditions are true in general; no exceptions
+have been brought to my attention since I've started posting these
+optimizations. Some parts of the code appear to already be more or less
+assuming the above. But be forewarned, if for some reason either one isn't
+true, applying and running this patch may lead to filesystem corruption.
+I'd like to know of any such instances. Now, with the geral babble out of
+the way, few notes on the choices made in this:
+The major improvement is replacing cluster-size by "cluster-shift", the
+two's power for the effective cluster-size. Most of the time either
+multiplying or dividing by the cluster-size is required, and because
+cluster-size itself is a variable, the compilers have no way to
+automatically optimize these operations to shifts when needed. Division is
+so expensive operations the performance-boost from this is noticeable.
+Even in the one tricky modulus-operation on the first chunk of the patch,
+the bit-operation is much preferable to taking real modulus. Further
+improvement might be gained by calculating and keeping around another
+bit-mask for the modulus, though, but I have not conssidered that worth
+increasing the memory-profile.
+The second improvement involves the function used to translate standard
+FAT style filenames into *nix filesystem type filenames. In this process
+the 8.3 type filename pieces are read from the FAT record, put into lower
+case and concatenated into result string for display. Unfortunately, quick
+look at the code shows that this bit of code gets so deeply nested it ends
+up with pretty poor optimization. I tried several approachs to get all out
+from the processor on this code, and finally settled on the attached
+approach.
+Here, to avoid running out of registers to use, the actual task has been
+divided up to a number of very simple, straightforward tasks executed
+after each another. Namely, we find the length of the filename portion; we
+copy it down. Next we find the length of the extension and copy it after,
+and finally we turn the whole result string to lower case. This appears to
+work pretty well in practice.
+With some experimenting I finally settled on the current approach here,
+where the filename-portions are scanned in reverse order to find their
+length - this way we won't have to scan the whole string for last
+non-whitespace, and also most filenames are close to 8 characters, so
+loop-count will stay low.
+Finally, in an earlier version of this patch, the case-conversion was done
+using a partial case-table. After some dry-profiling, I found out this
+approach is <10% faster even when the table can be counted to stay in
+cache all the time, so in this version I have reverted back to the
+approach using two compares and increment used elsewhere in the code, for
+a grand saving of 32 bytes.
+So... if you're using FAT based filesystems on your computer, feel free to
+give this patch a try. If, for some reason, the message "fat_read_super:
+Cluster size was not power of two!" appears during bootup or mounting, do
+not use the patch, but let me know of the details instantly. Ofcourse,
+this should not happen <g>. Any other problems, let me know as well. I'm
+hoping this patch can be included in the next developmental kernel version
+(2.3.x?)
+ -Donwulff
+diff --unified --recursive linux.221/fs/fat/cache.c linux/fs/fat/cache.c
+--- linux.221/fs/fat/cache.c	Sat Mar  6 03:19:04 1999
++++ linux/fs/fat/cache.c	Sat Mar  6 03:20:29 1999
+@@ -276,10 +276,10 @@
+ 			return 0;
+ 		return sector+sb->dir_start;
+ 	}
+-	cluster = sector/sb->cluster_size;
+-	offset = sector % sb->cluster_size;
++	cluster = sector>>sb->cluster_shift;
++	offset = sector & ~(~0<<sb->cluster_shift);
+ 	if (!(cluster = fat_get_cluster(inode,cluster))) return 0;
+-	return (cluster-2)*sb->cluster_size+sb->data_start+offset;
++	return ((cluster-2)<<sb->cluster_shift)+sb->data_start+offset;
+ }
+ 
+ 
+@@ -319,7 +319,7 @@
+ 				fat_clusters_flush(inode->i_sb);
+ 			}
+ 		}
+-		inode->i_blocks -= MSDOS_SB(inode->i_sb)->cluster_size;
++		inode->i_blocks -= 1<<MSDOS_SB(inode->i_sb)->cluster_shift;
+ 	}
+ 	unlock_fat(inode->i_sb);
+ 	fat_cache_inval_inode(inode);
+diff --unified --recursive linux.221/fs/fat/dir.c linux/fs/fat/dir.c
+--- linux.221/fs/fat/dir.c	Sat Mar  6 03:19:04 1999
++++ linux/fs/fat/dir.c	Sat Mar  6 05:35:07 1999
+@@ -122,8 +122,7 @@
+ 	int both)
+ {
+ 	struct super_block *sb = inode->i_sb;
+-	int ino,i,i2,last;
+-	char c;
++	int ino,i,i2;
+ 	struct buffer_head *bh;
+ 	struct msdos_dir_entry *de;
+ 	unsigned long oldpos = filp->f_pos;
+@@ -239,6 +238,7 @@
+ 			char *ptname = bufname;
+ 			int dotoffset = 0;
+ 			int was_long = is_long;
++			int last;
+ 
+ 			if (is_long) {
+ 				unsigned char sum;
+@@ -263,27 +263,24 @@
+ 				dotoffset = 1;
+ 				ptname = bufname+1;
+ 			}
+-			for (i = 0, last = 0; i < 8; i++) {
+-				if (!(c = de->name[i])) break;
+-				if (c >= 'A' && c <= 'Z') c += 32;
+-				/* see namei.c, msdos_format_name */
+-				if (c == 0x05) c = 0xE5;
+-				if (c != ' ')
+-					last = i+1;
+-				ptname[i] = c;
+-			}
+-			i = last;
+-			ptname[i] = '.';
+-			i++;
+-			for (i2 = 0; i2 < 3; i2++) {
+-				if (!(c = de->ext[i2])) break;
+-				if (c >= 'A' && c <= 'Z') c += 32;
+-				if (c != ' ')
+-					last = i+1;
+-				ptname[i] = c;
++
++			/* see namei.c, msdos_format_name */
++			if (*ptname == 0x05) *ptname = 0xE5;
++			last=8; while(last--&&(de->name[last]==' '));
++			for (i = 0; i <= last; i++)
++				ptname[i] = de->name[i];
++			last=3; while(last--&&(de->ext[last]==' '));
++			if(last>=0) {
++				ptname[i] = '.';
+ 				i++;
++				for (i2 = 0; i2 <= last; i2++)
++					ptname[i++] = de->ext[i2];
+ 			}
+-			if ((i = last) != 0) {
++			if (i != 0) {
++				/* Change upper-case letters to lower case */
++				for(i2=0;i2<i;i2++)
++					if(ptname[i2]>='A' && ptname[i2]<='Z')
++						ptname[i2]+=32;
+ 				if (!strcmp(de->name,MSDOS_DOT))
+ 					ino = inode->i_ino;
+ 				else if (!strcmp(de->name,MSDOS_DOTDOT))
+diff --unified --recursive linux.221/fs/fat/file.c linux/fs/fat/file.c
+--- linux.221/fs/fat/file.c	Sat Mar  6 03:19:04 1999
++++ linux/fs/fat/file.c	Sat Mar  6 03:20:29 1999
+@@ -456,7 +456,7 @@
+ 	/* Why no return value?  Surely the disk could fail... */
+ 	if (IS_IMMUTABLE(inode))
+ 		return /* -EPERM */;
+-	cluster = SECTOR_SIZE*MSDOS_SB(inode->i_sb)->cluster_size;
++	cluster = SECTOR_SIZE<<MSDOS_SB(inode->i_sb)->cluster_shift;
+ 	(void) fat_free(inode,(inode->i_size+(cluster-1))/cluster);
+ 	MSDOS_I(inode)->i_attrs |= ATTR_ARCH;
+ 	mark_inode_dirty(inode);
+diff --unified --recursive linux.221/fs/fat/inode.c linux/fs/fat/inode.c
+--- linux.221/fs/fat/inode.c	Sat Mar  6 03:19:04 1999
++++ linux/fs/fat/inode.c	Sat Mar  6 03:20:29 1999
+@@ -282,7 +282,7 @@
+ 	int fat32;
+ 	struct fat_mount_options opts;
+ 	char buf[50];
+-	int i;
++	int i,j;
+ 	char cvf_format[21];
+ 	char cvf_options[101];
+ 
+@@ -352,7 +352,11 @@
+ 	logical_sector_size =
+ 		CF_LE_W(get_unaligned((unsigned short *) &b->sector_size));
+ 	sector_mult = logical_sector_size >> SECTOR_BITS;
+-	MSDOS_SB(sb)->cluster_size = b->cluster_size*sector_mult;
++	i = b->cluster_size*sector_mult;
++	for(j=0;(i=i>>1)!=0;j++);
++	if((1<<j)!=b->cluster_size*sector_mult)
++		printk("fat_read_super: Cluster size was not power of two!\n");
++	MSDOS_SB(sb)->cluster_shift = j;
+ 	MSDOS_SB(sb)->fats = b->fats;
+ 	MSDOS_SB(sb)->fat_start = CF_LE_W(b->reserved)*sector_mult;
+ 	if (!b->fat_length && b->fat32_length) {
+@@ -435,7 +439,7 @@
+ 		       MSDOS_CAN_BMAP(MSDOS_SB(sb)) ? ",bmap" : "");
+ 		printk("[me=0x%x,cs=%d,#f=%d,fs=%d,fl=%ld,ds=%ld,de=%d,data=%ld,"
+ 		       "se=%d,ts=%ld,ls=%d,rc=%ld,fc=%u]\n",
+-			b->media,MSDOS_SB(sb)->cluster_size,
++			b->media,MSDOS_SB(sb)->cluster_shift,
+ 			MSDOS_SB(sb)->fats,MSDOS_SB(sb)->fat_start,
+ 			MSDOS_SB(sb)->fat_length,
+ 		       MSDOS_SB(sb)->dir_start,MSDOS_SB(sb)->dir_entries,
+@@ -539,7 +543,7 @@
+ 	}
+ 	unlock_fat(sb);
+ 	tmp.f_type = sb->s_magic;
+-	tmp.f_bsize = MSDOS_SB(sb)->cluster_size*SECTOR_SIZE;
++	tmp.f_bsize = SECTOR_SIZE<<MSDOS_SB(sb)->cluster_shift;
+ 	tmp.f_blocks = MSDOS_SB(sb)->clusters;
+ 	tmp.f_bfree = free;
+ 	tmp.f_bavail = free;
+@@ -562,10 +566,10 @@
+ 	if ((inode->i_ino == MSDOS_ROOT_INO) && (sb->fat_bits != 32)) {
+ 		return sb->dir_start + block;
+ 	}
+-	cluster = block/sb->cluster_size;
+-	offset = block % sb->cluster_size;
++	cluster = block>>sb->cluster_shift;
++	offset = block & ~(~0<<sb->cluster_shift);
+ 	if (!(cluster = fat_get_cluster(inode,cluster))) return 0;
+-	return (cluster-2)*sb->cluster_size+sb->data_start+offset;
++	return ((cluster-2)<<sb->cluster_shift)+sb->data_start+offset;
+ }
+ 
+ static int is_exec(char *extension)
+@@ -600,7 +604,7 @@
+ 			MSDOS_I(inode)->i_start = MSDOS_SB(sb)->root_cluster;
+ 			if ((nr = MSDOS_I(inode)->i_start) != 0) {
+ 				while (nr != -1) {
+-					inode->i_size += SECTOR_SIZE*MSDOS_SB(sb)->cluster_size;
++					inode->i_size += SECTOR_SIZE<<MSDOS_SB(sb)->cluster_shift;
+ 					if (!(nr = fat_access(sb,nr,-1))) {
+ 						printk("Directory %ld: bad FAT\n",
+ 						       inode->i_ino);
+@@ -613,10 +617,9 @@
+ 			inode->i_size = MSDOS_SB(sb)->dir_entries*
+ 				sizeof(struct msdos_dir_entry);
+ 		}
+-		inode->i_blksize = MSDOS_SB(sb)->cluster_size*
+-		    SECTOR_SIZE;
++		inode->i_blksize = SECTOR_SIZE<<MSDOS_SB(sb)->cluster_shift;
+ 		inode->i_blocks = (inode->i_size+inode->i_blksize-1)/
+-		    inode->i_blksize*MSDOS_SB(sb)->cluster_size;
++		    inode->i_blksize<<MSDOS_SB(sb)->cluster_shift;
+ 		MSDOS_I(inode)->i_logstart = 0;
+ 
+ 		MSDOS_I(inode)->i_attrs = 0;
+@@ -656,8 +659,8 @@
+ 		inode->i_size = 0;
+ 		if ((nr = MSDOS_I(inode)->i_start) != 0)
+ 			while (nr != -1) {
+-				inode->i_size += SECTOR_SIZE*MSDOS_SB(inode->
+-				    i_sb)->cluster_size;
++				inode->i_size += SECTOR_SIZE<<MSDOS_SB(inode->
++				    i_sb)->cluster_shift;
+ 				if (!(nr = fat_access(sb,nr,-1))) {
+ 					printk("Directory %ld: bad FAT\n",
+ 					    inode->i_ino);
+@@ -695,9 +698,9 @@
+ 	    raw_entry->ext);
+ 	MSDOS_I(inode)->i_attrs = raw_entry->attr & ATTR_UNUSED;
+ 	/* this is as close to the truth as we can get ... */
+-	inode->i_blksize = MSDOS_SB(sb)->cluster_size*SECTOR_SIZE;
++	inode->i_blksize = SECTOR_SIZE<<MSDOS_SB(sb)->cluster_shift;
+ 	inode->i_blocks = (inode->i_size+inode->i_blksize-1)/
+-	    inode->i_blksize*MSDOS_SB(sb)->cluster_size;
++	    inode->i_blksize<<MSDOS_SB(sb)->cluster_shift;
+ 	inode->i_mtime = inode->i_atime =
+ 	    date_dos2unix(CF_LE_W(raw_entry->time),CF_LE_W(raw_entry->date));
+ 	inode->i_ctime =
+diff --unified --recursive linux.221/fs/fat/misc.c linux/fs/fat/misc.c
+--- linux.221/fs/fat/misc.c	Sat Mar  6 03:19:04 1999
++++ linux/fs/fat/misc.c	Sat Mar  6 03:20:29 1999
+@@ -149,7 +149,7 @@
+ 	struct super_block *sb = inode->i_sb;
+ 	int count,nr,limit,last,curr,sector,last_sector,file_cluster;
+ 	struct buffer_head *bh;
+-	int cluster_size = MSDOS_SB(sb)->cluster_size;
++	int cluster_shift = MSDOS_SB(sb)->cluster_shift;
+ 
+ 	if (MSDOS_SB(sb)->fat_bits != 32) {
+ 		if (inode->i_ino == MSDOS_ROOT_INO) return -ENOSPC;
+@@ -219,8 +219,8 @@
+ #ifdef DEBUG
+ if (last) printk("next set to %d\n",fat_access(sb,last,-1));
+ #endif
+-	sector = MSDOS_SB(sb)->data_start+(nr-2)*cluster_size;
+-	last_sector = sector + cluster_size;
++	sector = MSDOS_SB(sb)->data_start+((nr-2)<<cluster_shift);
++	last_sector = sector + (1<<cluster_shift);
+ 	if (MSDOS_SB(sb)->cvf_format &&
+ 	    MSDOS_SB(sb)->cvf_format->zero_out_cluster)
+ 		MSDOS_SB(sb)->cvf_format->zero_out_cluster(inode,nr);
+@@ -238,20 +238,20 @@
+ 			fat_brelse(sb, bh);
+ 		}
+ 	}
+-	if (file_cluster != inode->i_blocks/cluster_size){
++	if (file_cluster != inode->i_blocks>>cluster_shift){
+ 		printk ("file_cluster badly computed!!! %d <> %ld\n"
+-			,file_cluster,inode->i_blocks/cluster_size);
++			,file_cluster,inode->i_blocks>>cluster_shift);
+ 	}else{
+ 		fat_cache_add(inode,file_cluster,nr);
+ 	}
+-	inode->i_blocks += cluster_size;
++	inode->i_blocks += 1<<cluster_shift;
+ 	if (S_ISDIR(inode->i_mode)) {
+ 		if (inode->i_size & (SECTOR_SIZE-1)) {
+ 			fat_fs_panic(sb,"Odd directory size");
+ 			inode->i_size = (inode->i_size+SECTOR_SIZE) &
+ 			    ~(SECTOR_SIZE-1);
+ 		}
+-		inode->i_size += SECTOR_SIZE*cluster_size;
++		inode->i_size += SECTOR_SIZE<<cluster_shift;
+ #ifdef DEBUG
+ printk("size is %d now (%x)\n",inode->i_size,inode);
+ #endif
+@@ -491,9 +491,9 @@
+ 	printk("raw_scan_nonroot: start=%d\n",start);
+ #endif
+ 	do {
+-		for (count = 0; count < MSDOS_SB(sb)->cluster_size; count++) {
+-			if ((cluster = raw_scan_sector(sb,(start-2)*
+-			    MSDOS_SB(sb)->cluster_size+MSDOS_SB(sb)->data_start+
++		for (count = 0; count < (1<<MSDOS_SB(sb)->cluster_shift); count++) {
++			if ((cluster = raw_scan_sector(sb,((start-2)<<
++			    MSDOS_SB(sb)->cluster_shift)+MSDOS_SB(sb)->data_start+
+ 			    count,name,number,ino,res_bh,res_de,scantype)) >= 0)
+ 				return cluster;
+ 		}
+diff --unified --recursive linux.221/include/linux/msdos_fs.h linux/include/linux/msdos_fs.h
+--- linux.221/include/linux/msdos_fs.h	Sat Mar  6 03:19:05 1999
++++ linux/include/linux/msdos_fs.h	Sat Mar  6 03:30:18 1999
+@@ -171,7 +171,7 @@
+ };
+ 
+ /* Determine whether this FS has kB-aligned data. */
+-#define MSDOS_CAN_BMAP(mib) (!(((mib)->cluster_size & 1) || \
++#define MSDOS_CAN_BMAP(mib) (!(((mib)->cluster_shift == 0) || \
+     ((mib)->data_start & 1)))
+ 
+ /* Convert attribute bits and a mask to the UNIX mode. */
+diff --unified --recursive linux.221/include/linux/msdos_fs_sb.h linux/include/linux/msdos_fs_sb.h
+--- linux.221/include/linux/msdos_fs_sb.h	Sat Mar  6 03:19:05 1999
++++ linux/include/linux/msdos_fs_sb.h	Sat Mar  6 03:20:29 1999
+@@ -33,7 +33,7 @@
+ };
+ 
+ struct msdos_sb_info {
+-	unsigned short cluster_size; /* sectors/cluster */
++	unsigned short cluster_shift; /* power of 2 for cluster size */
+ 	unsigned char fats,fat_bits; /* number of FATs, FAT bits (12 or 16) */
+ 	unsigned short fat_start;
+ 	unsigned long fat_length;    /* FAT start & length (sec.) */

@@ -1,0 +1,163 @@
+Date: Tue, 1 Feb 2000 00:03:05 +0100
+From: Jamie Lokier <>
+Subject: Adaptive thread creation by the kernel
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/1/31/145
+
+This article talks about blocking due to disk I/O and those languages
+that, conceptually at least, use threads as the basic method of
+multiplexed I/O (e.g. Java).
+Larry McVoy wrote:
+> : If they are frequently switching, there must be several processes to
+> : switch 
+> 
+> No.  You can have this with one process that is blocking on I/O.  It happens
+> all the time.  Think of a relatively low bandwidth network connection.
+Oh, I thought I'd covered that case: switching to/from the idle task
+doesn't count.  Any extra switching time is absorbed into the idle
+time.  A bit of latency is added, and that increases some queue lengths
+which is the reason the switch back (from idle) eventually gets absorbed
+by the next idle time.  If you add so much overhead to switching that
+all the idle time gets eaten up, then surprise you don't go idle any
+more.
+Blocking on disk I/O is a different matter -- there you have
+difficulties because there's no async interface.
+> : The thing is, here it's not obviously a user level mistake.  Linux
+> : threaded applications work the way they do because clone() provides
+> : threading facilities and there is no mechanism to help user-level
+> : context switching.
+> 
+> In my experience, if there is a need for user level context switching,
+> something is badly broken - either the scheduler or the application or
+> both.  I've seen this where people were thread-minded enough to allocate
+> a thread per logical operation (Sun once had all I/O implemented this
+> way, over my screams of protest that allocationg a 16K stack to shepard
+> an 8K page out the door was insane; they didn't listen, did it anyway,
+> figured out what crazy thing it was, and never shipped that kernel).
+In my experience, not everything that behaves like a thread has a stack
+or has much overhead.
+The extreme lightweight thing, which every video game has, is a list of
+objects doing their own thing.
+Consider a select() based app which maintains a list of event handler
+state machines.  The central select loop is like a user space scheduler,
+and the state machines like extremely light threads.  Most select()
+based programs work this way, but the terminology is usually different.
+Now, the reason it's useful to pretend that model has anything to do
+with "threads" is because when you call one particular fd's event
+handler, that handler might do something complicated such as block
+reading a file, or due to paging.  Things you can't capture in an event
+handling loop.
+You see that even the canonical "fast select loop" is not 100%
+efficient, because some blocking things be dealt with as events.
+(The system API doesn't support it).
+You can deliberatly spawn real threads for the blockable things --
+Netscape and Squid do it for DNS lookup -- but that defeats the point of
+an event loop, especially when you don't know which things will block.
+Paging is a cause of inefficiency here: you can't tell when a memory
+access will block.  Reading from a file is the other main cause.
+For 100% efficiency, you need to always be ready to handle something,
+never an idle CPU.  Even paging from disk shouldn't stop your program
+from doing other things.
+You would like that an event handler which was called from your select
+loop to be able to block, and for the select loop to call the other
+handlers in the meantime.  One way to do that is demand allocation of
+stacks by multiple real threads.
+Demand allocation of stacks can be done entirely by the application by
+things it knows can block.  E.g., you have 100 event handlers which you
+call in a simple loop: `while (evh) { (evh->fn) (evh, event); evh =
+evh->next; }'.  One of them (your loop does not know which) decides to
+do a blocking operation such as read a file.  So you do some fiddly
+below-the-hood thing which claims the current stack (on which the loop
+code is running) for code doing DNS lookup, and continue the event
+handling loop on another stack in another real thread.
+This way you automatically get as many stacks, in user space, as you
+have things blocking in the kernel, plus a stack for each running
+context (1 per processor).  No more and no less.  And you get the same
+number of kernel contexts.
+So it's memory efficient.
+The only problem here is that you tend to allocate real threads a bit too
+aggressively: if reading the file _doesn't_ block, you just wasted a
+thread and a whole bunch of context switching and activation cost.  On
+the other hand, if you don't know that reading memory location X is
+going to page in, you can't prepare a real thread to let you get on with
+other stuff while that one blocks.
+The usual solution that is used is to start more threads than
+processors, so that the CPUs are busy when something blocks.  But that
+results in overscheduling and excessive memory allocated for stacks and
+contexts.  It's better than not overallocating threads, but it's not as
+good as having exactly the right number of threads running at every time.
+There is a solution which does have the right number of threads running,
+automatically tuned by the kernel.  It is very simple, but needs kernel
+support:
+It's this: when a thread blocks, you wake up another.  The other thread
+was started and blocked especially for this.  The other thread then
+carries on pulling things to do from your event list, until the first,
+blocked one returns from the kernel.  When that happens, someone
+receives a signal or some other notification, so that one of the threads
+can stop again.
+Upon this simple kernel interface can be built automatic allocation
+and deallocation of threads, and on that, a simple event handling API
+that always has the appropriate number of threads to do the work.
+This general scheme will automatically adjust the thread load to fit the
+problem and the architecture of your machine.  You can have the criteria
+for unblocking take account of multiple CPUs, so an application runs a
+suitable number of threads to make best use of the entire system without
+even knowing the number of processors.
+As far as I know, this is the only way to ensure the CPUs have something
+to do 100% of the time without unnecessary cost due to redundant
+threads.
+> You really shouldn't be allocating lots and lots of threads, it just never
+> makes sense unless you have lots and lots of processors.
+Quite.  Unless you extend the idea of "thread" to include what every big
+server does really.  Note that some languages which have threads built in
+can implement their threads without stacks.  I'm not sure if Java can be
+done that way but it would seem to be worth a try, given it's lack of
+async I/O methods.
+What do you think of the general scheme I described above, for
+automatically balancing the number of machine threads for running event
+handlers?
+> : Then IBM would have nothing to bitch about -- their Java context
+> : switches would be _really_ fast and everything would run with equivalent
+> : performance.
+> 
+> This is just wall papering over a bad benchmark.
+Look at it this way.  Any web server written in Java has to use lots of
+threads to paper over the lack of select() in the language.  Whether
+it's a benchmark or not.
+> : That way threads can continue to use kernel facilities with the same ease
+> : of use as clone(), but if they block, it's easy for the application
+> : level to get on with something else.  Without having to have lots of
+> : kernel level threads runnable -- which is less efficient anyway.
+> 
+> Have you ever maintained such a system?  It really is a pain to have
+> both user level and kernel level semantics.  You get into all sorts of
+> nasty issues which need to be solved.  I much prefer the cleanliness of
+> the clone()/rfork() model.   I don't care if apps want to build wacky
+> stuff on top of that model, but I'd hate to see that wacky stuff being
+> part of a supported user level API.  Those sorts of things tend to be
+> a real support nightmare over the years.
+Do you think my event handler method has those kinds of warts?
+I've done that in real "toy server" programs (the event handler list
+that is, not the automatic thread creation), and I found it very clean.
+It seems to many a select loop which is running over a list of fds and
+"what to do with the fd when it's available for X" function pointers and
+states is quite a clean programming model.  In fact I think most
+select() based servers work that way.
+It simply adds flexibility to grant those functions the ability to
+block, if that looks like an easier way to implement something (e.g. so
+they can call gethostbyname()).  You would _prefer_ them to use their
+state machines as much as they because blocking is more expensive, but
+it's there when you need it.  Making it automatic means you don't get a
+hit due to paging, and you don't have to protect every possible place
+that _might_ block with the overhead that implies.
+I don't see any warts or wackiness at the application API level at all.
+have a nice day,
+-- Jamie
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

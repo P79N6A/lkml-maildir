@@ -1,0 +1,88 @@
+Date: Sat, 31 Mar 2001 16:07:13 +0100 (BST)
+From: Mark Hemment <>
+Subject: [PATCH] Possible SCSI + block-layer bugs
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2001/3/31/28
+
+Hi,
+  I've never seen these trigger, but they look theoretically possible.
+  When processing the completion of a SCSI request in a bottom-half,
+__scsi_end_request() can find all the buffers associated with the request
+haven't been completed (ie. leftovers).
+  One question is; can this ever happen?
+  If it can't then the code should be removed from __scsi_end_request(),
+if it can happen then there appears to be a few problems;
+  The request is re-queued to the block layer via 
+scsi_queue_next_request(), which uses the "special" pointer in the request
+structure to remember the Scsi_Cmnd associated with the request.  The SCSI
+request function is then called, but doesn't guarantee to immediately
+process the re-queued request even though it was added at the head (say,
+the queue has become plugged).  This can trigger two possible bugs.
+  The first is that __scsi_end_request() doesn't decrement the
+hard_nr_sectors count in the request.  As the request is back on the
+queue, it is possible for newly arriving buffer-heads to merge with the
+heads already hanging off the request.  This merging uses the
+hard_nr_sectors when calculating both the merged hard_nr_sectors and
+nr_sectors counts.
+  As the request is at the head, only back-merging can occur, but if
+__scsi_end_request() triggers another uncompleted request to be re-queued,
+it is possible to get front merging as well.
+  The merging of a re-queued request looks safe, except for the
+hard_nr_sectors.  This patch corrects the hard_nr_sectors accounting.
+  The second bug is from request merging in attempt_merge().
+  For a re-queued request, the request structure is the one embedded in
+the Scsi_Cmnd (which is a copy of the request taken in the 
+scsi_request_fn).
+  In attempt_merge(), q->merge_requests_fn() is called to see the requests
+are allowed to merge.  __scsi_merge_requests_fn() checks number of
+segments, etc, but doesn't check if one of the requests is a re-queued one
+(ie. no test against ->special).
+  This can lead to attempt_merge() releasing the embedded request
+structure (which, as an extract copy, has the ->q set, so to
+blkdev_release_request() it looks like a request which originated from
+the block layer).  This isn't too healthy.
+  The fix here is to add a check in __scsi_merge_requests_fn() to check
+for ->special being non-NULL.
+  The attached patch is against 2.4.3.
+  Jens, Eric, anyone, comments?
+Mark
+diff -urN -X dontdiff linux-2.4.3/drivers/scsi/scsi_lib.c markhe-2.4.3/drivers/scsi/scsi_lib.c
+--- linux-2.4.3/drivers/scsi/scsi_lib.c	Sat Mar  3 02:38:39 2001
++++ markhe-2.4.3/drivers/scsi/scsi_lib.c	Sat Mar 31 16:56:31 2001
+@@ -377,12 +377,15 @@
+ 			nsect = bh->b_size >> 9;
+ 			blk_finished_io(nsect);
+ 			req->bh = bh->b_reqnext;
+-			req->nr_sectors -= nsect;
+-			req->sector += nsect;
+ 			bh->b_reqnext = NULL;
+ 			sectors -= nsect;
+ 			bh->b_end_io(bh, uptodate);
+ 			if ((bh = req->bh) != NULL) {
++				req->hard_sector += nsect;
++				req->hard_nr_sectors -= nsect;
++				req->sector += nsect;
++				req->nr_sectors -= nsect;
++
+ 				req->current_nr_sectors = bh->b_size >> 9;
+ 				if (req->nr_sectors < req->current_nr_sectors) {
+ 					req->nr_sectors = req->current_nr_sectors;
+diff -urN -X dontdiff linux-2.4.3/drivers/scsi/scsi_merge.c markhe-2.4.3/drivers/scsi/scsi_merge.c
+--- linux-2.4.3/drivers/scsi/scsi_merge.c	Fri Feb  9 19:30:23 2001
++++ markhe-2.4.3/drivers/scsi/scsi_merge.c	Sat Mar 31 16:38:27 2001
+@@ -597,6 +597,13 @@
+ 	Scsi_Device *SDpnt;
+ 	struct Scsi_Host *SHpnt;
+ 
++	/*
++	 * First check if the either of the requests are re-queued
++	 * requests.  Can't merge them if they are.
++	 */
++	if (req->special || next->special)
++		return 0;
++
+ 	SDpnt = (Scsi_Device *) q->queuedata;
+ 	SHpnt = SDpnt->host;

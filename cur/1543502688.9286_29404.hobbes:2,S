@@ -1,0 +1,164 @@
+Date: Wed, 14 Jul 1999 18:48:43 +0100 (BST)
+From: "Stephen C. Tweedie" <>
+Subject: [PATCH 2.2.10] Re: Problem with memmap file with SMP
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/7/14/113
+
+Hi,
+On Tue, 13 Jul 1999 10:41:22 -0700, Steve Bradshaw
+<steveb@linoox.engr.tachyon.net> said:
+> The following test program running on an SMP machine does not run consitantly
+> with the USE_MEMMAP_FILE define set to 1 (using a memory mapped file shared
+> between two processes).  With the USE_MEMMAP_FILE define set to 0 (using a
+> shared memory segment), it works fine.
+> What's up with that?
+[Summary: task 1 does a repeated loop of (locked test_and_set_bit;
+ locked clear_bit) on a shared writable mapped file.  task 2 updates a
+ totally different area of the same page of the same file and exits.
+ task 1's operation gets trashed.]
+Ack.  I looked at this for a while, but it's one of those things that
+you just know *can't* be happening... until you realise what's going
+wrong.
+OK, what happens is that munmap() of a MAP_SHARED mapped file is
+trashing the data of another process on a different CPU which happens
+still to have the same page mapped.
+munmap() (happening implicitly due to exit() in your test program) does
+a filemap_sync(), which ends up calling ext2_file_write to write the
+page cache contents via ext2.  However, ext2 has to do an
+update_vm_cache() in its write routines, and that ends up copying the
+same buffer cache contents we just copied, *back* into the page cache.
+Any other process which was modifying the page in memory at the time
+loses its updates.
+Exactly the same happens on NFS, by the way.
+The patch below fixes this, but the ext2 side is a little messy
+(unavoidably).  update_vm_cache assumes that the source data is coming
+from kernel memory.  ext2 therefore really has to pass the bh->b_data
+in, not the user VA, when calling update_vm_cache.  However, from that
+address it is impossible for update_vm_cache to tell whether the
+original data came from the page cache in the first place or not.  And
+ext2 can't tell without doing an extra unnecessary page cache lookup.
+update_vm_cache_conditional accepts the original, source address of the
+data as an extra parameter to allow it to check for this overwrite
+special case.  ext2 can pass that in easily.  For NFS, it is more
+straightforward: NFS does the page cache update itself, so testing
+source==dest is just a two-liner in the write code.
+On 2.3 this just isn't an issue due to the VM infrastructure fixes.
+--Stephen
+----------------------------------------------------------------
+--- fs/ext2/file.c.~1~	Fri Jun 18 11:32:32 1999
++++ fs/ext2/file.c	Wed Jul 14 18:22:51 1999
+@@ -295,7 +295,8 @@
+ 			break;
+ 		}
+ 		mark_buffer_dirty(bh, 0);
+-		update_vm_cache(inode, pos, bh->b_data + offset, c);
++		update_vm_cache_conditional(inode, pos, bh->b_data + offset, c,
++					    (unsigned long) buf);
+ 		pos += c;
+ 		written += c;
+ 		buf += c;
+--- include/linux/pagemap.h.~1~	Fri Jun 18 11:33:33 1999
++++ include/linux/pagemap.h	Wed Jul 14 18:23:54 1999
+@@ -148,6 +148,7 @@
+ 		__wait_on_page(page);
+ }
+ 
++extern void update_vm_cache_conditional(struct inode *, unsigned long, const char *, int, unsigned long);
+ extern void update_vm_cache(struct inode *, unsigned long, const char *, int);
+ 
+ #endif
+--- kernel/ksyms.c.~1~	Tue Apr 20 22:33:14 1999
++++ kernel/ksyms.c	Wed Jul 14 18:25:02 1999
+@@ -105,6 +105,7 @@
+ EXPORT_SYMBOL(max_mapnr);
+ EXPORT_SYMBOL(high_memory);
+ EXPORT_SYMBOL(update_vm_cache);
++EXPORT_SYMBOL(update_vm_cache_conditional);
+ EXPORT_SYMBOL(vmtruncate);
+ EXPORT_SYMBOL(find_vma);
+ EXPORT_SYMBOL(get_unmapped_area);
+--- mm/filemap.c.~1~	Wed May 12 15:54:27 1999
++++ mm/filemap.c	Wed Jul 14 18:23:35 1999
+@@ -215,8 +215,25 @@
+ /*
+  * Update a page cache copy, when we're doing a "write()" system call
+  * See also "update_vm_cache()".
++ *
++ * This function is conditional in that it checks whether the original
++ * source of the data is the same as the ultimate destination, and
++ * aborts the update if so.  
++ *
++ * The "source_address" is the virtual address of the original location
++ * of the data we are injecting.  For writes from user mode, it is the
++ * user VA.  However, for filemap_sync writes, "source_address", it is
++ * the page cache address.  In both cases, "buf" points to the copy we
++ * have already made in kernel space and we use that pointer for the
++ * transfer.  source_address just allows us to detect an update_vm_cache
++ * which is being sourced from the copy of the data already in the page
++ * cache.  
++ * 
++ * This prevents munmap() and msync() from stomping all over shared
++ * memory maps.  --sct
+  */
+-void update_vm_cache(struct inode * inode, unsigned long pos, const char * buf, int count)
++
++void update_vm_cache_conditional(struct inode * inode, unsigned long pos, const char * buf, int count, unsigned long source_address)
+ {
+ 	unsigned long offset, len;
+ 
+@@ -230,8 +247,12 @@
+ 			len = count;
+ 		page = find_page(inode, pos);
+ 		if (page) {
+-			wait_on_page(page);
+-			memcpy((void *) (offset + page_address(page)), buf, len);
++			char *dest = (char*) (offset + page_address(page));
++
++			if (dest != source_address) {
++				wait_on_page(page);
++				memcpy(dest, buf, len);
++			}
+ 			page_cache_release(page);
+ 		}
+ 		count -= len;
+@@ -242,6 +263,12 @@
+ 	} while (count);
+ }
+ 
++void update_vm_cache(struct inode * inode, unsigned long pos, const char * buf, int count)
++{
++	update_vm_cache_conditional(inode, pos, buf, count, 0);
++}
++
++
+ static inline void add_to_page_cache(struct page * page,
+ 	struct inode * inode, unsigned long offset,
+ 	struct page **hash)
+@@ -1482,6 +1509,8 @@
+ 
+ 	while (count) {
+ 		unsigned long bytes, pgpos, offset;
++		char * dest;
++
+ 		/*
+ 		 * Try to find the page in the cache. If it isn't there,
+ 		 * allocate a free page.
+@@ -1516,7 +1545,9 @@
+ 		 * the writer needs to increment the page use counts until he
+ 		 * is done with the page.
+ 		 */
+-		bytes -= copy_from_user((u8*)page_address(page) + offset, buf, bytes);
++		dest = (char *) page_address(page) + offset;
++		if (dest != buf) /* See comment in update_vm_cache_cond. */
++			bytes -= copy_from_user(dest, buf, bytes);
+ 		status = -EFAULT;
+ 		if (bytes)
+ 			status = inode->i_op->updatepage(file, page, offset, bytes, sync);
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

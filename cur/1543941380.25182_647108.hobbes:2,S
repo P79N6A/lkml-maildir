@@ -1,0 +1,213 @@
+Date: Fri, 1 Feb 2008 20:30:46 +0000 (GMT)
+From: Hugh Dickins <>
+Subject: unionfs_copy_attr_times oopses
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2008/2/1/428
+
+Hi Erez,
+Aside from the occasional "unionfs: new lower inode mtime" messages
+on directories (which I've got into the habit of ignoring now), the
+only problem I'm still suffering with unionfs over tmpfs (not tested
+any other fs's below it recently) is oops in unionfs_copy_attr_times.
+I believe I'm working with your latest: 2.6.24-rc8-mm1 plus the four
+patches you posted to lkml on 26 Jan.  But this problem has been around
+for a while before that: I'd been hoping to debug it myself, but taken
+too long to make too little progress, so now handing over to you.
+The oops occurs while doing repeated "make -j20" kernel builds in a
+unionfs mount of a tmpfs (though I doubt tmpfs is relevant): most of
+my testing was while swapping, but today I find that's irrelevant,
+and it should happen much quicker without.  SMP kernels (4 cpus),
+I haven't tried UP; happens with or without PREEMPT, may just be
+coincidence that it happens quicker on the machines with PREEMPT.
+Most commonly it's unionfs_copy_attr_times called from unionfs_create,
+but that's probably just the most common route in this workload:
+I've seen it also when called from unionfs_rename or unionfs_open or
+unionfs_unlink.  It looks like there's a locking or refcounting bug,
+hence a race: the unionfs_inode_info which unionfs_copy_attr_times
+is working on gets changed underneath it, so it oopses on NULL
+lower_inodes.  It took me far too long to realize that ibstart
+(and ibend) are -1 when it oopses, yet the function returns
+immediately if ibstart is negative on entry.  I've not a clue
+what it is that's changing it.
+What I did make progress with yesterday was a workaround patch, which
+additionally makes the problem more manifest: by WARNing in much more
+common cases which were invisible (didn't go so far as to oops) before.
+The oops had typically taken 12 hours to happen, but I'm getting like
+one warning per hour (varies from machine to machine) with the patch
+while swapping, and now much more frequently giving it more memory.
+I've two patches.  The first isn't interesting, so I just attached
+it.  It moves unionfs_copy_attr_times (and unionfs_copy_attr_all)
+from inline in fanout.h to out-of-line in copyup.c: the function's
+too big and too widely used to be suitable for inlining, this reduces
+kernel text by about 6k.  But since making that patch, I've seen that
+copyup.c is really about copying up the data, and you may well prefer
+to move the functions to subr.c or elsewhere.
+The patch to go on top of that is appended below: makes unionfs_copy
+_attr_times more paranoid about the fields it's accessing; but this
+can only be a temporary workaround - so long as there's such a race,
+it could be accessing freed/reused memory with unpredictable results.
+Most of the warnings I see with this patch are the first, on bend < 0:
+the old "bindex <= ibend(upper)" condition would often have terminated
+the loop in that case, without noticing the discrepancy that ibend
+had gone negative.  Occasionally I'm seeing the second warning, on
+lower_inodes, which would correspond to the oops: here's a trace
+(cutting out the ? lines, just stale addresses left on the stack):
+WARNING: at fs/unionfs/copyup.c:906 unionfs_copy_attr_times+0x5f/0xcc()
+Modules linked in: acpi_cpufreq snd_pcm_oss snd_mixer_oss snd_seq snd_seq_device thermal button processor
+Pid: 13791, comm: cc1 Not tainted 2.6.24-rc8-mm1 #19
+ [<c0124ce6>] warn_on_slowpath+0x3e/0x51
+ [<c01d5f63>] unionfs_copy_attr_times+0x5f/0xcc
+ [<c01d169d>] unionfs_create+0x160/0x1e7
+ [<c0173b8f>] vfs_create+0x62/0xa8
+ [<c0173d85>] __open_namei_create+0x44/0x8e
+ [<c0173f55>] open_pathname+0x14d/0x55c
+ [<c016b7d9>] do_sys_open+0x41/0xbd
+ [<c016b868>] sys_open+0x13/0x15
+ [<c01040ee>] sysenter_past_esp+0x5f/0x85
+--- a/fs/unionfs/copyup.c	2008-01-29 16:59:13.000000000 +0000
++++ b/fs/unionfs/copyup.c	2008-01-31 12:24:58.000000000 +0000
+@@ -887,13 +887,25 @@ void unionfs_postcopyup_release(struct d
+ /* copy a/m/ctime from the lower branch with the newest times */
+ void unionfs_copy_attr_times(struct inode *upper)
+ {
+-	int bindex;
++	int bindex, bend;
+ 	struct inode *lower;
++	struct inode **lower_inodes;
+ 
+-	if (!upper || ibstart(upper) < 0)
++	if (!upper)
+ 		return;
+-	for (bindex = ibstart(upper); bindex <= ibend(upper); bindex++) {
+-		lower = unionfs_lower_inode_idx(upper, bindex);
++	bindex = ibstart(upper);
++	if (bindex < 0)
++		return;
++	while (1) {
++		bend = ibend(upper);
++		if (WARN_ON(bend < 0))
++			break;
++		if (bindex > bend)
++			break;
++		lower_inodes = UNIONFS_I(upper)->lower_inodes;
++		if (WARN_ON(!lower_inodes))
++			break;
++		lower = lower_inodes[bindex++];
+ 		if (!lower)
+ 			continue; /* not all lower dir objects may exist */
+ 		if (unlikely(timespec_compare(&upper->i_mtime,--- a/fs/unionfs/copyup.c	2008-01-27 13:00:24.000000000 +0000
++++ b/fs/unionfs/copyup.c	2008-01-27 16:50:34.000000000 +0000
+@@ -883,3 +883,52 @@ void unionfs_postcopyup_release(struct d
+ 	set_dbend(dentry, bindex);
+ 	ibend(dentry->d_inode) = ibstart(dentry->d_inode) = bindex;
+ }
++
++/* copy a/m/ctime from the lower branch with the newest times */
++void unionfs_copy_attr_times(struct inode *upper)
++{
++	int bindex;
++	struct inode *lower;
++
++	if (!upper || ibstart(upper) < 0)
++		return;
++	for (bindex = ibstart(upper); bindex <= ibend(upper); bindex++) {
++		lower = unionfs_lower_inode_idx(upper, bindex);
++		if (!lower)
++			continue; /* not all lower dir objects may exist */
++		if (unlikely(timespec_compare(&upper->i_mtime,
++					      &lower->i_mtime) < 0))
++			upper->i_mtime = lower->i_mtime;
++		if (unlikely(timespec_compare(&upper->i_ctime,
++					      &lower->i_ctime) < 0))
++			upper->i_ctime = lower->i_ctime;
++		if (unlikely(timespec_compare(&upper->i_atime,
++					      &lower->i_atime) < 0))
++			upper->i_atime = lower->i_atime;
++	}
++}
++
++/*
++ * A unionfs/fanout version of fsstack_copy_attr_all.  Uses a
++ * unionfs_get_nlinks to properly calcluate the number of links to a file.
++ * Also, copies the max() of all a/m/ctimes for all lower inodes (which is
++ * important if the lower inode is a directory type)
++ */
++void unionfs_copy_attr_all(struct inode *dest, const struct inode *src)
++{
++	dest->i_mode = src->i_mode;
++	dest->i_uid = src->i_uid;
++	dest->i_gid = src->i_gid;
++	dest->i_rdev = src->i_rdev;
++
++	unionfs_copy_attr_times(dest);
++
++	dest->i_blkbits = src->i_blkbits;
++	dest->i_flags = src->i_flags;
++
++	/*
++	 * Update the nlinks AFTER updating the above fields, because the
++	 * get_links callback may depend on them.
++	 */
++	dest->i_nlink = unionfs_get_nlinks(dest);
++}
+--- a/fs/unionfs/fanout.h	2008-01-17 16:51:14.000000000 +0000
++++ b/fs/unionfs/fanout.h	2008-01-27 16:48:12.000000000 +0000
+@@ -314,53 +314,7 @@ static inline void verify_locked(struct 
+ }
+ 
+ /* copy a/m/ctime from the lower branch with the newest times */
+-static inline void unionfs_copy_attr_times(struct inode *upper)
+-{
+-	int bindex;
+-	struct inode *lower;
+-
+-	if (!upper || ibstart(upper) < 0)
+-		return;
+-	for (bindex = ibstart(upper); bindex <= ibend(upper); bindex++) {
+-		lower = unionfs_lower_inode_idx(upper, bindex);
+-		if (!lower)
+-			continue; /* not all lower dir objects may exist */
+-		if (unlikely(timespec_compare(&upper->i_mtime,
+-					      &lower->i_mtime) < 0))
+-			upper->i_mtime = lower->i_mtime;
+-		if (unlikely(timespec_compare(&upper->i_ctime,
+-					      &lower->i_ctime) < 0))
+-			upper->i_ctime = lower->i_ctime;
+-		if (unlikely(timespec_compare(&upper->i_atime,
+-					      &lower->i_atime) < 0))
+-			upper->i_atime = lower->i_atime;
+-	}
+-}
+-
+-/*
+- * A unionfs/fanout version of fsstack_copy_attr_all.  Uses a
+- * unionfs_get_nlinks to properly calcluate the number of links to a file.
+- * Also, copies the max() of all a/m/ctimes for all lower inodes (which is
+- * important if the lower inode is a directory type)
+- */
+-static inline void unionfs_copy_attr_all(struct inode *dest,
+-					 const struct inode *src)
+-{
+-	dest->i_mode = src->i_mode;
+-	dest->i_uid = src->i_uid;
+-	dest->i_gid = src->i_gid;
+-	dest->i_rdev = src->i_rdev;
+-
+-	unionfs_copy_attr_times(dest);
+-
+-	dest->i_blkbits = src->i_blkbits;
+-	dest->i_flags = src->i_flags;
+-
+-	/*
+-	 * Update the nlinks AFTER updating the above fields, because the
+-	 * get_links callback may depend on them.
+-	 */
+-	dest->i_nlink = unionfs_get_nlinks(dest);
+-}
++void unionfs_copy_attr_times(struct inode *upper);
++void unionfs_copy_attr_all(struct inode *dest, const struct inode *src);
+ 
+ #endif	/* not _FANOUT_H */

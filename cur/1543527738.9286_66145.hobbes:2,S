@@ -1,0 +1,298 @@
+Date: Sun, 27 Feb 2000 23:29:18 +0100
+From: Andreas Gruenbacher <>
+Subject: Caches in modules: Patch updated to 2.3.48
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/2/27/167
+
+This is the [un]register_cache() patch, updated for 2.3.48.
+Description
+-----------
+This patch adds register_cache() and unregister_cache() functions to the
+kernel. The caches registered via that interface are shrunk when memory
+needs to be freed, just like e.g. the dentry and inode caches. The patch has no
+effect unless register_cache() is actually called.
+Benefit: Modules, drivers, filesystems, etc. can register caches that
+are shrunk only when necessary, rather than defining fixed-size caches.
+The caches defined with register_cache() are kept in a list. When enough memory
+becomes available, that list is rotated, so that the next un-shrunk cache is
+handled next. This is to increase fairness.
+For rotating the list of caches, this patch adds a function list_rotate to
+<linux/list.h>.
+Currently, only the caches registered with register_cache() are rotated. The
+behavior of the other caches doesn't change.
+At the moment, the mmap cache is emptied first. Only when that cache is mostly
+empty are the other caches shrunk.
+It may improve things to include all caches (mmap, inode, dentry, user-defined)
+in the cache list, and rotate them all. They would then all get their share.
+(This would probably need some tweaking in the inode and dentry caches so that
+they don't too small.)
+The patch also includes two tests, which should finally be removed.
+diff -Nur linux-2.3.48/include/linux/cache_def.h
+linux-2.3.48-rc/include/linux/cache_def.h
+--- linux-2.3.48/include/linux/cache_def.h      Thu Jan  1 01:00:00 1970
++++ linux-2.3.48-rc/include/linux/cache_def.h   Sun Feb 27 20:20:21 2000
+@@ -0,0 +1,16 @@
++/*
++ * linux/cache_def.h
++ * Handling of caches defined in drivers, filesystems, ...
++ *
++ * Copyright (C) 2000
++ * Andreas Gruenbacher, <a.gruenbacher@computer.org>
++ */
++
++struct cache_definition {
++       const char *name;
++       int (*shrink)(int, unsigned int, zone_t *zone);
++       struct list_head link;
++};
++
++extern void register_cache(struct cache_definition *);
++extern void unregister_cache(struct cache_definition *);
+diff -Nur linux-2.3.48/include/linux/list.h linux-2.3.48-rc/include/linux/list.h
+--- linux-2.3.48/include/linux/list.h   Sun Feb 27 20:07:42 2000
++++ linux-2.3.48-rc/include/linux/list.h        Sun Feb 27 20:29:48 2000
+@@ -101,6 +101,25 @@
+        }
+ }
++/*
++ * Rotate "head" so that "list" becomes the next element.
++ */
++static __inline__ void list_rotate(struct list_head *list, struct list_head
+*head)
++{
++       struct list_head *old_first = head->next;
++
++       if (list != head && list != old_first) {
++               struct list_head *old_last = head->prev;
++               head->prev = list->prev;
++               old_first->prev = old_last;
++               list->prev = head;
++
++               head->next = list;
++               old_last->next = old_first;
++               head->prev->next = head;
++       }
++}
++
+ #define list_entry(ptr, type, member) \
+        ((type *)((char *)(ptr)-(unsigned long)(&((type *)0)->member)))
+diff -Nur linux-2.3.48/kernel/ksyms.c linux-2.3.48-rc/kernel/ksyms.c
+--- linux-2.3.48/kernel/ksyms.c Sun Feb 27 20:07:43 2000
++++ linux-2.3.48-rc/kernel/ksyms.c      Sun Feb 27 20:20:21 2000
+@@ -34,6 +34,7 @@
+ #include <linux/genhd.h>
+ #include <linux/blkpg.h>
+ #include <linux/swap.h>
++#include <linux/cache_def.h>
+ #include <linux/ctype.h>
+ #include <linux/file.h>
+ #include <linux/iobuf.h>
+@@ -93,6 +94,8 @@
+ EXPORT_SYMBOL(exit_sighand);
+ /* internal kernel memory management */
++EXPORT_SYMBOL(register_cache);
++EXPORT_SYMBOL(unregister_cache);
+ EXPORT_SYMBOL(__alloc_pages);
+ EXPORT_SYMBOL(alloc_pages_node);
+ EXPORT_SYMBOL(__free_pages_ok);
+diff -Nur linux-2.3.48/mm/vmscan.c linux-2.3.48-rc/mm/vmscan.c
+--- linux-2.3.48/mm/vmscan.c    Sun Feb 27 20:07:43 2000
++++ linux-2.3.48-rc/mm/vmscan.c Sun Feb 27 20:29:23 2000
+@@ -15,6 +15,7 @@
+ #include <linux/kernel_stat.h>
+ #include <linux/swap.h>
+ #include <linux/swapctl.h>
++#include <linux/cache_def.h>
+ #include <linux/smp_lock.h>
+ #include <linux/pagemap.h>
+ #include <linux/init.h>
+@@ -24,6 +25,28 @@
+ #include <asm/pgalloc.h>
+ /*
++ * Handling of caches defined in drivers, filesystems, ...
++ *
++ * The cache definition contains a callback for shrinking 
++ * the cache.
++ *
++ * The [un]register_cache() functions may only be called when
++ * the kernel lock is held. The shrink() functions are also
++ * called with the kernel lock held.
++ */
++static LIST_HEAD(cache_definitions);
++
++void register_cache(struct cache_definition *cache)
++{
++        list_add_tail(&cache->link, &cache_definitions);
++   }
++
++void unregister_cache(struct cache_definition *cache)
++{
++        list_del(&cache->link);
++}
++
++/*
+  * The swap-out functions return 1 if they successfully
+  * threw something out, and we got a free page. It returns
+  * zero if it couldn't do anything, and any other value
+@@ -412,6 +435,7 @@
+ {
+        int priority;
+        int count = SWAP_CLUSTER_MAX;
++       struct list_head *cl;
+        /* Always trim SLAB caches when memory gets low. */
+        kmem_cache_reap(gfp_mask);
+@@ -423,6 +447,21 @@
+                                goto done;
+                }
++               /* Other caches */
++               list_for_each(cl, &cache_definitions) {
++                       struct cache_definition *cache =
++                               list_entry(cl, struct cache_definition, link);
++                       count -= cache->shrink(priority, gfp_mask, zone);
++#if 1
++                       if (count <= 0) {
++                               /* Next unshrunk cache becomes head->next */
++                               list_rotate(cl->next, &cache_definitions);
++                               goto done;
++                       }
++#endif
++               }
++               if (count <= 0)
++                       goto done;
+                /* Try to get rid of some shared memory pages.. */
+                if (gfp_mask & __GFP_IO) {
+diff -Nur linux-2.3.48/test/Makefile linux-2.3.48-rc/test/Makefile
+--- linux-2.3.48/test/Makefile  Thu Jan  1 01:00:00 1970
++++ linux-2.3.48-rc/test/Makefile       Sun Feb 27 20:20:21 2000
+@@ -0,0 +1,4 @@
++O_TARGET := test.o
++O_OBJS := cache_test.o
++
++include $(TOPDIR)/Rules.make
+diff -Nur linux-2.3.48/test/cache_test.c linux-2.3.48-rc/test/cache_test.c
+--- linux-2.3.48/test/cache_test.c      Thu Jan  1 01:00:00 1970
++++ linux-2.3.48-rc/test/cache_test.c   Sun Feb 27 20:20:21 2000
+@@ -0,0 +1,35 @@
++/*
++  This registers some user-defined caches, and logs a message whenever
++  the caches' shrink handler is called.
++*/
++
++#include <linux/kernel.h>
++#include <linux/mmzone.h>
++#include <linux/cache_def.h>
++
++#define SHRINK(N, S)                                                   \
++int shrink ## N(int priority, unsigned int flags, zone_t *zone)               
+\
++{                                                                      \
++       printk("Shrinking cache " S " priority=%d, flags=%o\n",         \
++              priority, flags);                                        \
++       return 0;                                                       \
++}                                                                      \
++                                                                       \
++static struct cache_definition cache ## N = {                          \
++       "cache " S,                                                     \
++       shrink ## N                                                     \
++};
++
++SHRINK(1, "1")
++SHRINK(2, "2")
++SHRINK(3, "3")
++
++void init_cache_test(void)
++{
++       printk("Initializing cache tests\n");
++
++       register_cache(&cache1);
++       register_cache(&cache2);
++       register_cache(&cache3);
++}
++
+diff -Nur linux-2.3.48/test/list.c linux-2.3.48-rc/test/list.c
+--- linux-2.3.48/test/list.c    Thu Jan  1 01:00:00 1970
++++ linux-2.3.48-rc/test/list.c Sun Feb 27 20:34:10 2000
+@@ -0,0 +1,69 @@
++/*
++  This example shows how to use the double-linked list macros.
++*/
++
++#include <stdio.h>
++
++#define __KERNEL__
++#include <linux/list.h>
++
++struct node {
++       int data;
++       struct list_head list;
++};
++
++void print(struct list_head *queue) {
++       struct list_head *l;
++       list_for_each(l, queue) {
++               struct node *n = list_entry(l, struct node, list);
++               printf("%d ", n->data);
++       }
++       printf(" -- ");
++       for (l = queue->prev; l != queue; l = l->prev) {
++               struct node *n = list_entry(l, struct node, list);
++               printf("%d ", n->data);
++       }
++       printf("\n");
++}
++
++struct list_head queue;
++struct node n1 = { 1 }, n2 = { 2 }, n3 = { 3 }, n4 = { 4 };
++
++void rotate(void)
++{
++       /* Special cases test for list_rotate() */
++       list_add_tail(&n1.list, &queue);
++       list_add_tail(&n2.list, &queue);
++       list_add_tail(&n3.list, &queue);
++       print(&queue);
++       list_rotate(&queue, &queue);  /* head itself */
++       print(&queue);
++       list_rotate(&n1.list, &queue);  /* first element */
++       print(&queue);
++       list_rotate(&n3.list, &queue);  /* last element */
++       print(&queue);
++}
++
++int main(void)
++{
++       INIT_LIST_HEAD(&queue);
++       list_add(&n3.list, &queue);
++       list_add(&n2.list, &queue);
++       list_add(&n1.list, &queue);
++       list_add_tail(&n4.list, &queue);
++       print(&queue);
++       list_rotate(&n2.list, &queue);
++       print(&queue);
++       list_rotate(&n4.list, &queue);
++       print(&queue);
++       list_del(&n2.list);
++       list_del(&n1.list);
++       list_del(&n4.list);
++       list_del(&n3.list);
++#if 1
++       rotate();
++#endif
++
++       return 0;
++}
++
+Regards,
+Andreas Gruenbacher
+------------------------------------------------------------------------
+ Andreas Gruenbacher, a.gruenbacher@computer.org
+ Contact information: 
+http://www.bestbits.at/~agruenba
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

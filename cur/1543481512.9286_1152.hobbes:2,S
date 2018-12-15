@@ -1,0 +1,292 @@
+Date: Fri, 22 Jan 1999 21:11:16 +0100 (CET)
+From: MOLNAR Ingo <>
+Subject: Re: [patch] cycle-counter synchronization on SMP, 2.2.0-final
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/1/22/269
+
+On Fri, 22 Jan 1999, Mark-Andre Hopf wrote:
+> > [... bootlog ...]
+> > checking TSC synchronization across CPUs: passed.
+> > [...]
+> > 
+> > what does it output on your system?
+> 
+> It says:
+> 
+> checking TSC synchronization across CPUs:
+> BIOS BUG: CPU#1 inproperly initialized, has 26 usecs TSC scew! FIXED.
+> BIOS BUG: CPU#1 inproperly initialized, has 26 usecs TSC scew! FIXED.
+> 
+>  and it's a wonderful patch! `gettimeofday' is working correct with it.
+(cool :)
+> I can't see no reason why it prints the second line two times, the CPU
+> number should've been different, right?, but it's okay here.
+not the same line twice, it's one line per CPU. it's (yet another) typo in
+the debugging printk, it should be CPU#0 in one case and CPU#1 in the
+other case. (which means the two clocks were 52 usecs apart, this is
+definitely enough to trigger your debugging code!) 
+>  I bet my machine is not overclocked, IBM sells it like this. It's an
+> IBM PC Server 325. 
+> 
+>  Hmm, is this a reason for a specific guy, we all love so much, to "wear a
+> brown paper bag over his head for a month"? :)
+nope, this was a longstanding bug. I'm glad it's fixed. That specific guy
+might feel uneasy about including it in 2.2.0, i think it's a clear
+candidate for 2.2.1. It also might explain some of the NTP+SMP problems? 
+(typo-fixed patch attached, could you try it again just to be sure it
+still fixes your system and reports the bug in a sane way? The patch is
+compiling/booting fine on SMP, UP, TSC-less systems. The patch tries to
+very accurately measure clock scew, and tries to synchronize clocks very
+accurately.)
+-- mingo
+--- linux/arch/i386/kernel/smp.c.orig	Fri Jan 22 13:01:53 1999
++++ linux/arch/i386/kernel/smp.c	Fri Jan 22 21:03:31 1999
+@@ -168,6 +168,17 @@
+ #endif
+ 
+ /*
++ * Reads and clears the Pentium Timestamp-Counter
++ */
++#define READ_TSC(x)	__asm__ __volatile__ (  "rdtsc" \
++				:"=a" (((unsigned long*)&(x))[0]),  \
++				 "=d" (((unsigned long*)&(x))[1]))
++
++#define CLEAR_TSC \
++	__asm__ __volatile__ ("\t.byte 0x0f, 0x30;\n"::\
++		"a"(0x00001000), "d"(0x00001000), "c"(0x10):"memory")
++
++/*
+  *	Setup routine for controlling SMP activation
+  *
+  *	Command-line option of "nosmp" or "maxcpus=0" will disable SMP
+@@ -713,6 +724,153 @@
+ 	return memory_start;
+ }
+ 
++#ifdef CONFIG_X86_TSC
++/*
++ * TSC synchronization.
++ *
++ * We first check wether all CPUs have their TSC's synchronized,
++ * then we resync if not.
++ */
++
++static atomic_t tsc_counter = ATOMIC_INIT(0);
++static atomic_t tsc_flag = ATOMIC_INIT(0);
++
++static atomic_t tsc_value_flag = ATOMIC_INIT(0);
++static unsigned long long tsc_values[NR_CPUS] = { 0, };
++static atomic_t tsc_value_count = ATOMIC_INIT(0);
++
++#define NR_LOOPS 5
++
++extern unsigned long fast_gettimeoffset_quotient;
++
++/*
++ * accurate 64-bit division, expanded to 32-bit divisions. Not terribly
++ * optimized but we need it at boot time only anyway.
++ *
++ * result == a / b
++ *        == (a1 + a2*(2^32)) / b
++ *        == a1/b + a2*(2^32/b)
++ *        == a1/b + a2*((2^32-1)/b) + a2/b + (a2*((2^32-1) % b))/b
++ *                    ^---- (this multiplication can overflow)
++ */
++
++unsigned long long div64 (unsigned long long a, unsigned long long b)
++{
++	unsigned int a1, a2, b0;
++	unsigned long long res;
++
++	if (b > 0x00000000ffffffffULL)
++		return 0;
++	if (!b)
++		panic("huh?\n");
++
++	b0 = (unsigned int) b;
++	a1 = ((unsigned int*)&a)[0];
++	a2 = ((unsigned int*)&a)[1];
++
++	res = a1/b0 +
++		(unsigned long long)a2 * (unsigned long long)(0xffffffff/b0) +
++		a2 / b0 +
++		(a2 * (0xffffffff % b0)) / b0;
++
++        return res;
++}
++
++
++static void __init synchronize_tsc_bp (void)
++{
++	int i;
++	unsigned long long t0;
++	unsigned long long sum, avg;
++	long long delta;
++	unsigned long one_usec;
++	int buggy = 0;
++
++	printk("checking TSC synchronization across CPUs: ");
++
++	one_usec = ((1<<30)/fast_gettimeoffset_quotient)*(1<<2);
++	
++	while (atomic_read(&tsc_counter) != smp_num_cpus-1) mb();
++	atomic_inc(&tsc_flag);
++
++	for (i = 0; i < NR_LOOPS; i++) {
++		atomic_set(&tsc_value_count, 0);
++		atomic_inc(&tsc_value_flag);
++
++		READ_TSC(tsc_values[smp_processor_id()]);
++
++		while (atomic_read(&tsc_value_count) != smp_num_cpus-1) mb();
++
++		atomic_dec(&tsc_value_flag);
++		if (i == NR_LOOPS-1)
++			CLEAR_TSC;
++	}
++	READ_TSC(t0);
++	atomic_dec(&tsc_flag);
++
++	sum = 0;
++	for (i = 0; i < NR_CPUS; i++) {
++		if (!(cpu_online_map & (1 << i)))
++			continue;
++
++		t0 = tsc_values[i];
++		sum += t0;
++	}
++	avg = div64(sum, smp_num_cpus);
++
++	sum = 0;
++	for (i = 0; i < NR_CPUS; i++) {
++		if (!(cpu_online_map & (1 << i)))
++			continue;
++
++		delta = tsc_values[i] - avg;
++		if (delta < 0)
++			delta = -delta;
++		/*
++		 * We report bigger than 2 microseconds clock differences.
++		 */
++		if (delta > 2*one_usec) {
++			if (!buggy) {
++				buggy = 1;
++				printk("\n");
++			}
++			printk("BIOS BUG: CPU#%d improperly initialised, has %ld usecs TSC scew! FIXED.\n",
++				i,
++				(unsigned long)div64(tsc_values[i] - avg, one_usec));
++		}
++				
++		sum += delta;
++	}
++	if (!buggy)
++		printk("passed.\n");
++}
++
++static void __init synchronize_tsc_ap (void)
++{
++	int i;
++	unsigned long long t0;
++
++	atomic_inc(&tsc_counter);
++	while (!atomic_read(&tsc_flag)) mb();
++
++	for (i = 0; i < NR_LOOPS; i++) {
++		while (!atomic_read(&tsc_value_flag)) mb();
++
++		READ_TSC(tsc_values[smp_processor_id()]);
++		atomic_inc(&tsc_value_count);
++		while (atomic_read(&tsc_value_flag)) mb();
++		if (i == NR_LOOPS-1)
++			CLEAR_TSC;
++	}
++	READ_TSC(t0);
++
++	atomic_dec(&tsc_counter);
++	while (atomic_read(&tsc_counter)) mb();
++}
++#undef NR_LOOPS
++
++#endif
++
+ extern void calibrate_delay(void);
+ 
+ void __init smp_callin(void)
+@@ -790,6 +948,13 @@
+ 	 *	Allow the master to continue.
+ 	 */
+ 	set_bit(cpuid, (unsigned long *)&cpu_callin_map[0]);
++
++#ifdef CONFIG_X86_TSC
++	/*
++	 *	Synchronize the TSC with the BP
++	 */
++ 	synchronize_tsc_ap ();
++#endif
+ }
+ 
+ int cpucount = 0;
+@@ -1310,6 +1475,14 @@
+ 		setup_IO_APIC();
+ smp_done:
+ #endif
++#ifdef CONFIG_X86_TSC
++	/*
++	 * Synchronize the TSC with the AP
++	 */
++	if (cpucount)
++	 	synchronize_tsc_bp();
++#endif
++
+ }
+ 
+ 
+@@ -1747,10 +1920,6 @@
+  * closely follows bus clocks.
+  */
+ 
+-#define RDTSC(x)	__asm__ __volatile__ (  "rdtsc" \
+-				:"=a" (((unsigned long*)&x)[0]),  \
+-				 "=d" (((unsigned long*)&x)[1]))
+-
+ /*
+  * The timer chip is already set up at HZ interrupts per second here,
+  * but we do not accept timer interrupts yet. We only allow the BP
+@@ -1869,7 +2038,7 @@
+ 	/*
+ 	 * We wrapped around just now. Let's start:
+ 	 */
+-	RDTSC(t1);
++	READ_TSC(t1);
+ 	tt1=apic_read(APIC_TMCCT);
+ 
+ #define LOOPS (HZ/10)
+@@ -1880,7 +2049,7 @@
+ 		wait_8254_wraparound ();
+ 
+ 	tt2=apic_read(APIC_TMCCT);
+-	RDTSC(t2);
++	READ_TSC(t2);
+ 
+ 	/*
+ 	 * The APIC bus clock counter is 32 bits only, it
+--- linux/arch/i386/kernel/time.c.orig	Fri Jan 22 15:01:48 1999
++++ linux/arch/i386/kernel/time.c	Fri Jan 22 15:14:13 1999
+@@ -86,7 +86,7 @@
+  * Equal to 2^32 * (1 / (clocks per usec) ).
+  * Initialized in time_init.
+  */
+-static unsigned long fast_gettimeoffset_quotient=0;
++unsigned long fast_gettimeoffset_quotient=0;
+ 
+ extern rwlock_t xtime_lock;
+ 
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

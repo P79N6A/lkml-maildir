@@ -1,0 +1,224 @@
+Date: Sun, 27 Jun 1999 16:23:56 +0200 (CEST)
+From: Andrea Arcangeli <>
+Subject: Re: [patch] pagecache-2.3.9-H3, bmap & ext2fs cleanup patch
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/6/27/49
+
+On Sun, 27 Jun 1999, Ingo Molnar wrote:
+>make_request() handles it already. Am i overlooking something? 
+Yes, ll_rw_block suppose that all buffer passed in the array blongs to the
+same blockdevice. I noticed this getting bug-reports from people using my
+early 2.2.x-VM patches :). I couldn't notice this since I have everything
+on the same blockdevice. My current ll_rw_block looks like this (and it's
+multi-blockdevice capable).
+(patch against pre-2.3.9-4)
+Index: ll_rw_blk.c
+===================================================================
+RCS file: /var/cvs/linux/drivers/block/ll_rw_blk.c,v
+retrieving revision 1.1.1.11
+diff -u -r1.1.1.11 ll_rw_blk.c
+--- ll_rw_blk.c	1999/06/26 02:45:33	1.1.1.11
++++ ll_rw_blk.c	1999/06/27 14:20:51
+@@ -206,7 +206,7 @@
+ /*
+  * wait until a free request in the first N entries is available.
+  */
+-static struct request * __get_request_wait(int n, kdev_t dev)
++static inline struct request * get_request_wait(int n, kdev_t dev)
+ {
+ 	register struct request *req;
+ 	DECLARE_WAITQUEUE(wait, current);
+@@ -214,33 +214,25 @@
+ 
+ 	add_wait_queue(&wait_for_request, &wait);
+ 	for (;;) {
++		run_task_queue(&tq_disk);
+ 		current->state = TASK_UNINTERRUPTIBLE;
+ 		spin_lock_irqsave(&io_request_lock,flags);
+ 		req = get_request(n, dev);
+ 		spin_unlock_irqrestore(&io_request_lock,flags);
+ 		if (req)
+ 			break;
+-		run_task_queue(&tq_disk);
+ 		schedule();
++		spin_lock_irqsave(&io_request_lock,flags);
++		req = get_request(n, dev);
++		spin_unlock_irqrestore(&io_request_lock,flags);
++		if (req)
++			break;
+ 	}
+ 	remove_wait_queue(&wait_for_request, &wait);
+ 	current->state = TASK_RUNNING;
+ 	return req;
+ }
+ 
+-static inline struct request * get_request_wait(int n, kdev_t dev)
+-{
+-	register struct request *req;
+-	unsigned long flags;
+-
+-	spin_lock_irqsave(&io_request_lock,flags);
+-	req = get_request(n, dev);
+-	spin_unlock_irqrestore(&io_request_lock,flags);
+-	if (req)
+-		return req;
+-	return __get_request_wait(n, dev);
+-}
+-
+ /* RO fail safe mechanism */
+ 
+ static long ro_bits[MAX_BLKDEV][8];
+@@ -542,8 +535,8 @@
+ /* if no request available: if rw_ahead, forget it; otherwise try again blocking.. */
+ 	if (!req) {
+ 		if (rw_ahead)
+-			goto end_io;
+-		req = __get_request_wait(max_req, bh->b_rdev);
++			goto failed_ahead;
++		req = get_request_wait(max_req, bh->b_rdev);
+ 	}
+ 
+ /* fill up the request-info, and add it to the queue */
+@@ -560,6 +553,16 @@
+ 	add_request(major+blk_dev,req);
+ 	return;
+ 
++failed_ahead:
++	switch (rw)
++	{
++	case READ:
++		kstat.pgpgin--;
++		break;
++	case WRITE:
++		kstat.pgpgout--;
++		break;
++	}
+ end_io:
+ 	bh->b_end_io(bh, test_bit(BH_Uptodate, &bh->b_state));
+ }
+@@ -570,9 +573,6 @@
+ 
+ void ll_rw_block(int rw, int nr, struct buffer_head * bh[])
+ {
+-	unsigned int major;
+-	int correct_size;
+-	struct blk_dev_struct * dev;
+ 	int i;
+ 
+ 	/* Make sure that the first block contains something reasonable */
+@@ -582,30 +582,36 @@
+ 			return;
+ 	}
+ 
+-	dev = NULL;
+-	if ((major = MAJOR(bh[0]->b_dev)) < MAX_BLKDEV)
+-		dev = blk_dev + major;
+-	if (!dev || !dev->request_fn) {
+-		printk(KERN_ERR
+-	"ll_rw_block: Trying to read nonexistent block-device %s (%ld)\n",
+-		kdevname(bh[0]->b_dev), bh[0]->b_blocknr);
+-		goto sorry;
+-	}
+-
+-	/* Determine correct block size for this device.  */
+-	correct_size = BLOCK_SIZE;
+-	if (blksize_size[major]) {
+-		i = blksize_size[major][MINOR(bh[0]->b_dev)];
+-		if (i)
+-			correct_size = i;
+-	}
++	for (i = 0; i < nr; i++)
++	{
++		unsigned int major;
++		int correct_size;
++		struct blk_dev_struct * dev;
++
++		dev = NULL;
++		if ((major = MAJOR(bh[i]->b_dev)) < MAX_BLKDEV)
++			dev = blk_dev + major;
++		if (!dev || !dev->request_fn) {
++			printk(KERN_ERR
++			       "ll_rw_block: Trying to read nonexistent "
++			       "block-device %s (%ld)\n",
++			       kdevname(bh[i]->b_dev), bh[i]->b_blocknr);
++			goto sorry;
++		}
+ 
+-	/* Verify requested block sizes.  */
+-	for (i = 0; i < nr; i++) {
++		/* Determine correct block size for this device.  */
++		correct_size = BLOCK_SIZE;
++		if (blksize_size[major]) {
++			int tmp_size;
++			tmp_size = blksize_size[major][MINOR(bh[i]->b_dev)];
++			if (tmp_size)
++				correct_size = tmp_size;
++		}
++		/* Verify requested block sizes.  */
+ 		if (bh[i]->b_size != correct_size) {
+ 			printk(KERN_NOTICE "ll_rw_block: device %s: "
+ 			       "only %d-char blocks implemented (%lu)\n",
+-			       kdevname(bh[0]->b_dev),
++			       kdevname(bh[i]->b_dev),
+ 			       correct_size, bh[i]->b_size);
+ 			goto sorry;
+ 		}
+@@ -622,35 +628,31 @@
+ 		        goto sorry;
+ 		}
+ #endif
+-	}
+-
+-	if ((rw == WRITE || rw == WRITEA) && is_read_only(bh[0]->b_dev)) {
+-		printk(KERN_NOTICE "Can't write to read-only device %s\n",
+-		       kdevname(bh[0]->b_dev));
+-		goto sorry;
++		if ((rw == WRITE || rw == WRITEA) &&
++		    is_read_only(bh[i]->b_dev)) {
++			printk(KERN_NOTICE
++			       "Can't write to read-only device %s\n",
++			       kdevname(bh[i]->b_dev));
++			goto sorry;
++		}
+ 	}
+ 
+ 	for (i = 0; i < nr; i++) {
+-		if (bh[i]) {
+-			set_bit(BH_Req, &bh[i]->b_state);
++		set_bit(BH_Req, &bh[i]->b_state);
+ #ifdef CONFIG_BLK_DEV_MD
+-			if (MAJOR(bh[i]->b_dev) == MD_MAJOR) {
+-				md_make_request(MINOR (bh[i]->b_dev), rw, bh[i]);
+-				continue;
+-			}
++		if (MAJOR(bh[i]->b_dev) == MD_MAJOR) {
++			md_make_request(MINOR (bh[i]->b_dev), rw, bh[i]);
++		} else
+ #endif
+ 			make_request(MAJOR(bh[i]->b_rdev), rw, bh[i]);
+-		}
+ 	}
+ 	return;
+ 
+       sorry:
+ 	for (i = 0; i < nr; i++) {
+-		if (bh[i]) {
+-			clear_bit(BH_Dirty, &bh[i]->b_state);
+-			clear_bit(BH_Uptodate, &bh[i]->b_state);
+-			bh[i]->b_end_io(bh[i], 0);
+-		}
++		clear_bit(BH_Dirty, &bh[i]->b_state);
++		clear_bit(BH_Uptodate, &bh[i]->b_state);
++		bh[i]->b_end_io(bh[i], 0);
+ 	}
+ 	return;
+ }
+Andrea Arcangeli
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

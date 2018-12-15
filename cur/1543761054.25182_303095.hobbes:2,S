@@ -1,0 +1,152 @@
+Date: Tue, 15 Mar 2005 20:20:01 +0300
+From: Oleg Nesterov <>
+Subject: [PATCH 2/2] del_timer_sync: proof of concept
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2005/3/15/150
+
+New rules:
+	->_base &  1	: is timer pending
+	->_base & ~1	: timer's base
+If ->_base == NULL, this timer is not running on any cpu.
+Cleared only in del_timer_sync().
+Note that now we don't need del_singleshot_timer_sync().
+Here is the code of del_timer_sync:
+int del_timer_sync(struct timer_list *timer)
+{
+	int ret = 0;
+	for (;;) {
+		unsigned long flags;
+		tvec_base_t *_base, *base;
+		_base = timer->_base;
+		if (!_base)
+			return ret;
+		base = __timer_base(_base);
+		spin_lock_irqsave(&base->lock, flags);
+		if (timer->_base != _base)
+			goto unlock;
+		if (base->running_timer == timer)
+			goto unlock;
+		if (__timer_pending(_base)) {
+			list_del(&timer->entry);
+			ret = 1;
+		}
+		smp_wmb();
+		timer->_base = NULL;
+unlock:
+		spin_unlock_irqrestore(&base->lock, flags);
+	}
+}
+Signed-off-by: Oleg Nesterov <oleg@tv-sign.ru>
+--- 2.6.11/include/linux/timer.h~2_PEND	2005-03-15 17:49:19.000000000 +0300
++++ 2.6.11/include/linux/timer.h	2005-03-15 18:09:06.000000000 +0300
+@@ -21,9 +21,11 @@ struct timer_list {
+ 	struct tvec_t_base_s *_base;
+ };
+ 
++#define	__TIMER_PENDING	1
++
+ static inline int __timer_pending(struct tvec_t_base_s *base)
+ {
+-	return base != NULL;
++	return ((unsigned long)base & __TIMER_PENDING) != 0;
+ }
+ 
+ #define TIMER_MAGIC	0x4b87ad6e
+--- 2.6.11/kernel/timer.c~2_PEND	2005-03-15 17:55:00.000000000 +0300
++++ 2.6.11/kernel/timer.c	2005-03-15 19:52:48.000000000 +0300
+@@ -86,16 +86,26 @@ static inline void set_running_timer(tve
+ 
+ static inline tvec_base_t *__get_base(struct timer_list *timer)
+ {
+-	return timer->_base;
++	tvec_base_t *base = timer->_base;
++
++	if (__timer_pending(base))
++		return (void*)base - __TIMER_PENDING;
++	else
++		return NULL;
+ }
+ 
+ static inline void __set_base(struct timer_list *timer,
+ 				tvec_base_t *base, int pending)
+ {
+ 	if (pending)
+-		timer->_base = base;
++		timer->_base = (void*)base + __TIMER_PENDING;
+ 	else
+-		timer->_base = NULL;
++		timer->_base = base;
++}
++
++static inline tvec_base_t *__timer_base(tvec_base_t *base)
++{
++	return (tvec_base_t*)((unsigned long)base & ~__TIMER_PENDING);
+ }
+ 
+ /* Fake initialization */
+@@ -356,29 +366,39 @@ EXPORT_SYMBOL(del_timer);
+  */
+ int del_timer_sync(struct timer_list *timer)
+ {
+-	tvec_base_t *base;
+-	int i, ret = 0;
++	int ret;
+ 
+ 	check_timer(timer);
+ 
+-del_again:
+-	ret += del_timer(timer);
++	ret = 0;
++	for (;;) {
++		unsigned long flags;
++		tvec_base_t *_base, *base;
++
++		_base = timer->_base;
++		if (!_base)
++			return ret;
+ 
+-	for_each_online_cpu(i) {
+-		base = &per_cpu(tvec_bases, i);
+-		if (base->running_timer == timer) {
+-			while (base->running_timer == timer) {
+-				cpu_relax();
+-				preempt_check_resched();
+-			}
+-			break;
++		base = __timer_base(_base);
++		spin_lock_irqsave(&base->lock, flags);
++
++		if (timer->_base != _base)
++			goto unlock;
++
++		if (base->running_timer == timer)
++			goto unlock;
++
++		if (__timer_pending(_base)) {
++			list_del(&timer->entry);
++			ret = 1;
+ 		}
++		/* Need to make sure that anybody who sees a NULL base
++		 * also sees the list ops */
++		smp_wmb();
++		timer->_base = NULL;
++unlock:
++		spin_unlock_irqrestore(&base->lock, flags);
+ 	}
+-	smp_rmb();
+-	if (timer_pending(timer))
+-		goto del_again;
+-
+-	return ret;
+ }
+ EXPORT_SYMBOL(del_timer_sync);
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+More majordomo info at  
+http://vger.kernel.org/majordomo-info.html
+Please read the FAQ at  
+http://www.tux.org/lkml/

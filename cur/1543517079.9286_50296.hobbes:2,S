@@ -1,0 +1,1342 @@
+Date: Thu, 25 Nov 1999 22:23:57 -0500 (EST)
+From: "Benjamin C.R. LaHaise" <>
+Subject: [RFC/RFT/PATCH] i386 rw semaphore/spinlocks + use for mmap_sem
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/11/25/183
+
+'loo folks,
+Okay, here's take two (actually 6) on the rw semaphores, with the same
+technique used for rw spinlocks, plus fixes for the problem Manfred
+pointed out (it won't do unnecessary wakes), plus an evil bug of decl vs
+subl (decl does *not* set the carry flag, which is *very* important to the
+functioning of this code).  When changing the rw spinlocks over, several
+bugs in the networking code cropped up (there were a few rw spinlocks that
+weren't being initialized in dynamically allocated structures -- tsk tsk!
+=).  Known caveats: there is no down_read_trylock or down_write_trylock. 
+They're possible, just tricky, so I've put them off until the base seems
+stable.  Also, as Andrea pointed out, there are still a few more fixes
+needed in the mm code for the change of mmap_sem to a rw semaphore to be
+stable.
+The assertions in this one are a bit heavy since the checks for
+uninitialized locks are present, but it's working on tests that it
+previously didn't pass, and looks otherwise race free.  Note that the
+down_.*failed.* cases have been completely rewritten, and are very
+symmetrical now, and generally look right.  Each rw semaphore now has two
+wait queues, as it needs to distinguish between two types of wakeups.
+ToFix: currently when waking sleeping readers with a sleeping writer,
+depending on how tasks are scheduled, the writer might come in before the
+reader awakens.  The fix is to have the down_failed_biased case for a
+reader add in all the other readers that were waiting when it
+successfully grabs the lock, which is for the next (and hopefully final) 
+revision. =)
+Marcelo, could you run the test that broken the last one on this and tell
+me how it fares?  Thanks!
+		-ben
+====begin mutex-2.3.29-6.diff====
+diff -urN clean/2.3.29/arch/i386/kernel/ldt.c 2.3.29/arch/i386/kernel/ldt.c
+--- clean/2.3.29/arch/i386/kernel/ldt.c	Tue Aug  3 15:10:35 1999
++++ 2.3.29/arch/i386/kernel/ldt.c	Thu Nov 25 12:19:56 1999
+@@ -86,7 +86,7 @@
+ 	 * the GDT index of the LDT is allocated dynamically, and is
+ 	 * limited by MAX_LDT_DESCRIPTORS.
+ 	 */
+-	down(&mm->mmap_sem);
++	down_write(&mm->mmap_sem);
+ 	if (!mm->segments) {
+ 		
+ 		error = -ENOMEM;
+@@ -141,7 +141,7 @@
+ 	error = 0;
+ 
+ out_unlock:
+-	up(&mm->mmap_sem);
++	up_write(&mm->mmap_sem);
+ out:
+ 	return error;
+ }
+diff -urN clean/2.3.29/arch/i386/kernel/semaphore.c 2.3.29/arch/i386/kernel/semaphore.c
+--- clean/2.3.29/arch/i386/kernel/semaphore.c	Tue Oct 26 20:54:38 1999
++++ 2.3.29/arch/i386/kernel/semaphore.c	Thu Nov 25 22:10:12 1999
+@@ -2,7 +2,17 @@
+  * i386 semaphore implementation.
+  *
+  * (C) Copyright 1999 Linus Torvalds
++ *
++ * Portions Copyright 1999 Red Hat, Inc.
++ *
++ *	This program is free software; you can redistribute it and/or
++ *	modify it under the terms of the GNU General Public License
++ *	as published by the Free Software Foundation; either version
++ *	2 of the License, or (at your option) any later version.
++ *
++ * rw semaphores implemented November 1999 by Benjamin LaHaise <bcrl@redhat.com>
+  */
++#include <linux/config.h>
+ #include <linux/sched.h>
+ 
+ #include <asm/semaphore.h>
+@@ -218,3 +228,196 @@
+ 	"popl %eax\n\t"
+ 	"ret"
+ );
++
++asm(
++"
++.align 4
++.globl __down_read_failed
++__down_read_failed:
++	pushl	%edx
++	pushl	%ecx
++	jnc	2f
++
++3:	call	down_failed_biased
++
++1:	popl	%ecx
++	popl	%edx
++	ret
++
++2:	call	down_read_failed
++	" LOCK "subl	$1,(%eax)
++	jns	1b
++	jnc	2b
++	jmp	3b
++"
++);
++
++asm(
++"
++.align 4
++.globl __down_write_failed
++__down_write_failed:
++	pushl	%edx
++	pushl	%ecx
++	jnc	2f
++
++3:	call	down_failed_biased
++
++1:	popl	%ecx
++	popl	%edx
++	ret
++
++2:	call	down_write_failed
++	" LOCK "subl	$" RW_LOCK_BIAS_STR ",(%eax)
++	jz	1b
++	jnc	2b
++	jmp	3b
++"
++);
++
++struct rw_semaphore *FASTCALL(rwsem_wake_zero(struct rw_semaphore *sem));
++struct rw_semaphore *FASTCALL(rwsem_wake_positive(struct rw_semaphore *sem));
++struct rw_semaphore *FASTCALL(rwsem_wake(struct rw_semaphore *sem));
++
++struct rw_semaphore *FASTCALL(down_failed_biased(struct rw_semaphore *sem));
++struct rw_semaphore *FASTCALL(down_read_failed(struct rw_semaphore *sem));
++struct rw_semaphore *FASTCALL(down_write_failed(struct rw_semaphore *sem));
++
++/* This code is shared for both the reader and writer case where down failed,
++ * but managed to bias the lock.
++ */
++struct rw_semaphore *down_failed_biased(struct rw_semaphore *sem)
++{
++	struct task_struct *tsk = current;
++	DECLARE_WAITQUEUE(wait, tsk);
++
++	add_wait_queue_exclusive(&sem->bias_wait, &wait);	/* put ourselves at the end of the list */
++
++	for (;;) {
++		if (sem->bias_granted && xchg(&sem->bias_granted, 0))
++			break;
++		set_task_state(tsk, TASK_UNINTERRUPTIBLE | TASK_EXCLUSIVE);
++		if (!sem->bias_granted)
++			schedule();
++	}
++
++	remove_wait_queue(&sem->bias_wait, &wait);
++	tsk->state = TASK_RUNNING;
++
++	/* if the lock is currently unbiased, awaken the sleepers */
++	if (atomic_read(&sem->count) >= 0)
++		wake_up(&sem->wait);
++
++	return sem;
++}
++
++/* Wait for the lock to become unbiased.  Readers
++ * are non-exclusive. =)
++ */
++struct rw_semaphore *down_read_failed(struct rw_semaphore *sem)
++{
++	struct task_struct *tsk = current;
++	DECLARE_WAITQUEUE(wait, tsk);
++
++	__up_read(sem);	/* this takes care of granting the lock */
++
++	add_wait_queue(&sem->wait, &wait);
++
++	while (atomic_read(&sem->count) < 0) {
++		set_task_state(tsk, TASK_UNINTERRUPTIBLE);
++		if (atomic_read(&sem->count) >= 0)
++			break;
++		schedule();
++	}
++
++	remove_wait_queue(&sem->wait, &wait);
++	tsk->state = TASK_RUNNING;
++
++	return sem;
++}
++
++/* Wait for the lock to become unbiased. Since we're
++ * a writer, we'll make ourselves exclusive.
++ */
++struct rw_semaphore *down_write_failed(struct rw_semaphore *sem)
++{
++	struct task_struct *tsk = current;
++	DECLARE_WAITQUEUE(wait, tsk);
++
++	__up_write(sem);	/* this takes care of granting the lock */
++
++	add_wait_queue_exclusive(&sem->wait, &wait);
++
++	while (atomic_read(&sem->count) < 0) {
++		set_task_state(tsk, TASK_UNINTERRUPTIBLE | TASK_EXCLUSIVE);
++		if (atomic_read(&sem->count) >= 0)
++			break;	/* we must attempt to aquire or bias the lock */
++		schedule();
++	}
++
++	remove_wait_queue(&sem->wait, &wait);
++	tsk->state = TASK_RUNNING;
++
++	return sem;
++}
++
++asm(
++"
++.align 4
++.globl __rwsem_wake
++__rwsem_wake:
++	pushl	%edx
++	pushl	%ecx
++	call	rwsem_wake
++	popl	%ecx
++	popl	%edx
++	ret
++"
++);
++
++/* Called when someone has done an up that transitioned from
++ * negative to non-negative, meaning that the lock has been
++ * granted to whomever owned the bias.
++ */
++struct rw_semaphore *rwsem_wake(struct rw_semaphore *sem)
++{
++	if (xchg(&sem->bias_granted, 1))
++		BUG();
++	wake_up(&sem->bias_wait);
++	return sem;
++}
++
++#if defined(CONFIG_SMP)
++asm(
++"
++.align	4
++.globl	__write_lock_failed
++__write_lock_failed:
++	jnc	2f
++1:	testl	$" RW_LOCK_BIAS_STR "-1,(%eax)
++	jnz	1b
++	ret
++
++2:	" LOCK "addl	$" RW_LOCK_BIAS_STR ",(%eax)
++3:	testl	$-1,(%eax)
++	js	3b
++
++	" LOCK "subl	$" RW_LOCK_BIAS_STR ",(%eax)
++	jnz	__write_lock_failed
++	ret
++
++
++.align	4
++.globl	__read_lock_failed
++__read_lock_failed:
++	lock ; incl	(%eax)
++1:	cmpl	$1,(%eax)
++	js	1b
++
++	lock ; decl	(%eax)
++	js	__read_lock_failed
++	ret
++"
++);
++#endif
++
+diff -urN clean/2.3.29/arch/i386/kernel/sys_i386.c 2.3.29/arch/i386/kernel/sys_i386.c
+--- clean/2.3.29/arch/i386/kernel/sys_i386.c	Wed Nov  3 14:31:09 1999
++++ 2.3.29/arch/i386/kernel/sys_i386.c	Thu Nov 25 12:19:56 1999
+@@ -66,7 +66,7 @@
+ 	if (copy_from_user(&a, arg, sizeof(a)))
+ 		return -EFAULT;
+ 
+-	down(&current->mm->mmap_sem);
++	down_write(&current->mm->mmap_sem);
+ 	lock_kernel();
+ 	if (!(a.flags & MAP_ANONYMOUS)) {
+ 		error = -EBADF;
+@@ -81,7 +81,7 @@
+ 		fput(file);
+ out:
+ 	unlock_kernel();
+-	up(&current->mm->mmap_sem);
++	up_write(&current->mm->mmap_sem);
+ 	return error;
+ }
+ 
+diff -urN clean/2.3.29/arch/i386/kernel/time.c 2.3.29/arch/i386/kernel/time.c
+--- clean/2.3.29/arch/i386/kernel/time.c	Thu Oct  7 13:17:08 1999
++++ 2.3.29/arch/i386/kernel/time.c	Thu Nov 25 12:19:56 1999
+@@ -78,7 +78,7 @@
+ 
+ extern rwlock_t xtime_lock;
+ 
+-static inline unsigned long do_fast_gettimeoffset(void)
++static unsigned long do_fast_gettimeoffset(void)
+ {
+ 	register unsigned long eax asm("ax");
+ 	register unsigned long edx asm("dx");
+diff -urN clean/2.3.29/arch/i386/mm/fault.c 2.3.29/arch/i386/mm/fault.c
+--- clean/2.3.29/arch/i386/mm/fault.c	Thu Nov 25 12:13:35 1999
++++ 2.3.29/arch/i386/mm/fault.c	Thu Nov 25 12:19:56 1999
+@@ -137,7 +137,7 @@
+ 	if (in_interrupt() || !mm)
+ 		goto no_context;
+ 
+-	down(&mm->mmap_sem);
++	down_read(&mm->mmap_sem);
+ 
+ 	vma = find_vma(mm, address);
+ 	if (!vma)
+@@ -204,7 +204,7 @@
+ 		if (bit < 32)
+ 			tsk->thread.screen_bitmap |= 1 << bit;
+ 	}
+-	up(&mm->mmap_sem);
++	up_read(&mm->mmap_sem);
+ 	return;
+ 
+ /*
+@@ -212,7 +212,7 @@
+  * Fix it, but check if it's kernel or user first..
+  */
+ bad_area:
+-	up(&mm->mmap_sem);
++	up_read(&mm->mmap_sem);
+ 
+ 	/* User mode accesses just cause a SIGSEGV */
+ 	if (error_code & 4) {
+@@ -280,14 +280,14 @@
+  * us unable to handle the page fault gracefully.
+  */
+ out_of_memory:
+-	up(&mm->mmap_sem);
++	up_read(&mm->mmap_sem);
+ 	printk("VM: killing process %s\n", tsk->comm);
+ 	if (error_code & 4)
+ 		do_exit(SIGKILL);
+ 	goto no_context;
+ 
+ do_sigbus:
+-	up(&mm->mmap_sem);
++	up_read(&mm->mmap_sem);
+ 
+ 	/*
+ 	 * Send a sigbus, regardless of whether we were in kernel
+diff -urN clean/2.3.29/drivers/char/mem.c 2.3.29/drivers/char/mem.c
+--- clean/2.3.29/drivers/char/mem.c	Thu Nov 25 12:13:36 1999
++++ 2.3.29/drivers/char/mem.c	Thu Nov 25 12:19:56 1999
+@@ -334,7 +334,7 @@
+ 
+ 	mm = current->mm;
+ 	/* Oops, this was forgotten before. -ben */
+-	down(&mm->mmap_sem);
++	down_read(&mm->mmap_sem);
+ 
+ 	/* For private mappings, just map in zero pages. */
+ 	for (vma = find_vma(mm, addr); vma; vma = vma->vm_next) {
+@@ -360,7 +360,7 @@
+ 			goto out_up;
+ 	}
+ 
+-	up(&mm->mmap_sem);
++	up_read(&mm->mmap_sem);
+ 	
+ 	/* The shared case is hard. Let's do the conventional zeroing. */ 
+ 	do {
+@@ -375,7 +375,7 @@
+ 
+ 	return size;
+ out_up:
+-	up(&mm->mmap_sem);
++	up_read(&mm->mmap_sem);
+ 	return size;
+ }
+ 
+diff -urN clean/2.3.29/fs/proc/array.c 2.3.29/fs/proc/array.c
+--- clean/2.3.29/fs/proc/array.c	Fri Nov 19 14:15:11 1999
++++ 2.3.29/fs/proc/array.c	Thu Nov 25 12:19:56 1999
+@@ -175,7 +175,7 @@
+ 	unsigned long data = 0, stack = 0;
+ 	unsigned long exec = 0, lib = 0;
+ 
+-	down(&mm->mmap_sem);
++	down_read(&mm->mmap_sem);
+ 	for (vma = mm->mmap; vma; vma = vma->vm_next) {
+ 		unsigned long len = (vma->vm_end - vma->vm_start) >> 10;
+ 		if (!vma->vm_file) {
+@@ -206,7 +206,7 @@
+ 		mm->rss << (PAGE_SHIFT-10),
+ 		data - stack, stack,
+ 		exec - lib, lib);
+-	up(&mm->mmap_sem);
++	up_read(&mm->mmap_sem);
+ 	return buffer;
+ }
+ 
+@@ -295,7 +295,7 @@
+ 	vsize = eip = esp = 0;
+ 	if (mm) {
+ 		struct vm_area_struct *vma;
+-		down(&mm->mmap_sem);
++		down_read(&mm->mmap_sem);
+ 		vma = mm->mmap;
+ 		while (vma) {
+ 			vsize += vma->vm_end - vma->vm_start;
+@@ -303,7 +303,7 @@
+ 		}
+ 		eip = KSTK_EIP(task);
+ 		esp = KSTK_ESP(task);
+-		up(&mm->mmap_sem);
++		up_read(&mm->mmap_sem);
+ 	}
+ 
+ 	wchan = get_wchan(task);
+@@ -451,7 +451,7 @@
+ 
+ 	if (mm) {
+ 		struct vm_area_struct * vma;
+-		down(&mm->mmap_sem);
++		down_read(&mm->mmap_sem);
+ 		vma = mm->mmap;
+ 		while (vma) {
+ 			pgd_t *pgd = pgd_offset(mm, vma->vm_start);
+@@ -472,7 +472,7 @@
+ 				drs += pages;
+ 			vma = vma->vm_next;
+ 		}
+-		up(&mm->mmap_sem);
++		up_read(&mm->mmap_sem);
+ 	}
+ 	return sprintf(buffer,"%d %d %d %d %d %d %d\n",
+ 		       size, resident, share, trs, lrs, drs, dt);
+@@ -541,7 +541,7 @@
+ 	column = *ppos & (MAPS_LINE_LENGTH-1);
+ 
+ 	/* quickly go to line lineno */
+-	down(&mm->mmap_sem);
++	down_read(&mm->mmap_sem);
+ 	for (map = mm->mmap, i = 0; map && (i < lineno); map = map->vm_next, i++)
+ 		continue;
+ 
+@@ -601,9 +601,9 @@
+ 		i = len-column;
+ 		if (i > count)
+ 			i = count;
+-		up(&mm->mmap_sem);
++		up_read(&mm->mmap_sem);
+ 		copy_to_user(destptr, line+column, i); /* may have slept */
+-		down(&mm->mmap_sem);
++		down_read(&mm->mmap_sem);
+ 		destptr += i;
+ 		count   -= i;
+ 		column  += i;
+@@ -622,7 +622,7 @@
+ 		if (volatile_task)
+ 			break;
+ 	}
+-	up(&mm->mmap_sem);
++	up_read(&mm->mmap_sem);
+ 
+ 	/* encode f_pos */
+ 	*ppos = (lineno << MAPS_LINE_SHIFT) + column;
+diff -urN clean/2.3.29/fs/proc/base.c 2.3.29/fs/proc/base.c
+--- clean/2.3.29/fs/proc/base.c	Fri Nov 19 14:15:11 1999
++++ 2.3.29/fs/proc/base.c	Thu Nov 25 12:19:56 1999
+@@ -58,7 +58,7 @@
+ 	mm = task->mm;
+ 	if (!mm)
+ 		goto out;
+-	down(&mm->mmap_sem);
++	down_read(&mm->mmap_sem);
+ 	vma = mm->mmap;
+ 	while (vma) {
+ 		if ((vma->vm_flags & VM_EXECUTABLE) && 
+@@ -68,7 +68,7 @@
+ 		}
+ 		vma = vma->vm_next;
+ 	}
+-	up(&mm->mmap_sem);
++	up_read(&mm->mmap_sem);
+ out:
+ 	task_unlock(task);
+ 	return result;
+diff -urN clean/2.3.29/include/asm-i386/atomic.h 2.3.29/include/asm-i386/atomic.h
+--- clean/2.3.29/include/asm-i386/atomic.h	Thu Nov 25 12:18:00 1999
++++ 2.3.29/include/asm-i386/atomic.h	Thu Nov 25 12:19:56 1999
+@@ -46,6 +46,17 @@
+ 		:"ir" (i), "m" (__atomic_fool_gcc(v)));
+ }
+ 
++static __inline__ int atomic_sub_and_test(int i, volatile atomic_t *v)
++{
++	unsigned char c;
++
++	__asm__ __volatile__(
++		LOCK "subl %2,%0; sete %1"
++		:"=m" (__atomic_fool_gcc(v)), "=qm" (c)
++		:"ir" (i), "m" (__atomic_fool_gcc(v)));
++	return c;
++}
++
+ static __inline__ void atomic_inc(volatile atomic_t *v)
+ {
+ 	__asm__ __volatile__(
+diff -urN clean/2.3.29/include/asm-i386/rwlock.h 2.3.29/include/asm-i386/rwlock.h
+--- clean/2.3.29/include/asm-i386/rwlock.h	Wed Dec 31 19:00:00 1969
++++ 2.3.29/include/asm-i386/rwlock.h	Thu Nov 25 22:07:43 1999
+@@ -0,0 +1,43 @@
++/* include/asm-i386/rwlock.h
++ *
++ *	Helpers used by both rw spinlocks and rw semaphores.
++ *
++ *	Based in part on code from semaphore.h and
++ *	spinlock.h Copyright 1996 Linus Torvalds.
++ *
++ *	Copyright 1999 Red Hat, Inc.
++ *
++ *	Written by Benjamin LaHaise.
++ *
++ *	This program is free software; you can redistribute it and/or
++ *	modify it under the terms of the GNU General Public License
++ *	as published by the Free Software Foundation; either version
++ *	2 of the License, or (at your option) any later version.
++ */
++#ifndef _ASM_I386_RWLOCK_H
++#define _ASM_I386_RWLOCK_H
++
++#define RW_LOCK_BIAS		 0x01000000
++#define RW_LOCK_BIAS_STR	"0x01000000"
++
++#define __build_read_lock(rw, helper)   \
++	asm volatile(LOCK "subl $1,(%0)\n\t" \
++		     "js 2f\n" \
++		     "1:\n" \
++		     ".section .text.lock,\"ax\"\n" \
++		     "2:\tcall " helper "\n\t" \
++		     "jmp 1b\n" \
++		     ".previous" \
++		     ::"a" (rw) : "memory")
++
++#define __build_write_lock(rw, helper) \
++	asm volatile(LOCK "subl $" RW_LOCK_BIAS_STR ",(%0)\n\t" \
++		     "jnz 2f\n" \
++		     "1:\n" \
++		     ".section .text.lock,\"ax\"\n" \
++		     "2:\tcall " helper "\n\t" \
++		     "jmp 1b\n" \
++		     ".previous" \
++		     ::"a" (rw) : "memory")
++
++#endif
+diff -urN clean/2.3.29/include/asm-i386/semaphore.h 2.3.29/include/asm-i386/semaphore.h
+--- clean/2.3.29/include/asm-i386/semaphore.h	Sat Nov  6 22:06:14 1999
++++ 2.3.29/include/asm-i386/semaphore.h	Thu Nov 25 18:28:51 1999
+@@ -30,7 +30,7 @@
+ 
+ #include <asm/system.h>
+ #include <asm/atomic.h>
+-#include <linux/spinlock.h>
++#include <asm/rwlock.h>
+ #include <linux/wait.h>
+ 
+ struct semaphore {
+@@ -111,10 +111,7 @@
+ 
+ 	__asm__ __volatile__(
+ 		"# atomic down operation\n\t"
+-#ifdef __SMP__
+-		"lock ; "
+-#endif
+-		"decl (%0)\n\t"     /* --sem->count */
++		LOCK "decl (%0)\n\t"     /* --sem->count */
+ 		"js 2f\n"
+ 		"1:\n"
+ 		".section .text.lock,\"ax\"\n"
+@@ -136,10 +133,7 @@
+ 
+ 	__asm__ __volatile__(
+ 		"# atomic interruptible down operation\n\t"
+-#ifdef __SMP__
+-		"lock ; "
+-#endif
+-		"decl (%1)\n\t"     /* --sem->count */
++		LOCK "decl (%1)\n\t"     /* --sem->count */
+ 		"js 2f\n\t"
+ 		"xorl %0,%0\n"
+ 		"1:\n"
+@@ -163,10 +157,7 @@
+ 
+ 	__asm__ __volatile__(
+ 		"# atomic interruptible down operation\n\t"
+-#ifdef __SMP__
+-		"lock ; "
+-#endif
+-		"decl (%1)\n\t"     /* --sem->count */
++		LOCK "decl (%1)\n\t"     /* --sem->count */
+ 		"js 2f\n\t"
+ 		"xorl %0,%0\n"
+ 		"1:\n"
+@@ -193,10 +184,7 @@
+ #endif
+ 	__asm__ __volatile__(
+ 		"# atomic up operation\n\t"
+-#ifdef __SMP__
+-		"lock ; "
+-#endif
+-		"incl (%0)\n\t"     /* ++sem->count */
++		LOCK "incl (%0)\n\t"     /* ++sem->count */
+ 		"jle 2f\n"
+ 		"1:\n"
+ 		".section .text.lock,\"ax\"\n"
+@@ -206,6 +194,174 @@
+ 		:/* no outputs */
+ 		:"c" (sem)
+ 		:"memory");
++}
++
++/* rw mutexes (should that be mutices? =) -- throw rw
++ * spinlocks and semaphores together, and this is what we
++ * end up with...
++ *
++ * The lock is initialized to BIAS.  This way, a writer
++ * subtracts BIAS ands gets 0 for the case of an uncontended
++ * lock.  Readers decrement by 1 and see a positive value
++ * when uncontended, negative if there are writers waiting
++ * (in which case it goes to sleep).
++ *
++ * The value 0x01000000 supports up to 128 processors and
++ * lots of processes.  BIAS must be chosen such that subl'ing
++ * BIAS once per CPU will result in the long remaining
++ * negative.
++ *
++ * In terms of fairness, this should result in the lock
++ * flopping back and forth between readers and writers
++ * under heavy use.
++ *
++ *		-ben
++ */
++struct rw_semaphore {
++	atomic_t		count;
++	volatile unsigned int	bias_granted;	/* lock was granted to the bias holder */
++	wait_queue_head_t	wait;
++	wait_queue_head_t	bias_wait;
++#if WAITQUEUE_DEBUG
++	long			__magic;
++	atomic_t		readers;
++	atomic_t		writers;
++#endif
++};
++
++#if WAITQUEUE_DEBUG
++#define __RWSEM_DEBUG_INIT	, ATOMIC_INIT(0), ATOMIC_INIT(0)
++#else
++#define __RWSEM_DEBUG_INIT	/* */
++#endif
++
++#define __RWSEM_INITIALIZER(name) \
++{ ATOMIC_INIT(RW_LOCK_BIAS), 0, __WAIT_QUEUE_HEAD_INITIALIZER((name).wait), \
++	__WAIT_QUEUE_HEAD_INITIALIZER((name).bias_wait) \
++	__SEM_DEBUG_INIT(name) __RWSEM_DEBUG_INIT }
++
++extern inline void init_rwsem(struct rw_semaphore *sem)
++{
++	atomic_set(&sem->count, RW_LOCK_BIAS);
++	sem->bias_granted = 0;
++	init_waitqueue_head(&sem->wait);
++	init_waitqueue_head(&sem->bias_wait);
++#if WAITQUEUE_DEBUG
++	sem->__magic = (long)&sem->__magic;
++	atomic_set(&sem->readers, 0);
++	atomic_set(&sem->writers, 0);
++#endif
++}
++
++/* we use FASTCALL convention for the helpers */
++extern struct rw_semaphore *FASTCALL(down_read_failed(struct rw_semaphore *sem));
++extern struct rw_semaphore *FASTCALL(down_write_failed(struct rw_semaphore *sem));
++extern struct rw_semaphore *FASTCALL(rwsem_wake(struct rw_semaphore *sem));
++
++extern inline void down_read(struct rw_semaphore *sem)
++{
++#if WAITQUEUE_DEBUG
++	if (sem->__magic != (long)&sem->__magic)
++		BUG();
++#endif
++	__asm__ __volatile__(
++		"# down_read\n\t"
++		LOCK "subl $1,(%%eax)\n\t"
++		"js 2f\n"
++		"1:\n"
++		".section .text.lock,\"ax\"\n"
++		"2:\tcall __down_read_failed\n\t"
++		"jmp 1b\n"
++		".previous"
++		::"a" (sem)
++		:"memory"
++		);
++#if WAITQUEUE_DEBUG
++	atomic_inc(&sem->readers);
++	if (atomic_read(&sem->writers))
++		BUG();
++#endif
++}
++
++extern inline void down_write(struct rw_semaphore *sem)
++{
++#if WAITQUEUE_DEBUG
++	if (sem->__magic != (long)&sem->__magic)
++		BUG();
++#endif
++	__build_write_lock(sem, "__down_write_failed");
++#if WAITQUEUE_DEBUG
++	if (atomic_read(&sem->writers))
++		BUG();
++	if (atomic_read(&sem->readers))
++		BUG();
++	atomic_inc(&sem->writers);
++	if (sem->bias_granted)
++		BUG();
++#endif
++}
++
++/* When a reader does a release, the only significant
++ * case is when there was a writer waiting, and we've
++ * bumped the count to 0: we must wake the writer up.
++ */
++extern inline void __up_read(struct rw_semaphore *sem)
++{
++	__asm__ __volatile__(
++		"# up_read\n\t"
++		LOCK "incl (%%eax)\n\t"
++		"jz 2f\n"			/* only do the wake if result == 0 (ie, a writer) */
++		"1:\n\t"
++		".section .text.lock,\"ax\"\n"
++		"2:\tcall __rwsem_wake\n\t"
++		"jmp 1b\n"
++		".previous"
++		::"a" (sem)
++		:"memory"
++		);
++}
++
++/* releasing the writer is easy -- just release it and
++ * wake up any sleepers.
++ */
++extern inline void __up_write(struct rw_semaphore *sem)
++{
++	__asm__ __volatile__(
++		"# up_write\n\t"
++		LOCK "addl $" RW_LOCK_BIAS_STR ",(%%eax)\n"
++		"jc 2f\n"			/* only do the wake if the result was -'ve to 0/+'ve */
++		"1:\n\t"
++		".section .text.lock,\"ax\"\n"
++		"2:\tcall __rwsem_wake\n\t"
++		"jmp 1b\n"
++		".previous"
++		::"a" (sem)
++		:"memory"
++		);
++}
++
++extern inline void up_read(struct rw_semaphore *sem)
++{
++#if WAITQUEUE_DEBUG
++	if (atomic_read(&sem->writers))
++		BUG();
++	atomic_dec(&sem->readers);
++#endif
++	__up_read(sem);
++}
++
++extern inline void up_write(struct rw_semaphore *sem)
++{
++#if WAITQUEUE_DEBUG
++	if (sem->bias_granted)
++		BUG();
++	if (atomic_read(&sem->readers))
++		BUG();
++	if (atomic_read(&sem->writers) != 1)
++		BUG();
++	atomic_dec(&sem->writers);
++#endif
++	__up_write(sem);
+ }
+ 
+ #endif
+diff -urN clean/2.3.29/include/asm-i386/smplock.h 2.3.29/include/asm-i386/smplock.h
+--- clean/2.3.29/include/asm-i386/smplock.h	Thu Nov 25 12:18:00 1999
++++ 2.3.29/include/asm-i386/smplock.h	Thu Nov 25 17:55:37 1999
+@@ -38,6 +38,10 @@
+  */
+ extern __inline__ void lock_kernel(void)
+ {
++#if 1
++	if (!++current->lock_depth)
++		spin_lock(&kernel_flag);
++#else
+ 	__asm__ __volatile__(
+ 		"incl %1\n\t"
+ 		"jne 9f"
+@@ -45,12 +49,17 @@
+ 		"\n9:"
+ 		:"=m" (__dummy_lock(&kernel_flag)),
+ 		 "=m" (current->lock_depth));
++#endif
+ }
+ 
+ extern __inline__ void unlock_kernel(void)
+ {
+ 	if (current->lock_depth < 0)
+ 		BUG();
++#if 1
++	if (--current->lock_depth < 0)
++		spin_unlock(&kernel_flag);
++#else
+ 	__asm__ __volatile__(
+ 		"decl %1\n\t"
+ 		"jns 9f\n\t"
+@@ -58,4 +67,5 @@
+ 		"\n9:"
+ 		:"=m" (__dummy_lock(&kernel_flag)),
+ 		 "=m" (current->lock_depth));
++#endif
+ }
+diff -urN clean/2.3.29/include/asm-i386/spinlock.h 2.3.29/include/asm-i386/spinlock.h
+--- clean/2.3.29/include/asm-i386/spinlock.h	Mon Oct  4 17:53:07 1999
++++ 2.3.29/include/asm-i386/spinlock.h	Thu Nov 25 17:55:37 1999
+@@ -1,6 +1,10 @@
+ #ifndef __ASM_SPINLOCK_H
+ #define __ASM_SPINLOCK_H
+ 
++#include <asm/atomic.h>
++#include <asm/rwlock.h>
++#include <asm/page.h>
++
+ /*
+  * Your basic SMP spinlocks, allowing only a single CPU anywhere
+  */
+@@ -9,6 +13,7 @@
+ 	volatile unsigned int lock;
+ } spinlock_t;
+ 
++#if 1
+ #define SPIN_LOCK_UNLOCKED (spinlock_t) { 0 }
+ 
+ #define spin_lock_init(x)	do { (x)->lock = 0; } while(0)
+@@ -20,10 +25,12 @@
+  */
+ 
+ #define spin_unlock_wait(x)	do { barrier(); } while(((volatile spinlock_t *)(x))->lock)
++#endif
+ 
+ typedef struct { unsigned long a[100]; } __dummy_lock_t;
+ #define __dummy_lock(lock) (*(__dummy_lock_t *)(lock))
+ 
++#if 1
+ #define spin_lock_string \
+ 	"\n1:\t" \
+ 	"lock ; btsl $0,%0\n\t" \
+@@ -49,6 +56,7 @@
+ 	:"=m" (__dummy_lock(lock)))
+ 
+ #define spin_trylock(lock) (!test_and_set_bit(0,(lock)))
++#endif
+ 
+ /*
+  * Read-write spinlocks, allowing multiple readers
+@@ -62,47 +70,64 @@
+  */
+ typedef struct {
+ 	volatile unsigned int lock;
++	unsigned magic;
+ } rwlock_t;
+ 
+-#define RW_LOCK_UNLOCKED (rwlock_t) { 0 }
++#define RWLOCK_MAGIC	0xdeaf1eed
++
++#define RW_LOCK_UNLOCKED (rwlock_t) { RW_LOCK_BIAS, RWLOCK_MAGIC }
+ 
+ /*
+  * On x86, we implement read-write locks as a 32-bit counter
+- * with the high bit (sign) being the "write" bit.
++ * with the high bit (sign) being the "contended" bit.
+  *
+  * The inline assembly is non-obvious. Think about it.
++ *
++ * Changed to use the same technique as rw semaphores.  See
++ * semaphore.h for details.  -ben
+  */
+-#define read_lock(rw)	\
+-	asm volatile("\n1:\t" \
+-		     "lock ; incl %0\n\t" \
+-		     "js 2f\n" \
+-		     ".section .text.lock,\"ax\"\n" \
+-		     "2:\tlock ; decl %0\n" \
+-		     "3:\tcmpl $0,%0\n\t" \
+-		     "js 3b\n\t" \
+-		     "jmp 1b\n" \
+-		     ".previous" \
+-		     :"=m" (__dummy_lock(&(rw)->lock)))
+-
+-#define read_unlock(rw) \
+-	asm volatile("lock ; decl %0" \
+-		:"=m" (__dummy_lock(&(rw)->lock)))
+-
+-#define write_lock(rw) \
+-	asm volatile("\n1:\t" \
+-		     "lock ; btsl $31,%0\n\t" \
+-		     "jc 4f\n" \
+-		     "2:\ttestl $0x7fffffff,%0\n\t" \
+-		     "jne 3f\n" \
+-		     ".section .text.lock,\"ax\"\n" \
+-		     "3:\tlock ; btrl $31,%0\n" \
+-		     "4:\tcmp $0,%0\n\t" \
+-		     "jne 4b\n\t" \
+-		     "jmp 1b\n" \
+-		     ".previous" \
+-		     :"=m" (__dummy_lock(&(rw)->lock)))
+-
+-#define write_unlock(rw) \
+-	asm volatile("lock ; btrl $31,%0":"=m" (__dummy_lock(&(rw)->lock)))
++/* the spinlock helpers are in arch/i386/kernel/semaphore.S */
++#if 0
++#define read_lock(rw)	__build_read_lock(rw, "__read_lock_failed")
++#define write_lock(rw)	__build_write_lock(rw, "__write_lock_failed")
++#endif
++
++extern int printk(const char *fmt, ...);
++
++extern inline void read_lock(rwlock_t *rw)
++{
++	if (rw->magic != RWLOCK_MAGIC)
++		BUG();
++	__build_read_lock(rw, "__read_lock_failed");
++}
++
++extern inline void write_lock(rwlock_t *rw)
++{
++	if (rw->magic != RWLOCK_MAGIC)
++		BUG();
++	__build_write_lock(rw, "__write_lock_failed");
++}
++
++#define read_unlock(rw)		asm volatile("lock ; incl %0" :"=m" (__dummy_lock(&(rw)->lock)))
++#define write_unlock(rw)	asm volatile("lock ; addl $" RW_LOCK_BIAS_STR ",%0":"=m" (__dummy_lock(&(rw)->lock)))
++
++extern inline int write_trylock(rwlock_t *lock)
++{
++	atomic_t *count = (atomic_t *)lock;
++	if (atomic_sub_and_test(RW_LOCK_BIAS, count))
++		return 1;
++	atomic_add(RW_LOCK_BIAS, count);
++	return 0;
++}
++
++#if 0
++#define SPIN_LOCK_UNLOCKED (spinlock_t) { RW_LOCK_BIAS }
++#define spin_lock_init(x)	do { (x)->lock = RW_LOCK_BIAS; } while(0)
++#define spin_unlock_wait(x)	do { barrier(); } while(((volatile spinlock_t *)(x))->lock != RW_LOCK_BIAS)
++
++#define spin_lock(lock)		write_lock(lock)
++#define spin_unlock(lock)	write_unlock(lock)
++#define spin_trylock(lock)	write_trylock((rwlock_t *)lock)
++#endif
+ 
+ #endif /* __ASM_SPINLOCK_H */
+diff -urN clean/2.3.29/include/linux/sched.h 2.3.29/include/linux/sched.h
+--- clean/2.3.29/include/linux/sched.h	Thu Nov 25 12:18:00 1999
++++ 2.3.29/include/linux/sched.h	Thu Nov 25 18:28:59 1999
+@@ -212,7 +212,7 @@
+ 	atomic_t mm_users;			/* How many users with user space? */
+ 	atomic_t mm_count;			/* How many references to "struct mm_struct" (users count as 1) */
+ 	int map_count;				/* number of VMAs */
+-	struct semaphore mmap_sem;
++	struct rw_semaphore mmap_sem;
+ 	spinlock_t page_table_lock;
+ 	unsigned long context;
+ 	unsigned long start_code, end_code, start_data, end_data;
+@@ -234,7 +234,7 @@
+ 		&init_mmap, NULL, NULL,			\
+ 		swapper_pg_dir, 			\
+ 		ATOMIC_INIT(2), ATOMIC_INIT(1), 1,	\
+-		__MUTEX_INITIALIZER(name.mmap_sem),	\
++		__RWSEM_INITIALIZER(name.mmap_sem),	\
+ 		SPIN_LOCK_UNLOCKED,			\
+ 		0,					\
+ 		0, 0, 0, 0,				\
+diff -urN clean/2.3.29/include/net/sock.h 2.3.29/include/net/sock.h
+--- clean/2.3.29/include/net/sock.h	Sat Nov  6 22:07:25 1999
++++ 2.3.29/include/net/sock.h	Thu Nov 25 18:29:44 1999
+@@ -386,6 +386,7 @@
+ 
+ #define sock_lock_init(__sk) \
+ do {	spin_lock_init(&((__sk)->lock.slock)); \
++	(__sk)->dst_lock = RW_LOCK_UNLOCKED; \
+ 	(__sk)->lock.users = 0; \
+ 	init_waitqueue_head(&((__sk)->lock.wq)); \
+ } while(0);
+diff -urN clean/2.3.29/ipc/shm.c 2.3.29/ipc/shm.c
+--- clean/2.3.29/ipc/shm.c	Thu Nov 18 13:27:31 1999
++++ 2.3.29/ipc/shm.c	Thu Nov 25 12:19:56 1999
+@@ -289,7 +289,7 @@
+ 	if (size > shmmax)
+ 		return -EINVAL;
+ 
+-	down(&current->mm->mmap_sem);
++	down_write(&current->mm->mmap_sem);
+ 	spin_lock(&shm_lock);
+ 	if (key == IPC_PRIVATE) {
+ 		err = newseg(key, shmflg, size);
+@@ -312,7 +312,7 @@
+ 			err = (int) shp->u.shm_perm.seq * IPCMNI + id;
+ 	}
+ 	spin_unlock(&shm_lock);
+-	up(&current->mm->mmap_sem);
++	up_write(&current->mm->mmap_sem);
+ 	return err;
+ }
+ 
+@@ -591,7 +591,7 @@
+ 	unsigned long addr;
+ 	unsigned long len;
+ 
+-	down(&current->mm->mmap_sem);
++	down_write(&current->mm->mmap_sem);
+ 	spin_lock(&shm_lock);
+ 	if (shmid < 0)
+ 		goto out;
+@@ -682,14 +682,14 @@
+ 	err = 0;
+ out:
+ 	spin_unlock(&shm_lock);
+-	up(&current->mm->mmap_sem);
++	up_write(&current->mm->mmap_sem);
+ 	return err;
+ 
+ failed_shm_map:
+ 	if (--shp->u.shm_nattch <= 0 && shp->u.shm_perm.mode & SHM_DEST)
+ 		killseg(id);
+ 	spin_unlock(&shm_lock);
+-	up(&current->mm->mmap_sem);
++	up_write(&current->mm->mmap_sem);
+ 	kmem_cache_free(vm_area_cachep, shmd);
+ 	return err;
+ }
+@@ -737,14 +737,14 @@
+ {
+ 	struct vm_area_struct *shmd, *shmdnext;
+ 
+-	down(&current->mm->mmap_sem);
++	down_write(&current->mm->mmap_sem);
+ 	for (shmd = current->mm->mmap; shmd; shmd = shmdnext) {
+ 		shmdnext = shmd->vm_next;
+ 		if (shmd->vm_ops == &shm_vm_ops
+ 		    && shmd->vm_start - (shmd->vm_pgoff << PAGE_SHIFT) == (ulong) shmaddr)
+ 			do_munmap(shmd->vm_start, shmd->vm_end - shmd->vm_start);
+ 	}
+-	up(&current->mm->mmap_sem);
++	up_write(&current->mm->mmap_sem);
+ 	return 0;
+ }
+ 
+diff -urN clean/2.3.29/kernel/fork.c 2.3.29/kernel/fork.c
+--- clean/2.3.29/kernel/fork.c	Thu Nov 25 12:13:39 1999
++++ 2.3.29/kernel/fork.c	Thu Nov 25 12:19:56 1999
+@@ -303,7 +303,7 @@
+ 		memset(mm, 0, sizeof(*mm));
+ 		atomic_set(&mm->mm_users, 1);
+ 		atomic_set(&mm->mm_count, 1);
+-		init_MUTEX(&mm->mmap_sem);
++		init_rwsem(&mm->mmap_sem);
+ 		mm->page_table_lock = SPIN_LOCK_UNLOCKED;
+ 		mm->pgd = pgd_alloc();
+ 		if (mm->pgd)
+@@ -400,9 +400,9 @@
+ 	 */
+ 	copy_segments(tsk, mm);
+ 
+-	down(&current->mm->mmap_sem);
++	down_write(&current->mm->mmap_sem);
+ 	retval = dup_mmap(mm);
+-	up(&current->mm->mmap_sem);
++	up_write(&current->mm->mmap_sem);
+ 	if (retval)
+ 		goto free_pt;
+ 
+diff -urN clean/2.3.29/kernel/ptrace.c 2.3.29/kernel/ptrace.c
+--- clean/2.3.29/kernel/ptrace.c	Thu Nov 18 13:27:31 1999
++++ 2.3.29/kernel/ptrace.c	Thu Nov 25 12:19:56 1999
+@@ -82,10 +82,10 @@
+ 	int copied;
+ 	struct vm_area_struct * vma;
+ 
+-	down(&tsk->mm->mmap_sem);
++	down_write(&tsk->mm->mmap_sem);
+ 	vma = find_extend_vma(tsk, addr);
+ 	if (!vma) {
+-		up(&tsk->mm->mmap_sem);
++		up_write(&tsk->mm->mmap_sem);
+ 		return 0;
+ 	}
+ 	copied = 0;
+@@ -117,7 +117,7 @@
+ 	
+ 		vma = vma->vm_next;
+ 	}
+-	up(&tsk->mm->mmap_sem);
++	up_write(&tsk->mm->mmap_sem);
+ 	return copied;
+ }
+ 
+diff -urN clean/2.3.29/mm/filemap.c 2.3.29/mm/filemap.c
+--- clean/2.3.29/mm/filemap.c	Thu Nov 25 12:13:39 1999
++++ 2.3.29/mm/filemap.c	Thu Nov 25 12:19:56 1999
+@@ -1715,7 +1715,7 @@
+ 	struct vm_area_struct * vma;
+ 	int unmapped_error, error = -EINVAL;
+ 
+-	down(&current->mm->mmap_sem);
++	down_write(&current->mm->mmap_sem);
+ 	lock_kernel();
+ 	if (start & ~PAGE_MASK)
+ 		goto out;
+@@ -1763,7 +1763,7 @@
+ 	}
+ out:
+ 	unlock_kernel();
+-	up(&current->mm->mmap_sem);
++	up_write(&current->mm->mmap_sem);
+ 	return error;
+ }
+ 
+diff -urN clean/2.3.29/mm/memory.c 2.3.29/mm/memory.c
+--- clean/2.3.29/mm/memory.c	Thu Nov 25 12:13:39 1999
++++ 2.3.29/mm/memory.c	Thu Nov 25 12:19:56 1999
+@@ -458,7 +458,7 @@
+ 		return err;
+ 
+  repeat:
+-	down(&mm->mmap_sem);
++	down_read(&mm->mmap_sem);
+ 
+ 	err = -EFAULT;
+ 	iobuf->locked = 1;
+@@ -498,12 +498,12 @@
+ 		ptr += PAGE_SIZE;
+ 	}
+ 
+-	up(&mm->mmap_sem);
++	up_read(&mm->mmap_sem);
+ 	dprintk ("map_user_kiobuf: end OK\n");
+ 	return 0;
+ 
+  out_unlock:
+-	up(&mm->mmap_sem);
++	up_read(&mm->mmap_sem);
+ 	unmap_kiobuf(iobuf);
+ 	dprintk ("map_user_kiobuf: end %d\n", err);
+ 	return err;
+@@ -515,7 +515,7 @@
+ 	 */
+ 	spin_unlock(&mm->page_table_lock);
+ 	unmap_kiobuf(iobuf);
+-	up(&mm->mmap_sem);
++	up_read(&mm->mmap_sem);
+ 
+ 	/* 
+ 	 * Did the release also unlock the page we got stuck on?
+diff -urN clean/2.3.29/mm/mlock.c 2.3.29/mm/mlock.c
+--- clean/2.3.29/mm/mlock.c	Thu Oct 28 16:03:38 1999
++++ 2.3.29/mm/mlock.c	Thu Nov 25 12:19:56 1999
+@@ -190,7 +190,7 @@
+ 	unsigned long lock_limit;
+ 	int error = -ENOMEM;
+ 
+-	down(&current->mm->mmap_sem);
++	down_write(&current->mm->mmap_sem);
+ 	len = (len + (start & ~PAGE_MASK) + ~PAGE_MASK) & PAGE_MASK;
+ 	start &= PAGE_MASK;
+ 
+@@ -211,7 +211,7 @@
+ 
+ 	error = do_mlock(start, len, 1);
+ out:
+-	up(&current->mm->mmap_sem);
++	up_write(&current->mm->mmap_sem);
+ 	return error;
+ }
+ 
+@@ -219,11 +219,11 @@
+ {
+ 	int ret;
+ 
+-	down(&current->mm->mmap_sem);
++	down_write(&current->mm->mmap_sem);
+ 	len = (len + (start & ~PAGE_MASK) + ~PAGE_MASK) & PAGE_MASK;
+ 	start &= PAGE_MASK;
+ 	ret = do_mlock(start, len, 0);
+-	up(&current->mm->mmap_sem);
++	up_write(&current->mm->mmap_sem);
+ 	return ret;
+ }
+ 
+@@ -263,7 +263,7 @@
+ 	unsigned long lock_limit;
+ 	int ret = -EINVAL;
+ 
+-	down(&current->mm->mmap_sem);
++	down_write(&current->mm->mmap_sem);
+ 	if (!flags || (flags & ~(MCL_CURRENT | MCL_FUTURE)))
+ 		goto out;
+ 
+@@ -281,7 +281,7 @@
+ 
+ 	ret = do_mlockall(flags);
+ out:
+-	up(&current->mm->mmap_sem);
++	up_write(&current->mm->mmap_sem);
+ 	return ret;
+ }
+ 
+@@ -289,8 +289,8 @@
+ {
+ 	int ret;
+ 
+-	down(&current->mm->mmap_sem);
++	down_write(&current->mm->mmap_sem);
+ 	ret = do_mlockall(0);
+-	up(&current->mm->mmap_sem);
++	up_write(&current->mm->mmap_sem);
+ 	return ret;
+ }
+diff -urN clean/2.3.29/mm/mmap.c 2.3.29/mm/mmap.c
+--- clean/2.3.29/mm/mmap.c	Thu Nov 25 12:13:39 1999
++++ 2.3.29/mm/mmap.c	Thu Nov 25 12:19:56 1999
+@@ -98,7 +98,7 @@
+ 	unsigned long newbrk, oldbrk;
+ 	struct mm_struct *mm = current->mm;
+ 
+-	down(&mm->mmap_sem);
++	down_write(&mm->mmap_sem);
+ 
+ 	if (brk < mm->end_code)
+ 		goto out;
+@@ -134,7 +134,7 @@
+ 	mm->brk = brk;
+ out:
+ 	retval = mm->brk;
+-	up(&mm->mmap_sem);
++	up_write(&mm->mmap_sem);
+ 	return retval;
+ }
+ 
+@@ -721,9 +721,9 @@
+ {
+ 	int ret;
+ 
+-	down(&current->mm->mmap_sem);
++	down_write(&current->mm->mmap_sem);
+ 	ret = do_munmap(addr, len);
+-	up(&current->mm->mmap_sem);
++	up_write(&current->mm->mmap_sem);
+ 	return ret;
+ }
+ 
+diff -urN clean/2.3.29/mm/mprotect.c 2.3.29/mm/mprotect.c
+--- clean/2.3.29/mm/mprotect.c	Thu Nov 25 12:13:39 1999
++++ 2.3.29/mm/mprotect.c	Thu Nov 25 12:19:56 1999
+@@ -223,7 +223,7 @@
+ 	if (end == start)
+ 		return 0;
+ 
+-	down(&current->mm->mmap_sem);
++	down_write(&current->mm->mmap_sem);
+ 
+ 	vma = find_vma(current->mm, start);
+ 	error = -EFAULT;
+@@ -262,6 +262,6 @@
+ 	merge_segments(current->mm, start, end);
+ 	vmlist_modify_unlock(current->mm);
+ out:
+-	up(&current->mm->mmap_sem);
++	up_write(&current->mm->mmap_sem);
+ 	return error;
+ }
+diff -urN clean/2.3.29/mm/mremap.c 2.3.29/mm/mremap.c
+--- clean/2.3.29/mm/mremap.c	Thu Nov 25 12:13:39 1999
++++ 2.3.29/mm/mremap.c	Thu Nov 25 12:19:56 1999
+@@ -171,7 +171,7 @@
+ 	struct vm_area_struct *vma;
+ 	unsigned long ret = -EINVAL;
+ 
+-	down(&current->mm->mmap_sem);
++	down_write(&current->mm->mmap_sem);
+ 	if (addr & ~PAGE_MASK)
+ 		goto out;
+ 	old_len = PAGE_ALIGN(old_len);
+@@ -246,6 +246,6 @@
+ 	else
+ 		ret = -ENOMEM;
+ out:
+-	up(&current->mm->mmap_sem);
++	up_write(&current->mm->mmap_sem);
+ 	return ret;
+ }
+diff -urN clean/2.3.29/net/core/neighbour.c 2.3.29/net/core/neighbour.c
+--- clean/2.3.29/net/core/neighbour.c	Mon Aug 23 13:01:02 1999
++++ 2.3.29/net/core/neighbour.c	Thu Nov 25 12:19:56 1999
+@@ -55,7 +55,7 @@
+ static struct neigh_table *neigh_tables;
+ 
+ #if defined(__i386__) && defined(__SMP__)
+-#define ASSERT_WL(n) if ((int)((n)->lock.lock) >= 0) { printk("WL assertion failed at " __FILE__ "(%d):" __FUNCTION__ "\n", __LINE__); }
++#define ASSERT_WL(n) if ((int)((n)->lock.lock) > 0) { printk("WL assertion failed at " __FILE__ "(%d):" __FUNCTION__ "\n", __LINE__); }
+ #else
+ #define ASSERT_WL(n) do { } while(0)
+ #endif
+@@ -881,6 +881,7 @@
+ 
+ 	if (!hh && (hh = kmalloc(sizeof(*hh), GFP_ATOMIC)) != NULL) {
+ 		memset(hh, 0, sizeof(struct hh_cache));
++		hh->hh_lock = RW_LOCK_UNLOCKED;
+ 		hh->hh_type = protocol;
+ 		atomic_set(&hh->hh_refcnt, 0);
+ 		hh->hh_next = NULL;
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

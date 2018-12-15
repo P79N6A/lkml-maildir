@@ -1,0 +1,235 @@
+Date: Fri, 13 Apr 2007 01:15:34 +0200
+From: "Dmitry Adamushko" <>
+Subject: [PATCH] [DEBUG] sd-sched: monitor dynamic priority levels of a running task
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2007/4/12/342
+
+Hi,
+[ just in case, it can be of some avail for anybody ]
+target : 2.6.21-rc6-mm1
+a very simplified but quite funny "toy" that
+[1]  allows to monitor all the dynamic priority levels (counts a
+number of hits per level) on which a given task (configured via proc)
+is running;
+# echo "pid" > /proc/sd_pid  - to monitor a task with a given pid";
+# cat /proc/sd_slots              - to dump statistics.
+[2]  triggers a message when task's *prio* and *static_prio* are out
+of sync, i.e. a current prio is not allowed by
+prio_matrix[USER_PRIO(static_prio)].
+[ example: --- [1857] static: 35, slot: 3  -  nice ]
+maybe Con has something similar.. but at least I haven't found
+anything on his website.
+e.g. for X all the following scenarios give different (obviously)
+patterns: (1) just occasional cpu users ; (2) a cpu hog with the same
+static_prio; (3) a niced cpu hog.
+There are cases when [2] is triggered indeed. It's due to
+set_user_nice(). Con, is it a "feature"?
+-------- [ explanation ] ---------
+In fact, all this "delta" calculation (delta = p->prio - old_prio)
+staff is useless in set_user_prio() as effective_prio() returns just
+the old p->prio and, as a result, we have got p->prio = p->prio :)  It
+makes sense to use delta = p->static_prio - old_static_prio;
+The p->prio will be recalculated as a result of enqueue_task ->
+__enqueue_task -> recalc_task_prio ..  _but_ if the task is currently
+in the "active" array and its time_slice != 0 -- the old p->prio is
+not changed
+So the task is queued taking into account the old_prio, although this
+slot can be prohibited by a new p->static_prio. It's only for the very
+first slot so one may call it err.. a feature (?)
+------------------------------------------------
+-- 
+Best regards,
+Dmitry Adamushko
+--- linux-2.6.21-rc6-mm1/kernel/sched-orig3.c	2007-04-11 14:48:19.000000000 +0200
++++ linux-2.6.21-rc6-mm1/kernel/sched.c	2007-04-12 16:13:12.000000000 +0200
+@@ -260,6 +260,164 @@ struct rq {
+ static DEFINE_PER_CPU(struct rq, runqueues);
+ static DEFINE_MUTEX(sched_hotcpu_mutex);
+ 
++#define DEBUG_SD_SLOTS
++#ifdef DEBUG_SD_SLOTS
++
++#include <linux/proc_fs.h>
++
++static int sd_monitor_pid, sd_monitor_idx;
++static unsigned long sd_slot_hits[PRIO_RANGE];
++static struct proc_dir_entry *sd_pid_dir, *sd_slots_dir;
++static int sd_debug_done;
++
++static void init_debug_slots(void);
++
++static void reset_slot_hits(void)
++{
++	int i = 0;
++
++	for ( ; i < PRIO_RANGE; i++)
++		sd_slot_hits[i] = 0;
++}
++
++static inline void debug_check_slot_validity(struct task_struct *p)
++{
++	int sprio = USER_PRIO(p->static_prio), uprio = USER_PRIO(p->prio);
++
++	/* SCHED_BATCH and rt tasks don't use prio_matrix so just skip them. */
++	if (p->policy == SCHED_BATCH || rt_task(p))
++		return;
++
++	if (unlikely(!sd_debug_done))
++		init_debug_slots();
++
++	if (sd_monitor_pid && p->pid == sd_monitor_pid)
++		++sd_slot_hits[uprio];
++
++	if (test_bit(uprio, prio_matrix[sprio]))
++		printk(KERN_EMERG "--- [%d] static: %d, slot: %d  -  %s\n",
++			p->pid, sprio, uprio, p->comm);
++}
++
++static int sd_pid_proc_read(char *page, char **start, off_t off,
++			int count, int *eof, void *data)
++{
++	char *p = page;
++	int len = 0;
++
++	p += sprintf(p, "pid: %d\n", sd_monitor_pid);
++
++        len = p - page - off;
++
++        if (len <= off + count)
++                *eof = 1;
++        *start = page + off;
++        if (len > count)
++                len = count;
++        if (len < 0)
++                len = 0;
++
++        return len;
++}
++
++static int sd_pid_proc_write(struct file *file, const char __user *buffer,
++			unsigned long count, void *data)
++{
++	struct task_struct *task;
++        char *end, buf[16];
++        long pid;
++        int n;
++
++        n = count > sizeof(buf) - 1 ? sizeof(buf) - 1 : count;
++
++        if (copy_from_user(buf, buffer, n))
++                return -EFAULT;
++
++        buf[n] = '\0';
++        pid = simple_strtol(buf, &end, 0);
++
++	/* Stop monitoring. */
++	if (!pid) {
++		sd_monitor_pid = 0;
++		goto out_exit;
++	}
++
++	read_lock(&tasklist_lock);
++	task = find_task_by_pid(pid);
++
++	if (!task || task->policy == SCHED_BATCH || rt_task(task)) {
++		read_unlock(&tasklist_lock);
++
++		printk(KERN_EMERG "*** don't monitor SCHED_BATCH or Real-Time tasks ***\n");
++		goto out_exit;
++	}
++
++	sd_monitor_idx = USER_PRIO(task->static_prio);
++	read_unlock(&tasklist_lock);
++
++	reset_slot_hits();
++	sd_monitor_pid = pid;
++
++out_exit:
++        return count;
++}
++
++static int sd_slots_proc_read(char *page, char **start, off_t off,
++			int count, int *eof, void *data)
++{
++	int len = 0, i = 0;
++	char *p = page;
++
++	if (!sd_monitor_pid)
++		goto out_exit;
++
++	p += sprintf(p, " slot  allowed     hits\n\n");
++
++	for ( ; i < PRIO_RANGE; i++)
++		p += sprintf(p, "[ %d ] - %d : %lu \n",
++			i, !!test_bit(i, prio_matrix[sd_monitor_idx]), sd_slot_hits[i]);
++
++out_exit:
++        len = p - page - off;
++
++        if (len <= off + count)
++                *eof = 1;
++        *start = page + off;
++        if (len > count)
++                len = count;
++        if (len < 0)
++                len = 0;
++
++        return len;
++}
++
++static void init_debug_slots(void)
++{
++	sd_pid_dir = create_proc_entry("sd_pid", 0644, NULL);
++	sd_slots_dir = create_proc_read_entry("sd_slots", 0444, NULL,
++				sd_slots_proc_read, NULL);
++
++	if (!sd_pid_dir || !sd_slots_dir)
++		goto out_failed;
++
++	sd_pid_dir->read_proc = sd_pid_proc_read;
++	sd_pid_dir->write_proc = sd_pid_proc_write;
++
++	sd_debug_done = 1;
++	return;
++
++out_failed:
++	printk(KERN_ERR "init_debug_slots: failed\n");
++	if (sd_pid_dir)
++		remove_proc_entry("sd_pid", NULL);
++	if (sd_slots_dir)
++		remove_proc_entry("sd_slots", NULL);
++}
++
++#else
++static inline void debug_check_slot_validity(struct task_struct *p) {};
++#endif
++
+ static inline int cpu_of(struct rq *rq)
+ {
+ #ifdef CONFIG_SMP
+@@ -832,12 +990,14 @@ static inline void __enqueue_task(struct
+ static void enqueue_task(struct task_struct *p, struct rq *rq)
+ {
+ 	__enqueue_task(p, rq);
++	debug_check_slot_validity(p);
+ 	list_add_tail(&p->run_list, p->array->queue + p->prio);
+ }
+ 
+ static inline void enqueue_task_head(struct task_struct *p, struct rq *rq)
+ {
+ 	__enqueue_task(p, rq);
++	debug_check_slot_validity(p);
+ 	list_add(&p->run_list, p->array->queue + p->prio);
+ }
+ 
+@@ -850,6 +1010,7 @@ static void requeue_task(struct task_str
+ {
+ 	if (p->array == rq->expired)
+ 		queue_expired(p, rq);
++	debug_check_slot_validity(p);
+ 	list_move_tail(&p->run_list, p->array->queue + p->prio);
+ 	if (!rt_task(p)) {
+ 		if (list_empty(old_array->queue + old_prio))

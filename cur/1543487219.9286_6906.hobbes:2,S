@@ -1,0 +1,936 @@
+Date: Wed, 24 Feb 1999 11:14:05 -0600
+From: James Bottomley <>
+Subject: [PATCH] SMP multiple IO-APIC support against 2.2.2
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/2/24/61
+
+This patch will allow linux to run in symmetric IO mode on big iron intel 
+boxes.  I've tried to put as little as possible in the way of the single 
+IO-APIC code path which is the default for smaller SMP machines.
+I'd like this to go in 2.2 to give the stable kernel a good big iron SMP 
+story, but since current 2.2 will boot on big boxes (with all interrupts 
+routed through CPU0 in PIC mode) it's an enhancement not an essential fix.
+I've tested this on several NCR boxes with both single and dual IO-APIC 
+configurations.  I hope to test it on the Quad IO-APIC monster box in the 
+third week of March when I have the lab time.
+James Bottomley
+Index: arch/i386/kernel/io_apic.c
+===================================================================
+RCS file: /home/jejb/CVSROOT/linux/arch/i386/kernel/io_apic.c,v
+retrieving revision 1.1.1.1
+diff -u -r1.1.1.1 io_apic.c
+--- 1.1.1.1	1999/02/23 17:00:51
++++ io_apic.c	1999/02/24 11:46:23
+@@ -5,6 +5,8 @@
+  *
+  *	Many thanks to Stig Venaas for trying out countless experimental
+  *	patches and reporting/debugging problems patiently!
++ *
++ *	James.Bottomley@ColumbiaSC.ncr.com: multiple IO-APIC support.
+  */
+ 
+ #include <linux/sched.h>
+@@ -16,12 +18,6 @@
+ #include "irq.h"
+ 
+ /*
+- * volatile is justified in this case, IO-APIC register contents
+- * might change spontaneously, GCC should not cache it
+- */
+-#define IO_APIC_BASE ((volatile int *)fix_to_virt(FIX_IO_APIC_BASE))
+-
+-/*
+  * The structure of the IO-APIC:
+  */
+ 
+@@ -47,7 +43,7 @@
+ /*
+  * # of IRQ routing registers
+  */
+-int nr_ioapic_registers = 0;
++int nr_ioapic_registers[MAX_IO_APICS] = { 0 };
+ 
+ enum ioapic_irq_destination_types {
+ 	dest_Fixed = 0,
+@@ -100,6 +96,25 @@
+ int mpc_default_type = 0;			/* non-0 if default (table-less)
+ 						   MP configuration */
+ 
++/* functions to transform between fictitious irq and apic, pin */
++
++static inline int
++irq_from_apic_pin(int apic, int pin)
++{
++	return apic * max_ioapic_pin + pin;
++}
++
++static inline int
++apic_from_irq(int irq)
++{
++	return irq / max_ioapic_pin;
++}
++
++static inline int
++pin_from_irq(int irq)
++{
++	return irq % max_ioapic_pin;
++}
+ 
+ /*
+  * This is performance-critical, we want to do it O(1)
+@@ -108,25 +123,26 @@
+  * between pins and IRQs.
+  */
+ 
+-static inline unsigned int io_apic_read(unsigned int reg)
++static inline unsigned int io_apic_read(int apic, unsigned int reg)
+ {
+-	*IO_APIC_BASE = reg;
+-	return *(IO_APIC_BASE+4);
++	*IO_APIC_BASE(apic) = reg;
++	return *(IO_APIC_BASE(apic)+4);
+ }
+ 
+-static inline void io_apic_write(unsigned int reg, unsigned int value)
++static inline void io_apic_write(int apic, unsigned int reg, 
++				 unsigned int value)
+ {
+-	*IO_APIC_BASE = reg;
+-	*(IO_APIC_BASE+4) = value;
++	*IO_APIC_BASE(apic) = reg;
++	*(IO_APIC_BASE(apic)+4) = value;
+ }
+ 
+ /*
+  * Re-write a value: to be used for read-modify-write
+  * cycles where the read already set up the index register.
+  */
+-static inline void io_apic_modify(unsigned int value)
++static inline void io_apic_modify(int apic, unsigned int value)
+ {
+-	*(IO_APIC_BASE+4) = value;
++	*(IO_APIC_BASE(apic)+4) = value;
+ }
+ 
+ /*
+@@ -135,7 +151,10 @@
+  */
+ static inline void io_apic_sync(void)
+ {
+-	(void) *(IO_APIC_BASE+4);
++	int i;
++	for(i=0; i<num_ioapics; i++) {
++		(void) *(IO_APIC_BASE(i)+4);
++	}
+ }
+ 
+ /*
+@@ -146,17 +165,24 @@
+ #define PIN_MAP_SIZE (MAX_PLUS_SHARED_IRQS + NR_IRQS)
+ 
+ static struct irq_pin_list {
+-	int pin, next;
++	int apic, pin, next;
+ } irq_2_pin[PIN_MAP_SIZE];
+ 
+-/*
+- * The common case is 1:1 IRQ<->pin mappings. Sometimes there are
+- * shared ISA-space IRQs, so we have to support them. We are super
+- * fast in the common case, and fast for shared ISA-space IRQs.
+- */
++/* This mapping is critical to system operation.  If nature had been
++ * kind to us we would just use the index into the MP table as the
++ * IRQ.  Unfortunately we also need to support the first 16 interrupts
++ * as legacy ISA/EISA.
++ *
++ * The way this works: if(irq <= 16) just map the irq to whatever pin
++ * is requested.  if(irq > 16) we enforce the mapping irq = apic *
++ * num_ioapics + pin.  This means that given any irq we can always
++ * derive the apic and pin.  In order to support this as easily as
++ * possible, the IO APICs are always ordered so that IOAPIC[0] handles
++ * the ISA/EISA interrupts */
+ static void add_pin_to_irq(unsigned int irq, int pin)
+ {
+ 	static int first_free_entry = NR_IRQS;
++	int apic = apic_from_irq(irq);
+ 	struct irq_pin_list *entry = irq_2_pin + irq;
+ 
+ 	while (entry->next)
+@@ -168,7 +194,17 @@
+ 		if (++first_free_entry >= PIN_MAP_SIZE)
+ 			panic("io_apic.c: whoops");
+ 	}
++	entry->apic = apic;
+ 	entry->pin = pin;
++	if(irq > 16 && pin != pin_from_irq(irq)) {
++		/* this should never happen */
++		printk(KERN_WARNING "WARNING: " __FILE__ 
++		       ": violation of irq=%d to pin=%d,apic=%d mappings", 
++		       irq, pin, apic_from_irq(irq));
++		skip_ioapic_setup = 1;
++		/* just in case we're already in symmetric mode */
++		init_pic_mode();
++	}
+ }
+ 
+ #define DO_ACTION(name,R,ACTION, FINAL)					\
+@@ -183,9 +219,9 @@
+ 		pin = entry->pin;					\
+ 		if (pin == -1)						\
+ 			break;						\
+-		reg = io_apic_read(0x10 + R + pin*2);			\
++		reg = io_apic_read(entry->apic, 0x10 + R + pin*2);	\
+ 		reg ACTION;						\
+-		io_apic_modify(reg);					\
++		io_apic_modify(entry->apic, reg);			\
+ 		if (!entry->next)					\
+ 			break;						\
+ 		entry = irq_2_pin + entry->next;			\
+@@ -202,7 +238,7 @@
+ DO_ACTION( mask,    0, |= 0x00010000, io_apic_sync())		/* mask = 1 */
+ DO_ACTION( unmask,  0, &= 0xfffeffff, )				/* mask = 0 */
+ 
+-static void clear_IO_APIC_pin(unsigned int pin)
++static void clear_IO_APIC_pin(int apic, unsigned int pin)
+ {
+ 	struct IO_APIC_route_entry entry;
+ 
+@@ -211,16 +247,17 @@
+ 	 */
+ 	memset(&entry, 0, sizeof(entry));
+ 	entry.mask = 1;
+-	io_apic_write(0x10 + 2 * pin, *(((int *)&entry) + 0));
+-	io_apic_write(0x11 + 2 * pin, *(((int *)&entry) + 1));
++	io_apic_write(apic, 0x10 + 2 * pin, *(((int *)&entry) + 0));
++	io_apic_write(apic, 0x11 + 2 * pin, *(((int *)&entry) + 1));
+ }
+ 
+ static void clear_IO_APIC (void)
+ {
+ 	int pin;
+-
+-	for (pin = 0; pin < nr_ioapic_registers; pin++)
+-		clear_IO_APIC_pin(pin);
++	int apic;
++	for(apic = 0; apic < num_ioapics; apic++)
++		for (pin = 0; pin < nr_ioapic_registers[apic]; pin++)
++			clear_IO_APIC_pin(apic, pin);
+ }
+ 
+ /*
+@@ -234,8 +271,6 @@
+ 
+ void __init ioapic_setup(char *str, int *ints)
+ {
+-	extern int skip_ioapic_setup;	/* defined in arch/i386/kernel/smp.c */
+-
+ 	skip_ioapic_setup = 1;
+ }
+ 
+@@ -270,13 +305,14 @@
+ /*
+  * Find the IRQ entry number of a certain pin.
+  */
+-static int __init find_irq_entry(int pin, int type)
++static int __init find_irq_entry(int apic, int pin, int type)
+ {
+ 	int i;
+ 
+ 	for (i = 0; i < mp_irq_entries; i++)
+ 		if ( (mp_irqs[i].mpc_irqtype == type) &&
+-			(mp_irqs[i].mpc_dstirq == pin))
++		     (mp_irqs[i].mpc_dstirq == pin) &&
++		     (mp_irqs[i].mpc_dstapic == apic))
+ 
+ 			return i;
+ 
+@@ -305,7 +341,9 @@
+ /*
+  * Find a specific PCI IRQ entry.
+  * Not an initfunc, possibly needed by modules
+- */
++ *
++ * NOTE: this mapping relies on the assumption that if the PCI IRQ
++ * overlays an ISA/EISA one on IOAPIC[0] that srcirq == dstirq.  */
+ int IO_APIC_get_PCI_irq_vector(int bus, int slot, int pci_pin)
+ {
+ 	int i;
+@@ -320,7 +358,8 @@
+ 		    (slot == ((mp_irqs[i].mpc_srcbusirq >> 2) & 0x1f)) &&
+ 		    (pci_pin == (mp_irqs[i].mpc_srcbusirq & 3)))
+ 
+-			return mp_irqs[i].mpc_dstirq;
++			return irq_from_apic_pin(mp_irqs[i].mpc_dstapic,
++						 mp_irqs[i].mpc_dstirq);
+ 	}
+ 	return -1;
+ }
+@@ -512,7 +551,7 @@
+ 			/*
+ 			 * PCI IRQs are 'directly mapped'
+ 			 */
+-			irq = pin;
++			irq = irq_from_apic_pin(mp_irqs[idx].mpc_dstapic, pin);
+ 			break;
+ 		}
+ 		default:
+@@ -542,12 +581,14 @@
+ 
+ static inline int IO_APIC_irq_trigger(int irq)
+ {
+-	int idx, pin;
++	int idx, pin, apic;
+ 
+-	for (pin = 0; pin < nr_ioapic_registers; pin++) {
+-		idx = find_irq_entry(pin,mp_INT);
+-		if ((idx != -1) && (irq == pin_2_irq(idx,pin)))
+-			return irq_trigger(idx);
++	for(apic = 0; apic < num_ioapics; apic++) {
++		for (pin = 0; pin < nr_ioapic_registers[apic]; pin++) {
++			idx = find_irq_entry(apic, pin, mp_INT);
++			if ((idx != -1) && (irq == pin_2_irq(idx,pin)))
++				return irq_trigger(idx);
++		}
+ 	}
+ 	/*
+ 	 * nonexistent IRQs are edge default
+@@ -566,8 +607,6 @@
+ 	if (current_vector > 0xFE) {
+ 		offset++;
+ 		current_vector = IRQ0_TRAP_VECTOR + offset;
+-		printk("WARNING: ASSIGN_IRQ_VECTOR wrapped back to %02X\n",
+-		       current_vector);
+ 	}
+ 	if (current_vector == SYSCALL_VECTOR)
+ 		panic("ran out of interrupt sources!");
+@@ -579,57 +618,59 @@
+ void __init setup_IO_APIC_irqs(void)
+ {
+ 	struct IO_APIC_route_entry entry;
+-	int pin, idx, bus, irq, first_notcon = 1;
++	int pin, idx, bus, irq, first_notcon, apic;
+ 
+ 	printk("init IO_APIC IRQs\n");
+-
+-	for (pin = 0; pin < nr_ioapic_registers; pin++) {
+-
+-		/*
+-		 * add it to the IO-APIC irq-routing table:
+-		 */
+-		memset(&entry,0,sizeof(entry));
+-
+-		entry.delivery_mode = dest_LowestPrio;
+-		entry.dest_mode = 1;			/* logical delivery */
+-		entry.mask = 0;				/* enable IRQ */
+-		entry.dest.logical.logical_dest = 0;	/* but no route */
+-
+-		idx = find_irq_entry(pin,mp_INT);
+-		if (idx == -1) {
+-			if (first_notcon) {
+-				printk(" IO-APIC pin %d", pin);
++	for(apic = 0; apic < num_ioapics; apic++) {
++		first_notcon = 1;
++		for (pin = 0; pin < nr_ioapic_registers[apic]; pin++) {
++			
++			/*
++			 * add it to the IO-APIC irq-routing table:
++			 */
++			memset(&entry,0,sizeof(entry));
++			
++			entry.delivery_mode = dest_LowestPrio;
++			entry.dest_mode = 1;			/* logical delivery */
++			entry.mask = 0;				/* enable IRQ */
++			entry.dest.logical.logical_dest = 0;	/* but no route */
++			
++			idx = find_irq_entry(apic, pin, mp_INT);
++			if (idx == -1) {
++				if (first_notcon) {
++				printk(" IO-APIC[%d] pin %d", apic, pin);
+ 				first_notcon = 0;
+-			} else
+-				printk(", %d", pin);
+-			continue;
+-		}
+-
+-		entry.trigger = irq_trigger(idx);
+-		entry.polarity = irq_polarity(idx);
++				} else
++					printk(", %d", pin);
++				continue;
++			}
+ 
+-		if (irq_trigger(idx)) {
+-			entry.trigger = 1;
+-			entry.mask = 1;
+-			entry.dest.logical.logical_dest = 0xff;
++			entry.trigger = irq_trigger(idx);
++			entry.polarity = irq_polarity(idx);
++			
++			if (irq_trigger(idx)) {
++				entry.trigger = 1;
++				entry.mask = 1;
++				entry.dest.logical.logical_dest = 0xff;
++			}
++			
++			irq = pin_2_irq(idx,pin);
++			add_pin_to_irq(irq, pin);
++			
++			if (!IO_APIC_IRQ(irq))
++				continue;
++			
++			entry.vector = assign_irq_vector(irq);
++			
++			bus = mp_irqs[idx].mpc_srcbus;
++			
++			io_apic_write(apic, 0x11+2*pin, *(((int *)&entry)+1));
++			io_apic_write(apic, 0x10+2*pin, *(((int *)&entry)+0));
+ 		}
+ 
+-		irq = pin_2_irq(idx,pin);
+-		add_pin_to_irq(irq, pin);
+-
+-		if (!IO_APIC_IRQ(irq))
+-			continue;
+-
+-		entry.vector = assign_irq_vector(irq);
+-
+-		bus = mp_irqs[idx].mpc_srcbus;
+-
+-		io_apic_write(0x11+2*pin, *(((int *)&entry)+1));
+-		io_apic_write(0x10+2*pin, *(((int *)&entry)+0));
++		if (!first_notcon)
++			printk(" not connected.\n");
+ 	}
+-
+-	if (!first_notcon)
+-		printk(" not connected.\n");
+ }
+ 
+ /*
+@@ -659,8 +700,8 @@
+ 	entry.polarity = 0;
+ 	entry.trigger = 0;
+ 
+-	io_apic_write(0x10+2*pin, *(((int *)&entry)+0));
+-	io_apic_write(0x11+2*pin, *(((int *)&entry)+1));
++	io_apic_write(0, 0x10+2*pin, *(((int *)&entry)+0));
++	io_apic_write(0, 0x11+2*pin, *(((int *)&entry)+1));
+ }
+ 
+ void __init UNEXPECTED_IO_APIC(void)
+@@ -671,84 +712,87 @@
+ 
+ void __init print_IO_APIC(void)
+ {
+-	int i;
++	int i, apic;
+ 	struct IO_APIC_reg_00 reg_00;
+ 	struct IO_APIC_reg_01 reg_01;
+ 	struct IO_APIC_reg_02 reg_02;
+ 
+  	printk("number of MP IRQ sources: %d.\n", mp_irq_entries);
+- 	printk("number of IO-APIC registers: %d.\n", nr_ioapic_registers);
++	printk("number of IO-APICS: %d.\n", num_ioapics);
+ 
+-	*(int *)&reg_00 = io_apic_read(0);
+-	*(int *)&reg_01 = io_apic_read(1);
+-	*(int *)&reg_02 = io_apic_read(2);
+-
+-	/*
+-	 * We are a bit conservative about what we expect.  We have to
+-	 * know about every hardware change ASAP.
+-	 */
+-	printk("testing the IO APIC.......................\n");
+-
+-	printk(".... register #00: %08X\n", *(int *)&reg_00);
+-	printk(".......    : physical APIC id: %02X\n", reg_00.ID);
+-	if (reg_00.__reserved_1 || reg_00.__reserved_2)
+-		UNEXPECTED_IO_APIC();
+-
+-	printk(".... register #01: %08X\n", *(int *)&reg_01);
+-	printk(".......     : max redirection entries: %04X\n", reg_01.entries);
+-	if (	(reg_01.entries != 0x0f) && /* older (Neptune) boards */
+-		(reg_01.entries != 0x17) && /* typical ISA+PCI boards */
+-		(reg_01.entries != 0x1b) && /* Compaq Proliant boards */
+-		(reg_01.entries != 0x1f) && /* dual Xeon boards */
+-		(reg_01.entries != 0x3F)    /* bigger Xeon boards */
+-	)
+-		UNEXPECTED_IO_APIC();
+-	if (reg_01.entries == 0x0f)
+-		printk(".......       [IO-APIC cannot route PCI PIRQ 0-3]\n");
+-
+-	printk(".......     : IO APIC version: %04X\n", reg_01.version);
+-	if (	(reg_01.version != 0x10) && /* oldest IO-APICs */
+-		(reg_01.version != 0x11) && /* Pentium/Pro IO-APICs */
+-		(reg_01.version != 0x13)    /* Xeon IO-APICs */
+-	)
+-		UNEXPECTED_IO_APIC();
+-	if (reg_01.__reserved_1 || reg_01.__reserved_2)
+-		UNEXPECTED_IO_APIC();
+-
+-	printk(".... register #02: %08X\n", *(int *)&reg_02);
+-	printk(".......     : arbitration: %02X\n", reg_02.arbitration);
+-	if (reg_02.__reserved_1 || reg_02.__reserved_2)
+-		UNEXPECTED_IO_APIC();
+-
+-	printk(".... IRQ redirection table:\n");
+-
+-	printk(" NR Log Phy ");
+-	printk("Mask Trig IRR Pol Stat Dest Deli Vect:   \n");
+-
+-	for (i = 0; i <= reg_01.entries; i++) {
+-		struct IO_APIC_route_entry entry;
+-
+-		*(((int *)&entry)+0) = io_apic_read(0x10+i*2);
+-		*(((int *)&entry)+1) = io_apic_read(0x11+i*2);
+-
+-		printk(" %02x %03X %02X  ",
+-			i,
+-			entry.dest.logical.logical_dest,
+-			entry.dest.physical.physical_dest
+-		);
+-
+-		printk("%1d    %1d    %1d   %1d   %1d    %1d    %1d    %02X\n",
+-			entry.mask,
+-			entry.trigger,
+-			entry.irr,
+-			entry.polarity,
+-			entry.delivery_status,
+-			entry.dest_mode,
+-			entry.delivery_mode,
+-			entry.vector
+-		);
++	for(apic = 0; apic < num_ioapics; apic++) {
++		*(int *)&reg_00 = io_apic_read(apic, 0);
++		*(int *)&reg_01 = io_apic_read(apic, 1);
++		*(int *)&reg_02 = io_apic_read(apic, 2);
++
++		/* We are a bit conservative about what we expect.  We
++		 * have to know about every hardware change ASAP.  */
++		printk("testing IO APIC[%d].......................\n", apic);
++		
++		printk("number of IO-APIC registers: %d.\n", 
++		       nr_ioapic_registers[apic]);
++
++		printk(".... register #00: %08X\n", *(int *)&reg_00);
++		printk(".......    : physical APIC id: %02X\n", reg_00.ID);
++		if (reg_00.__reserved_1 || reg_00.__reserved_2)
++			UNEXPECTED_IO_APIC();
++		
++		printk(".... register #01: %08X\n", *(int *)&reg_01);
++		printk(".......     : max redirection entries: %04X\n", reg_01.entries);
++		if (	(reg_01.entries != 0x0f) && /* older (Neptune) boards */
++			(reg_01.entries != 0x17) && /* typical ISA+PCI boards */
++			(reg_01.entries != 0x1b) && /* Compaq Proliant boards */
++			(reg_01.entries != 0x1f) && /* dual Xeon boards */
++			(reg_01.entries != 0x3F)    /* bigger Xeon boards */
++			)
++			UNEXPECTED_IO_APIC();
++		if (num_ioapics == 1 && reg_01.entries == 0x0f)
++			printk(".......       [IO-APIC cannot route PCI PIRQ 0-3]\n");
++		
++		printk(".......     : IO APIC version: %04X\n", reg_01.version);
++		if (	(reg_01.version != 0x10) && /* oldest IO-APICs */
++			(reg_01.version != 0x11) && /* Pentium/Pro IO-APICs */
++			(reg_01.version != 0x13)    /* Xeon IO-APICs */
++			)
++			UNEXPECTED_IO_APIC();
++		if (reg_01.__reserved_1 || reg_01.__reserved_2)
++			UNEXPECTED_IO_APIC();
++		
++		printk(".... register #02: %08X\n", *(int *)&reg_02);
++		printk(".......     : arbitration: %02X\n", reg_02.arbitration);
++		if (reg_02.__reserved_1 || reg_02.__reserved_2)
++			UNEXPECTED_IO_APIC();
++		
++		printk(".... IRQ redirection table:\n");
++		
++		printk(" NR Log Phy ");
++		printk("Mask Trig IRR Pol Stat Dest Deli Vect:   \n");
++		
++		for (i = 0; i <= reg_01.entries; i++) {
++			struct IO_APIC_route_entry entry;
++			
++			*(((int *)&entry)+0) = io_apic_read(apic, 0x10+i*2);
++			*(((int *)&entry)+1) = io_apic_read(apic, 0x11+i*2);
++			
++			printk(" %02x %03X %02X  ",
++			       i,
++			       entry.dest.logical.logical_dest,
++			       entry.dest.physical.physical_dest
++			       );
++
++			printk("%1d    %1d    %1d   %1d   %1d    %1d    %1d    %02X\n",
++			       entry.mask,
++			       entry.trigger,
++			       entry.irr,
++			       entry.polarity,
++			       entry.delivery_status,
++			       entry.dest_mode,
++			       entry.delivery_mode,
++			       entry.vector
++			       );
++		}
+ 	}
+-
++		
+ 	printk(KERN_DEBUG "IRQ to pin mappings:\n");
+ 	for (i = 0; i < NR_IRQS; i++) {
+ 		struct irq_pin_list *entry = irq_2_pin + i;
+@@ -771,7 +815,7 @@
+ 
+ static void __init init_sym_mode(void)
+ {
+-	int i;
++	int i, apic;
+ 
+ 	for (i = 0; i < PIN_MAP_SIZE; i++) {
+ 		irq_2_pin[i].pin = -1;
+@@ -791,11 +835,11 @@
+ 	/*
+ 	 * The number of IO-APIC IRQ registers (== #pins):
+ 	 */
+-	{
++	for(apic = 0; apic < num_ioapics; apic++) {
+ 		struct IO_APIC_reg_01 reg_01;
+ 
+-		*(int *)&reg_01 = io_apic_read(1);
+-		nr_ioapic_registers = reg_01.entries+1;
++		*(int *)&reg_01 = io_apic_read(apic, 1);
++		nr_ioapic_registers[apic] = reg_01.entries+1;
+ 	}
+ 
+ 	/*
+@@ -894,15 +938,15 @@
+ 	/*
+ 	 * Set the ID
+ 	 */
+-	*(int *)&reg_00 = io_apic_read(0);
++	*(int *)&reg_00 = io_apic_read(0, 0);
+ 	printk("...changing IO-APIC physical APIC ID to 2...\n");
+ 	reg_00.ID = 0x2;
+-	io_apic_write(0, *(int *)&reg_00);
++	io_apic_write(0, 0, *(int *)&reg_00);
+ 
+ 	/*
+ 	 * Sanity check
+ 	 */
+-	*(int *)&reg_00 = io_apic_read(0);
++	*(int *)&reg_00 = io_apic_read(0, 0);
+ 	if (reg_00.ID != 0x2)
+ 		panic("could not set ID");
+ }
+@@ -1221,9 +1265,9 @@
+ 			 * Just in case ...
+ 			 */
+ 			if (pin1 != -1)
+-				clear_IO_APIC_pin(pin1);
++				clear_IO_APIC_pin(0, pin1);
+ 			if (pin2 != -1)
+-				clear_IO_APIC_pin(pin2);
++				clear_IO_APIC_pin(0, pin2);
+ 
+ 			make_8259A_irq(0);
+ 
+@@ -1265,7 +1309,7 @@
+ 	 * - those for which the user has specified a pirq= parameter
+ 	 */
+ 	if (	ioapic_whitelisted() ||
+-		(nr_ioapic_registers == 16) ||
++		(nr_ioapic_registers[0] == 16) ||
+ 		pirqs_enabled)
+ 	{
+ 		printk("ENABLING IO-APIC IRQs\n");
+Index: arch/i386/kernel/irq.h
+===================================================================
+RCS file: /home/jejb/CVSROOT/linux/arch/i386/kernel/irq.h,v
+retrieving revision 1.1.1.1
+diff -u -r1.1.1.1 irq.h
+--- 1.1.1.1	1999/02/23 17:00:51
++++ irq.h	1999/02/24 11:24:37
+@@ -251,4 +251,21 @@
+ 	}
+ }
+ 
++/* Exported variables for multiple IO APIC support */
++extern int num_ioapics;		/* total number of detected IO APICs */
++extern unsigned int max_ioapic_pin; /* highest IO APIC pin number */
++extern int skip_ioapic_setup;
++
++/*
++ * volatile is justified in this case, IO-APIC register contents
++ * might change spontaneously, GCC should not cache it.
++ *
++ * IO APICS are mapped descending one page at a time from
++ * FIX_IO_APIC_BASE.  The fix_to_virt function always leaves enough
++ * room for MAX_IO_APIC of them.  This variable is defined in
++ * asm/fixmap.h */
++
++#define IO_APIC_BASE(i) ((volatile int *)(fix_to_virt(FIX_IO_APIC_BASE) - ((i)<<PAGE_SHIFT)))
++
++
+ #endif
+Index: arch/i386/kernel/smp.c
+===================================================================
+RCS file: /home/jejb/CVSROOT/linux/arch/i386/kernel/smp.c,v
+retrieving revision 1.1.1.1
+diff -u -r1.1.1.1 smp.c
+--- 1.1.1.1	1999/02/23 17:00:51
++++ smp.c	1999/02/24 11:36:03
+@@ -29,6 +29,7 @@
+  *					from Jose Renau
+  *		Alan Cox	:	Added EBDA scanning
+  *		Ingo Molnar	:	various cleanups and rewrites
++ *		James Bottomley	:	Added multiple IO-APIC support
+  */
+ 
+ #include <linux/config.h>
+@@ -111,7 +112,23 @@
+ volatile unsigned long kstack_ptr;			/* Stack vector for booting CPUs			*/
+ struct cpuinfo_x86 cpu_data[NR_CPUS];			/* Per CPU bogomips and other parameters 		*/
+ static unsigned int num_processors = 1;			/* Internal processor count				*/
+-unsigned long mp_ioapic_addr = 0xFEC00000;		/* Address of the I/O apic (not yet used) 		*/
++unsigned long mp_ioapic_addr[MAX_IO_APICS] 
++	= {0xFEC00000, 0};/* Address of the I/O apic */
++int ioapic_id[MAX_IO_APICS] = { 0 };
++int num_ioapics = 0;		/* number of IO APICs detected */
++
++/* the following is a bit of a hack.  In a multiple IO APIC system we
++ * need a way to transform the fictitious irq number into an apic/pin
++ * mapping.  The easiest way to do this is to do the mapping as irq =
++ * apic*max_apic_pins + pin; where max_apic_pin is found by scanning
++ * the MP table for the largest APIC pin number.
++ *
++ * WARNING: Using this method, IOAPIC[0] *MUST* be the one handling
++ * the ISA/EISA IRQs, since the real irq and the fictitious irq must
++ * be the same number on this bus.  mp_apic_addr entries should be
++ * swapped to achieve this */
++unsigned int max_ioapic_pin = 0;
++
+ unsigned char boot_cpu_id = 0;				/* Processor that is doing the boot up 			*/
+ static int smp_activated = 0;				/* Tripped once we need to start cross invalidating 	*/
+ int apic_version[NR_CPUS];				/* APIC version number					*/
+@@ -231,6 +248,23 @@
+ 	return n;
+ }
+ 
++static inline int
++find_ioapic_by_id(int apicid)
++{
++	int i;
++
++	for(i=0; i<num_ioapics; i++) {
++		if(ioapic_id[i] == apicid)
++			return i;
++	}
++	/* the MP table doesn't contain the IOAPIC; this should be
++         * impossible */
++	printk("ERROR: System cannot find IOAPIC with id %d\n", apicid);
++	printk("Warning: switching to non APIC mode.\n");
++	skip_ioapic_setup = 1;
++	return 0;
++}
++
+ /*
+  *	Read the MPC
+  */
+@@ -239,9 +273,11 @@
+ {
+ 	char str[16];
+ 	int count=sizeof(*mpc);
+-	int ioapics = 0;
++	int isa_ioapic_idx = 0;
+ 	unsigned char *mpt=((unsigned char *)mpc)+count;
+ 
++	num_ioapics = 0;
++
+ 	if (memcmp(mpc->mpc_signature,MPC_SIGNATURE,4))
+ 	{
+ 		panic("SMP mptable: bad signature [%c%c%c%c]!\n",
+@@ -367,15 +403,11 @@
+ 					(struct mpc_config_ioapic *)mpt;
+ 				if (m->mpc_flags&MPC_APIC_USABLE)
+ 				{
+-					ioapics++;
+-					printk("I/O APIC #%d Version %d at 0x%lX.\n",
+-						m->mpc_apicid,m->mpc_apicver,
++					ioapic_id[num_ioapics] = m->mpc_apicid;
++					mp_ioapic_addr[num_ioapics++] = m->mpc_apicaddr;
++					printk("I/O APIC Id %d Version %d at 0x%lX.\n",
++						m->mpc_apicid, m->mpc_apicver,
+ 						m->mpc_apicaddr);
+-					/*
+-					 * we use the first one only currently
+-					 */
+-					if (ioapics == 1)
+-						mp_ioapic_addr = m->mpc_apicaddr;
+ 				}
+ 				mpt+=sizeof(*m);
+ 				count+=sizeof(*m);
+@@ -387,12 +419,39 @@
+ 					(struct mpc_config_intsrc *)mpt;
+ 
+ 				mp_irqs [mp_irq_entries] = *m;
++				/* now work on the copy */
++				m = &mp_irqs [mp_irq_entries];
+ 				if (++mp_irq_entries == MAX_IRQ_SOURCES) {
+ 					printk("Max irq sources exceeded!!\n");
+ 					printk("Skipping remaining sources.\n");
+ 					--mp_irq_entries;
+ 				}
+-
++				if(m->mpc_dstirq > max_ioapic_pin)
++					max_ioapic_pin = m->mpc_dstirq;
++				/* transform the physical IOAPIC id
++                                 * into an index into our IOAPIC table
++                                 * */
++				m->mpc_dstapic = find_ioapic_by_id(m->mpc_dstapic);
++				if(mp_bus_id_to_type[m->mpc_srcbus] == MP_BUS_ISA)
++					isa_ioapic_idx = m->mpc_dstapic;
++					
++#ifdef SMP_DEBUG
++				if(mp_bus_id_to_type[m->mpc_srcbus] == MP_BUS_PCI) {
++					printk("interrupt %d: type=%d flags=0x%x pcidevice=%d:%d, pciintr=%d, apic=%d, pin=%d\n",
++					       mp_irq_entries, m->mpc_irqtype, 
++					       m->mpc_irqflag, m->mpc_srcbus, 
++					       m->mpc_srcbusirq>>2, 
++					       m->mpc_srcbusirq & 3,
++					       m->mpc_dstapic, m->mpc_dstirq);
++				}
++				else {
++					printk("interrupt %d: type=%d flags=0x%x srcbus=%d, srcbusirq=%d, apic=%d, pin=%d\n",
++					       mp_irq_entries, m->mpc_irqtype, 
++					       m->mpc_irqflag, m->mpc_srcbus, 
++					       m->mpc_srcbusirq,
++					       m->mpc_dstapic, m->mpc_dstirq);
++				}
++#endif /* SMP_DEBUG */
+ 				mpt+=sizeof(*m);
+ 				count+=sizeof(*m);
+ 				break;
+@@ -407,12 +466,30 @@
+ 			}
+ 		}
+ 	}
+-	if (ioapics > 1)
++	if (num_ioapics > MAX_IO_APICS)
+ 	{
+-		printk("Warning: Multiple IO-APICs not yet supported.\n");
++		printk("Warning: This kernel only supports %d IO-APICs\n",
++		       MAX_IO_APICS);
+ 		printk("Warning: switching to non APIC mode.\n");
+ 		skip_ioapic_setup=1;
++		return num_processors;
+ 	}
++	/* finally, loop over all entries working out which IO APIC
++         * corresponds to the ISA/EISA bus and make that IOAPIC[0] */
++	if(isa_ioapic_idx != 0) {
++		int i;
++		unsigned long tmp_addr;
++		SMP_PRINTK(("Shuffling IOAPIC addresses %d->0\n", isa_ioapic_idx));
++		for(i = 0; i < num_ioapics; i++)
++			if(mp_irqs[i].mpc_dstapic == 0) 
++				mp_irqs[i].mpc_dstapic = isa_ioapic_idx;
++			else if(mp_irqs[i].mpc_dstapic == isa_ioapic_idx)
++				mp_irqs[i].mpc_dstapic = 0;
++		tmp_addr = mp_ioapic_addr[0];
++		mp_ioapic_addr[0] = mp_ioapic_addr[isa_ioapic_idx];
++		mp_ioapic_addr[isa_ioapic_idx] = tmp_addr;
++	}
++	max_ioapic_pin++;	/* set to one past highest pin number */
+ 	return num_processors;
+ }
+ 
+@@ -755,6 +832,7 @@
+ unsigned long __init init_smp_mappings(unsigned long memory_start)
+ {
+ 	unsigned long apic_phys;
++	int i;
+ 
+ 	memory_start = PAGE_ALIGN(memory_start);
+ 	if (smp_found_config) {
+@@ -774,19 +852,20 @@
+ 	printk("mapped APIC to %08lx (%08lx)\n", APIC_BASE, apic_phys);
+ 
+ #ifdef CONFIG_X86_IO_APIC
+-	{
++	for(i=0; i<num_ioapics; i++) {
+ 		unsigned long ioapic_phys;
+ 
+ 		if (smp_found_config) {
+-			ioapic_phys = mp_ioapic_addr;
++			ioapic_phys = mp_ioapic_addr[i];
+ 		} else {
+ 			ioapic_phys = __pa(memory_start);
+ 			memset((void *)memory_start, 0, PAGE_SIZE);
+ 			memory_start += PAGE_SIZE;
+ 		}
+-		set_fixmap(FIX_IO_APIC_BASE,ioapic_phys);
+-		printk("mapped IOAPIC to %08lx (%08lx)\n",
+-				fix_to_virt(FIX_IO_APIC_BASE), ioapic_phys);
++		set_fixmap(FIX_IO_APIC_BASE + i,ioapic_phys);
++		printk("mapped IOAPIC[%d] to %08lx (%08lx)\n", i,
++		       (unsigned long)IO_APIC_BASE(i),
++		       ioapic_phys);
+ 	}
+ #endif
+ 
+@@ -1386,8 +1465,9 @@
+ 	 * Here we can be sure that there is an IO-APIC in the system. Let's
+ 	 * go and set it up:
+ 	 */
+-	if (!skip_ioapic_setup) 
++	if (!skip_ioapic_setup) {
+ 		setup_IO_APIC();
++	}
+ #endif
+ 
+ smp_done:
+Index: include/asm-i386/fixmap.h
+===================================================================
+RCS file: /home/jejb/CVSROOT/linux/include/asm-i386/fixmap.h,v
+retrieving revision 1.1.1.1
+diff -u -r1.1.1.1 fixmap.h
+--- 1.1.1.1	1999/02/23 17:00:31
++++ fixmap.h	1999/02/23 20:50:43
+@@ -40,12 +40,22 @@
+  * future, say framebuffers for the console driver(s) could be
+  * fix-mapped?
+  */
++
++/* define MAX_IO_APICS here to allow fix-map to include sufficient space.
++ *
++ * This number affects the size of certain arrays in the kernel.  For
++ * most SMP machines it could probably be 1; However the kernel will
++ * not boot in symmetric IO mode if it is too low.  The value of 4 is
++ * the largest number I've ever seen in an x86 based SMP machine (An
++ * NCR 4380 eight way with 4 PCI busses) */
++#define	MAX_IO_APICS	4
+ enum fixed_addresses {
+ #ifdef CONFIG_X86_LOCAL_APIC
+ 	FIX_APIC_BASE,	/* local (CPU) APIC) -- required for SMP or not */
+ #endif
+ #ifdef CONFIG_X86_IO_APIC
+ 	FIX_IO_APIC_BASE,
++	__end_of_all_apics = FIX_IO_APIC_BASE + MAX_IO_APICS - 1,
+ #endif
+ #ifdef CONFIG_X86_VISWS_APIC
+ 	FIX_CO_CPU,	/* Cobalt timer */
+Index: include/asm-i386/smp.h
+===================================================================
+RCS file: /home/jejb/CVSROOT/linux/include/asm-i386/smp.h,v
+retrieving revision 1.1.1.1
+diff -u -r1.1.1.1 smp.h
+--- 1.1.1.1	1999/02/23 17:00:30
++++ smp.h	1999/02/24 11:49:26
+@@ -7,6 +7,7 @@
+ #include <linux/config.h>
+ #ifdef CONFIG_X86_LOCAL_APIC
+ #ifndef ASSEMBLY
++/* MAX_IO_APICS is defined in asm/fixmap.h */
+ #include <asm/fixmap.h>
+ #include <asm/i82489.h>
+ #include <asm/bitops.h>

@@ -1,0 +1,184 @@
+Date: Tue, 3 Apr 2007 19:29:19 +0530
+From: Srivatsa Vaddagiri <>
+Subject: Re: [PATCH 7/8] Clean up workqueue.c with respect to the freezer based cpu-hotplug
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2007/4/3/99
+
+On Tue, Apr 03, 2007 at 03:47:29PM +0400, Oleg Nesterov wrote:
+> I still think that wait_to_die + bind_cpu is unneeded complication.
+> Why can't we do the following:
+> 
+> 	static int worker_thread(void *__cwq)
+> 	{
+> 		...
+> 
+> 		for (;;) {
+> 			try_to_freeze();
+> 
+> 			prepare_to_wait(&cwq->more_work, &wait, TASK_INTERRUPTIBLE);
+> 			if (!kthread_should_stop() && list_empty(&cwq->worklist))
+> 				schedule();
+> 			finish_wait(&cwq->more_work, &wait);
+> 
+> 			if (kthread_should_stop(cwq))
+> 				break;
+> 
+> 			run_workqueue(cwq);
+> 		}
+> 
+> 		return 0;
+> 	}
+> 
+> ?
+cleanup_workqueue_thread (in Gautham's patches) does this:
+	thaw_process()
+	kthread_stop()
+There is a chance that after thaw_process() [but before we have posted
+the kthread_stop], worker thread can come out of the refrigerator and start
+running run_workqueue() - that will simply prolong the subsequent
+kthread_stop() and the system freeze time.
+We could do what you are suggesting if the thaw_process() part was
+integrated into kthread_stop() code [basically thaw_process after
+setting the kthread_stop_info.k flag].
+> >  void fastcall flush_workqueue(struct workqueue_struct *wq)
+> >  {
+> > -	const cpumask_t *cpu_map = wq_cpu_map(wq);
+> >  	int cpu;
+> >
+> >  	might_sleep();
+> > -	for_each_cpu_mask(cpu, *cpu_map)
+> > +	for_each_online_cpu(cpu)
+> >  		flush_cpu_workqueue(per_cpu_ptr(wq->cpu_wq, cpu));
+> >  }
+> 
+> Hm... I can't understand this change. I believe it is wrong.
+Why?
+> > -		for_each_possible_cpu(cpu) {
+> > +		for_each_online_cpu(cpu) {
+> 
+> This is wrong. CPU_UP_PREPARE doesn't call init_cpu_workqueue().
+> Easy to fix, but I personally think is is better to initialize
+> the whole cpu_possible_map.
+I tend to agree yes.
+> >  static void cleanup_workqueue_thread(struct cpu_workqueue_struct *cwq, int cpu)
+[snip]
+> > -	if (alive) {
+> >  		thaw_process(cwq->thread);
+> > -		wait_for_completion(&barr.done);
+> > -
+> > -		while (unlikely(cwq->status != CWQ_STOPPED))
+> > -			cpu_relax();
+> > -		/*
+> > -		 * Wait until cwq->thread unlocks cwq->lock,
+> > -		 * it won't touch *cwq after that.
+> > -		 */
+> > -		smp_rmb();
+> > +		kthread_stop(cwq->thread);
+> >  		cwq->thread = NULL;
+> > -		spin_unlock_wait(&cwq->lock);
+> >  	}
+> >  }
+> 
+> Deadlockable. Suppose that the freezing is in progress, cwq->thread is not
+> frozen yet. cleanup_workqueue_thread() calls thaw_process(cwq->thread),
+> then cwq->thread() goes to refrigerator, kthread_stop() blocks forever.
+Good catch! Can cleanup_workqueue_thread take some mutex to serialize
+with freezer here (say freezer_mutex)?
+Or better, since this seems to be a general problem for anyone who wants to do a
+kthread_stop, how abt modifying kthread_stop like below:
+kthread_stop(p)
+{
+	int old_exempt_flags;
+	task_lock(p);
+	old_exempt_flags = p->flags;
+	p->flags |= PFE_ALL;	/* Exempt 'p' from being frozen? */
+	task_unlock(p);
+	kthread_stop_info.k = p;
+	thaw_process(p);
+	wait_for_completion();
+}
+Marking 'p' as exempt shouldn't be a problem because freezer would wait
+on the thread doing kthread_stop() anyway before declaring system as
+frozen.
+> > +static void take_over_work(struct workqueue_struct *wq, unsigned int cpu)
+> > +{
+> > +	struct cpu_workqueue_struct *cwq = per_cpu_ptr(wq->cpu_wq, cpu);
+> > +	struct list_head list;
+> > +	struct work_struct *work;
+> > +
+> > +	spin_lock_irq(&cwq->lock);
+> 
+> This CPU is dead (or cancelled), we don't need cwq->lock.
+yeah ..
+> 
+> >  static int __devinit workqueue_cpu_callback(struct notifier_block *nfb,
+> >  						unsigned long action,
+> >  						void *hcpu)
+> > @@ -782,11 +768,6 @@ static int __devinit workqueue_cpu_callb
+> >  	struct cpu_workqueue_struct *cwq;
+> >  	struct workqueue_struct *wq;
+> >
+> > -	switch (action) {
+> > -	case CPU_UP_PREPARE:
+> > -		cpu_set(cpu, cpu_populated_map);
+> > -	}
+> > -
+> >  	mutex_lock(&workqueue_mutex);
+> >  	list_for_each_entry(wq, &workqueues, list) {
+> >  		cwq = per_cpu_ptr(wq->cpu_wq, cpu);
+> > @@ -799,6 +780,7 @@ static int __devinit workqueue_cpu_callb
+> >  			return NOTIFY_BAD;
+> >
+> >  		case CPU_ONLINE:
+> > +			kthread_bind(cwq->thread, cpu);
+> >  			wake_up_process(cwq->thread);
+> >  			break;
+> >
+> > @@ -806,6 +788,7 @@ static int __devinit workqueue_cpu_callb
+> >  			if (cwq->thread)
+> >  				wake_up_process(cwq->thread);
+> >  		case CPU_DEAD:
+> > +			take_over_work(wq, cpu);
+> >  			cleanup_workqueue_thread(cwq, cpu);
+> >  			break;
+> >  		}
+> 
+> This means that the work_struct on single_threaded wq can't use any of
+> 
+> 	__create_workqueue()
+> 	destroy_workqueue()
+> 	flush_workqueue()
+> 	cancel_work_sync()
+The workqueue_mutex() should serialize these with workqueue_cpu_callback() to 
+an extent, but  ..
+> , they are all racy wrt workqueue_cpu_callback(), and we don't freeze
+> single_threaded workqueues. This is bad.
+> 
+> Probaly we should:
+> 
+> 	- freeze all workqueues, even the single_threaded ones.
+Yes I agree, we should target freezing everybody here. It feels much
+safer that way!
+The only dependency I have seen is stop_machine() called after processes
+are frozen. It needs the services of a workqueue to create kthreads. We
+need to atleast exempt that worker thread from being frozen. Hopefully
+the list of such non-freezable singlethreaded workqueues will be tiny
+enough for us to audit time-to-time.
+> 	- helper_init() explicitely does __create_workqueue(FE_ALL).
+> 	  this means that we should never use the functions above
+> 	  with this workqueue.
+Ok you seem to have covered what I went out to say above! 
+Thx for your review so far ..
+-- 
+Regards,
+vatsa
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+More majordomo info at  
+http://vger.kernel.org/majordomo-info.html
+Please read the FAQ at  
+http://www.tux.org/lkml/

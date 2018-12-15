@@ -1,0 +1,157 @@
+Date: Mon, 8 Feb 1999 12:32:05 +0100 (CET)
+From: Andrea Arcangeli <>
+Subject: Re: Linux-2.2.2-pre2..
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/2/8/39
+
+On Sun, 7 Feb 1999, Andrea Arcangeli wrote:
+>>done synchronously anyway, but for other events it should be enough to
+>>just move the run_task_queue() in the scheduler to the top of the
+>>function. 
+>
+>It's enough according to me too. I'll try now.
+Looking at the tty drivers (not only at the pty software ones), it's not
+enough. Many lowlevel drivers can still race easily in the same way pty
+was doing. 
+These lowlevel tty drivers (just grep for tq_scheduler to see which)
+inside an irq handler can queue an hangup task in the tq_scheduler.
+_Then_ such hangup task will eventually call our tty_hangup() that will be
+queued again in tq_scheduler. It's obviuos that in such many cases,
+do_tty_hangup() can be run again from the scheduler (and not from an aware
+piece of code like tty_io.c) and so do_tty_hangup() can race again with
+the other CPU in the same way it was doing that in the pty case in 2.2.1.
+The pty case was just fine moving up the run_task_queue(&tq_scheduler)
+because it could hangup only when release_dev was recalled I think (and
+not when the hardware ask for a hangup, because there's no hardware for
+the pty).
+It seems to me that the _only_ reason we was queuing the hangup tasks in
+tq_scheduler was just to have the lock_kernel() thing and to avoid to run 
+do_tty_hangup() from irq space (so avoiding irq race issues). Is that the
+real reason?
+To fix the lowlevel drivers issue I simply made tq_scheduler lock kernel
+SMP safe: 
+Index: sched.c
+===================================================================
+RCS file: /var/cvs/linux/kernel/sched.c,v
+retrieving revision 1.1.2.11
+diff -u -r1.1.2.11 sched.c
+--- sched.c	1999/02/06 16:42:46	1.1.2.11
++++ linux/kernel/sched.c	1999/02/08 08:40:09
+@@ -653,12 +653,18 @@
+ 
+ 	if (in_interrupt())
+ 		goto scheduling_in_interrupt;
++
++	/*
++	 * Run the tq_scheduler with the big kernel lock still held because
++	 * the tty layer need it in order to be SMP safe. -arca
++	 */
++	run_task_queue(&tq_scheduler);
++
+ 	release_kernel_lock(prev, this_cpu);
+ 
+ 	/* Do "administrative" work here while we don't hold any locks */
+ 	if (bh_active & bh_mask)
+ 		do_bottom_half();
+-	run_task_queue(&tq_scheduler);
+ 
+ 	spin_lock(&scheduler_lock);
+ 	spin_lock_irq(&runqueue_lock);
+Then I thought that everything should be just OK with only this patch but
+I was wrong.
+With _only_ this sched.c change applyed to 2.2.1 there is no risk of
+lock_kernel() races anymore even if the tq_scheduler task queue is run
+from the scheduler, but there's still a problem: we could release the tty
+memory while there is a do_tty_hangup that is spinning on the kernel lock
+on the other CPU :(. 
+	CPU 1				CPU 2
+	----------			------------
+					lock_kernel() /*spin*/
+	release_dev(pty)
+	tty_hangup()
+	unlock_kernel()
+					got the lock
+	close(ttyp)
+	lock_kernel() /* spin */
+					do something
+					unlock_kenrel()
+	got the lock
+					schedule()
+					run_task_queue(&tq_scheduler)
+					do_tty_hangup()
+					lock_kernel /* spin */
+	release_dev(ttyp)
+	run_task_queue() /* ther's nothing
+			 here but do_tty_hangup
+			 is not run yet */
+	release_mem()
+	unlock_kernel()
+					check_tty_count() /* boom!! */
+That was happening here (and since I was thinking that the sched.c patch
+_had_ to be enough to fix all races I debugged the problem).
+Running a run_task_queue() on every release_dev() should be enough to cure
+this problem too. Moving up run_task_queue(&tq_scheduler) we would have:
+	CPU 1				CPU 2
+	----------			------------
+					lock_kernel() /*spin*/
+	release_dev(pty)
+	tty_hangup()
+	do_tty_hangup() /* safe place */
+	unlock_kernel()
+					got the lock
+	close(ttyp)
+	lock_kernel() /* spin */
+					do something
+					unlock_kenrel()
+	got the lock
+					schedule()
+					run_task_queue(&tq_scheduler) /*
+								nothing
+								here */
+	release_dev(ttyp)
+	run_task_queue() /* ther's nothing
+			 here but do_tty_hangup
+			 ist just been run */
+	release_mem()
+	unlock_kernel()
+So applying also this other patch on the top of the one above (that you
+Linus should just have on your tree since it's the one you suggested
+yesterday) the tty layer should be completly SMP safe (and I can't
+reproduce races anymore here).
+Index: tty_io.c
+===================================================================
+RCS file: /var/cvs/linux/drivers/char/tty_io.c,v
+retrieving revision 1.1.2.4
+diff -u -r1.1.2.4 tty_io.c
+--- tty_io.c	1999/01/31 22:44:47	1.1.2.4
++++ linux/drivers/char/tty_io.c	1999/02/08 11:10:09
+@@ -1181,6 +1181,8 @@
+ 			redirect = NULL;
+ 	}
+ 
++	run_task_queue(&tq_scheduler);
++
+ 	/* check whether both sides are closing ... */
+ 	if (!tty_closing || (o_tty && !o_tty_closing))
+ 		return;
+@@ -1203,11 +1205,7 @@
+ 		o_tty->ldisc = ldiscs[N_TTY];
+ 	}
+ 	
+-	/*
+-	 * Make sure that the tty's task queue isn't activated. 
+-	 */
+ 	run_task_queue(&tq_timer);
+-	run_task_queue(&tq_scheduler);
+ 
+ 	/* 
+ 	 * The release_mem function takes care of the details of clearing
+Andrea Arcangeli
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

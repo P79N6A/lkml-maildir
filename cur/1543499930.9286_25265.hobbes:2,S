@@ -1,0 +1,333 @@
+Date: Mon, 21 Jun 1999 18:55:06 +0200 (CEST)
+From: Ingo Molnar <>
+Subject: Re: ext2fs corruption on 2.3.7
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/6/21/125
+
+On Mon, 21 Jun 1999, Jeremy Katz wrote:
+> I think that some file system corruption still exists in 2.3.7.  I copied
+> over the quake2 pak0.pak from my p200 running 2.3.6 to my dual pIII 450
+> running 2.3.7 and am getting different md5sums between the file on the two
+> machines.  I have tested the copy via both ftp and nfs with the same end
+> result (though the md5sum on the 2.3.7 system was different each time).  
+> 
+> Unfortunately, I haven't the _slightest_ idea of where to start looking
+> for the problem, but I'm willing to test patches or even take a look at it
+> myself if someone can point me in the right direction.
+I've attached my latest pagecache fixes, it fixedsa (rare) data corruption
+bug, and also contains fixes for the swap oopses reported earlier today.
+Does this fix your problem?
+-- mingo
+--- linux/fs/buffer.c.orig	Mon Jun 21 08:54:37 1999
++++ linux/fs/buffer.c	Mon Jun 21 14:43:18 1999
+@@ -1505,16 +1505,22 @@
+ 			 * We also rely on the fact that filesystem holes
+ 			 * cannot be written.
+ 			 */
+-			if (!created && (start_offset ||
+-					(end_bytes && (i == end_block)))) {
+-				bh->b_state = 0;
+-				ll_rw_block(READ, 1, &bh);
+-				lock_kernel();
+-				wait_on_buffer(bh);
+-				unlock_kernel();
+-				err = -EIO;
+-				if (!buffer_uptodate(bh))
+-					goto out;
++			if (start_offset || (end_bytes && (i == end_block))) {
++				/*
++				 * if the block is already on-disk then
++				 * we read it here. Otherwise we memset it
++				 * later.
++				 */
++				if (!created) {
++					bh->b_state = 0;
++					ll_rw_block(READ, 1, &bh);
++					lock_kernel();
++					wait_on_buffer(bh);
++					unlock_kernel();
++					err = -EIO;
++					if (!buffer_uptodate(bh))
++						goto out;
++				}
+ 			}
+ 
+ 			bh->b_state = (1<<BH_Uptodate);
+@@ -1524,15 +1530,28 @@
+ 			 */
+ 			bh->b_end_io = end_buffer_io_sync;
+ 			set_bit(BH_Uptodate, &bh->b_state);
++			created = 0;
+ 		}
+ 
+ 		err = -EFAULT;
+ 		if (start_offset) {
+ 			len = start_bytes;
++			/*
++			 * A freshly created, partially written block has
++			 * to be cleared for security reasons. We only
++			 * clear the not-written portion.
++			 */
++			if (created)
++				memset(target_buf-start_offset,0, start_offset);
+ 			start_offset = 0;
+ 		} else
+ 		if (end_bytes && (i == end_block)) {
+ 			len = end_bytes;
++			/*
++			 * We clear the block up to the end of the block.
++			 */
++			if (created)
++				memset(target_buf+len, 0, blocksize-len);
+ 			end_bytes = 0;
+ 		} else {
+ 			/*
+--- linux/mm/filemap.c.orig	Mon Jun 21 08:54:37 1999
++++ linux/mm/filemap.c	Mon Jun 21 14:43:18 1999
+@@ -310,6 +310,7 @@
+ 		if (page->buffers) {
+ 			kdev_t dev = page->buffers->b_dev;
+ 			spin_unlock(&pagecache_lock);
++			count--;
+ 			if (try_to_free_buffers(page))
+ 				goto made_progress;
+ 			if (!atomic_read(&too_many_dirty_buffers)) {
+@@ -646,7 +647,6 @@
+ struct page * __find_lock_page (struct inode * inode,
+ 				unsigned long offset, struct page **hash)
+ {
+-	int locked;
+ 	struct page *page;
+ 
+ 	/*
+@@ -656,16 +656,12 @@
+ repeat:
+ 	spin_lock(&pagecache_lock);
+ 	page = __find_page_nolock(inode, offset, *hash);
+-	locked = 0;
+-	if (page) {
++	if (page)
+ 		get_page(page);
+-		if (TryLockPage(page))
+-			locked = 1;
+-	}
+ 	spin_unlock(&pagecache_lock);
+ 
+ 	/* Found the page, sleep if locked. */
+-	if (page && locked) {
++	if (page && TryLockPage(page)) {
+ 		struct task_struct *tsk = current;
+ 		DECLARE_WAITQUEUE(wait, tsk);
+ 
+--- linux/mm/page_io.c.orig	Mon Jun 21 13:39:25 1999
++++ linux/mm/page_io.c	Mon Jun 21 14:43:18 1999
+@@ -288,8 +288,8 @@
+ 		PAGE_BUG(page);
+ 	PageClearSwapCache(page);
+ 	remove_inode_page(page);
+-	page_cache_release(page);
+ 	UnlockPage(page);
++	page_cache_release(page);
+ }
+ 
+ /*
+--- linux/mm/vmscan.c.orig	Mon Jun 21 13:14:04 1999
++++ linux/mm/vmscan.c	Mon Jun 21 14:43:18 1999
+@@ -36,31 +36,35 @@
+ {
+ 	pte_t pte;
+ 	unsigned long entry;
+-	unsigned long page;
+-	struct page * page_map;
++	unsigned long page_addr;
++	struct page * page;
+ 
+ 	pte = *page_table;
+ 	if (!pte_present(pte))
+-		return 0;
+-	page = pte_page(pte);
+-	if (MAP_NR(page) >= max_mapnr)
+-		return 0;
+-	page_map = mem_map + MAP_NR(page);
++		goto out_failed;
++	page_addr = pte_page(pte);
++	if (MAP_NR(page_addr) >= max_mapnr)
++		goto out_failed;
++	page = mem_map + MAP_NR(page_addr);
+ 
+-	if (pte_young(pte)) {
++	/*
++	 * Dont be too eager to get aging right if
++	 * memory is dangerously low.
++	 */
++	if (!low_on_memory && pte_young(pte)) {
+ 		/*
+ 		 * Transfer the "accessed" bit from the page
+ 		 * tables to the global page map.
+ 		 */
+ 		set_pte(page_table, pte_mkold(pte));
+-		set_bit(PG_referenced, &page_map->flags);
+-		return 0;
++		set_bit(PG_referenced, &page->flags);
++		goto out_failed;
+ 	}
+ 
+-	if (PageReserved(page_map)
+-	    || PageLocked(page_map)
+-	    || ((gfp_mask & __GFP_DMA) && !PageDMA(page_map)))
+-		return 0;
++	if (PageReserved(page)
++	    || PageLocked(page)
++	    || ((gfp_mask & __GFP_DMA) && !PageDMA(page)))
++		goto out_failed;
+ 
+ 	/*
+ 	 * Is the page already in the swap cache? If so, then
+@@ -70,15 +74,15 @@
+ 	 * Return 0, as we didn't actually free any real
+ 	 * memory, and we should just continue our scan.
+ 	 */
+-	if (PageSwapCache(page_map)) {
+-		entry = page_map->offset;
++	if (PageSwapCache(page)) {
++		entry = page->offset;
+ 		swap_duplicate(entry);
+ 		set_pte(page_table, __pte(entry));
+ drop_pte:
+ 		vma->vm_mm->rss--;
+ 		flush_tlb_page(vma, address);
+-		__free_page(page_map);
+-		return 0;
++		__free_page(page);
++		goto out_failed;
+ 	}
+ 
+ 	/*
+@@ -105,7 +109,7 @@
+ 	 * locks etc.
+ 	 */
+ 	if (!(gfp_mask & __GFP_IO))
+-		return 0;
++		goto out_failed;
+ 
+ 	/*
+ 	 * Ok, it's really dirty. That means that
+@@ -120,7 +124,7 @@
+ 	 * assume we free'd something.
+ 	 *
+ 	 * NOTE NOTE NOTE! This should just set a
+-	 * dirty bit in page_map, and just drop the
++	 * dirty bit in 'page', and just drop the
+ 	 * pte. All the hard work would be done by
+ 	 * shrink_mmap().
+ 	 *
+@@ -133,10 +137,9 @@
+ 		flush_tlb_page(vma, address);
+ 		vma->vm_mm->rss--;
+ 		
+-		if (vma->vm_ops->swapout(vma, page_map))
++		if (vma->vm_ops->swapout(vma, page))
+ 			kill_proc(pid, SIGBUS, 1);
+-		__free_page(page_map);
+-		return 1;
++		goto out_free_success;
+ 	}
+ 
+ 	/*
+@@ -147,23 +150,26 @@
+ 	 */
+ 	entry = get_swap_page();
+ 	if (!entry)
+-		return 0; /* No swap space left */
++		goto out_failed; /* No swap space left */
+ 		
+ 	vma->vm_mm->rss--;
+ 	tsk->nswap++;
+ 	set_pte(page_table, __pte(entry));
+ 	flush_tlb_page(vma, address);
+ 	swap_duplicate(entry);	/* One for the process, one for the swap cache */
+-	add_to_swap_cache(page_map, entry);
++	add_to_swap_cache(page, entry);
+ 	/* We checked we were unlocked way up above, and we
+ 	   have been careful not to stall until here */
+-	LockPage(page_map);
++	LockPage(page);
+ 
+ 	/* OK, do a physical asynchronous write to swap.  */
+-	rw_swap_page(WRITE, entry, (char *) page, 0);
++	rw_swap_page(WRITE, entry, (char *) page_addr, 0);
+ 
+-	__free_page(page_map);
++out_free_success:
++	__free_page(page);
+ 	return 1;
++out_failed:
++	return 0;
+ }
+ 
+ /*
+@@ -490,8 +496,8 @@
+ 
+ 			if (!do_try_to_free_pages(GFP_KSWAPD))
+ 				break;
++			run_task_queue(&tq_disk);
+ 		} while (!tsk->need_resched);
+-		run_task_queue(&tq_disk);
+ 		tsk->state = TASK_INTERRUPTIBLE;
+ 		schedule_timeout(HZ);
+ 	}
+--- linux/mm/swap_state.c.orig	Mon Jun 21 14:37:53 1999
++++ linux/mm/swap_state.c	Mon Jun 21 14:43:18 1999
+@@ -202,21 +202,27 @@
+ 
+ static inline void remove_from_swap_cache(struct page *page)
+ {
+-	if (!page->inode) {
++	struct inode *inode = page->inode;
++
++	if (!inode) {
+ 		printk ("VM: Removing swap cache page with zero inode hash "
+ 			"on page %08lx\n", page_address(page));
+ 		return;
+ 	}
+-	if (page->inode != &swapper_inode) {
++	if (inode != &swapper_inode) {
+ 		printk ("VM: Removing swap cache page with wrong inode hash "
+ 			"on page %08lx\n", page_address(page));
+ 	}
++	if (!PageSwapCache(page))
++		PAGE_BUG(page);
+ 
+ #ifdef DEBUG_SWAP
+ 	printk("DebugVM: remove_from_swap_cache(%08lx count %d)\n",
+ 		   page_address(page), page_count(page));
+ #endif
+ 	PageClearSwapCache(page);
++	if (inode->i_op->flushpage)
++		inode->i_op->flushpage(inode, page, 0);
+ 	remove_inode_page(page);
+ }
+ 
+@@ -263,11 +269,17 @@
+ {
+ 	struct page *page = mem_map + MAP_NR(addr);
+ 
++	lock_page(page);
++
++	if (PageSwapCache(page) && !is_page_shared(page)) {
++		__delete_from_swap_cache(page);
++		page_cache_release(page);
++	}
++
++	UnlockPage(page);
+ 	/* 
+ 	 * If we are the only user, then free up the swap cache. 
+ 	 */
+-	if (PageSwapCache(page) && !is_page_shared(page))
+-		delete_from_swap_cache(page);
+ 	
+ 	__free_page(page);
+ }

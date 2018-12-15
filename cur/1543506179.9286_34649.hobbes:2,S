@@ -1,0 +1,446 @@
+Date: Tue, 17 Aug 1999 20:34:10 -0400 (EDT)
+From: "Benjamin C.R. LaHaise" <>
+Subject: [PATCH] [RFC] x86 SMP lazy FPU context switching
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/8/17/247
+
+Below is a patch to implement lazy context switching for the FPU state on
+x86.  Actual testing of the patch has thus far involved the mmx rc5
+client, plus mpg123 on a dual P233MMX and a K6-2/350.  Comments and bugs
+reports appreciated.  Soon to follow: use of the FPU for large memcpy.  In
+case the patch gets manged, a copy is also available at
+http://www.kvack.org/~blah/patches/2.3.14-1_fpu-3.diff
+		-ben
+diff -ur clean/2.3.14-1/arch/i386/kernel/irq.c lin/arch/i386/kernel/irq.c
+--- clean/2.3.14-1/arch/i386/kernel/irq.c	Fri Aug  6 14:43:09 1999
++++ lin/arch/i386/kernel/irq.c	Mon Aug 16 22:15:15 1999
+@@ -320,6 +320,7 @@
+  */
+ BUILD_SMP_INTERRUPT(reschedule_interrupt)
+ BUILD_SMP_INTERRUPT(invalidate_interrupt)
++BUILD_SMP_INTERRUPT(fpu_save_interrupt)
+ BUILD_SMP_INTERRUPT(stop_cpu_interrupt)
+ BUILD_SMP_INTERRUPT(call_function_interrupt)
+ BUILD_SMP_INTERRUPT(spurious_interrupt)
+@@ -1086,6 +1087,9 @@
+ 	 * IPI, driven by wakeup.
+ 	 */
+ 	set_intr_gate(RESCHEDULE_VECTOR, reschedule_interrupt);
++
++	/* IPI for FPU save */
++	set_intr_gate(FPU_SAVE_VECTOR, fpu_save_interrupt);
+ 
+ 	/* IPI for invalidation */
+ 	set_intr_gate(INVALIDATE_TLB_VECTOR, invalidate_interrupt);
+diff -ur clean/2.3.14-1/arch/i386/kernel/irq.h lin/arch/i386/kernel/irq.h
+--- clean/2.3.14-1/arch/i386/kernel/irq.h	Mon Aug  9 15:43:43 1999
++++ lin/arch/i386/kernel/irq.h	Mon Aug 16 22:11:40 1999
+@@ -63,6 +63,7 @@
+  */
+ #define RESCHEDULE_VECTOR	0x30
+ #define INVALIDATE_TLB_VECTOR	0x31
++#define FPU_SAVE_VECTOR		0x32
+ #define STOP_CPU_VECTOR		0x40
+ #define LOCAL_TIMER_VECTOR	0x41
+ #define CALL_FUNCTION_VECTOR	0x50
+diff -ur clean/2.3.14-1/arch/i386/kernel/process.c lin/arch/i386/kernel/process.c
+--- clean/2.3.14-1/arch/i386/kernel/process.c	Fri Aug 13 22:56:18 1999
++++ lin/arch/i386/kernel/process.c	Tue Aug 17 02:19:58 1999
+@@ -480,7 +480,6 @@
+ 	 * Forget coprocessor state..
+ 	 */
+ 	clear_fpu(tsk);
+-	tsk->used_math = 0;
+ }
+ 
+ void release_thread(struct task_struct *dead_task)
+@@ -564,7 +563,7 @@
+ 	int fpvalid;
+ 	struct task_struct *tsk = current;
+ 
+-	fpvalid = tsk->used_math;
++	fpvalid = tsk->flags & PF_USEDFPU;
+ 	if (fpvalid) {
+ 		unlazy_fpu(tsk);
+ 		memcpy(fpu,&tsk->thread.i387.hard,sizeof(*fpu));
+@@ -647,13 +646,16 @@
+  * more flexibility.
+  */
+ extern int cpus_initialized;
++
+ void __switch_to(struct task_struct *prev_p, struct task_struct *next_p)
+ {
+ 	struct thread_struct *prev = &prev_p->thread,
+ 				 *next = &next_p->thread;
+-	struct tss_struct *tss = init_tss + smp_processor_id();
++	int cpu = smp_processor_id();
++	struct tss_struct *tss = init_tss + cpu;
+ 
+-	unlazy_fpu(prev_p);
++	if (prev_p->last_used_fpu == cpu)
++		stts();
+ 
+ 	/*
+ 	 * Reload esp0, LDT and the page table pointer:
+diff -ur clean/2.3.14-1/arch/i386/kernel/ptrace.c lin/arch/i386/kernel/ptrace.c
+--- clean/2.3.14-1/arch/i386/kernel/ptrace.c	Sun Jul 11 12:11:46 1999
++++ lin/arch/i386/kernel/ptrace.c	Tue Aug 17 02:22:13 1999
+@@ -407,7 +407,7 @@
+ 			    goto out;
+ 			  }
+ 			ret = 0;
+-			if ( !child->used_math ) {
++			if ( !(child->flags & PF_USEDFPU) ) {
+ 			  /* Simulate an empty FPU. */
+ 			  child->thread.i387.hard.cwd = 0xffff037f;
+ 			  child->thread.i387.hard.swd = 0xffff0000;
+@@ -434,7 +434,8 @@
+ 			    ret = -EIO;
+ 			    goto out;
+ 			  }
+-			child->used_math = 1;
++			clear_fpu(child);
++			child->flags |= PF_USEDFPU;
+ #ifdef CONFIG_MATH_EMULATION
+ 			if ( boot_cpu_data.hard_math ) {
+ #endif
+diff -ur clean/2.3.14-1/arch/i386/kernel/setup.c lin/arch/i386/kernel/setup.c
+--- clean/2.3.14-1/arch/i386/kernel/setup.c	Fri Aug 13 22:56:18 1999
++++ lin/arch/i386/kernel/setup.c	Tue Aug 17 02:22:47 1999
+@@ -1066,6 +1066,6 @@
+ 	 * Force FPU initialization:
+ 	 */
+ 	current->flags &= ~PF_USEDFPU;
+-	current->used_math = 0;
++	current->last_used_fpu = NO_PROC_ID;
+ 	stts();
+ }
+diff -ur clean/2.3.14-1/arch/i386/kernel/signal.c lin/arch/i386/kernel/signal.c
+--- clean/2.3.14-1/arch/i386/kernel/signal.c	Thu Jul 22 12:47:55 1999
++++ lin/arch/i386/kernel/signal.c	Tue Aug 17 02:34:54 1999
+@@ -169,7 +169,7 @@
+ 	else
+ 		err = restore_i387_soft(&current->thread.i387.soft, buf);
+ #endif
+-	current->used_math = 1;
++	current->flags |= PF_USEDFPU;
+ 	return err;
+ }
+ 
+@@ -316,20 +316,25 @@
+ 
+ static int save_i387(struct _fpstate *buf)
+ {
+-	if (!current->used_math)
+-		return 0;
++	int ret;
+ 
+-	/* This will cause a "finit" to be triggered by the next
+-	   attempted FPU operation by the 'current' process.
+-	   */
+-	current->used_math = 0;
++	if (!(current->flags & PF_USEDFPU))
++		return 0;
+ 
+ #ifndef CONFIG_MATH_EMULATION
+-	return save_i387_hard(buf);
++	ret = save_i387_hard(buf);
+ #else
+-	return boot_cpu_data.hard_math ? save_i387_hard(buf)
++	ret = boot_cpu_data.hard_math ? save_i387_hard(buf)
+ 	  : save_i387_soft(&current->thread.i387.soft, buf);
+ #endif
++
++	/* This will cause a "finit" to be triggered by the next
++	   attempted FPU operation by the 'current' process.
++	   Note that this must be done after unlazy_fpu, or else
++	   unlazy_fpu won't be able to find the task's FPU state.
++	   */
++	clear_fpu(current);
++	return ret;
+ }
+ 
+ static int
+diff -ur clean/2.3.14-1/arch/i386/kernel/smp.c lin/arch/i386/kernel/smp.c
+--- clean/2.3.14-1/arch/i386/kernel/smp.c	Sat Aug  7 15:59:40 1999
++++ lin/arch/i386/kernel/smp.c	Tue Aug 17 14:06:23 1999
+@@ -41,6 +41,7 @@
+ #include <linux/init.h>
+ #include <asm/mtrr.h>
+ #include <asm/msr.h>
++#include <asm/processor.h>	/* FPU stuff */
+ 
+ #include "irq.h"
+ 
+@@ -1916,6 +1917,58 @@
+ {
+ 	ack_APIC_irq();
+ }
++
++asmlinkage void smp_fpu_save_interrupt(void)
++{
++	struct task_struct *tsk;
++	int cpu;
++
++	ack_APIC_irq();
++
++	/* local interrupts had better be disabled */
++	cpu = smp_processor_id();
++	if (((tsk = fpu_owner(cpu)) != current) && (tsk != idle_task(cpu)) && tsk) {
++		if (tsk->flags & PF_USEDFPU) {
++			save_fpu(tsk);
++			wmb();
++		}
++		tsk->last_used_fpu = NO_PROC_ID;
++		fpu_owner(cpu) = NULL;
++	}
++}
++
++/*
++ * If another cpu is holding onto the FPU state of this
++ * task, force it to save the state.  Returns when done.
++ */
++void __unlazy_fpu(struct task_struct *tsk)
++{
++	int cpu;
++
++	__cli();
++	cpu = tsk->last_used_fpu;
++	if (cpu == smp_processor_id()) {
++		save_fpu(tsk);
++		wmb();
++		tsk->last_used_fpu = NO_PROC_ID;
++		fpu_owner(cpu) = NULL;
++		__sti();
++		return;
++	}
++
++	__sti();
++	if (cpu != NO_PROC_ID) {
++		unsigned long count = 0;
++		send_IPI_single(cpu, FPU_SAVE_VECTOR);
++		do {
++			if (count++ > 20000000)
++				printk("%d->%d: %p/%p stuck on FPU flush\n", smp_processor_id(), cpu,
++					tsk, fpu_owner(cpu));
++			rmb();
++		} while (tsk->last_used_fpu != NO_PROC_ID) ;
++	}
++}
++
+ 
+ /*
+  * Invalidate call-back.
+diff -ur clean/2.3.14-1/arch/i386/kernel/traps.c lin/arch/i386/kernel/traps.c
+--- clean/2.3.14-1/arch/i386/kernel/traps.c	Sun Jul 25 16:45:25 1999
++++ lin/arch/i386/kernel/traps.c	Tue Aug 17 14:53:26 1999
+@@ -48,6 +48,7 @@
+ asmlinkage void lcall7(void);
+ 
+ struct desc_struct default_ldt = { 0, 0 };
++struct task_struct *__fpu_owner[NR_CPUS][8] __cacheline_aligned;
+ 
+ /*
+  * The IDT has to be page-aligned to simplify the Pentium
+@@ -416,15 +417,29 @@
+ void math_error(void)
+ {
+ 	struct task_struct * task;
++	int cpu = smp_processor_id();
+ 
+ 	/*
+ 	 * Save the info for the exception handler
+ 	 * (this will also clear the error)
+ 	 */
+-	task = current;
+-	save_fpu(task);
++	__cli();
++	task = fpu_owner(cpu);
++printk("math_error: tsk=%p flags=%08x last_used=%04x cpu=%02x owner(cpu)=%p\n",
++	task, !task ? 0 : task->flags, !task ? 0xaaaa : task->last_used_fpu, smp_processor_id(), fpu_owner(smp_processor_id())
++	);
++
++	/* FIXME: this happens during boot from check_fpu */
++	if (!task)
++		task = current;
++
++	save_fpu(task);		/* check_fpu relies on this */
++	wmb();
++	task->last_used_fpu = NO_PROC_ID;
+ 	task->thread.trap_no = 16;
+ 	task->thread.error_code = 0;
++	__sti();
++
+ 	force_sig(SIGFPE, task);
+ }
+ 
+@@ -452,18 +467,41 @@
+  */
+ asmlinkage void math_state_restore(struct pt_regs regs)
+ {
++	int cpu = smp_processor_id();
++	struct task_struct *tsk;
++
++	__cli();
+ 	__asm__ __volatile__("clts");		/* Allow maths ops (or we recurse) */
+-	if(current->used_math)
++
++	/* Are we doing a lazy restore? */
++	if ((tsk = fpu_owner(cpu)) == current)
++		goto out_sti;
++
++	if (tsk != idle_task(cpu) && tsk) {
++		save_fpu(tsk);
++		__asm__ __volatile__("clts");
++	}
++
++	if(current->flags & PF_USEDFPU) {
++		if (current->last_used_fpu != NO_PROC_ID) {
++			unlazy_fpu(current);	/* enables local interrupts */
++			__cli();
++			__asm__ __volatile__("clts");		/* Allow maths ops (or we recurse) */
++		}
+ 		__asm__("frstor %0": :"m" (current->thread.i387));
+-	else
+-	{
+-		/*
+-		 *	Our first FPU usage, clean the chip.
+-		 */
+-		__asm__("fninit");
+-		current->used_math = 1;
++		goto out;
+ 	}
++
++	/*
++	 *	Our first FPU usage, clean the chip.
++	 */
++	__asm__("fninit");
+ 	current->flags|=PF_USEDFPU;		/* So we fnsave on switch_to() */
++out:
++	current->last_used_fpu = cpu;
++	fpu_owner(cpu) = current;
++out_sti:
++	__sti();
+ }
+ 
+ #ifndef CONFIG_MATH_EMULATION
+diff -ur clean/2.3.14-1/include/asm-i386/processor.h lin/include/asm-i386/processor.h
+--- clean/2.3.14-1/include/asm-i386/processor.h	Mon Aug  9 15:42:00 1999
++++ lin/include/asm-i386/processor.h	Tue Aug 17 13:56:22 1999
+@@ -12,6 +12,7 @@
+ #include <asm/segment.h>
+ #include <asm/page.h>
+ #include <asm/types.h>
++#include <asm/cache.h>
+ #include <linux/threads.h>
+ 
+ /*
+@@ -370,22 +371,34 @@
+ /*
+  * FPU lazy state save handling..
+  */
++extern void FASTCALL(__unlazy_fpu(struct task_struct *tsk));
++extern struct task_struct *__fpu_owner[NR_CPUS][8] __cacheline_aligned;
++
++#define fpu_owner(cpu)	__fpu_owner[cpu][0]
++
+ #define save_fpu(tsk) do { \
+ 	asm volatile("fnsave %0\n\tfwait":"=m" (tsk->thread.i387)); \
+-	tsk->flags &= ~PF_USEDFPU; \
+ 	stts(); \
+ } while (0)
+ 
+ #define unlazy_fpu(tsk) do { \
+-	if (tsk->flags & PF_USEDFPU) \
+-		save_fpu(tsk); \
++	if ((tsk)->flags & PF_USEDFPU && (tsk)->last_used_fpu != NO_PROC_ID) \
++		__unlazy_fpu(tsk); \
+ } while (0)
+ 
+ #define clear_fpu(tsk) do { \
++	int cpu; \
++	__cli(); \
+ 	if (tsk->flags & PF_USEDFPU) { \
+ 		tsk->flags &= ~PF_USEDFPU; \
+-		stts(); \
++		if (tsk->last_used_fpu == (cpu = smp_processor_id())) { \
++			tsk->last_used_fpu = NO_PROC_ID; \
++			fpu_owner(cpu) = NULL; \
++			stts(); \
++		} else if (tsk->last_used_fpu != NO_PROC_ID) \
++			__unlazy_fpu(tsk); \
+ 	} \
++	__sti(); \
+ } while (0)
+ 
+ /*
+diff -ur clean/2.3.14-1/include/linux/sched.h lin/include/linux/sched.h
+--- clean/2.3.14-1/include/linux/sched.h	Mon Aug  9 15:42:10 1999
++++ lin/include/linux/sched.h	Tue Aug 17 14:28:43 1999
+@@ -310,7 +310,7 @@
+ 	struct user_struct *user;
+ /* limits */
+ 	struct rlimit rlim[RLIM_NLIMITS];
+-	unsigned short used_math;
++	short last_used_fpu;	/* processor id that we last used the FPU on or NO_PROC_ID if we haven't. */
+ 	char comm[16];
+ /* file system info */
+ 	int link_count;
+@@ -391,7 +391,7 @@
+ /* caps */      CAP_INIT_EFF_SET,CAP_INIT_INH_SET,CAP_FULL_SET, \
+ /* user */	NULL,						\
+ /* rlimits */   INIT_RLIMITS, \
+-/* math */	0, \
++/* math */	NO_PROC_ID, \
+ /* comm */	"swapper", \
+ /* fs info */	0,NULL, \
+ /* ipc */	NULL, NULL, \
+@@ -415,6 +415,18 @@
+ 
+ extern struct   mm_struct init_mm;
+ extern struct task_struct *init_tasks[NR_CPUS];
++
++#ifdef __SMP__
++
++#define idle_task(cpu) (init_tasks[cpu_number_map[(cpu)]])
++#define can_schedule(p) (!(p)->has_cpu)
++
++#else
++
++#define idle_task(cpu) (&init_task)
++#define can_schedule(p) (1)
++
++#endif
+ 
+ /* PID hashing. (shouldnt this be dynamic?) */
+ #define PIDHASH_SZ (4096 >> 2)
+diff -ur clean/2.3.14-1/kernel/sched.c lin/kernel/sched.c
+--- clean/2.3.14-1/kernel/sched.c	Tue Aug  3 11:01:29 1999
++++ lin/kernel/sched.c	Tue Aug 17 02:16:41 1999
+@@ -128,18 +128,6 @@
+ 
+ struct kernel_stat kstat = { 0 };
+ 
+-#ifdef __SMP__
+-
+-#define idle_task(cpu) (init_tasks[cpu_number_map[(cpu)]])
+-#define can_schedule(p)	(!(p)->has_cpu)
+-
+-#else
+-
+-#define idle_task(cpu) (&init_task)
+-#define can_schedule(p) (1)
+-
+-#endif
+-
+ void scheduling_functions_start_here(void) { }
+ 
+ /*
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

@@ -1,0 +1,150 @@
+Date: Mon, 23 Apr 2001 18:05:22 +0200 (CEST)
+From: Ingo Molnar <>
+Subject: [patch] swap-speedup-2.4.3-A2
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2001/4/23/18
+
+On Mon, 23 Apr 2001, Rik van Riel wrote:
+> There seems to be one more reason, take a look at the function
+> read_swap_cache_async() in swap_state.c, around line 240:
+you are right - i thought about that issue too and assumed it works like
+the pagecache (which first reads the page without hashing it, then tries
+to add the result to the pagecache and throws away the page if anyone else
+finished it already), but that was incorrect.
+i think the swapcache's behavior is actually the more correct one, and the
+pagecache should first hash pending reads, then start the IO. If someone
+else tries to read the page and the page is not uptodate and locked, then
+we should sleep on the page's waitqueue. End-of-page-IO or PageError
+should then unlock the page and wake up all waiters. [which happens
+already]
+several processes trying to read the same page is a legitimate scenario,
+and should not result in multiple reads done on the same disk area.
+Besides the (albeit small) performance win, IMO this is also a quality of
+implementation issue, even if the window is small. (the window might be
+not that small in some cases like NFS?)
+i've fixed the patch so that it checks Page_Uptodate() within
+__find_get_swapcache_page(). The only case i'm not convinced about is the
+case of IO errors, but otherwise this should work. I've also fixed an
+SMP-only bug in the new __find_get_swapcache_page()  function: it must not
+run __find_page_nolock() with the LRU lock held.
+i've attached swap-speedup-2.4.3-A2 which has these fixes included.
+> OTOH, no matter how fast we make the current functionality, there will
+> always be some point at which the system is so overloaded that no
+> paging system can help save it from thrashing.
+agreed - but this should really be the last resort, and i'm still worried
+about potentially hiding real performance bugs.
+> Btw, to test this ... try running 10 copies of gnuchess playing
+> against itself on a machine with 64 MB of RAM. You'll go under
+> thrashing pretty quickly.
+thanks, i'll try that. (do you have any easy oneliner command line to
+start up gnuchess against itself?)
+	Ingo
+--- linux/mm/filemap.c.orig	Mon Apr 23 13:35:06 2001
++++ linux/mm/filemap.c	Mon Apr 23 20:55:23 2001
+@@ -710,6 +710,43 @@
+ }
+ 
+ /*
++ * Find a swapcache page (and get a reference) or return NULL.
++ * The SwapCache check is protected by the pagecache lock.
++ */
++struct page * __find_get_swapcache_page(struct address_space *mapping,
++			      unsigned long offset, struct page **hash)
++{
++	struct page *page;
++
++	/*
++	 * We need the LRU lock to protect against page_launder().
++	 */
++repeat:
++	spin_lock(&pagecache_lock);
++	page = __find_page_nolock(mapping, offset, *hash);
++	if (page) {
++		spin_lock(&pagemap_lru_lock);
++		if (PageSwapCache(page)) {
++			page_cache_get(page);
++			if (!Page_Uptodate(page) && PageLocked(page)) {
++				spin_unlock(&pagemap_lru_lock);
++				spin_unlock(&pagecache_lock);
++				___wait_on_page(page);
++				page_cache_release(page);
++				goto repeat;
++			}
++			if (!Page_Uptodate(page))
++				printk("hm: page not uptodate in __find_get_swapcache_page()? page flags: %08lx\n", page->flags);
++		} else
++			page = NULL;
++		spin_unlock(&pagemap_lru_lock);
++	}
++	spin_unlock(&pagecache_lock);
++
++	return page;
++}
++
++/*
+  * Same as the above, but lock the page too, verifying that
+  * it's still valid once we own it.
+  */
+--- linux/mm/swap_state.c.orig	Mon Apr 23 13:35:06 2001
++++ linux/mm/swap_state.c	Mon Apr 23 13:37:01 2001
+@@ -163,37 +163,18 @@
+ 		/*
+ 		 * Right now the pagecache is 32-bit only.  But it's a 32 bit index. =)
+ 		 */
+-repeat:
+-		found = find_lock_page(&swapper_space, entry.val);
++		found = find_get_swapcache_page(&swapper_space, entry.val);
+ 		if (!found)
+ 			return 0;
+-		/*
+-		 * Though the "found" page was in the swap cache an instant
+-		 * earlier, it might have been removed by refill_inactive etc.
+-		 * Re search ... Since find_lock_page grabs a reference on
+-		 * the page, it can not be reused for anything else, namely
+-		 * it can not be associated with another swaphandle, so it
+-		 * is enough to check whether the page is still in the scache.
+-		 */
+-		if (!PageSwapCache(found)) {
+-			UnlockPage(found);
+-			page_cache_release(found);
+-			goto repeat;
+-		}
++		if (!PageSwapCache(found))
++			BUG();
+ 		if (found->mapping != &swapper_space)
+-			goto out_bad;
++			BUG();
+ #ifdef SWAP_CACHE_INFO
+ 		swap_cache_find_success++;
+ #endif
+-		UnlockPage(found);
+ 		return found;
+ 	}
+-
+-out_bad:
+-	printk (KERN_ERR "VM: Found a non-swapper swap page!\n");
+-	UnlockPage(found);
+-	page_cache_release(found);
+-	return 0;
+ }
+ 
+ /* 
+--- linux/include/linux/pagemap.h.orig	Mon Apr 23 13:35:05 2001
++++ linux/include/linux/pagemap.h	Mon Apr 23 13:37:01 2001
+@@ -77,7 +77,12 @@
+ 				unsigned long index, struct page **hash);
+ extern void lock_page(struct page *page);
+ #define find_lock_page(mapping, index) \
+-		__find_lock_page(mapping, index, page_hash(mapping, index))
++	__find_lock_page(mapping, index, page_hash(mapping, index))
++
++extern struct page * __find_get_swapcache_page (struct address_space * mapping,
++				unsigned long index, struct page **hash);
++#define find_get_swapcache_page(mapping, index) \
++	__find_get_swapcache_page(mapping, index, page_hash(mapping, index))
+ 
+ extern void __add_page_to_hash_queue(struct page * page, struct page **p);
+ 

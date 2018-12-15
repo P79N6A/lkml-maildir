@@ -1,0 +1,95 @@
+Date: Mon, 28 Apr 2003 01:29:03 +0400
+From: Alex Tomas <>
+Subject: [RFC] concurrent JBD for 2.5
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2003/4/27/57
+
+hi!
+I've been trying to implement new locking schema for JBD
+(Journaling Block Device). JBD is well-known bottleneck
+for some configurations and loads.
+The main ideas of locking design:
+1) we do not lock the whole journal trying to get access for
+   some buffer, we do lock buffer only. let's call this lock
+   'bh lock'. in fact, this lock is simple one-bit state in
+   bh->b_state field. there are primitives to operate on this
+   lock: jbd_lock_bh(), jbd_unlock_bh() and jbd_bh_locked().
+   any operation on jh must be protected by this lock
+2) each transaction has own lock to protect buffer list.
+   journal_file_buffer() and journal_unfile_buffer() uses
+   jh->j_transaction to find that lock. jh->j_transaction is
+   protected by bh lock. so, every time one tries to get write
+   access for a buffer following locking will be used:
+   get_write_access(bh)
+   {
+     jbd_lock_bh(bh);
+     /* decide what to do with buffer: wait, file it, etc */
+     journal_file_buffer(jh, th, BJ_Metadata);
+     {
+       spin_lock(&th->t_list_lock);
+       /* add buffer to transaction's list */
+       spin_unlock(&th->t_list_lock);
+     }       
+     jbd_unlock_bh(bh);
+   }
+   while transaction is T_RUNNING state all proccessing go throught
+   this lock order. invalidatpage(), releasepage() and dirty_data()
+   also use this order. journal_commit_transaction() accesses buffers
+   in another order:
+   for_each_buffer_in_list(list) {
+     jbd_lock_bh(bh);
+     /* process it */
+     jbd_unlock_bh(bh);
+   }
+    
+   so, it looks like lock ordeding violation. but, it isn't, because
+   this buffer is owned by commiting transaction and must not be refiled
+   by running transaction. the only places are flushing ordered data in
+   journal_commit_transaction() against journal_releasepage() and
+   journal_commit_transaction() against journal_dirty_data().
+   journal_commit_transaction() walks throught the list of transaction's
+   data buffers and journal_releasepage() first looks at buffer (so gets
+   bh lock), then refile it (so gets t_list_lock) => possible deadlock.
+   at this moment I use following schema:
+   lock(transaction->t_list_lock);
+   for_each_buffer_in_list(bh) {
+     get_bh(bh);
+     put bh in special array
+   unlock(transaction->t_list_lock);
+   for_each_buffer_in_special_array(bh) {
+     jbd_lock_bh(bh);
+     jh = bh2jh2(bh);
+     if (buffer belongs to the same transaction AND
+         buffer is on the same list) {
+           /* process buffer */
+     }
+     jbd_unlock_bh(bh);
+     put_bh(bh);
+   }
+3) transaction's state and credits are protected by transaction->t_lock
+   
+3) revoke list protection
+   as we may have one running transaction and one committing transaction
+   at the same time, it's indeed that we simple need two revoke lists:
+   one for running transaction and one for committing transaction.
+   processes may modify revoke list simultaneously, so we protect current
+   revoke list by journal->j_revoke_lock
+4) every time, journal_commit_transaction() starts to commit new transaction,
+   journal->j_running_transaction is set to NULL several start_this_handle()
+   may try to allocate new transaction. in order to make this SMP-compatible
+   get_transaction() uses journal->j_lock.
+5) to protect list of committed transaction JDB uses journal->j_checkpoint_lock
+6) log_do_checkpoint() scans list of transactions and list of buffers to be
+   flushed. it competes with journal_commit_transaction(). once again, here is
+   incompatible access order. I use schema, described in item 2.
+The patch I'm sending have been tested for dozens of hours by
+fsx-linux & bash-shared-mapping & make -j8 bzImage on dual
+pIII-1GHz with 512MB RAM. Preempt was off. Patch is against
+2.5.68-mm1.
+I'd like to thank Andrew Morton for huge help.
+with best regards, Alex
+PS. would be happy to hear any comments/suggestions ;)
+[unhandled content-type:application/x-bzip2]

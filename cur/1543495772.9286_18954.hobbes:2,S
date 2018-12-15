@@ -1,0 +1,211 @@
+Date: Fri, 14 May 1999 12:20:48 -0700
+From: Dimitris Michailidis <>
+Subject: [PATCH] scheduler fixes and improvements
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/5/15/110
+
+This patch addresses two race conditions and makes two enhancements to the
+scheduler.  
+The first race condition occurs in reschedule_idle_slow() where we may be
+trying to reschedule a task that is already running.  This is possible 
+because the task we are trying to reschedule may have been selected by some
+other CPU while we were not holding the run queue lock.
+The second race condition concerns need_resched.  If a CPU receives a 
+reschedule request after it drops the run queue lock but before the 
+context switch we set the need_resched flag of the wrong task (the one being
+descheduled rather than the one being resumed).  We fix this by checking
+prev->need_resched in __schedule_tail().
+The first improvement is an even faster way to recalculate counters without
+going through the task list.  Previously, the scheduler made three traversals
+through the run queue if all counters had expired, the first and third to 
+find a task, and the second to recalculate the counters.  Here we combine the
+second and third traversals into one.
+Finally, goodness was doing some unnecessary work for idle tasks that have
+negative counters.
+----
+Dimitris Michailidis				dimitris@engr.sgi.com
+--- /usr/src/linux-2.2.8/linux/include/linux/sched.h	Thu May 13 14:19:28 1999
++++ /build2/dm/2.2.8-sched/include/linux/sched.h	Thu May 13 14:21:06 1999
+@@ -236,6 +236,7 @@
+ 	int processor;
+ 	int last_processor;
+ 	int lock_depth;		/* Lock depth. We can context switch in and out of holding a syscall kernel lock... */	
++	int recalc_generation;
+ 	struct task_struct *next_task, *prev_task;
+ 	struct task_struct *next_run,  *prev_run;
+ 
+@@ -348,7 +349,7 @@
+ #define INIT_TASK \
+ /* state etc */	{ 0,0,0,KERNEL_DS,&default_exec_domain,0, \
+ /* counter */	DEF_PRIORITY,DEF_PRIORITY,0, \
+-/* SMP */	0,0,0,-1, \
++/* SMP */	0,0,0,-1,0, \
+ /* schedlink */	&init_task,&init_task, &init_task, &init_task, \
+ /* binfmt */	NULL, \
+ /* ec,brk... */	0,0,0,0,0,0, \
+--- /usr/src/linux-2.2.8/linux/kernel/sched.c	Thu May 13 13:37:18 1999
++++ /build2/dm/2.2.8-sched/kernel/sched.c	Fri May 14 10:57:25 1999
+@@ -90,6 +90,12 @@
+ unsigned long volatile jiffies=0;
+ 
+ /*
++ *	Count how many times we've recalculated task_struct.counter.
++ */
++
++static int recalc_generation = 0;
++
++/*
+  *	Init task must be ok at boot for the ix86 as we will check its signals
+  *	via the SMP irq return path.
+  */
+@@ -163,7 +169,7 @@
+ 	 * over..
+ 	 */
+ 	weight = p->counter;
+-	if (!weight)
++	if (weight <= 0)
+ 		goto out;
+ 			
+ #ifdef __SMP__
+@@ -276,6 +282,13 @@
+ 
+ 	spin_lock_irqsave(&runqueue_lock, flags);
+ 
++	/* The task we are trying to schedule may already be running because
++	 * some other CPU selected it while we were not holding the run queue
++	 * lock.  Detect this here and bail out.
++	 */
++	if (!can_schedule(p))
++		goto out_no_target;
++	
+ 	/*
+ 	 * shortcut if the woken up task's last CPU is
+ 	 * idle now.
+@@ -367,12 +380,29 @@
+ static inline void add_to_runqueue(struct task_struct * p)
+ {
+ 	struct task_struct *next = init_task.next_run;
++	int shift;
+ 
+ 	p->prev_run = &init_task;
+ 	init_task.next_run = p;
+ 	p->next_run = next;
+ 	next->prev_run = p;
+ 	nr_running++;
++
++	/* Apply any counter recalculations that occured while we were not
++	 * on the run queue.  If too many such recalculations have taken 
++	 * place we fast path the calculation by setting p->counter to its
++	 * max for this process.  Here, 'too many' is 6, the base 2 log of
++	 * the max priority.
++	 */
++	shift = recalc_generation - p->recalc_generation;
++	if (shift) {
++		if (shift > 5)
++			p->counter = 2 * p->priority - 1;
++		else
++			while (shift--)
++				p->counter = (p->counter >> 1) + p->priority;
++		p->recalc_generation = recalc_generation;
++	}
+ }
+ 
+ static inline void del_from_runqueue(struct task_struct * p)
+@@ -659,12 +689,23 @@
+  */
+ static inline void __schedule_tail (struct task_struct *prev)
+ {
++	/* It is possible that prev->need_resched was set after we 
++	 * dropped the run queue lock but before the context switch.
++	 * That reschedule request was really intended for the current task.
++	 */
++	if (prev->need_resched) {
++		prev->need_resched = 0;
++		current->need_resched = 1;
++	}
++	
+ #ifdef __SMP__
+-	if ((prev->state == TASK_RUNNING) &&
+-			(prev != idle_task(smp_processor_id())))
+-		reschedule_idle(prev);
++	/* Drop has_cpu first to allow reschedule_idle_slow() to detect
++	 * whether prev has already been scheduled on some othere CPU.
++	 */
+ 	wmb();
+ 	prev->has_cpu = 0;
++	if ((prev->state == TASK_RUNNING) && prev->pid)
++		reschedule_idle(prev);
+ #endif /* __SMP__ */
+ }
+ 
+@@ -731,18 +772,17 @@
+ 	}
+ 	prev->need_resched = 0;
+ 
+-repeat_schedule:
+-
+ 	/*
+ 	 * this is the scheduler proper:
+ 	 */
+ 
+ 	p = init_task.next_run;
++	if (prev->state == TASK_RUNNING)
++		goto still_running;
++
+ 	/* Default process to select.. */
+ 	next = idle_task(this_cpu);
+ 	c = -1000;
+-	if (prev->state == TASK_RUNNING)
+-		goto still_running;
+ still_running_back:
+ 
+ 	/*
+@@ -772,6 +812,9 @@
+ 	/* Do we need to re-calculate counters? */
+ 	if (!c)
+ 		goto recalculate;
++
++selected_task:
++	
+ 	/*
+ 	 * from this point on nothing can prevent us from
+ 	 * switching to the next task, save this fact in
+@@ -829,16 +872,21 @@
+ 	return;
+ 
+ recalculate:
+-	{
+-		struct task_struct *p;
+-		spin_unlock_irq(&runqueue_lock);
+-		read_lock(&tasklist_lock);
+-		for_each_task(p)
+-			p->counter = (p->counter >> 1) + p->priority;
+-		read_unlock(&tasklist_lock);
+-		spin_lock_irq(&runqueue_lock);
+-		goto repeat_schedule;
++	/* Recalculate counters and choose a process to schedule in one pass.
++	 * At this point we are certain that we will find some process to
++	 * schedule.
++	 */
++	recalc_generation++;
++	for (p = init_task.next_run; p != &init_task; p = p->next_run) {
++		p->counter = (p->counter >> 1) + p->priority;
++		p->recalc_generation = recalc_generation;
++		if (can_schedule(p)) {
++			int weight = goodness(prev, p, this_cpu);
++			if (weight > c)
++				c = weight, next = p;
++		}
+ 	}
++	goto selected_task;
+ 
+ still_running:
+ 	c = prev_goodness(prev, prev, this_cpu);
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

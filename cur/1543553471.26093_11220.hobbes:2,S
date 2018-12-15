@@ -1,0 +1,489 @@
+Date: Fri, 3 Nov 2000 16:45:51 +0100 (CET)
+From: Mike Galbraith <>
+Subject: Re: [BUG] /proc/<pid>/stat access stalls badly for swapping process, 2.4.0-test10
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/11/3/118
+
+On Fri, 3 Nov 2000, Mike Galbraith wrote:
+> On Thu, 2 Nov 2000, Jens Axboe wrote:
+> 
+> > On Thu, Nov 02 2000, Val Henson wrote:
+> > > > > 3) combine this with the elevator starvation stuff (ask Jens
+> > > > >    Axboe for blk-7 to alleviate this issue) and you have a
+> > > > >    scenario where processes using /proc/<pid>/stat have the
+> > > > >    possibility to block on multiple processes that are in the
+> > > > >    process of handling a page fault (but are being starved)
+> > > > 
+> > > > I'm experimenting with blk.[67] in test10 right now.  The stalls
+> > > > are not helped at all.  It doesn't seem to become request bound
+> > > > (haven't instrumented that yet to be sure) but the stalls persist.
+> > > > 
+> > > > 	-Mike
+> > > 
+> > > This is not an elevator starvation problem.
+> > 
+> > True, but the blk-xx patches help work-around (what I believe) is
+> > bad flushing behaviour by the vm.
+> 
+> I very much agree.  Kflushd is still hungry for free write
+> bandwidth here.
+In the LKML tradition of code talks and silly opinions walk...
+Attached is a diagnostic patch which gets kflushd under control,
+and takes make -j30 bzImage build times down from 12 minutes to
+9 here.  I have no more massive context switching on write, and
+copies seem to go a lot quicker to boot.  (that may be because
+some of my failures were really _really_ horrible)
+Comments are very welcome.  I haven't had problems with this yet,
+but it's early so...  This patch isn't supposed to be pretty either
+(hw techs don't do pretty;) it's only supposed to say 'Huston...'
+so be sure to grab a barfbag before you take a look. 
+	-Mike
+P.S. almost forgot. vmstat freezes were shortened too :-)
+diff -urN linux-2.4.0-test10.virgin/fs/buffer.c linux-2.4.0-test10.mike/fs/buffer.c
+--- linux-2.4.0-test10.virgin/fs/buffer.c	Wed Nov  1 06:42:40 2000
++++ linux-2.4.0-test10.mike/fs/buffer.c	Fri Nov  3 14:59:10 2000
+@@ -38,6 +38,7 @@
+ #include <linux/swapctl.h>
+ #include <linux/smp_lock.h>
+ #include <linux/vmalloc.h>
++#include <linux/blk.h>
+ #include <linux/blkdev.h>
+ #include <linux/sysrq.h>
+ #include <linux/file.h>
+@@ -705,13 +706,12 @@
+ /*
+  * We used to try various strange things. Let's not.
+  */
++static int flush_dirty_buffers(int mode);
++
+ static void refill_freelist(int size)
+ {
+-	if (!grow_buffers(size)) {
+-		wakeup_bdflush(1);  /* Sets task->state to TASK_RUNNING */
+-		current->policy |= SCHED_YIELD;
+-		schedule();
+-	}
++	if (!grow_buffers(size))
++		flush_dirty_buffers(2);
+ }
+ 
+ void init_buffer(struct buffer_head *bh, bh_end_io_t *handler, void *private)
+@@ -859,7 +859,9 @@
+ 
+ /* -1 -> no need to flush
+     0 -> async flush
+-    1 -> sync flush (wait for I/O completation) */
++    1 -> sync flush (wait for I/O completation)
++    throttle_IO will be set by kflushd to indicate IO saturation. */
++int throttle_IO;
+ int balance_dirty_state(kdev_t dev)
+ {
+ 	unsigned long dirty, tot, hard_dirty_limit, soft_dirty_limit;
+@@ -2469,6 +2471,7 @@
+  * response to dirty buffers.  Once this process is activated, we write back
+  * a limited number of buffers to the disks and then go back to sleep again.
+  */
++static DECLARE_WAIT_QUEUE_HEAD(bdflush_wait);
+ static DECLARE_WAIT_QUEUE_HEAD(bdflush_done);
+ struct task_struct *bdflush_tsk = 0;
+ 
+@@ -2476,11 +2479,12 @@
+ {
+ 	DECLARE_WAITQUEUE(wait, current);
+ 
+-	if (current == bdflush_tsk)
++	if (current->flags & PF_MEMALLOC)
+ 		return;
+ 
+ 	if (!block) {
+-		wake_up_process(bdflush_tsk);
++		if (waitqueue_active(&bdflush_wait))
++		wake_up(&bdflush_wait);
+ 		return;
+ 	}
+ 
+@@ -2491,7 +2495,9 @@
+ 	__set_current_state(TASK_UNINTERRUPTIBLE);
+ 	add_wait_queue(&bdflush_done, &wait);
+ 
+-	wake_up_process(bdflush_tsk);
++	if (waitqueue_active(&bdflush_wait))
++		wake_up(&bdflush_wait);
++	current->policy |= SCHED_YIELD;
+ 	schedule();
+ 
+ 	remove_wait_queue(&bdflush_done, &wait);
+@@ -2503,11 +2509,19 @@
+    NOTENOTENOTENOTE: we _only_ need to browse the DIRTY lru list
+    as all dirty buffers lives _only_ in the DIRTY lru list.
+    As we never browse the LOCKED and CLEAN lru lists they are infact
+-   completly useless. */
+-static int flush_dirty_buffers(int check_flushtime)
++   completly useless.
++   modes: 0 = check bdf_prm.b_un.ndirty [kflushd]
++          1 = check flushtime [kupdate]
++          2 = check bdf_prm.b_un.nrefill [refill_freelist()] */
++#define  MODE_KFLUSHD 0
++#define  MODE_KUPDATE 1
++#define  MODE_REFILL 2
++static int flush_dirty_buffers(int mode)
+ {
+ 	struct buffer_head * bh, *next;
++	request_queue_t *q;
+ 	int flushed = 0, i;
++	unsigned long flags;
+ 
+  restart:
+ 	spin_lock(&lru_list_lock);
+@@ -2524,31 +2538,52 @@
+ 		if (buffer_locked(bh))
+ 			continue;
+ 
+-		if (check_flushtime) {
++		if (mode == MODE_KUPDATE) {
+ 			/* The dirty lru list is chronologically ordered so
+ 			   if the current bh is not yet timed out,
+ 			   then also all the following bhs
+ 			   will be too young. */
+ 			if (time_before(jiffies, bh->b_flushtime))
+ 				goto out_unlock;
++		} else if (MODE_KFLUSHD) {
++			if (flushed >= bdf_prm.b_un.ndirty)
++				goto out_unlock;
+ 		} else {
+-			if (++flushed > bdf_prm.b_un.ndirty)
++			if (flushed >= bdf_prm.b_un.nrefill)
+ 				goto out_unlock;
+ 		}
+ 
+-		/* OK, now we are committed to write it out. */
++		/* We are almost committed to write it out. */
+ 		atomic_inc(&bh->b_count);
++		q = blk_get_queue(bh->b_rdev);
++		spin_lock_irqsave(&q->request_lock, flags);
+ 		spin_unlock(&lru_list_lock);
++		if (list_empty(&q->request_freelist[WRITE])) {
++			throttle_IO = 1;
++			atomic_dec(&bh->b_count);
++			spin_unlock_irqrestore(&q->request_lock, flags);
++			run_task_queue(&tq_disk);
++			break;
++		} else
++			throttle_IO = 0;
++		spin_unlock_irqrestore(&q->request_lock, flags);
++		/* OK, now we are really committed. */
++
+ 		ll_rw_block(WRITE, 1, &bh);
+ 		atomic_dec(&bh->b_count);
++		flushed++;
+ 
+-		if (current->need_resched)
+-			schedule();
++		if (current->need_resched) {
++			if (!(mode == MODE_KFLUSHD))
++				schedule();
++			else
++				goto out;
++		}
+ 		goto restart;
+ 	}
+- out_unlock:
++out_unlock:
+ 	spin_unlock(&lru_list_lock);
+-
++out:
+ 	return flushed;
+ }
+ 
+@@ -2640,7 +2675,7 @@
+ int bdflush(void *sem)
+ {
+ 	struct task_struct *tsk = current;
+-	int flushed;
++	int flushed, dirty, pdirty=0;
+ 	/*
+ 	 *	We have a bare-bones task_struct, and really should fill
+ 	 *	in a few more things so "top" and /proc/2/{exe,root,cwd}
+@@ -2649,6 +2684,7 @@
+ 
+ 	tsk->session = 1;
+ 	tsk->pgrp = 1;
++	tsk->flags |= PF_MEMALLOC;
+ 	strcpy(tsk->comm, "kflushd");
+ 	bdflush_tsk = tsk;
+ 
+@@ -2664,32 +2700,39 @@
+ 	for (;;) {
+ 		CHECK_EMERGENCY_SYNC
+ 
++		if (balance_dirty_state(NODEV) < 0)
++			goto sleep;
++
+ 		flushed = flush_dirty_buffers(0);
+ 		if (free_shortage())
+ 			flushed += page_launder(GFP_BUFFER, 0);
+ 
+-		/* If wakeup_bdflush will wakeup us
+-		   after our bdflush_done wakeup, then
+-		   we must make sure to not sleep
+-		   in schedule_timeout otherwise
+-		   wakeup_bdflush may wait for our
+-		   bdflush_done wakeup that would never arrive
+-		   (as we would be sleeping) and so it would
+-		   deadlock in SMP. */
+-		__set_current_state(TASK_INTERRUPTIBLE);
+-		wake_up_all(&bdflush_done);
++#if 0
++		/*
++		 * Did someone create lots of dirty buffers while we slept?
++		 */
++		dirty = size_buffers_type[BUF_DIRTY] >> PAGE_SHIFT;
++		if (dirty - pdirty > flushed && throttle_IO) {
++			printk(KERN_WARNING 
++			"kflushd: pdirty(%d) dirtied (%d) flushed (%d)\n",
++			pdirty, pdirty - dirty, flushed);
++		}
++		pdirty = dirty;
++#endif
++
++		run_task_queue(&tq_disk);
++		if (flushed)
++			wake_up_all(&bdflush_done);
+ 		/*
+ 		 * If there are still a lot of dirty buffers around,
+-		 * skip the sleep and flush some more. Otherwise, we
++		 * we sleep and the flush some more. Otherwise, we
+ 		 * go to sleep waiting a wakeup.
+ 		 */
+-		if (!flushed || balance_dirty_state(NODEV) < 0) {
+-			run_task_queue(&tq_disk);
+-			schedule();
++		if (balance_dirty_state(NODEV) < 0) {
++sleep:
++			wake_up_all(&bdflush_done);
++			interruptible_sleep_on_timeout(&bdflush_wait, HZ/10);
+ 		}
+-		/* Remember to mark us as running otherwise
+-		   the next schedule will block. */
+-		__set_current_state(TASK_RUNNING);
+ 	}
+ }
+ 
+@@ -2706,6 +2749,7 @@
+ 
+ 	tsk->session = 1;
+ 	tsk->pgrp = 1;
++	tsk->flags |= PF_MEMALLOC;
+ 	strcpy(tsk->comm, "kupdate");
+ 
+ 	/* sigstop and sigcont will stop and wakeup kupdate */
+diff -urN linux-2.4.0-test10.virgin/mm/page_alloc.c linux-2.4.0-test10.mike/mm/page_alloc.c
+--- linux-2.4.0-test10.virgin/mm/page_alloc.c	Wed Nov  1 06:42:45 2000
++++ linux-2.4.0-test10.mike/mm/page_alloc.c	Fri Nov  3 15:22:55 2000
+@@ -285,7 +285,7 @@
+ struct page * __alloc_pages(zonelist_t *zonelist, unsigned long order)
+ {
+ 	zone_t **zone;
+-	int direct_reclaim = 0;
++	int direct_reclaim = 0, strikes = 0;
+ 	unsigned int gfp_mask = zonelist->gfp_mask;
+ 	struct page * page;
+ 
+@@ -310,22 +310,30 @@
+ 			!(current->flags & PF_MEMALLOC))
+ 		direct_reclaim = 1;
+ 
+-	/*
+-	 * If we are about to get low on free pages and we also have
+-	 * an inactive page shortage, wake up kswapd.
+-	 */
+-	if (inactive_shortage() > inactive_target / 2 && free_shortage())
+-		wakeup_kswapd(0);
++#define STRIKE_ONE \
++	(strikes++ && (gfp_mask & GFP_USER) == GFP_USER)
++#define STRIKE_TWO \
++	(strikes++ < 2 && (gfp_mask & GFP_USER) == GFP_USER)
++#define STRIKE_THREE \
++	(strikes++ < 3 && (gfp_mask & GFP_USER) == GFP_USER)
++#define STRIKE_THREE_NOIO \
++	(strikes++ < 3 && (gfp_mask & GFP_USER) == __GFP_WAIT)
+ 	/*
+ 	 * If we are about to get low on free pages and cleaning
+ 	 * the inactive_dirty pages would fix the situation,
+ 	 * wake up bdflush.
+ 	 */
+-	else if (free_shortage() && nr_inactive_dirty_pages > free_shortage()
++try_again:
++	if (free_shortage() && nr_inactive_dirty_pages > free_shortage()
+ 			&& nr_inactive_dirty_pages >= freepages.high)
+-		wakeup_bdflush(0);
++		wakeup_bdflush(STRIKE_ONE);
++	/*
++	 * If we are about to get low on free pages and we also have
++	 * an inactive page shortage, wake up kswapd.
++	 */
++	else if (inactive_shortage() || free_shortage())
++		wakeup_kswapd(STRIKE_ONE);
+ 
+-try_again:
+ 	/*
+ 	 * First, see if we have any zones with lots of free memory.
+ 	 *
+@@ -374,35 +382,16 @@
+ 	if (page)
+ 		return page;
+ 
+-	/*
+-	 * OK, none of the zones on our zonelist has lots
+-	 * of pages free.
+-	 *
+-	 * We wake up kswapd, in the hope that kswapd will
+-	 * resolve this situation before memory gets tight.
+-	 *
+-	 * We also yield the CPU, because that:
+-	 * - gives kswapd a chance to do something
+-	 * - slows down allocations, in particular the
+-	 *   allocations from the fast allocator that's
+-	 *   causing the problems ...
+-	 * - ... which minimises the impact the "bad guys"
+-	 *   have on the rest of the system
+-	 * - if we don't have __GFP_IO set, kswapd may be
+-	 *   able to free some memory we can't free ourselves
+-	 */
+-	wakeup_kswapd(0);
+-	if (gfp_mask & __GFP_WAIT) {
+-		__set_current_state(TASK_RUNNING);
++	if (STRIKE_TWO) {
+ 		current->policy |= SCHED_YIELD;
+-		schedule();
++		goto try_again;
+ 	}
+ 
+ 	/*
+-	 * After waking up kswapd, we try to allocate a page
++	 * After waking up daemons, we try to allocate a page
+ 	 * from any zone which isn't critical yet.
+ 	 *
+-	 * Kswapd should, in most situations, bring the situation
++	 * Kswapd/kflushd should, in most situations, bring the situation
+ 	 * back to normal in no time.
+ 	 */
+ 	page = __alloc_pages_limit(zonelist, order, PAGES_MIN, direct_reclaim);
+@@ -426,7 +415,7 @@
+ 		 * in the hope of creating a large, physically contiguous
+ 		 * piece of free memory.
+ 		 */
+-		if (order > 0 && (gfp_mask & __GFP_WAIT)) {
++		if (gfp_mask & __GFP_WAIT) {
+ 			zone = zonelist->zones;
+ 			/* First, clean some dirty pages. */
+ 			page_launder(gfp_mask, 1);
+@@ -463,26 +452,23 @@
+ 		 * simply cannot free a large enough contiguous area
+ 		 * of memory *ever*.
+ 		 */
+-		if ((gfp_mask & (__GFP_WAIT|__GFP_IO)) == (__GFP_WAIT|__GFP_IO)) {
++		if (~gfp_mask & __GFP_HIGH && STRIKE_THREE) {
++			memory_pressure++;
+ 			wakeup_kswapd(1);
++			goto try_again;
++		} else if (~gfp_mask & __GFP_HIGH && STRIKE_THREE_NOIO) {
++			/*
++		 	* If __GFP_IO isn't set, we can't wait on kswapd because
++		 	* daemons just might need some IO locks /we/ are holding ...
++		 	*
++		 	* SUBTLE: The scheduling point above makes sure that
++		 	* kswapd does get the chance to free memory we can't
++		 	* free ourselves...
++		 	*/
+ 			memory_pressure++;
+-			if (!order)
+-				goto try_again;
+-		/*
+-		 * If __GFP_IO isn't set, we can't wait on kswapd because
+-		 * kswapd just might need some IO locks /we/ are holding ...
+-		 *
+-		 * SUBTLE: The scheduling point above makes sure that
+-		 * kswapd does get the chance to free memory we can't
+-		 * free ourselves...
+-		 */
+-		} else if (gfp_mask & __GFP_WAIT) {
+ 			try_to_free_pages(gfp_mask);
+-			memory_pressure++;
+-			if (!order)
+-				goto try_again;
++			goto try_again;
+ 		}
+-
+ 	}
+ 
+ 	/*
+diff -urN linux-2.4.0-test10.virgin/mm/vmscan.c linux-2.4.0-test10.mike/mm/vmscan.c
+--- linux-2.4.0-test10.virgin/mm/vmscan.c	Wed Nov  1 06:42:45 2000
++++ linux-2.4.0-test10.mike/mm/vmscan.c	Fri Nov  3 15:20:32 2000
+@@ -562,6 +562,7 @@
+  * go out to Matthew Dillon.
+  */
+ #define MAX_LAUNDER 		(4 * (1 << page_cluster))
++extern int throttle_IO;
+ int page_launder(int gfp_mask, int sync)
+ {
+ 	int launder_loop, maxscan, cleaned_pages, maxlaunder;
+@@ -573,7 +574,7 @@
+ 	 * We can only grab the IO locks (eg. for flushing dirty
+ 	 * buffers to disk) if __GFP_IO is set.
+ 	 */
+-	can_get_io_locks = gfp_mask & __GFP_IO;
++	can_get_io_locks = gfp_mask & __GFP_IO && !throttle_IO;
+ 
+ 	launder_loop = 0;
+ 	maxlaunder = 0;
+@@ -1050,13 +1051,23 @@
+ 	for (;;) {
+ 		static int recalc = 0;
+ 
++		/* Once a second, recalculate some VM stats. */
++		if (time_after(jiffies, recalc + HZ)) {
++			recalc = jiffies;
++			recalculate_vm_stats();
++		}
++
+ 		/* If needed, try to free some memory. */
+ 		if (inactive_shortage() || free_shortage()) {
+ 			int wait = 0;
+ 			/* Do we need to do some synchronous flushing? */
+ 			if (waitqueue_active(&kswapd_done))
+ 				wait = 1;
++#if 0 /* Undo this and watch allocations fail under heavy stress */
+ 			do_try_to_free_pages(GFP_KSWAPD, wait);
++#else
++			do_try_to_free_pages(GFP_KSWAPD, 0);
++#endif
+ 		}
+ 
+ 		/*
+@@ -1067,12 +1078,6 @@
+ 		 */
+ 		refill_inactive_scan(6, 0);
+ 
+-		/* Once a second, recalculate some VM stats. */
+-		if (time_after(jiffies, recalc + HZ)) {
+-			recalc = jiffies;
+-			recalculate_vm_stats();
+-		}
+-
+ 		/*
+ 		 * Wake up everybody waiting for free memory
+ 		 * and unplug the disk queue.
+@@ -1112,7 +1117,7 @@
+ {
+ 	DECLARE_WAITQUEUE(wait, current);
+ 
+-	if (current == kswapd_task)
++	if (current->flags & PF_MEMALLOC)
+ 		return;
+ 
+ 	if (!block) {

@@ -1,0 +1,151 @@
+Date: Fri, 20 Aug 1999 12:14:46 -0400
+From: "Bradley D. LaRonde" <>
+Subject: Re: [patch] ramdisk blocksize
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/8/20/83
+
+> People who wants to use extensively ramdisks should use a blocksize of
+> PAGE_SIZE to avoid the fragmentation of not-freeable memory. NOTE: you
+> can't generate a 4k filesystem using a blocksize of 1k simply because the
+> buffer-size used from mke2fs must be the same used by the filesystem code
+> otherwise you won't read on the memory you written before (on a ramdisk
+> you can't emulate larger softblocksize). So to use a blocksize of 4k you
+> must:
+>
+> insmod rd rd_blocksize=4096
+> mke2fs -b 4096 /dev/ramdisk
+> mount /dev/ramdisk /mnt
+>
+> then you'll avoid the fragmentation of protected buffers
+I plan to use ramdisks extensively.  Thanks for the advice.
+> (really I don't
+> ever know if the ramdisk driver will work correctly on 2.3.14-pre2 but
+> that's a different issue and it has only to deal with the VM not with the
+> ramdisk internals that have only to set the protected bit upon lowlevel
+> writes).
+All of the tests that I've seen say that it is broken post 2.3.6.  I've
+included details from Mike Klar at the end of this message.
+I would really like to get this fixed.  For now, we are running with a hack
+from Mike Klar that goes like this:
+diff -rubN linux-clean/drivers/block/rd.c linux/drivers/block/rd.c
+--- linux-clean/drivers/block/rd.c Thu Aug 12 01:59:38 1999
++++ linux/drivers/block/rd.c Fri Aug 13 20:15:54 1999
+@@ -171,10 +171,15 @@
+   * If we're writing, we protect the buffer.
+     */
+- if (CURRENT->cmd == READ)
++ if (CURRENT->cmd == READ) {
++  if (minor == 0) {
++   memcpy(CURRENT->buffer, (char *)initrd_start + offset, len);
++  } else {
+   memset(CURRENT->buffer, 0, len);
+- else
++  }
++ } else {
+   set_bit(BH_Protected, &CURRENT->bh->b_state);
++ }
+  end_request(1);
+  goto repeat;
+@@ -250,7 +255,7 @@
+  NULL,  /* mmap */
+  NULL,  /* open */
+  NULL,  /* flush */
+- initrd_release, /* release */
++ NULL,  /* release */
+  NULL  /* fsync */
+ };
+I am not very familiar with the page cache / buffer cache mechanisms (among
+other things), so I'm not sure how to approach fixing this properly.
+Will you offer some advice as to how you would fix the ramdisk?  Or would it
+be better for us to wait for someone qualified to do this?
+Some other questions:
+1.  Is the page cache just to improve latency, or does it server another
+purpose or purposes?
+2.  Is it necessary (or good) for ramdisk access to go through the page
+cache, or would it be better to "turn it off" somehow for the ramdisk?
+3.  Do you know if the page cache is positioned to replace the buffer cache
+eventually?
+Regards,
+Brad
+-------------------------------------
+Mike's observations:
+OK, here's a summary of what I see to be the problem with ramdisk as of
+2.3.7.  Note that it's partly predicated on a not-so-good understanding of
+the page cache, so some of the analysis is very subject to error:
+First the problem:  With kernel version 2.3.7 , and continuing through the
+current 2.3.13 version, the ramdisk driver does not function properly when
+mounted as root, whether loaded from initrd or from a floppy disk.  Non-root
+ramdisk can also function improperly if direct device IO and file IO are
+both used on a ramdisk (for example, by loading a filesystem image by dd,
+then mounting it and attempting to read files).  I believe this is
+indicative of a broader, but more subtle, problem that could affect any
+device.
+The specific symptoms of the ramdisk problem: The filesystem is recognized,
+mounts properly, directory reads are OK, but file reads return bogus data.
+When using ramdisk as root, the kernel fails with "Kernel panic: No init
+found.  Try passing init= option to kernel." regardless of whether there is
+a valid init= option present.  Debugging has revealed that the kernel does
+find the directory entry for the init executable, but when it reads the
+executable file, it gets back all 00s, and so it rejects the file as
+non-executable.  If a (non-root) ramdisk is prepared with mke2fs, mounted,
+files are written, then read, that appears to work OK.
+The short version of why it's happening:  Ramdisk keeps its data in the
+buffer cache, file IO checks the page cache.  The file reads are missing in
+the page cache, and creating new buffer entries (filled from the ramdisk
+device, which will return 00s), even though the data already exists in the
+buffer cache.
+The longer version of why it's happening:  The rd device driver itself
+doesn't know anything about the actual data, it lets the buffer cache worry
+about storing the data and servicing reads.  Whenever a read request
+actually gets to the rd device, it assumes that since it must have missed in
+the buffer cache, it's a new block that was never accessed before, so it
+just returns 00s.
+When a ramdisk is mounted as root, the image is loaded into the ramdisk at
+boot-time via direct device IO, which creates buffer cache entries, but not
+page cache entries.
+File IO reads then check the page cache, which keeps its data in the buffer
+cache, but is searched in a separate hash.  If the data wasn't written via
+file IO, it will miss in the page cache search and issue a read request
+directly to the device.  The ramdisk thinks it missed in the buffer cache,
+so it returns 00s.  This results in 2 separate buffers for the same block on
+the ramdisk, only one of which has a page cache entry.  Because of the way
+the ramdisk works, the second copy is wrong (filled with 00s).
+This problem could affect any other device that mixes direct device IO and
+file IO as well, but the consequences are more subtle.  If a buffer cache
+(but not a page cache) entry exists for a particular block of a device, then
+a file IO read (or even worse, a write) takes place to that same block, the
+read will miss in the page cache and create new buffers.  For any device
+other than ramdisk, the new buffers will be filled from the physical device
+itself, so the data at least has a good chance of being valid.  You still
+wind up with 2 separate buffers claiming to represent the same block on the
+device, not a good thing.  Aside from the inefficiency (both space and
+speed), if those 2 buffers ever get to hold different versions of the data
+(which I assume would happen if a write takes place to that block), you've
+got big big trouble.
+Some possible solutions:  The obvious answer to the ramdisk problem would
+seem to be having it store its data in the page cache, but that would
+probably result in throwing out many of the advantages of the current
+ramdisk implementation (which is simple, efficient, and clean), and also
+wouldn't do anything about the broader problem.  I don't like this approach
+because I think the problem is with the page cache implementation, not with
+the ramdisk implementation.
+On the broader problem, I don't see any alternative to either checking the
+buffer cache on page cache misses, or fundamentally changing either the
+buffer cache or page cache implementations.  If the buffer cache is checked
+on page cache misses, what to do if a block hits in the buffer cache, but
+not the page cache, is a fuzzier issue.  Should the old buffer be flushed
+and invalidated, then a new buffer created and filled from the device?  That
+seems unnecessarily inefficient, and would still leave the current ramdisk
+broken.  Should the new buffer be filled from the old buffer, then the old
+buffer invalidated?  Or should the page cache entry be created to use the
+old buffer without moving the data (which is not nearly as simple as it
+sounds)?  Or something I haven't thought of?
+Mike K.
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

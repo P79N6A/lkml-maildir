@@ -1,0 +1,335 @@
+Date: Wed, 8 Dec 1999 18:45:55 +0100 (CET)
+From: Ingo Molnar <>
+Subject: [patch] fastcall-2.3.31-B3, SYSENTER/SYSEXIT support
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/12/8/90
+
+Linus, Ulrich,
+here is some code so we can argue about real stuff.
+the attached fastcall-2.3.31-B3 patch is a port of my fastcall-2.1.105-B
+patch to pre1-2.3.31, it implements the Intel SYSENTER/SYSEXIT fast system
+call entry points. (porting this to K6/K7 CPUs is not hard)
+(you can find the original 1+ years old fastcall-2.1.105-B patch under
+http://www.uwsg.indiana.edu/hypermail/linux/kernel/9806.1/0878.html
+ -
+hypermail indexing got my name wrong.)
+the patch fixes a couple of problems in fastcall-2.1.105-B, and should be
+a 'complete' implementation, all system calls under all circumstances
+should work. It's been tested on SMP.
+i've also attached a small testing program:
+moon:~/fastcall> ./fastcall
+(INT $0x80 based getpid(), got pid 900) latency:296 cycles
+(SYSENTER  based getpid(), got pid 900) latency:126 cycles
+so the null-syscall latency speedup is ~135%!
+the patch aims to handle all the boundary cases, ie. CPUs without
+SYSENTER/SYSEXIT will work just fine (because the system call entry path
+is completely split). User-space is not trusted to put a valid value into
+%%ebp either, full exception handling all along the way.
+*NOTE*. Although the patch does reload an MSR in switch_to(),
+context-switch times do not get slower. Think about it.
+suggestion: since we can control all the fastcall stubs on the glibc side,
+i'd like to implement a different approach for 5 and 6-parameter system
+calls. Only a minority of system calls has so many arguments, and those
+can take some overhead anyway (since they are complex, obviously). The
+solution would be to wrap all >4 parameter system calls into a special
+4-parameter setup, where the 4th parameter points to an on-stack array of
+2 or 3 additional parameters, which would be fetched (in a safe manner) by
+arch/i386 and the generic system calls would be called with 5 or 6
+parameters. This would speed up fast system calls by an additional 5%.
+This means that the syscall table has to be split between fast and 'slow'
+system calls - this is not a problem i believe, only one table will be
+active for any given running kernel, so it's not a cache footprint
+problem. If there are no conceptual objections, then i'd like to start
+implementing this ASAP.
+comments, flames, suggestions, bug/success reports welcome.
+-- mingo
+--- linux/include/asm-i386/processor.h.orig	Wed Dec  8 07:52:38 1999
++++ linux/include/asm-i386/processor.h	Wed Dec  8 07:54:16 1999
+@@ -115,6 +115,8 @@
+ 		(boot_cpu_data.x86_capability & X86_FEATURE_PAE)
+ #define cpu_has_tsc \
+ 		(cpu_data[smp_processor_id()].x86_capability & X86_FEATURE_TSC)
++#define cpu_has_fastsys \
++		(boot_cpu_data.x86_capability & X86_FEATURE_SEP)
+ 
+ extern char ignore_irq13;
+ 
+--- linux/arch/i386/kernel/process.c.orig	Wed Dec  8 08:00:45 1999
++++ linux/arch/i386/kernel/process.c	Wed Dec  8 08:12:05 1999
+@@ -547,6 +547,10 @@
+ 			: /* no output */ \
+ 			:"r" (thread->debugreg[register]))
+ 
++#define LOAD_FASTSYS(p) \
++__asm__ __volatile__("wrmsr" : : \
++       "c" (0x175), "a" ((int)(p) + 2*PAGE_SIZE), "d" (0))
++
+ /*
+  *	switch_to(x,yn) should switch tasks from x to y.
+  *
+@@ -579,6 +583,7 @@
+ 
+ 	unlazy_fpu(prev_p);
+ 
++	LOAD_FASTSYS(next_p);
+ 	/*
+ 	 * Reload esp0, LDT and the page table pointer:
+ 	 */
+--- linux/arch/i386/kernel/entry.S.orig	Wed Dec  8 05:54:22 1999
++++ linux/arch/i386/kernel/entry.S	Wed Dec  8 08:30:34 1999
+@@ -2,6 +2,8 @@
+  *  linux/arch/i386/entry.S
+  *
+  *  Copyright (C) 1991, 1992  Linus Torvalds
++ *
++ *  implemented fast system call support, Ingo Molnar <mingo@redhat.com>
+  */
+ 
+ /*
+@@ -45,6 +47,7 @@
+ #include <asm/segment.h>
+ #define ASSEMBLY
+ #include <asm/smp.h>
++#include <asm/page.h>
+ 
+ EBX		= 0x00
+ ECX		= 0x04
+@@ -95,7 +98,7 @@
+ 	movl %dx,%ds; \
+ 	movl %dx,%es;
+ 
+-#define RESTORE_ALL	\
++#define RESTORE_ALL_REGS\
+ 	popl %ebx;	\
+ 	popl %ecx;	\
+ 	popl %edx;	\
+@@ -106,12 +109,40 @@
+ 1:	popl %ds;	\
+ 2:	popl %es;	\
+ 	addl $4,%esp;	\
+-3:	iret;		\
+ .section .fixup,"ax";	\
+ 4:	movl $0,(%esp);	\
+ 	jmp 1b;		\
+ 5:	movl $0,(%esp);	\
+ 	jmp 2b;		\
++.previous;		\
++.section __ex_table,"a";\
++	.align 4;	\
++	.long 1b,4b;	\
++	.long 2b,5b;	\
++.previous;
++
++#define RESTORE_ALL \
++	RESTORE_ALL_REGS \
++3:	iret;		\
++.section .fixup,"ax";	\
++6:	pushl %ss;	\
++	popl %ds;	\
++	pushl %ss;	\
++	popl %es;	\
++	pushl $11;	\
++	call do_exit;	\
++.previous;		\
++.section __ex_table,"a";\
++	.align 4;	\
++	.long 3b,6b;	\
++.previous
++
++#define RESTORE_ALL_FASTSYS \
++	RESTORE_ALL_REGS \
++	movl %ebp, %ecx; \
++3:	movl (%ebp), %edx; \
++	.byte 0x0f, 0x35; \
++.section .fixup,"ax";	\
+ 6:	pushl %ss;	\
+ 	popl %ds;	\
+ 	pushl %ss;	\
+@@ -121,15 +152,111 @@
+ .previous;		\
+ .section __ex_table,"a";\
+ 	.align 4;	\
+-	.long 1b,4b;	\
+-	.long 2b,5b;	\
+ 	.long 3b,6b;	\
+ .previous
+ 
++
+ #define GET_CURRENT(reg) \
+ 	movl %esp, reg; \
+ 	andl $-8192, reg;
+ 
++ENTRY(fast_system_call)
++
++/*
++ * %ebp has the caller's stack, first entry on the stack is the
++ * return eip ... a bit ugly but we have to do it this way due
++ * to the (only?) 5 parameter system call select().
++ *
++ * alternatively, if we could restrict all x86 system calls to be
++ * 4-parameter only, and send 5-6 parameter system calls through
++ * special stubs which fetch additional parameters from the stack,
++ * then we could further speed up the common path.
++ */
++
++	sti				# ugh! SYSENTER disables IRQs
++
++	pushl %eax			# save orig_eax
++	SAVE_ALL
++
++	/*
++	 * Kernel-space will hopefully not do a fastcall directly
++	 */
++	cmpl $__PAGE_OFFSET, %ebp
++	jl 2f
++1:	cli
++	jmp 1b
++2:
++
++	#
++	# validate the user provided return stack-pointer and EIP
++	# _before_ we execute the system call.
++	#
++
++	GET_CURRENT(%ebx)
++	cmpl  $(NR_syscalls),%eax
++	jae   badfastsys
++	testb $0x20,flags(%ebx)		# PF_TRACESYS
++	jne tracefastsys
++	call *SYMBOL_NAME(sys_call_table)(,%eax,4)
++	movl %eax,EAX(%esp)		# save the return value
++	ALIGN
++	.globl ret_from_fastsys_call
++ret_from_fastsys_call:
++	movl SYMBOL_NAME(bh_mask),%eax
++	andl SYMBOL_NAME(bh_active),%eax
++	jne handle_bottom_half_fastsys
++ret_with_reschedule_fastsys:
++	cmpl $0,need_resched(%ebx)
++	jne reschedule_fastsys
++	cmpl $0,sigpending(%ebx)
++	jne signal_return_fastsys
++restore_all_fastsys:
++	RESTORE_ALL_FASTSYS
++
++	ALIGN
++handle_bottom_half_fastsys:
++	call SYMBOL_NAME(do_bottom_half)
++	jmp ret_with_reschedule_fastsys;
++
++	ALIGN
++reschedule_fastsys:
++	call SYMBOL_NAME(schedule)
++	jmp ret_with_reschedule_fastsys;
++
++signal_return_fastsys:
++	sti				# we can get here from an interrupt handler
++	testl $(VM_MASK),EFLAGS(%esp)
++	movl %esp,%eax
++	jne v86_signal_return_fastsys
++	xorl %edx,%edx
++	call SYMBOL_NAME(do_signal)
++	jmp restore_all_fastsys
++
++	ALIGN
++v86_signal_return_fastsys:
++	call SYMBOL_NAME(save_v86_state)
++	movl %eax,%esp
++	xorl %edx,%edx
++	call SYMBOL_NAME(do_signal)
++	jmp restore_all_fastsys
++
++tracefastsys:
++	movl $-ENOSYS,EAX(%esp)
++	call SYMBOL_NAME(syscall_trace)
++	movl ORIG_EAX(%esp),%eax
++	cmpl $(NR_syscalls),%eax
++	jae tracefastsys_exit
++	call *SYMBOL_NAME(sys_call_table)(,%eax,4)
++	movl %eax,EAX(%esp)		# save the return value
++tracefastsys_exit:
++	call SYMBOL_NAME(syscall_trace)
++	jmp ret_from_fastsys_call
++badfastsys:
++	movl $-ENOSYS,EAX(%esp)
++	jmp ret_from_fastsys_call
++
++	ALIGN
++
+ ENTRY(lcall7)
+ 	pushfl			# We get a different stack layout with call gates,
+ 	pushl %eax		# which has to be cleaned up later..
+@@ -173,15 +300,14 @@
+ 	jmp ret_from_sys_call
+ 
+ 
+-	ALIGN
+-	.globl	ret_from_fork
+-ret_from_fork:
++ENTRY(ret_from_fork)
+ 	pushl %ebx
+ 	call SYMBOL_NAME(schedule_tail)
+ 	addl $4, %esp
+ 	GET_CURRENT(%ebx)
+ 	jmp	ret_from_sys_call
+ 
++
+ /*
+  * Return to user mode is not as complex as all this looks,
+  * but we want the default path for a system call return to
+@@ -269,7 +395,7 @@
+ 
+ 	ALIGN
+ reschedule:
+-	call SYMBOL_NAME(schedule)    # test
++	call SYMBOL_NAME(schedule)
+ 	jmp ret_from_sys_call
+ 
+ ENTRY(divide_error)
+--- linux/arch/i386/kernel/setup.c.orig	Wed Dec  8 07:55:13 1999
++++ linux/arch/i386/kernel/setup.c	Wed Dec  8 07:59:50 1999
+@@ -1480,6 +1480,24 @@
+ 	return p - buffer;
+ }
+ 
++/*
++ * SYSENTER/SYSEXIT fast system call support on PPro+ CPUs.
++ * K6+ CPUs have this too - only the MSRs differ.
++ *
++ * This functions sets up the MSRs which show the kernel entrypoint
++ * for fast syscalls. See entry.S's fast_system_call for more.
++ */
++static inline void fastsys_init (void)
++{
++	extern char fast_system_call;
++
++	printk("fastsys init on CPU#%d.\n", smp_processor_id());
++
++	wrmsr(0x174, 0x10, 0);
++	wrmsr(0x175, 0, 0);
++	wrmsr(0x176, &fast_system_call, 0);
++}
++
+ int cpus_initialized = 0;
+ unsigned long cpu_initialized = 0;
+ 
+@@ -1489,7 +1507,7 @@
+  * and IDT. We reload them nevertheless, this function acts as a
+  * 'CPU state barrier', nothing should get across.
+  */
+-void cpu_init (void)
++void __init cpu_init (void)
+ {
+ 	int nr = smp_processor_id();
+ 	struct tss_struct * t = &init_tss[nr];
+@@ -1539,4 +1557,7 @@
+ 	current->flags &= ~PF_USEDFPU;
+ 	current->used_math = 0;
+ 	stts();
++
++	if (cpu_has_fastsys)
++		fastsys_init();
+ }[unhandled content-type:application/octet-stream]

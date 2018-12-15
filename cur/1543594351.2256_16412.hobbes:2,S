@@ -1,0 +1,293 @@
+Date: Fri, 15 Jun 2001 16:03:32 -0400 (EDT)
+From:  ddstreet@us ...
+Subject: ps2 keyboard filter hook
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2001/6/15/82
+
+IBM Retail Store Solutions dept has certain PS/2 keyboards which extend the
+standard PS/2 specification in order to support addition hardware built into the
+keyboard (such as a Magnetic Strip Reader, Keylock, Tone generator, extra keys,
+extra LEDs, etc).  This addition hardware behaves in a manner that makes it
+unusable if driven by a standard PS/2 driver (sadly, due to the fact that its
+design is "IP" I can't elaborate on how or why it is incompatible with the
+standard PS/2 specification).
+In order to use these keyboards, a the standard PS/2 driver needs to behave a
+bit differently; thus attached is a modifcation to the PS/2 driver which allows
+other drivers to register with the PS/2 driver as 'filters'.  There is a
+arbitrary max number of 'filters' set to 1, which is a compile-time define.
+The registered drivers are called (in order of registration) for every scancode,
+and they may change or consume the scancode (or allow it to pass).  Also the
+'filters' are given a function to send an variable-sized buffer to the keyboard
+output port; this function is synchronized using a semaphore which also
+coordinates with pckbd_leds().
+-Dan
+diff -urN 2.4.5-clean/Documentation/Configure.help linux/Documentation/Configure.help
+--- 2.4.5-clean/Documentation/Configure.help	Thu May 24 18:03:06 2001
++++ linux/Documentation/Configure.help	Fri Jun 15 13:34:18 2001
+@@ -13274,6 +13274,21 @@
+   If you are unsure, say N and read the HOWTO nevertheless: it will
+   tell you what you have.
+ 
++PS/2 Keyboard Filter support
++CONFIG_PC_KEYB_FILTER
++  This enables filter support in the PS/2 keyboard driver.  With
++  this enabled, other drivers will be able to register with the
++  PS/2 driver and filter all incoming scancodes.  This is useful
++  for keyboards which extend the PS/2 keyboard standard with
++  non-standard scancodes which should not be normally routed to
++  the current console.
++
++  This option does not actually filter any scancodes, it only
++  allows other drivers (who will do the filtering) to register
++  with the PS/2 driver.
++
++  If unsure, say N.
++
+ QIC-02 tape support
+ CONFIG_QIC02_TAPE
+   If you have a non-SCSI tape drive like that, say Y. Or, if you want
+diff -urN 2.4.5-clean/drivers/char/Config.in linux/drivers/char/Config.in
+--- 2.4.5-clean/drivers/char/Config.in	Tue Mar  6 22:44:34 2001
++++ linux/drivers/char/Config.in	Fri Jun 15 13:34:18 2001
+@@ -105,6 +105,11 @@
+ 
+ source drivers/char/joystick/Config.in
+ 
++mainmenu_option next_comment
++comment 'Keyboards'
++bool 'PS/2 Keyboard Filter support' CONFIG_PC_KEYB_FILTER
++endmenu
++
+ tristate 'QIC-02 tape support' CONFIG_QIC02_TAPE
+ if [ "$CONFIG_QIC02_TAPE" != "n" ]; then
+    bool '  Do you want runtime configuration for QIC-02' CONFIG_QIC02_DYNCONF
+diff -urN 2.4.5-clean/drivers/char/Makefile linux/drivers/char/Makefile
+--- 2.4.5-clean/drivers/char/Makefile	Wed May 16 13:27:02 2001
++++ linux/drivers/char/Makefile	Fri Jun 15 13:34:18 2001
+@@ -21,7 +21,7 @@
+ # All of the (potential) objects that export symbols.
+ # This list comes from 'grep -l EXPORT_SYMBOL *.[hc]'.
+ 
+-export-objs     :=	busmouse.o console.o keyboard.o sysrq.o \
++export-objs     :=	busmouse.o console.o keyboard.o pc_keyb.o sysrq.o \
+ 			misc.o pty.o random.o selection.o serial.o \
+ 			tty_io.o
+ 
+diff -urN 2.4.5-clean/drivers/char/pc_keyb.c linux/drivers/char/pc_keyb.c
+--- 2.4.5-clean/drivers/char/pc_keyb.c	Fri Apr  6 13:42:55 2001
++++ linux/drivers/char/pc_keyb.c	Fri Jun 15 13:34:18 2001
+@@ -13,6 +13,11 @@
+  * Code fixes to handle mouse ACKs properly.
+  * C. Scott Ananian <cananian@alumni.princeton.edu> 1999-01-29.
+  *
++ * Added optional scancode filtering, used in keyboards which
++ * (incompatibly) extend the standard PS/2 specification.
++ * Also added synchronized output writing using a semaphore.
++ * Dan Streetman <ddstreet@us.ibm.com> 2001-03-14
++ *
+  */
+ 
+ #include <linux/config.h>
+@@ -32,6 +37,7 @@
+ #include <linux/slab.h>
+ #include <linux/kbd_kern.h>
+ #include <linux/smp_lock.h>
++#include <linux/module.h>
+ 
+ #include <asm/keyboard.h>
+ #include <asm/bitops.h>
+@@ -60,6 +66,7 @@
+ 
+ static void kbd_write_command_w(int data);
+ static void kbd_write_output_w(int data);
++static void kb_wait(void);
+ #ifdef CONFIG_PSMOUSE
+ static void aux_write_ack(int val);
+ static void __aux_write_ack(int val);
+@@ -68,7 +75,7 @@
+ static spinlock_t kbd_controller_lock = SPIN_LOCK_UNLOCKED;
+ static unsigned char handle_kbd_event(void);
+ 
+-/* used only by send_data - set by keyboard_interrupt */
++/* used by send_data and send_data_buffer - set by keyboard_interrupt */
+ static volatile unsigned char reply_expected;
+ static volatile unsigned char acknowledge;
+ static volatile unsigned char resend;
+@@ -94,6 +101,104 @@
+ #define MAX_RETRIES	60		/* some aux operations take long time*/
+ #endif /* CONFIG_PSMOUSE */
+ 
++#ifdef CONFIG_PC_KEYB_FILTER
++/* Use an array (instead of a linked list) to save time in_interrupt() */
++static struct pc_keyb_filter *filters[PC_KEYB_MAX_FILTERS];
++static int num_filters = 0;
++
++static DECLARE_MUTEX(kbd_output_sema);
++static spinlock_t pc_keyb_filter_lock = SPIN_LOCK_UNLOCKED;
++
++static int send_data_buffer( unsigned char *buffer, unsigned int len, unsigned int *xferred, unsigned int retries, unsigned int timeout )
++{
++	const unsigned int timeout_jiffies = ( (timeout * HZ) + 999 ) / 1000;
++	int i;
++	unsigned int xfer = 0;
++
++	if (xferred) *xferred = 0;
++
++	if (down_interruptible(&kbd_output_sema))
++		return -EINTR;
++	for (i=0; i<len; i++) {
++		do {
++			timeout = timeout_jiffies;
++			acknowledge = resend = 0;
++			reply_expected = 1;
++			kbd_write_output_w( (int)buffer[i] );
++			while (timeout-- && !resend && !acknowledge) {
++				set_current_state(TASK_INTERRUPTIBLE);
++				if (schedule_timeout(1) && signal_pending(current)) {
++					set_current_state(TASK_RUNNING);
++					up(&kbd_output_sema);
++					return -EINTR;
++				}
++				set_current_state(TASK_RUNNING);
++			}
++#ifdef KBD_REPORT_TIMEOUTS
++			if (0 >= timeout)
++				printk( __FILE__ ": Timeout - AT keyboard not present?\n" );
++#endif
++		} while (retries-- && !acknowledge && resend);
++		if (acknowledge) {
++			xfer++;
++			if (xferred) *xferred = xfer;
++		} else {
++#ifdef KBD_REPORT_TIMEOUTS
++			if (resend)
++				printk( __FILE__ ": Too many NACKs - Noisy keyboard cable?\n" );
++#endif
++			break;
++		}
++	}
++	up(&kbd_output_sema);
++
++	return len == xfer ? 0 : -ETIMEDOUT;
++}
++#endif /* CONFIG_PC_KEYB_FILTER */
++
++int register_pc_keyb_filter( struct pc_keyb_filter *filter )
++{
++#ifdef CONFIG_PC_KEYB_FILTER
++	unsigned long flags;
++	int retval = 0;
++
++	spin_lock_irqsave(&pc_keyb_filter_lock, flags);
++	if (PC_KEYB_MAX_FILTERS > num_filters) {
++		filters[num_filters++] = filter;
++		filter->write_data = send_data_buffer;
++	} else {
++		retval = -EDQUOT;
++	}
++	spin_unlock_irqrestore(&pc_keyb_filter_lock, flags);
++	return retval;
++#else
++	return -ENOSYS;
++#endif
++}
++
++void unregister_pc_keyb_filter( struct pc_keyb_filter *filter )
++{
++#ifdef CONFIG_PC_KEYB_FILTER
++	unsigned long flags;
++	int i, found = 0;
++
++	spin_lock_irqsave(&pc_keyb_filter_lock, flags);
++	filter->write_data = NULL;
++	for (i=0; i<num_filters; i++) {
++		if (filters[i] == filter)
++			found = 1;
++		if (found && i+1<PC_KEYB_MAX_FILTERS)
++			filters[i] = filters[i+1];
++	}
++	if (found)
++		filters[num_filters--] = NULL;
++	spin_unlock_irqrestore(&pc_keyb_filter_lock, flags);
++#endif
++}
++
++EXPORT_SYMBOL(register_pc_keyb_filter);
++EXPORT_SYMBOL(unregister_pc_keyb_filter);
++
+ /*
+  * Wait for keyboard controller input buffer to drain.
+  *
+@@ -428,6 +533,18 @@
+ 
+ static inline void handle_keyboard_event(unsigned char scancode)
+ {
++#ifdef CONFIG_PC_KEYB_FILTER
++	int i;
++
++	spin_lock(&pc_keyb_filter_lock);
++	for (i=0; i<num_filters; i++) {
++		if (filters[i]->filter_scancode( &scancode )) {
++			spin_unlock(&pc_keyb_filter_lock);
++			return;
++		}
++	}
++	spin_unlock(&pc_keyb_filter_lock);
++#endif /* CONFIG_PC_KEYB_FILTER */
+ #ifdef CONFIG_VT
+ 	kbd_exists = 1;
+ 	if (do_acknowledge(scancode))
+@@ -527,10 +644,17 @@
+ 
+ void pckbd_leds(unsigned char leds)
+ {
++#ifdef CONFIG_PC_KEYB_FILTER
++	if (down_interruptible(&kbd_output_sema))
++		return;
++#endif
+ 	if (kbd_exists && (!send_data(KBD_CMD_SET_LEDS) || !send_data(leds))) {
+ 		send_data(KBD_CMD_ENABLE);	/* re-enable kbd if any errors */
+ 		kbd_exists = 0;
+ 	}
++#ifdef CONFIG_PC_KEYB_FILTER
++	up(&kbd_output_sema);
++#endif
+ }
+ 
+ /*
+diff -urN 2.4.5-clean/include/linux/pc_keyb.h linux/include/linux/pc_keyb.h
+--- 2.4.5-clean/include/linux/pc_keyb.h	Mon Oct 11 13:15:40 1999
++++ linux/include/linux/pc_keyb.h	Fri Jun 15 13:34:18 2001
+@@ -6,6 +6,11 @@
+  *	(c) 1997 Martin Mares <mj@atrey.karlin.mff.cuni.cz>
+  */
+ 
++#ifndef __PC_KEYB_H
++#define __PC_KEYB_H
++
++#ifdef __KERNEL__
++
+ /*
+  *	Configuration Switches
+  */
+@@ -128,3 +133,17 @@
+ 	struct fasync_struct *fasync;
+ 	unsigned char buf[AUX_BUF_SIZE];
+ };
++
++#define PC_KEYB_MAX_FILTERS		1
++
++struct pc_keyb_filter {
++	int (*filter_scancode)( unsigned char *scancode );
++	int (*write_data)( unsigned char *data, unsigned int length, unsigned int *xferred, unsigned int retries, unsigned int timeout );
++};
++
++int register_pc_keyb_filter( struct pc_keyb_filter *filter );
++void unregister_pc_keyb_filter( struct pc_keyb_filter *filter );
++
++#endif /* __KERNEL__ */
++
++#endif /* __PC_KEYB_H */

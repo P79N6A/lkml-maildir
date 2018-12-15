@@ -1,0 +1,455 @@
+Date: Mon, 7 Aug 2000 00:58:49 -0700 (PDT)
+From: Dawson Engler <>
+Subject: An assortment of module inc/dec races
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/8/7/19
+
+Hi,
+we have a g++ extension that checks that linux module code follows the
+three rules laid out by Tim & Rusty w.r.t. MOD_INC/MOD_DEC:
+	1. cannot call a sleep function before MOD_INC
+	2. cannot call a sleep function after MOD_DEC
+	3. if you return with an error after MOD_INC, must do a MOD_DEC
+The current functions it thinks can sleep are limited to:
+	- kmalloc(*, GFP_KERNEL)
+	- *_user
+Run on the 2.3.99 kernel it turned up 22 cases that look like bugs (a
+representative subset is enclosed).  If this is something that is useful
+to people, we also did a global analysis using the transitive closure of   
+all functions that could call functions that could sleep.  This turned
+up about 2x more suspicious cases.
+[Thanks to Rusty and Tim for looking these over.]
+Dawson
+-------------------------------------------------------------------------
+CONFIRM
+/u2/engler/ic/linux-2.3.99/drivers/block/lvm.c:1779:lvm_do_vg_create: ERROR: MOD_INC_COUNT after sleep!
+ create
+ */
+int lvm_do_vg_create(int minor, void *arg)
+{
+        int snaporg_minor = 0;
+        ulong l, p;
+        lv_t lv;
+        vg_t *vg_ptr;
+        pv_t *pv_ptr;
+        lv_t *lv_ptr;
+        if (vg[VG_CHR(minor)] != NULL) return -EPERM;
+sleeps
+-->>>   if ((vg_ptr = kmalloc(sizeof(vg_t),GFP_KERNEL)) == NULL) {
+                printk(KERN_CRIT
+                       "%s -- VG_CREATE: kmalloc error VG at line %d\n",
+                       lvm_name, __LINE__);
+                return -ENOMEM;
+        }
+        /* get the volume group structure */
+sleeps
+--->>> if (copy_from_user(vg_ptr, arg, sizeof(vg_t)) != 0) {
+                kfree(vg_ptr);
+                return -EFAULT;
+        }
+...
+        vg_count++;
+        /* let's go active */
+        vg_ptr->vg_status |= VG_ACTIVE;
+---->   MOD_INC_USE_COUNT;
+        return 0;} /* lvm_do_vg_create() */
+-------------------------------------------------------------------------
+UNSURE
+	- On one hand they bail after incremented.  
+	+ On the other hand, they do it after it is busy.
+/u2/engler/ic/linux-2.3.99/drivers/char/ftape/zftape/zftape-init.c:163:zft_open: ERROR: bailing out with an error but not decrementing reference count!
+        MOD_INC_USE_COUNT; /*  sets MOD_VISITED and MOD_USED_ONCE,
+                            *  locking is done with can_unload()
+                            */
+        TRACE(ft_t_flow, "called for minor %d", MINOR(ino->i_rdev));
+        if (busy_flag) {
+                TRACE_ABORT(-EBUSY, ft_t_warn, "failed: already busy");
+        }
+/u2/engler/ic/linux-2.3.99/drivers/char/ftape/zftape/zftape-init.c:151:zft_open: ERROR: bailing out with an error but not decrementing reference count!
+        busy_flag = 1;
+        if ((MINOR(ino->i_rdev) & ~(ZFT_MINOR_OP_MASK | FTAPE_NO_REWIND))
+             >
+            FTAPE_SEL_D) {
+                busy_flag = 0;
+#if defined(MODULE) && LINUX_VERSION_CODE < KERNEL_VER(2,1,18)
+                if (!zft_dirty()) {
+                        MOD_DEC_USE_COUNT; /* unlock module in memory */
+                }
+#endif
+                TRACE_ABORT(-ENXIO, ft_t_err, "failed: illegal unit nr");
+        }
+-------------------------------------------------------------------------
+CONFIRMED (this is a generalized disaster)
+/u2/engler/ic/linux-2.3.99/drivers/char/pcmcia/serial_cb.c:118:serial_attach: ERROR: MOD_INC_COUNT after sleep!
+static dev_node_t *serial_attach(dev_locator_t *loc)
+{
+	...
+    } else {
+--->    dev_node_t *node = kmalloc(sizeof(dev_node_t), GFP_KERNEL);
+        sprintf(node->dev_name, "ttyS%d", line);
+        node->major = TTY_MAJOR; node->minor = 0x40 + line;
+        node->next = NULL;
+-->     MOD_INC_USE_COUNT;
+        return node;
+    }
+}
+-------------------------------------------------------------------------
+CONFIRMED (looks like a general disaster)
+/u2/engler/ic/linux-2.3.99/drivers/char/agp/agpgart_fe.c:729:agp_open: ERROR: MOD_INC_COUNT after sleep!
+static int agp_open(struct inode *inode, struct file *file)
+{
+---->   priv = kmalloc(sizeof(agp_file_private), GFP_KERNEL);
+	...
+        agp_insert_file_private(priv);
+--->    MOD_INC_USE_COUNT;
+        AGP_UNLOCK();
+        return 0;
+}
+-------------------------------------------------------------------------
+CONFIRMED
+/u2/engler/ic/linux-2.3.99/drivers/net/irda/irtty.c:260:irtty_open: ERROR: MOD_INC_COUNT after sleep!
+static int irtty_open(struct tty_struct *tty)
+{
+        struct net_device *dev;
+        struct irtty_cb *self;
+        char name[16];
+        int err;
+        ASSERT(tty != NULL, return -EEXIST;);
+        /* First make sure we're not already connected. */
+        self = (struct irtty_cb *) tty->disc_data;
+        if (self != NULL && self->magic == IRTTY_MAGIC)
+                return -EEXIST;
+        /*
+         *  Allocate new instance of the driver
+         */
+        self = kmalloc(sizeof(struct irtty_cb), GFP_KERNEL);
+...
+        MOD_INC_USE_COUNT;
+        return 0;
+}
+-------------------------------------------------------------------------
+CONFIRMED (sure looks like it)
+/u2/engler/ic/linux-2.3.99/drivers/net/tokenring/lanstreamer.c:736:streamer_open: ERROR: MOD_INC_COUNT after sleep!
+        /* setup rx descriptors */
+        streamer_priv->streamer_rx_ring=
+            kmalloc( sizeof(struct streamer_rx_desc)*
+                     STREAMER_RX_RING_SIZE,GFP_KERNEL);
+...
+        MOD_INC_USE_COUNT;
+        return 0;
+}
+-------------------------------------------------------------------------
+CONFIRMED (pretty clear)
+/u2/engler/ic/linux-2.3.99/drivers/sound/i810_audio.c:1547:i810_open: ERROR: MOD_INC_COUNT after sleep!
+static int i810_open(struct inode *inode, struct file *file)
+{
+        int i = 0;
+        int minor = MINOR(inode->i_rdev);
+        struct i810_card *card = devs;
+        struct i810_state *state = NULL;
+        struct dmabuf *dmabuf = NULL;
+        /* find an avaiable virtual channel (instance of /dev/dsp) */
+        while (card != NULL) {
+                for (i = 0; i < NR_HW_CH; i++) {
+                        if (card->states[i] == NULL) {
+                                state = card->states[i] = (struct i810_state *)
+---->                               kmalloc(sizeof(struct i810_state), GFP_KERNEL);
+                                if (state == NULL)
+                                        return -ENOMEM;
+                                memset(state, 0, sizeof(struct i810_state));
+                                dmabuf = &state->dmabuf;
+                                goto found_virt;
+                        }
+                }
+                card = card->next;
+        }
+	...
+--->    MOD_INC_USE_COUNT;
+        return 0;
+}
+-------------------------------------------------------------------------
+CONFIRMED (looks like cut and paste)
+/u2/engler/ic/linux-2.3.99/drivers/sound/trident.c:1957:trident_open: ERROR: MOD_INC_COUNT after sleep!
+static int trident_open(struct inode *inode, struct file *file)
+{
+        int i = 0;
+        int minor = MINOR(inode->i_rdev);
+        struct trident_card *card = devs;
+        struct trident_state *state = NULL;
+        struct dmabuf *dmabuf = NULL;
+        /* find an avaiable virtual channel (instance of /dev/dsp) */
+        while (card != NULL) {
+                for (i = 0; i < NR_HW_CH; i++) {
+                        if (card->states[i] == NULL) {
+                             state = card->states[i] = (struct trident_state *)
+---->                        kmalloc(sizeof(struct trident_state), GFP_KERNEL);
+	...
+        MOD_INC_USE_COUNT;
+        return 0;
+}
+-------------------------------------------------------------------------
+CONFIRMED (looks like it)
+/u2/engler/ic/linux-2.3.99/drivers/pcmcia/cb_enabler.c:135:cb_attach: ERROR: MOD_INC_COUNT after sleep!
+struct dev_link_t *cb_attach(int n)
+{
+    client_reg_t client_reg;
+    dev_link_t *link;
+    int ret;
+    DEBUG(0, "cb_attach(%d)\n", n);
+    link = kmalloc(sizeof(struct dev_link_t), GFP_KERNEL);
+    if (!link) return NULL;
+    MOD_INC_USE_COUNT;
+-------------------------------------------------------------------------
+CONFIRMED (looks like it)
+/u2/engler/ic/linux-2.3.99/drivers/pcmcia/ds.c:564:ds_open: ERROR: MOD_INC_COUNT after sleep!
+static int ds_open(struct inode *inode, struct file *file)
+{
+    socket_t i = MINOR(inode->i_rdev);
+    socket_info_t *s;
+    user_info_t *user;
+    DEBUG(0, "ds_open(socket %d)\n", i);
+    if ((i >= sockets) || (sockets == 0))
+        return -ENODEV;
+    s = &socket_table[i];
+    if ((file->f_flags & O_ACCMODE) != O_RDONLY) {
+        if (s->state & SOCKET_BUSY)
+            return -EBUSY;
+        else
+            s->state |= SOCKET_BUSY;
+    }
+    user = kmalloc(sizeof(user_info_t), GFP_KERNEL);
+    if (!user) return -ENOMEM;    
+    MOD_INC_USE_COUNT;
+    user->event_tail = user->event_head = 0;
+-------------------------------------------------------------------------
+UNSURE (have no idea)
+/u2/engler/ic/linux-2.3.99/drivers/video/matrox/matroxfb_crtc2.c:258:matroxfb_dh_open: ERROR: bailing out with an error but not decrementing reference count!
+static int matroxfb_dh_open(struct fb_info* info, int user) {
+#define m2info ((struct matroxfb_dh_fb_info*)info)
+        struct matrox_fb_info* minfo = m2info->primary_dev;
+        MOD_INC_USE_COUNT;
+        if (minfo) {
+                if (ACCESS_FBINFO(dead)) {                        
+			return -ENXIO;
+                }        
+	}
+        return 0;
+#undef m2info
+}
+-------------------------------------------------------------------------
+CONFIRMED
+/u2/engler/ic/linux-2.3.99/drivers/usb/dc2xx.c:289:camera_open: ERROR: MOD_INC_COUNT after sleep!
+static int camera_open (struct inode *inode, struct file *file)
+{
+        struct camera_state     *camera;
+        int                     subminor;
+        subminor = MINOR (inode->i_rdev) - USB_CAMERA_MINOR_BASE;
+        if (subminor < 0 || subminor >= MAX_CAMERAS
+                        || !(camera = minor_data [subminor])) {
+                return -ENODEV;
+        }
+        if (!(camera->buf = (char *) kmalloc (MAX_PACKET_SIZE, GFP_KERNEL))) {
+                return -ENOMEM;
+        }
+        dbg ("open");
+        /* Keep driver from being unloaded while it's in use */        MOD_INC_USE_COUNT;
+        camera->isActive = 0;
+        file->private_data = camera;
+        return 0;
+}
+-------------------------------------------------------------------------
+CONFIRMED
+/u2/engler/ic/linux-2.3.99/drivers/usb/ibmcam.c:2430:ibmcam_open: ERROR: MOD_INC_COUNT after sleep!
+static int ibmcam_open(struct video_device *dev, int flags)
+{
+        struct usb_ibmcam *ibmcam = (struct usb_ibmcam *)dev;
+        const int sb_size = FRAMES_PER_DESC * ibmcam->iso_packet_len;
+        int i, err = 0;
+        down(&ibmcam->lock);
+        if (ibmcam->user)
+                err = -EBUSY;
+        else {
+                /* Clean pointers so we know if we allocated something */
+                for (i=0; i < IBMCAM_NUMSBUF; i++)
+                        ibmcam->sbuf[i].data = NULL;
+                /* Allocate memory for the frame buffers */
+                ibmcam->fbuf_size = IBMCAM_NUMFRAMES * MAX_FRAME_SIZE;
+                ibmcam->fbuf = rvmalloc(ibmcam->fbuf_size);
+----->          ibmcam->scratch = kmalloc(scratchbufsize, GFP_KERNEL);
+                ibmcam->scratchlen = 0;
+	....
+---->                        MOD_INC_USE_COUNT;
+-------------------------------------------------------------------------
+CONFIRMED
+/u2/engler/ic/linux-2.3.99/drivers/usb/ov511.c:1397:ov511_open: ERROR: MOD_INC_COUNT after sleep!
+/* Video 4 Linux API */
+static int ov511_open(struct video_device *dev, int flags)
+{
+	...
+        ov511->sbuf[0].data = kmalloc(FRAMES_PER_DESC * MAX_FRAME_SIZE_PER_DESC, GFP_KERNEL);
+	...
+        MOD_INC_USE_COUNT;
+        return 0;
+-------------------------------------------------------------------------
+CONFIRMED
+/u2/engler/ic/linux-2.3.99/drivers/usb/plusb.c:554:plusb_probe: ERROR: MOD_INC_COUNT after sleep!
+static void *plusb_probe (struct usb_device *usbdev, unsigned int ifnum)
+{
+	...
+        if(!s->net_dev.name) {
+                s->net_dev.name=kmalloc(16, GFP_KERNEL);
+	...
+        info("bound to interface: %d dev: %p", ifnum, usbdev);
+        MOD_INC_USE_COUNT;
+        return s;
+}
+-------------------------------------------------------------------------
+CONFIRMED
+/u2/engler/ic/linux-2.3.99/drivers/usb/uss720.c:606:uss720_probe: ERROR: MOD_INC_COUNT after sleep!
+static void * uss720_probe(struct usb_device *usbdev, unsigned int ifnum)
+{
+	...
+        if (!(priv = kmalloc(sizeof(struct parport_uss720_private), GFP_KERNEL))
+	...
+        MOD_INC_USE_COUNT;
+        return pp;
+-------------------------------------------------------------------------
+CONFIRMED
+/u2/engler/ic/linux-2.3.99/drivers/i2o/i2o_config.c:843:cfg_open: ERROR: MOD_INC_COUNT after sleep!
+static int cfg_open(struct inode *inode, struct file *file)
+{
+        struct i2o_cfg_info *tmp =
+                (struct i2o_cfg_info *)kmalloc(sizeof(struct i2o_cfg_info), GFP_KERNEL);
+        unsigned int flags;
+        if(!tmp)                return -ENOMEM;
+	...
+        MOD_INC_USE_COUNT;
+        return 0;}
+--------------------------------------------------------------------------
+/u2/engler/ic/linux-2.3.99/drivers/ieee1394/raw1394.c:846:dev_open: ERROR: MOD_INC_COUNT after sleep!
+static int dev_open(struct inode *inode, struct file *file)
+{
+        struct file_info *fi;
+        if (MINOR(inode->i_rdev)) {                
+		return -ENXIO;
+        }
+        fi = kmalloc(sizeof(struct file_info), SLAB_KERNEL);        
+	if (fi == NULL) {
+                return -ENOMEM;        
+	}
+        memset(fi, 0, sizeof(struct file_info));
+        INIT_LIST_HEAD(&fi->list);
+        fi->state = opened;
+        INIT_LIST_HEAD(&fi->req_pending);
+        INIT_LIST_HEAD(&fi->req_complete);
+        sema_init(&fi->complete_sem, 0);
+        spin_lock_init(&fi->reqlists_lock);
+        init_waitqueue_head(&fi->poll_wait_complete);
+        file->private_data = fi;
+        MOD_INC_USE_COUNT;
+        return 0;
+}
+--------------------------------------------------------------------------
+CONFIRMED
+/u2/engler/ic/linux-2.3.99/drivers/atm/atmtcp.c:340:atmtcp_create: ERROR: MOD_INC_COUNT after sleep!
+static int atmtcp_create(int itf,int persist,struct atm_dev **result){        
+	struct atmtcp_dev_data *dev_data;
+        struct atm_dev *dev;
+        dev_data = kmalloc(sizeof(*dev_data),GFP_KERNEL);        
+	if (!dev_data) return -ENOMEM;
+        dev = atm_dev_register(DEV_LABEL,&atmtcp_v_dev_ops,itf,NULL);        
+	if (!dev) {
+                kfree(dev_data);
+                return itf == -1 ? -ENOMEM : -EBUSY;        
+	}
+        MOD_INC_USE_COUNT;
+----------------------------------------------------------------------
+CONFIRMED
+/u2/engler/ic/linux-2.3.99/drivers/atm/eni.c:2268:eni_init_one: ERROR: MOD_INC_COUNT after sleep!
+static int 
+__devinit eni_init_one(struct pci_dev *pci_dev, const struct pci_device_id *ent)
+{        
+	struct atm_dev *dev;
+        struct eni_dev *eni_dev;        int error = -ENOMEM;
+        DPRINTK("eni_init_one\n");
+        eni_dev = (struct eni_dev *) kmalloc(sizeof(struct eni_dev),GFP_KERNEL);
+	...
+        MOD_INC_USE_COUNT; /* @@@ we don't support unloading yet */        
+	return 0;
+----------------------------------------------------------------------
+CONFIRMED
+/u2/engler/ic/linux-2.3.99/drivers/atm/nicstar.c:889:ns_init_card: ERROR: MOD_INC_COUNT after sleep!
+static int ns_init_card(int i, struct pci_dev *pcidev)
+{
+   int j;
+	... < many many allocates >
+   {
+      struct sk_buff *iovb;
+      iovb = alloc_skb(NS_IOVBUFSIZE, GFP_KERNEL);
+      if (iovb == NULL)
+      {
+         printk("nicstar%d: can't allocate %dth of %d iovec buffers.\n",
+                i, j, NUM_IOVB);
+         error = 16;
+         ns_init_card_error(card, error);
+         return error;
+      }
+      skb_queue_tail(&card->iovpool.queue, iovb);
+      card->iovpool.count++;
+   }
+	...
+      MOD_INC_USE_COUNT;      
+      /* Can't remove the nicstar driver or the suni driver would oops */
+#endif /* MODULE */
+---------------------------------------------------------------------------
+CONFIRMED
+/u2/engler/ic/linux-2.3.99/drivers/i2c/i2c-dev.c:377:i2cdev_open: ERROR: MOD_INC_COUNT after sleep!
+int i2cdev_open (struct inode *inode, struct file *file)
+{
+	...
+        /* Note that we here allocate a client for later use, but we will *not*
+           register this client! Yes, this is safe. No, it is not very clean. */
+        if(! (client = kmalloc(sizeof(struct i2c_client),GFP_KERNEL)))
+                return -ENOMEM;
+	...
+        MOD_INC_USE_COUNT;
+-------------------------------------------------------------------------
+CONFIRMED
+/u2/engler/ic/linux-2.3.99/net/sched/sch_dsmark.c:347:dsmark_init: ERROR: MOD_INC_COUNT after sleep!
+int dsmark_init(struct Qdisc *sch,struct rtattr *opt)
+{
+	...
+        p->set_tc_index = !!tb[TCA_DSMARK_SET_TC_INDEX-1];
+        p->mask = kmalloc(p->indices*2,GFP_KERNEL);
+	...
+        MOD_INC_USE_COUNT;
+        return 0;
+}
+----------------------------------------------------------------------------
+CONFIRMED
+/u2/engler/ic/linux-2.3.99/net/appletalk/ddp.c:365:atif_add_device: ERROR: MOD_INC_COUNT after sleep!
+static struct atalk_iface *atif_add_device(struct net_device *dev, struct at_addr *sa)
+{
+        struct atalk_iface *iface = (struct atalk_iface *)
+                kmalloc(sizeof(*iface), GFP_KERNEL);
+        if (iface == NULL)
+                return NULL;
+        iface->dev = dev;
+        dev->atalk_ptr = iface;
+        iface->address = *sa;
+        iface->status = 0;
+        spin_lock_bh(&atalk_iface_lock);        iface->next = atalk_iface_list;
+        atalk_iface_list = iface;
+        spin_unlock_bh(&atalk_iface_lock);
+        MOD_INC_USE_COUNT;
+        return iface;
+}
+----------------------------------------------------------------------------
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

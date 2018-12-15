@@ -1,0 +1,219 @@
+Date: Tue, 29 Dec 1998 00:46:17 -0500 (EST)
+From: Alexander Viro <>
+Subject: [PATCH] plip breakage (Re: Linux-2.2.0 (pre1))
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1998/12/29/24
+
+On Mon, 28 Dec 1998, Linus Torvalds wrote:
+> 
+> 
+> On Mon, 28 Dec 1998, Alan Cox wrote:
+> > >  we're in the pre-2.2.0 series now, I'm all synched up with Alan, and I
+> > > don't have anything pending any more. Over the internet nobody can hear
+> > 
+> > Almost ;) 100,000fd's and vma patch short. To follow once I can seperate them
+> > from the other -ac stuff. 
+> 
+> The multi-fd patch wasn't stable the last I heard - unless the multi-fd
+> patch has magically stabilized since, it's not 2.2.0 material. 
+> 
+> The vma one I just forgot about.
+> 
+> 		Linus
+	Linus, PLIP got broken by changes in enable/disable_irq. Driver
+assumed that disable_irq() is idempotent. Well, since '132 it isn't.
+Result: any dropped package => disabled IRQ => no incoming traffic
+accepted. Reproducible within 5 seconds of pingflood from K5-75 to 486DX2.
+Or just several minutes of normal traffic. I've finally written the darn
+finite automate down and rebalanced disable_irq()/enable_irq() stuff ;-/
+It seems to be OK now (compiles, works, doesn't hang, survives *bad*
+loads and I don't see any holes in the correctness proof).
+	I'm afraid that we'll have to check quite a few drivers and it's
+not going to be a pleasant work ;-<<<
+	Patch for PLIP follows. Could you apply it?
+							TIA,
+								Al
+diff -urN linux.vanilla/drivers/net/plip.c linux.bird/drivers/net/plip.c
+--- linux.vanilla/drivers/net/plip.c	Fri Nov 13 18:01:56 1998
++++ linux.bird/drivers/net/plip.c	Mon Dec 28 21:52:33 1998
+@@ -21,6 +21,10 @@
+  *		  - Make sure other end is OK, before sending a packet.
+  *		  - Fix immediate timer problem.
+  *
++ *		Al Viro
++ *		  - Changed {enable,disable}_irq handling to make it work
++ *		    with new ("stack") semantics.
++ *
+  *		This program is free software; you can redistribute it and/or
+  *		modify it under the terms of the GNU General Public License
+  *		as published by the Free Software Foundation; either version
+@@ -120,6 +124,9 @@
+ #endif
+ static unsigned int net_debug = NET_DEBUG;
+ 
++#define ENABLE(irq) enable_irq(irq)
++#define DISABLE(irq) disable_irq(irq)
++
+ /* In micro second */
+ #define PLIP_DELAY_UNIT		   1
+ 
+@@ -333,6 +340,7 @@
+ #define OK        0
+ #define TIMEOUT   1
+ #define ERROR     2
++#define HS_TIMEOUT	3
+ 
+ typedef int (*plip_func)(struct device *dev, struct net_local *nl,
+ 			 struct plip_local *snd, struct plip_local *rcv);
+@@ -371,13 +379,22 @@
+ 		      int error)
+ {
+ 	unsigned char c0;
++	/*
++	 * This is tricky. If we got here from the beginning of send (either
++	 * with ERROR or HS_TIMEOUT) we have IRQ enabled. Otherwise it's
++	 * already disabled. With the old variant of {enable,disable}_irq()
++	 * extra disable_irq() was a no-op. Now it became mortal - it's
++	 * unbalanced and thus we'll never re-enable IRQ (until rmmod plip,
++	 * that is). So we have to treat HS_TIMEOUT and ERROR from send
++	 * in a special way.
++	 */
+ 
+ 	spin_lock_irq(&nl->lock);
+ 	if (nl->connection == PLIP_CN_SEND) {
+ 
+ 		if (error != ERROR) { /* Timeout */
+ 			nl->timeout_count++;
+-			if ((snd->state == PLIP_PK_TRIGGER
++			if ((error == HS_TIMEOUT
+ 			     && nl->timeout_count <= 10)
+ 			    || nl->timeout_count <= 3) {
+ 				spin_unlock_irq(&nl->lock);
+@@ -387,7 +404,8 @@
+ 			c0 = inb(PAR_STATUS(dev));
+ 			printk(KERN_WARNING "%s: transmit timeout(%d,%02x)\n",
+ 			       dev->name, snd->state, c0);
+-		}
++		} else
++			error = HS_TIMEOUT;
+ 		nl->enet_stats.tx_errors++;
+ 		nl->enet_stats.tx_aborted_errors++;
+ 	} else if (nl->connection == PLIP_CN_RECEIVE) {
+@@ -419,8 +437,10 @@
+ 		snd->skb = NULL;
+ 	}
+ 	spin_unlock_irq(&nl->lock);
+-	disable_irq(dev->irq);
+-	synchronize_irq();
++	if (error == HS_TIMEOUT) {
++		DISABLE(dev->irq);
++		synchronize_irq();
++	}
+ 	outb(PAR_INTR_OFF, PAR_CONTROL(dev));
+ 	dev->tbusy = 1;
+ 	nl->connection = PLIP_CN_ERROR;
+@@ -498,7 +518,7 @@
+ 
+ 	switch (rcv->state) {
+ 	case PLIP_PK_TRIGGER:
+-		disable_irq(dev->irq);
++		DISABLE(dev->irq);
+ 		/* Don't need to synchronize irq, as we can safely ignore it */
+ 		outb(PAR_INTR_OFF, PAR_CONTROL(dev));
+ 		dev->interrupt = 0;
+@@ -518,7 +538,7 @@
+ 				nl->connection = PLIP_CN_SEND;
+ 				queue_task(&nl->deferred, &tq_timer);
+ 				outb(PAR_INTR_ON, PAR_CONTROL(dev));
+-				enable_irq(dev->irq);
++				ENABLE(dev->irq);
+ 				return OK;
+ 			}
+ 		} else {
+@@ -592,13 +612,13 @@
+ 			queue_task(&nl->immediate, &tq_immediate);
+ 			mark_bh(IMMEDIATE_BH);
+ 			outb(PAR_INTR_ON, PAR_CONTROL(dev));
+-			enable_irq(dev->irq);
++			ENABLE(dev->irq);
+ 			return OK;
+ 		} else {
+ 			nl->connection = PLIP_CN_NONE;
+ 			spin_unlock_irq(&nl->lock);
+ 			outb(PAR_INTR_ON, PAR_CONTROL(dev));
+-			enable_irq(dev->irq);
++			ENABLE(dev->irq);
+ 			return OK;
+ 		}
+ 	}
+@@ -674,7 +694,7 @@
+ 	switch (snd->state) {
+ 	case PLIP_PK_TRIGGER:
+ 		if ((inb(PAR_STATUS(dev)) & 0xf8) != 0x80)
+-			return TIMEOUT;
++			return HS_TIMEOUT;
+ 
+ 		/* Trigger remote rx interrupt. */
+ 		outb(0x08, data_addr);
+@@ -691,12 +711,16 @@
+ 			c0 = inb(PAR_STATUS(dev));
+ 			if (c0 & 0x08) {
+ 				spin_unlock_irq(&nl->lock);
+-				disable_irq(dev->irq);
++				DISABLE(dev->irq);
+ 				synchronize_irq();
+ 				if (nl->connection == PLIP_CN_RECEIVE) {
+ 					/* Interrupted.
+ 					   We don't need to enable irq,
+ 					   as it is soon disabled.    */
++					/* Yes, we do. New variant of
++					   {enable,disable}_irq *counts*
++					   them.  -- AV  */
++					ENABLE(dev->irq);
+ 					nl->enet_stats.collisions++;
+ 					return OK;
+ 				}
+@@ -711,7 +735,7 @@
+ 			spin_unlock_irq(&nl->lock);
+ 			if (--cx == 0) {
+ 				outb(0x00, data_addr);
+-				return TIMEOUT;
++				return HS_TIMEOUT;
+ 			}
+ 		}
+ 
+@@ -760,7 +784,7 @@
+ 		nl->is_deferred = 1;
+ 		queue_task(&nl->deferred, &tq_timer);
+ 		outb(PAR_INTR_ON, PAR_CONTROL(dev));
+-		enable_irq(dev->irq);
++		ENABLE(dev->irq);
+ 		return OK;
+ 	}
+ 	return OK;
+@@ -800,7 +824,7 @@
+ 		dev->tbusy = 0;
+ 		dev->interrupt = 0;
+ 		outb(PAR_INTR_ON, PAR_CONTROL(dev));
+-		enable_irq(dev->irq);
++		ENABLE(dev->irq);
+ 		mark_bh(NET_BH);
+ 	} else {
+ 		nl->is_deferred = 1;
+@@ -1000,7 +1024,7 @@
+ 
+ 	dev->tbusy = 1;
+ 	dev->start = 0;
+-	disable_irq(dev->irq);
++	DISABLE(dev->irq);
+ 	synchronize_irq();
+ 
+ #ifdef NOTDEF
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

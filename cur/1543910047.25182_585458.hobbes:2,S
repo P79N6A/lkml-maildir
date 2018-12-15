@@ -1,0 +1,96 @@
+Date: Thu, 16 Aug 2007 18:01:08 -0700
+From: "Paul E. McKenney" <>
+Subject: Re: [PATCH 0/24] make atomic_read() behave consistently across all architectures
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2007/8/16/341
+
+On Fri, Aug 17, 2007 at 07:59:02AM +0800, Herbert Xu wrote:
+> On Thu, Aug 16, 2007 at 09:34:41AM -0700, Paul E. McKenney wrote:
+> >
+> > The compiler can also reorder non-volatile accesses.  For an example
+> > patch that cares about this, please see:
+> > 
+> > 
+http://lkml.org/lkml/2007/8/7/280
+> > 
+> > This patch uses an ORDERED_WRT_IRQ() in rcu_read_lock() and
+> > rcu_read_unlock() to ensure that accesses aren't reordered with respect
+> > to interrupt handlers and NMIs/SMIs running on that same CPU.
+> 
+> Good, finally we have some code to discuss (even though it's
+> not actually in the kernel yet).
+There was some earlier in this thread as well.
+> First of all, I think this illustrates that what you want
+> here has nothing to do with atomic ops.  The ORDERED_WRT_IRQ
+> macro occurs a lot more times in your patch than atomic
+> reads/sets.  So *assuming* that it was necessary at all,
+> then having an ordered variant of the atomic_read/atomic_set
+> ops could do just as well.
+Indeed.  If I could trust atomic_read()/atomic_set() to cause the compiler
+to maintain ordering, then I could just use them instead of having to
+create an  ORDERED_WRT_IRQ().  (Or ACCESS_ONCE(), as it is called in a
+different patch.)
+> However, I still don't know which atomic_read/atomic_set in
+> your patch would be broken if there were no volatile.  Could
+> you please point them out?
+Suppose I tried replacing the ORDERED_WRT_IRQ() calls with
+atomic_read() and atomic_set().  Starting with __rcu_read_lock():
+o	If "ORDERED_WRT_IRQ(__get_cpu_var(rcu_flipctr)[idx])++"
+	was ordered by the compiler after
+	"ORDERED_WRT_IRQ(me->rcu_read_lock_nesting) = nesting + 1", then
+	suppose an NMI/SMI happened after the rcu_read_lock_nesting but
+	before the rcu_flipctr.
+	Then if there was an rcu_read_lock() in the SMI/NMI
+	handler (which is perfectly legal), the nested rcu_read_lock()
+	would believe that it could take the then-clause of the
+	enclosing "if" statement.  But because the rcu_flipctr per-CPU
+	variable had not yet been incremented, an RCU updater would
+	be within its rights to assume that there were no RCU reads
+	in progress, thus possibly yanking a data structure out from
+	under the reader in the SMI/NMI function.
+	Fatal outcome.  Note that only one CPU is involved here
+	because these are all either per-CPU or per-task variables.
+o	If "ORDERED_WRT_IRQ(me->rcu_read_lock_nesting) = nesting + 1"
+	was ordered by the compiler to follow the
+	"ORDERED_WRT_IRQ(me->rcu_flipctr_idx) = idx", and an NMI/SMI
+	happened between the two, then an __rcu_read_lock() in the NMI/SMI
+	would incorrectly take the "else" clause of the enclosing "if"
+	statement.  If some other CPU flipped the rcu_ctrlblk.completed
+	in the meantime, then the __rcu_read_lock() would (correctly)
+	write the new value into rcu_flipctr_idx.
+	Well and good so far.  But the problem arises in
+	__rcu_read_unlock(), which then decrements the wrong counter.
+	Depending on exactly how subsequent events played out, this could
+	result in either prematurely ending grace periods or never-ending
+	grace periods, both of which are fatal outcomes.
+And the following are not needed in the current version of the
+patch, but will be in a future version that either avoids disabling
+irqs or that dispenses with the smp_read_barrier_depends() that I
+have 99% convinced myself is unneeded:
+o	nesting = ORDERED_WRT_IRQ(me->rcu_read_lock_nesting);
+o	idx = ORDERED_WRT_IRQ(rcu_ctrlblk.completed) & 0x1;
+Furthermore, in that future version, irq handlers can cause the same
+mischief that SMI/NMI handlers can in this version.
+Next, looking at __rcu_read_unlock():
+o	If "ORDERED_WRT_IRQ(me->rcu_read_lock_nesting) = nesting - 1"
+	was reordered by the compiler to follow the
+	"ORDERED_WRT_IRQ(__get_cpu_var(rcu_flipctr)[idx])--",
+	then if an NMI/SMI containing an rcu_read_lock() occurs between
+	the two, this nested rcu_read_lock() would incorrectly believe
+	that it was protected by an enclosing RCU read-side critical
+	section as described in the first reversal discussed for
+	__rcu_read_lock() above.  Again, fatal outcome.
+This is what we have now.  It is not hard to imagine situations that
+interact with -both- interrupt handlers -and- other CPUs, as described
+earlier.
+							Thanx, Paul
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+More majordomo info at  
+http://vger.kernel.org/majordomo-info.html
+Please read the FAQ at  
+http://www.tux.org/lkml/

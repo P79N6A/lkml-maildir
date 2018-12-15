@@ -1,0 +1,426 @@
+Date: Wed, 27 Sep 2000 01:29:35 +1100
+From: Andrew Morton <>
+Subject: tty and ldisc module safety
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/9/26/54
+
+Hi, Ted.
+The patch applies the industry-standard `struct module *owner' stuff to
+tty_driver and tty_ldisc (as per the TODO list!).  It also closes the
+schedule()-with-zero-module-refcount hole in release_dev().
+There is still no explanation for Harley Anderson's crash though.
+serial.c and ppp_async.c have been converted so they no longer use
+MOD_INC/DEC_USE_COUNT. This was for testing.  All the other ldisc and
+tty driver modules will show double increments and decrements in `lsmod'
+until they're converted.  This is somewhat of a cosmetic issue, but is
+pretty trivial to fix, apart from retaining 2.2/2.3 compatibility.  It's
+not clear which drivers really, honestly support 2.2, rather than just
+looking like they do.
+I've also snuck a couple of BUG()s into rs_fini.  The kernel is dead
+meat if we hit these paths (the tty_drivers list will point into
+vfree'ed memory), so we may as well catch it earlier.
+I am by no means 100% confident on this one (esp. the hangup()
+paths), so please review carefully.
+--- linux-2.4.0-test9-pre7/include/linux/tty_driver.h	Sat Aug  5 13:35:24 2000
++++ linux-akpm/include/linux/tty_driver.h	Wed Sep 27 00:47:24 2000
+@@ -117,6 +117,15 @@
+ 
+ #include <linux/fs.h>
+ 
++#ifdef CONFIG_MODULES
++#include <linux/module.h>
++struct module;
++#define SET_TTY_OWNER(driver)	\
++	do { (driver)->owner = THIS_MODULE; } while (0)
++#define SET_LDISC_OWNER(ldisc)	\
++	do { (ldisc)->owner = THIS_MODULE; } while (0)
++#endif
++
+ struct tty_driver {
+ 	int	magic;		/* magic number for this structure */
+ 	const char	*driver_name;
+@@ -176,6 +185,9 @@
+ 	 */
+ 	struct tty_driver *next;
+ 	struct tty_driver *prev;
++#ifdef CONFIG_MODULES
++	struct module *owner;
++#endif
+ };
+ 
+ /* tty driver magic number */
+--- linux-2.4.0-test9-pre7/include/linux/tty_ldisc.h	Sat Aug  5 13:35:24 2000
++++ linux-akpm/include/linux/tty_ldisc.h	Wed Sep 27 00:47:24 2000
+@@ -100,6 +100,8 @@
+ #include <linux/fs.h>
+ #include <linux/wait.h>
+ 
++struct module;
++
+ struct tty_ldisc {
+ 	int	magic;
+ 	char	*name;
+@@ -129,6 +131,9 @@
+ 			       char *fp, int count);
+ 	int	(*receive_room)(struct tty_struct *);
+ 	void	(*write_wakeup)(struct tty_struct *);
++#ifdef CONFIG_MODULES
++	struct module *owner;
++#endif
+ };
+ 
+ #define TTY_LDISC_MAGIC	0x5403
+--- linux-2.4.0-test9-pre7/drivers/char/tty_io.c	Tue Sep 26 21:45:30 2000
++++ linux-akpm/drivers/char/tty_io.c	Wed Sep 27 00:21:57 2000
+@@ -183,6 +183,69 @@
+ }
+ 
+ /*
++ * Lock a driver's module into core and increment its low-level refcount.
++ * Return 0 on success.  If we return non-zero then the driver module isn't there
++ * any more and action needs to be taken by the caller
++ */
++static int tty_dev_hold(struct tty_driver *driver)
++{
++#ifdef CONFIG_MODULES
++	if (driver->owner) {
++		if (try_inc_mod_count(driver->owner) == 0)
++			return -ENODEV;	/* Module is deleted */
++	}
++#endif
++	(*driver->refcount)++;
++	return 0;
++}
++
++/*
++ * Release the driver and (possibly) its module
++ */
++static void tty_dev_put(struct tty_driver *driver)
++{
++#ifdef CONFIG_MODULES
++	if (driver->owner)
++		__MOD_DEC_USE_COUNT(driver->owner);
++#endif
++	(*driver->refcount)--;
++}
++
++/*
++ * Lock an ldisc's module into core.  Return non-zero if the
++ * containing module is unusable - remedial action is needed
++ * by the caller
++ */
++static int tty_ldisc_hold(struct tty_ldisc *ldisc)
++{
++#ifdef CONFIG_MODULES
++	if (ldisc->owner) {
++		if (try_inc_mod_count(ldisc->owner) == 0)
++			return -ENODEV;	/* Module is deleted */
++	}
++	return 0;
++#endif
++}
++
++/*
++ * Release an ldisc and (possibly) its module
++ */
++static void tty_ldisc_put(struct tty_ldisc *ldisc)
++{
++#ifdef CONFIG_MODULES
++	if (ldisc->owner) {
++		int uc;
++		__MOD_DEC_USE_COUNT(ldisc->owner);
++		uc = atomic_read(&(ldisc->owner)->uc.usecount);
++		if (uc < 0) {
++			printk("tty_ldisc_put: count=%d.  This is not good\n",
++				atomic_read(&(ldisc->owner)->uc.usecount));
++		}
++	}
++#endif
++}
++
++/*
+  * This routine returns the name of tty.
+  */
+ static char *
+@@ -297,15 +360,24 @@
+ 	if (tty->ldisc.close)
+ 		(tty->ldisc.close)(tty);
+ 
++	/* Don't do tty_ldisc_put(&o_ldisc) - we may need it later */
++
+ 	/* Now set up the new line discipline. */
+ 	tty->ldisc = ldiscs[ldisc];
+ 	tty->termios->c_line = ldisc;
+-	if (tty->ldisc.open)
++
++	retval = tty_ldisc_hold(&tty->ldisc);
++
++	if (retval == 0 && tty->ldisc.open)
+ 		retval = (tty->ldisc.open)(tty);
++
+ 	if (retval < 0) {
++		tty_ldisc_put(&tty->ldisc);
++		tty_ldisc_hold(&o_ldisc);
+ 		tty->ldisc = o_ldisc;
+ 		tty->termios->c_line = tty->ldisc.num;
+ 		if (tty->ldisc.open && (tty->ldisc.open(tty) < 0)) {
++			tty_ldisc_put(&tty->ldisc);
+ 			tty->ldisc = ldiscs[N_TTY];
+ 			tty->termios->c_line = N_TTY;
+ 			if (tty->ldisc.open) {
+@@ -318,6 +390,7 @@
+ 			}
+ 		}
+ 	}
++	tty_ldisc_put(&o_ldisc);	/* Do it now */
+ 	if (tty->ldisc.num != o_ldisc.num && tty->driver.set_ldisc)
+ 		tty->driver.set_ldisc(tty);
+ 	return retval;
+@@ -491,6 +564,7 @@
+ 	if (tty->ldisc.num != ldiscs[N_TTY].num) {
+ 		if (tty->ldisc.close)
+ 			(tty->ldisc.close)(tty);
++		tty_ldisc_put(&tty->ldisc);
+ 		tty->ldisc = ldiscs[N_TTY];
+ 		tty->termios->c_line = N_TTY;
+ 		if (tty->ldisc.open) {
+@@ -905,7 +979,8 @@
+ 			*o_ltp_loc = o_ltp;
+ 		o_tty->termios = *o_tp_loc;
+ 		o_tty->termios_locked = *o_ltp_loc;
+-		(*driver->other->refcount)++;
++		if (tty_dev_hold(driver->other) != 0)
++			goto free_mem_out;
+ 		if (driver->subtype == PTY_TYPE_MASTER)
+ 			o_tty->count++;
+ 
+@@ -914,6 +989,9 @@
+ 		o_tty->link = tty;
+ 	}
+ 
++	if (tty_dev_hold(driver) != 0)
++		goto free_mem_out;
++
+ 	/* 
+ 	 * All structures have been allocated, so now we install them.
+ 	 * Failures after this point use release_mem to clean up, so 
+@@ -927,7 +1005,6 @@
+ 		*ltp_loc = ltp;
+ 	tty->termios = *tp_loc;
+ 	tty->termios_locked = *ltp_loc;
+-	(*driver->refcount)++;
+ 	tty->count++;
+ 
+ 	/* 
+@@ -1024,7 +1101,7 @@
+ 			kfree(tp);
+ 		}
+ 		o_tty->magic = 0;
+-		(*o_tty->driver.refcount)--;
++		tty_dev_put(&o_tty->driver);
+ 		free_tty_struct(o_tty);
+ 	}
+ 
+@@ -1035,7 +1112,7 @@
+ 		kfree(tp);
+ 	}
+ 	tty->magic = 0;
+-	(*tty->driver.refcount)--;
++	tty_dev_put(&tty->driver);
+ 	free_tty_struct(tty);
+ }
+ 
+@@ -1252,11 +1329,13 @@
+ 	 */
+ 	if (tty->ldisc.close)
+ 		(tty->ldisc.close)(tty);
++	tty_ldisc_put(&tty->ldisc);
+ 	tty->ldisc = ldiscs[N_TTY];
+ 	tty->termios->c_line = N_TTY;
+ 	if (o_tty) {
+ 		if (o_tty->ldisc.close)
+ 			(o_tty->ldisc.close)(o_tty);
++		tty_ldisc_put(&o_tty->ldisc);
+ 		o_tty->ldisc = ldiscs[N_TTY];
+ 	}
+ 	
+--- linux-2.4.0-test9-pre7/drivers/char/serial.c	Tue Sep 26 21:45:30 2000
++++ linux-akpm/drivers/char/serial.c	Wed Sep 27 01:02:23 2000
+@@ -212,6 +212,14 @@
+ #include <linux/sysrq.h>
+ #endif
+ 
++#ifdef SET_TTY_OWNER
++#define TTY_MOD_INC do {} while (0)
++#define TTY_MOD_DEC do {} while (0)
++#else
++#define TTY_MOD_INC	MOD_INC_USE_COUNT
++#define TTY_MOD_DEC	MOD_DEC_USE_COUNT
++#endif
++
+ /*
+  * All of the compatibilty code so we can compile serial.c against
+  * older kernels is hidden in serial_compat.h
+@@ -2761,7 +2769,7 @@
+ 	
+ 	if (tty_hung_up_p(filp)) {
+ 		DBG_CNT("before DEC-hung");
+-		MOD_DEC_USE_COUNT;
++		TTY_MOD_DEC;
+ 		restore_flags(flags);
+ 		return;
+ 	}
+@@ -2788,7 +2796,7 @@
+ 	}
+ 	if (state->count) {
+ 		DBG_CNT("before DEC-2");
+-		MOD_DEC_USE_COUNT;
++		TTY_MOD_DEC;
+ 		restore_flags(flags);
+ 		return;
+ 	}
+@@ -2844,7 +2852,7 @@
+ 	info->flags &= ~(ASYNC_NORMAL_ACTIVE|ASYNC_CALLOUT_ACTIVE|
+ 			 ASYNC_CLOSING);
+ 	wake_up_interruptible(&info->close_wait);
+-	MOD_DEC_USE_COUNT;
++	TTY_MOD_DEC;
+ }
+ 
+ /*
+@@ -3128,21 +3136,21 @@
+ 	int 			retval, line;
+ 	unsigned long		page;
+ 
+-	MOD_INC_USE_COUNT;
++	TTY_MOD_INC;
+ 	line = MINOR(tty->device) - tty->driver.minor_start;
+ 	if ((line < 0) || (line >= NR_PORTS)) {
+-		MOD_DEC_USE_COUNT;
++		TTY_MOD_DEC;
+ 		return -ENODEV;
+ 	}
+ 	retval = get_async_struct(line, &info);
+ 	if (retval) {
+-		MOD_DEC_USE_COUNT;
++		TTY_MOD_DEC;
+ 		return retval;
+ 	}
+ 	tty->driver_data = info;
+ 	info->tty = tty;
+ 	if (serial_paranoia_check(info, tty->device, "rs_open")) {
+-		MOD_DEC_USE_COUNT;		
++		TTY_MOD_DEC;		
+ 		return -ENODEV;
+ 	}
+ 
+@@ -3157,7 +3165,7 @@
+ 	if (!tmp_buf) {
+ 		page = get_zeroed_page(GFP_KERNEL);
+ 		if (!page) {
+-			MOD_DEC_USE_COUNT;
++			TTY_MOD_DEC;
+ 			return -ENOMEM;
+ 		}
+ 		if (tmp_buf)
+@@ -3173,7 +3181,7 @@
+ 	    (info->flags & ASYNC_CLOSING)) {
+ 		if (info->flags & ASYNC_CLOSING)
+ 			interruptible_sleep_on(&info->close_wait);
+-		MOD_DEC_USE_COUNT;
++		TTY_MOD_DEC;
+ #ifdef SERIAL_DO_RESTART
+ 		return ((info->flags & ASYNC_HUP_NOTIFY) ?
+ 			-EAGAIN : -ERESTARTSYS);
+@@ -3187,7 +3195,7 @@
+ 	 */
+ 	retval = startup(info);
+ 	if (retval) {
+-		MOD_DEC_USE_COUNT;
++		TTY_MOD_DEC;
+ 		return retval;
+ 	}
+ 
+@@ -3197,7 +3205,7 @@
+ 		printk("rs_open returning after block_til_ready with %d\n",
+ 		       retval);
+ #endif
+-		MOD_DEC_USE_COUNT;
++		TTY_MOD_DEC;
+ 		return retval;
+ 	}
+ 
+@@ -5180,7 +5188,9 @@
+ 	serial_driver.wait_until_sent = rs_wait_until_sent;
+ 	serial_driver.read_proc = rs_read_proc;
+ #endif
+-	
++#ifdef SET_TTY_OWNER
++	SET_TTY_OWNER(&serial_driver);
++#endif
+ 	/*
+ 	 * The callout device is just like normal device except for
+ 	 * major number and the subtype code.
+@@ -5383,12 +5393,16 @@
+ 	del_timer_sync(&serial_timer);
+ 	save_flags(flags); cli();
+         remove_bh(SERIAL_BH);
+-	if ((e1 = tty_unregister_driver(&serial_driver)))
++	if ((e1 = tty_unregister_driver(&serial_driver))) {
+ 		printk("serial: failed to unregister serial driver (%d)\n",
+ 		       e1);
+-	if ((e2 = tty_unregister_driver(&callout_driver)))
++		BUG();
++	}
++	if ((e2 = tty_unregister_driver(&callout_driver))) {
+ 		printk("serial: failed to unregister callout driver (%d)\n", 
+ 		       e2);
++		BUG();
++	}
+ 	restore_flags(flags);
+ 
+ 	for (i = 0; i < NR_PORTS; i++) {
+--- linux-2.4.0-test9-pre7/drivers/net/ppp_async.c	Sat Apr 22 06:31:10 2000
++++ linux-akpm/drivers/net/ppp_async.c	Wed Sep 27 00:21:58 2000
+@@ -119,7 +119,6 @@
+ 	struct asyncppp *ap;
+ 	int err;
+ 
+-	MOD_INC_USE_COUNT;
+ 	err = -ENOMEM;
+ 	ap = kmalloc(sizeof(*ap), GFP_KERNEL);
+ 	if (ap == 0)
+@@ -152,7 +151,6 @@
+  out_free:
+ 	kfree(ap);
+  out:
+-	MOD_DEC_USE_COUNT;
+ 	return err;
+ }
+ 
+@@ -177,7 +175,6 @@
+ 	if (ap->tpkt != 0)
+ 		kfree_skb(ap->tpkt);
+ 	kfree(ap);
+-	MOD_DEC_USE_COUNT;
+ }
+ 
+ /*
+@@ -355,6 +352,9 @@
+ 	receive_room: ppp_asynctty_room,
+ 	receive_buf: ppp_asynctty_receive,
+ 	write_wakeup: ppp_asynctty_wakeup,
++#ifdef CONFIG_MODULES
++	owner: THIS_MODULE,
++#endif
+ };
+ 
+ int
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+Please read the FAQ at 
+http://www.tux.org/lkml/

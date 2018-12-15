@@ -1,0 +1,178 @@
+Date: Sat, 30 Oct 1999 20:02:52 +0200
+From: Jens Axboe <>
+Subject: Re: scsi cdrom panic in 2.3.13+(?) with isa dma [patch]
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/10/30/34
+
+On Sat, Oct 30 1999, Arnd Bergmann wrote:
+> Hi!
+> 
+> I always get a 'Kernel panic: Buffer at physical address > 16Mb 
+> used for aha1542' when accessing my cd-writer as a cd rom drive
+> in the latest 2.3 kernels.
+> Roel Teuwen (Roel.Teuwen@advalvas.be) has reporeted the same 
+> problem some weeks ago.
+> 
+> The problem is that the current sr driver uses transfer buffers 
+> on the stack instead of scsi_malloc()'ed ones like the 2.2.x 
+> driver. This will not work with ISA scsi adaptors using DMA.
+> I wrote a small patch that implements extra buffering in the 
+> same way the sd drivers uses them, which works perfectly for me.
+Yes, that is exactly the problem. This is something I missed
+when I cleaned it up.
+> The patch is attached to this mail and I put it up on
+> 
+http://www.et.fh-osnabrueck.de/~std7652/scsi-dmabuf.patch
+ as 
+> well.
+> 
+> I'm not sure whether I got the spin locks right so this should 
+> be checked before it get included in a main kernel.
+You don't need the spin locks in sr_packet - in fact, there seems
+to be quite a spin lock frenzy going on in the various SCSI
+devices (sr* and sd*). And I don't like the concept of calling
+panic() either, when we can just fail the request gracefully. 
+>      {
+>  	DECLARE_MUTEX_LOCKED(sem);
+>  	SCpnt->request.sem = &sem;
+> +	
+> +	/* use ISA DMA buffer if necessary */
+> +	SCpnt->request.buffer=buffer;
+> +	if (buffer && SCpnt->host->unchecked_isa_dma
+> +	      && (virt_to_phys(buffer) + buflength - 1 > ISA_DMA_THRESHOLD)) {
+> +	    spin_lock_irqsave(&io_request_lock, flags);
+> +	    bounce_buffer=(char *)(scsi_malloc((buflength + 511) & ~511));
+> +	    if (!bounce_buffer)
+> +		panic("SCSI DMA pool exhausted.");
+> +	    memcpy(bounce_buffer,(char *)buffer,buflength);
+> +	    spin_unlock_irqrestore(&io_request_lock, flags);
+> +	    buffer=bounce_buffer;
+> +	}
+> +
+This is inside the retry loop?
+I reworked the patch a bit (and also cleaned up the scsi_do_cmd()
+in sr_ioctl.c) - does this look ok?
+-- 
+*  Jens Axboe <axboe@image.dk>
+*  Linux CD-ROM Maintainer
+*  
+http://www.kernel.dk
+diff -ur scsi/sr.c /usr/src/linux/drivers/scsi/sr.c
+--- scsi/sr.c	Sun Oct 24 14:39:33 1999
++++ /usr/src/linux/drivers/scsi/sr.c	Sat Oct 30 19:57:27 1999
+@@ -1030,6 +1030,8 @@
+ {
+ 	Scsi_Cmnd *SCpnt;
+ 	Scsi_Device *device = scsi_CDs[MINOR(cdi->dev)].device;
++	unsigned char *buffer = cgc->buffer;
++	int buflen;
+ 	int stat;
+ 
+ 	/* get the device */
+@@ -1037,6 +1039,17 @@
+ 	if (SCpnt == NULL)
+ 		return -ENODEV;	/* this just doesn't seem right /axboe */
+ 
++	/* use buffer for ISA DMA */
++	buflen = (cgc->buflen + 511) & ~511;
++	if (cgc->buffer && SCpnt->host->unchecked_isa_dma &&
++    	   (virt_to_phys(cgc->buffer) + cgc->buflen - 1 > ISA_DMA_THRESHOLD)) {
++		if ((buffer = scsi_malloc(buflen)) == NULL) {
++			printk("sr: SCSI DMA pool exhausted.");
++			return -ENOMEM;
++		}
++		memcpy(buffer, cgc->buffer, cgc->buflen);
++	}
++
+ 	/* set the LUN */
+ 	cgc->cmd[1] |= device->lun << 5;
+ 
+@@ -1044,8 +1057,8 @@
+ 	SCpnt->request.rq_dev = cdi->dev;
+ 	/* scsi_do_cmd sets the command length */
+ 	SCpnt->cmd_len = 0;
+-	
+-	scsi_wait_cmd (SCpnt, (void *)cgc->cmd, (void *)cgc->buffer, cgc->buflen,
++
++	scsi_wait_cmd (SCpnt, (void *)cgc->cmd, (void *)buffer, cgc->buflen,
+ 		sr_init_done, SR_TIMEOUT, MAX_RETRIES);
+ 
+ 	stat = SCpnt->result;
+@@ -1054,6 +1067,12 @@
+ 	SCpnt->request.rq_dev = MKDEV(0, 0);
+ 	scsi_release_command(SCpnt);
+ 	SCpnt = NULL;
++
++	/* write DMA buffer back if used */
++	if (buffer && (buffer != cgc->buffer)) {
++		memcpy(cgc->buffer, buffer, cgc->buflen);
++		scsi_free(buffer, buflen);
++	}
+ 
+ 	return stat;
+ }
+diff -ur scsi/sr_ioctl.c /usr/src/linux/drivers/scsi/sr_ioctl.c
+--- scsi/sr_ioctl.c	Mon Oct 11 12:06:45 1999
++++ /usr/src/linux/drivers/scsi/sr_ioctl.c	Sat Oct 30 19:54:26 1999
+@@ -36,6 +36,12 @@
+     
+     req = &SCpnt->request;
+     req->rq_status = RQ_SCSI_DONE; /* Busy, but indicate request done */
++
++    if (SCpnt->buffer && req->buffer && SCpnt->buffer != req->buffer) {
++	memcpy(req->buffer, SCpnt->buffer, SCpnt->bufflen);
++	scsi_free(SCpnt->buffer, (SCpnt->bufflen + 511) & ~511);
++	SCpnt->buffer = req->buffer;
++    } 
+     
+     if (req->sem != NULL) {
+ 	up(req->sem);
+@@ -52,27 +58,33 @@
+     Scsi_Device * SDev;
+     int result, err = 0, retries = 0;
+     unsigned long flags;
++    char * bounce_buffer;
+ 
+     spin_lock_irqsave(&io_request_lock, flags);
+     SDev  = scsi_CDs[target].device;
+     SCpnt = scsi_allocate_device(NULL, scsi_CDs[target].device, 1);
+     spin_unlock_irqrestore(&io_request_lock, flags);
+ 
++    /* use ISA DMA buffer if necessary */
++    SCpnt->request.buffer=buffer;
++    if (buffer && SCpnt->host->unchecked_isa_dma &&
++       (virt_to_phys(buffer) + buflength - 1 > ISA_DMA_THRESHOLD)) {
++	bounce_buffer = (char *)scsi_malloc((buflength + 511) & ~511);
++	if (bounce_buffer == NULL) {
++		printk("SCSI DMA pool exhausted.");
++		return -ENOMEM;
++	}
++	memcpy(bounce_buffer, (char *)buffer, buflength);
++	buffer = bounce_buffer;
++    }
++
+ retry:
+     if( !scsi_block_when_processing_errors(SDev) )
+         return -ENODEV;
+-    {
+-	DECLARE_MUTEX_LOCKED(sem);
+-	SCpnt->request.sem = &sem;
+-	spin_lock_irqsave(&io_request_lock, flags);
+-	scsi_do_cmd(SCpnt,
+-		    (void *) sr_cmd, buffer, buflength, sr_ioctl_done, 
+-		    IOCTL_TIMEOUT, IOCTL_RETRIES);
+-	spin_unlock_irqrestore(&io_request_lock, flags);
+-	down(&sem);
+-        SCpnt->request.sem = NULL;
+-    }
+-    
++
++    scsi_wait_cmd(SCpnt, (void *)sr_cmd, (void *)buffer, buflength,
++		  sr_ioctl_done, IOCTL_TIMEOUT, IOCTL_RETRIES);
++
+     result = SCpnt->result;
+     
+     /* Minimal error checking.  Ignore cases we know about, and report the rest. */

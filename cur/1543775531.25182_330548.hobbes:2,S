@@ -1,0 +1,189 @@
+Date: Fri, 1 Jul 2005 15:33:33 -0500
+From: <>
+Subject: RE: page allocation/attributes question (i386/x86_64 specific)
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2005/7/1/178
+
+> 
+> So, if I understand correctly what's going on in x86_64, your fix
+> wouldn't be applicable to i386.  In x86_64, every large page has a
+> correct "ref_prot" that is the normal setting for that page... but in
+> i386, the kernel text area does not--it should ideally be split into
+> small pages all the time if there are both kernel code & free pages
+> residing in the same 2M area.     
+> 
+> Stuart
+(This isn't a submission--I'm just posting this for comments.)
+Right now, any large page that touches anywhere from PAGE_OFFSET to
+__init_end is initially set up as a large, executable page... but some
+of this area contains data & free pages.  The patch below adds a
+"cleanup_nx_in_kerneltext()" function, called at the end of
+free_initmem(), which changes these pages--except for the range from
+"_text" to "_etext"--to PAGE_KERNEL (i.e., non-executable).
+This does result in two large pages being split up into small PTEs
+permanently, but all the non-code regions will be non-executable, and
+change_page_attr() will work correctly.
+What do you think of this?  I have tested this on 2.6.12.
+(I've attached the patch as a file, too, since my mail server can't be
+convinced to not wrap text.)
+Stuart
+-----
+diff -purN --exclude='*.o' --exclude='*.cmd'
+linux-2.6.12grep/arch/i386/mm/init.c linux-2.6.12/arch/i386/mm/init.c
+--- linux-2.6.12grep/arch/i386/mm/init.c	2005-07-01
+15:09:27.000000000 -0500
++++ linux-2.6.12/arch/i386/mm/init.c	2005-07-01 15:13:06.000000000
+-0500
+@@ -666,6 +666,30 @@ static int noinline do_test_wp_bit(void)
+ 	return flag;
+ }
+ 
++extern int change_page_attr_perm(struct page *, int, pgprot_t);
++
++/*
++ * In kernel_physical_mapping_init(), any big pages that contained
+kernel text area were
++ * set up as big executable pages.  This function should be called when
+the initmem
++ * is freed, to correctly set up the executable & non-executable pages
+in this area.
++ */
++static void cleanup_nx_in_kerneltext(void)
++{
++	unsigned long from, to;
++
++	if (!nx_enabled) return;
++
++	from = PAGE_OFFSET;
++	to = (unsigned long)_text & PAGE_MASK;
++	for (; from<to; from += PAGE_SIZE)
++		change_page_attr_perm(virt_to_page(from), 1,
+PAGE_KERNEL); 
++	
++	from = ((unsigned long)_etext + PAGE_SIZE - 1) & PAGE_MASK;
++	to = ((unsigned long)__init_end + LARGE_PAGE_SIZE) &
+LARGE_PAGE_MASK;
++	for (; from<to; from += PAGE_SIZE)
++		change_page_attr_perm(virt_to_page(from), 1,
+PAGE_KERNEL); 
++}
++
+ void free_initmem(void)
+ {
+ 	unsigned long addr;
+@@ -679,6 +703,8 @@ void free_initmem(void)
+ 		totalram_pages++;
+ 	}
+ 	printk (KERN_INFO "Freeing unused kernel memory: %dk freed\n",
+(__init_end - __init_begin) >> 10);
++
++	cleanup_nx_in_kerneltext();
+ }
+ 
+ #ifdef CONFIG_BLK_DEV_INITRD
+diff -purN --exclude='*.o' --exclude='*.cmd'
+linux-2.6.12grep/arch/i386/mm/pageattr.c
+linux-2.6.12/arch/i386/mm/pageattr.c
+--- linux-2.6.12grep/arch/i386/mm/pageattr.c	2005-07-01
+15:09:08.000000000 -0500
++++ linux-2.6.12/arch/i386/mm/pageattr.c	2005-07-01
+14:56:06.000000000 -0500
+@@ -35,7 +35,7 @@ pte_t *lookup_address(unsigned long addr
+         return pte_offset_kernel(pmd, address);
+ } 
+ 
+-static struct page *split_large_page(unsigned long address, pgprot_t
+prot)
++static struct page *split_large_page(unsigned long address, pgprot_t
+prot, pgprot_t ref_prot)
+ { 
+ 	int i; 
+ 	unsigned long addr;
+@@ -53,7 +53,7 @@ static struct page *split_large_page(uns
+ 	pbase = (pte_t *)page_address(base);
+ 	for (i = 0; i < PTRS_PER_PTE; i++, addr += PAGE_SIZE) {
+ 		pbase[i] = pfn_pte(addr >> PAGE_SHIFT, 
+-				   addr == address ? prot :
+PAGE_KERNEL);
++				   addr == address ? prot : ref_prot);
+ 	}
+ 	return base;
+ } 
+@@ -122,7 +122,7 @@ __change_page_attr(struct page *page, pg
+ 		if ((pte_val(*kpte) & _PAGE_PSE) == 0) { 
+ 			set_pte_atomic(kpte, mk_pte(page, prot)); 
+ 		} else {
+-			struct page *split = split_large_page(address,
+prot); 
++			struct page *split = split_large_page(address,
+prot, PAGE_KERNEL); 
+ 			if (!split)
+ 				return -ENOMEM;
+ 			set_pmd_pte(kpte,address,mk_pte(split,
+PAGE_KERNEL));
+@@ -152,6 +152,38 @@ __change_page_attr(struct page *page, pg
+ 	return 0;
+ } 
+ 
++static int __change_page_attr_perm (struct page *page, pgprot_t prot)
++{ 
++	pte_t *kpte; 
++	unsigned long address;
++	struct page *kpte_page;
++
++	BUG_ON(PageHighMem(page));
++	address = (unsigned long)page_address(page);
++
++	kpte = lookup_address(address);
++	if (!kpte)
++		return -EINVAL;
++	kpte_page = virt_to_page(kpte);
++
++	if ((pte_val(*kpte) & _PAGE_PSE) == 0) { 
++		set_pte_atomic(kpte, mk_pte(page, prot)); 
++	} else {
++		pgprot_t ref_prot;
++
++		if ((pte_val(*kpte) & _PAGE_NX))
++			ref_prot = PAGE_KERNEL;
++		else
++			ref_prot = PAGE_KERNEL_EXEC;
++		kpte_page = split_large_page(address, prot, ref_prot);
++		if (!kpte_page)
++			return -ENOMEM;
++		set_pmd_pte(kpte,address,mk_pte(kpte_page, ref_prot));
++	}	
++	SetPageReserved(kpte_page);
++	return 0;
++} 
++
+ static inline void flush_map(void)
+ {
+ 	on_each_cpu(flush_kernel_map, NULL, 1, 1);
+@@ -186,6 +218,22 @@ int change_page_attr(struct page *page, 
+ 	return err;
+ }
+ 
++int change_page_attr_perm(struct page *page, int numpages, pgprot_t
+prot)
++{
++	int err = 0; 
++	int i; 
++	unsigned long flags;
++
++	spin_lock_irqsave(&cpa_lock, flags);
++	for (i = 0; i < numpages; i++, page++) { 
++		err = __change_page_attr_perm(page, prot);
++		if (err) 
++			break; 
++	} 	
++	spin_unlock_irqrestore(&cpa_lock, flags);
++	return err;
++}
++
+ void global_flush_tlb(void)
+ { 
+ 	LIST_HEAD(l);[unhandled content-type:application/octet-stream]

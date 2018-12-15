@@ -1,0 +1,467 @@
+Date: Thu, 13 Jan 2005 16:28:50 +0100
+From: Jan Frey <>
+Subject: [PATCH] Updated: support for gzipped (ELF) core dumps
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2005/1/13/134
+
+Hi all,
+now I managed to use lib/crc32. Obviously the patch looks a lot better
+now!
+Regards,
+Jan
+> Hi,
+> 
+> I tried to use those "in-kernel" functions, but they seem to do little
+> different CRC calculations. Unfortunately I don't have any experiences
+> with CRC stuff, anyone able to help here?
+> 
+> Regards,
+> Jan
+> 
+> >  >+/* This table is needed for efficient CRC32 calculation */
+> >  >+static const unsigned long crc_table[8][256] = {
+> >  >+ {
+> >  >+ 0x00000000UL, 0x77073096UL, 0xee0e612cUL, 0x990951baUL, 0x076dc419UL,
+> > 
+> > First, by using "unsigned long", you may be doubling the size on most 64 bit 
+> > platforms. Second, I'm pretty sure there is a standard implementation of 
+> > several CRCs already in the kernel - is there a reason not to use one of them 
+> > (e.g. a different polynomial)?
+> > -
+> > To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+> > the body of a message to majordomo@vger.kernel.org
+> > More majordomo info at  
+http://vger.kernel.org/majordomo-info.html
+> > Please read the FAQ at  
+http://www.tux.org/lkml/
+> -
+> To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+> the body of a message to majordomo@vger.kernel.org
+> More majordomo info at  
+http://vger.kernel.org/majordomo-info.html
+> Please read the FAQ at  
+http://www.tux.org/lkml/
+diff -ur linux-2.4.28/arch/i386/config.in linux-2.4.28-gzip-coredump/arch/i386/config.in
+--- linux-2.4.28/arch/i386/config.in	2004-11-17 12:54:21.000000000 +0100
++++ linux-2.4.28-gzip-coredump/arch/i386/config.in	2005-01-10 08:45:36.000000000 +0100
+@@ -479,6 +479,7 @@
+    bool '  Magic SysRq key' CONFIG_MAGIC_SYSRQ
+    bool '  Spinlock debugging' CONFIG_DEBUG_SPINLOCK
+    bool '  Compile the kernel with frame pointers' CONFIG_FRAME_POINTER
++   bool '  Write gzipped core dump files' CONFIG_GZIP_COREDUMPS
+ fi
+ 
+ int 'Kernel messages buffer length shift (0 = default)' CONFIG_LOG_BUF_SHIFT 0
+diff -ur linux-2.4.28/Documentation/Configure.help linux-2.4.28-gzip-coredump/Documentation/Configure.help
+--- linux-2.4.28/Documentation/Configure.help	2004-11-17 12:54:20.000000000 +0100
++++ linux-2.4.28-gzip-coredump/Documentation/Configure.help	2005-01-10 08:45:45.000000000 +0100
+@@ -29121,6 +29121,11 @@
+   
+   If unsure, say N.
+ 
++CONFIG_GZIP_COREDUMPS
++  Saying yes here makes the kernel writing core dump files in a 
++  gzipped compressed format. You will have to uncompress core files
++  with gzip -d prior to usage (e.g. with gdb).
++
+ #
+ # A couple of things I keep forgetting:
+ #   capitalize: AppleTalk, Ethernet, DOS, DMA, FAT, FTP, Internet,
+diff -ur linux-2.4.28/fs/binfmt_elf.c linux-2.4.28-gzip-coredump/fs/binfmt_elf.c
+--- linux-2.4.28/fs/binfmt_elf.c	2004-11-17 12:54:21.000000000 +0100
++++ linux-2.4.28-gzip-coredump/fs/binfmt_elf.c	2005-01-13 15:42:45.000000000 +0100
+@@ -9,6 +9,7 @@
+  * Copyright 1993, 1994: Eric Youngdale (ericy@cais.com).
+  */
+ 
++#include <linux/config.h>
+ #include <linux/module.h>
+ 
+ #include <linux/fs.h>
+@@ -59,6 +60,18 @@
+  */
+ #ifdef USE_ELF_CORE_DUMP
+ static int elf_core_dump(long signr, struct pt_regs * regs, struct file * file);
++
++#ifdef CONFIG_GZIP_COREDUMPS
++
++/*
++ * Functions added to support writing core files in gzipped format, 2004
++ * Jan Frey <jan.frey@nokia.com>
++ */
++#include <linux/zlib.h>
++#include <linux/vmalloc.h>
++#include <linux/crc32.h>
++#endif
++
+ #else
+ #define elf_core_dump	NULL
+ #endif
+@@ -941,15 +954,83 @@
+  * Modelled on fs/exec.c:aout_core_dump()
+  * Jeremy Fitzhardinge <jeremy@sw.oz.au>
+  */
++#ifdef CONFIG_GZIP_COREDUMPS
+ /*
+- * These are the only things you should do on a core-file: use only these
+- * functions to write out all the necessary info.
++ * gz writing support 
++ * Jan Frey <jan.frey@nokia.com>
+  */
+-static int dump_write(struct file *file, const void *addr, int nr)
++static int gz_dump_write(struct file *file, const void *addr, int nr, u32 *crc, z_streamp zstr)
+ {
+-	return file->f_op->write(file, addr, nr, &file->f_pos) == nr;
++	const int OUT_BUF_SIZE = 100*1024;
++	int       all_fine     = 1;
++	void     *out_buf      = vmalloc(OUT_BUF_SIZE);
++
++	if (!out_buf) {
++		printk(KERN_WARNING "Failed to allocate deflate buffer");
++		return 0;
++	}
++
++	*crc = crc32_le (*crc, addr, nr);
++
++	zstr->next_in  = addr;
++	zstr->avail_in = nr;
++
++	do {
++		zstr->next_out  = out_buf;
++		zstr->avail_out = OUT_BUF_SIZE;
++
++		if (zlib_deflate (zstr, Z_NO_FLUSH) == Z_OK) { 
++			/* new output generated */
++			all_fine = (file->f_op->write (file, 
++						       out_buf, 
++						       OUT_BUF_SIZE - zstr->avail_out, 
++						       &file->f_pos) 
++				    == (OUT_BUF_SIZE - zstr->avail_out));
++		}
++	} while ((zstr->avail_out != OUT_BUF_SIZE) && all_fine);
++
++	vfree (out_buf);
++	return all_fine;
+ }
+ 
++static int gz_finish (struct file *file, z_streamp zstr)
++{
++	const int OUT_BUF_SIZE = 100*1024;
++	int       all_fine     = 1;
++	int       ret;
++	void     *out_buf      = vmalloc(OUT_BUF_SIZE);
++
++	if (!out_buf) {
++		printk(KERN_WARNING "Failed to allocate deflate buffer");
++		return 0;
++	}
++
++	zstr->next_in   = 0;
++	zstr->avail_in  = 0;
++
++	do {
++		zstr->next_out  = out_buf;
++		zstr->avail_out = OUT_BUF_SIZE;
++
++		ret = zlib_deflate (zstr, Z_FINISH);
++		if ((ret == Z_OK) || (ret == Z_STREAM_END)) { 
++			/* new output generated */
++			all_fine = (file->f_op->write (file, 
++						      out_buf, 
++						      OUT_BUF_SIZE - zstr->avail_out, 
++						      &file->f_pos) 
++				    == (OUT_BUF_SIZE - zstr->avail_out)); 
++		}
++	} while ((zstr->avail_out != OUT_BUF_SIZE) && all_fine && (ret != Z_STREAM_END));
++
++	vfree (out_buf);
++	return all_fine;
++}
++#else
++/*
++ * These are the only things you should do on a core-file: use only these
++ * functions to write out all the necessary info.
++ */
+ static int dump_seek(struct file *file, off_t off)
+ {
+ 	if (file->f_op->llseek) {
+@@ -959,6 +1040,13 @@
+ 		file->f_pos = off;
+ 	return 1;
+ }
++#endif
++
++static int dump_write(struct file *file, const void *addr, int nr)
++{
++	return file->f_op->write(file, addr, nr, &file->f_pos) == nr;
++}
++
+ 
+ /*
+  * Decide whether a segment is worth dumping; default is yes to be
+@@ -1030,11 +1118,54 @@
+ }
+ #endif
+ 
+-#define DUMP_WRITE(addr, nr)	\
+-	do { if (!dump_write(file, (addr), (nr))) return 0; } while(0)
++#ifdef CONFIG_GZIP_COREDUMPS
++#define PAD_GZ(nr, buf, crc, str) \
++        do { \
++	        int cur=(nr); \
++         	while (cur>1024) { \
++                        gz_dump_write(file, (buf), 1024, (crc), (str)); \
++                        cur-=1024; \
++                } \
++                if (cur) { \
++                        gz_dump_write(file, (buf), cur, (crc), (str)); \
++                } \
++        } while(0)
++
++#define DUMP_GZ(addr, nr, crc, str)	\
++	do { if (!gz_dump_write(file, (addr), (nr), (crc), (str))) return 0; } while(0)
++#else
+ #define DUMP_SEEK(off)	\
+ 	do { if (!dump_seek(file, (off))) return 0; } while(0)
++#endif
++
++#define DUMP_WRITE(addr, nr)	\
++	do { if (!dump_write(file, (addr), (nr))) return 0; } while(0)
+ 
++#ifdef CONFIG_GZIP_COREDUMPS
++static int writenote_gz(struct memelfnote *men, struct file *file, char *buf, u32 *crc, z_streamp zstr)
++{
++	struct elf_note en;
++	int dummy_bytes;
++
++	en.n_namesz = strlen(men->name);
++	en.n_descsz = men->datasz;
++	en.n_type = men->type;
++
++	DUMP_GZ(&en, sizeof(en), crc, zstr);
++	DUMP_GZ(men->name, en.n_namesz, crc, zstr);
++
++	dummy_bytes = roundup((unsigned long)zstr->total_in, 4) - zstr->total_in;
++	PAD_GZ(dummy_bytes, buf, crc, zstr);
++
++	DUMP_GZ(men->data, men->datasz, crc, zstr);
++
++	dummy_bytes = roundup((unsigned long)zstr->total_in, 4) - zstr->total_in;
++	PAD_GZ(dummy_bytes, buf, crc, zstr);
++
++	return 1;
++}
++#undef DUMP_GZ
++#else
+ static int writenote(struct memelfnote *men, struct file *file)
+ {
+ 	struct elf_note en;
+@@ -1054,13 +1185,21 @@
+ }
+ #undef DUMP_WRITE
+ #undef DUMP_SEEK
++#endif
+ 
++#ifdef CONFIG_GZIP_COREDUMPS
++#define DUMP_GZ(addr, nr, crc, str)	\
++	if ((size += (nr)) > limit || !gz_dump_write(file, (addr), (nr), (crc), (str))) \
++		goto end_coredump;
++#else
+ #define DUMP_WRITE(addr, nr)	\
+ 	if ((size += (nr)) > limit || !dump_write(file, (addr), (nr))) \
+ 		goto end_coredump;
+ #define DUMP_SEEK(off)	\
+ 	if (!dump_seek(file, (off))) \
+ 		goto end_coredump;
++#endif
++
+ /*
+  * Actual dumper
+  *
+@@ -1085,6 +1224,39 @@
+ 	elf_fpregset_t fpu;		/* NT_PRFPREG */
+ 	struct elf_prpsinfo psinfo;	/* NT_PRPSINFO */
+ 
++#ifdef CONFIG_GZIP_COREDUMPS
++	z_stream gz_stream;
++	void *deflate_workspace;
++	u32 crc = ~0; /* init */
++	unsigned char gz_magic[10] = { /* gzip magic header */
++	  0x1f, 0x8b, Z_DEFLATED, 0, 0, 0, 0, 0, 0, 0x03 }; 
++	unsigned char *empty_buf;	
++
++	deflate_workspace = vmalloc(zlib_deflate_workspacesize());
++        if (!deflate_workspace) {
++		printk(KERN_WARNING "Failed to allocate deflate workspace\n");
++		return -ENOMEM;
++        }
++
++	gz_stream.workspace = deflate_workspace;
++	if (Z_OK != zlib_deflateInit2(&gz_stream, 
++				      7, /* compression level */
++				      Z_DEFLATED,
++				      -15, /* window bits */
++				      6, /* mem level */
++				      Z_DEFAULT_STRATEGY)) {
++		printk(KERN_WARNING "deflateInit failed\n");
++		return -ENOMEM;
++        }
++	
++	empty_buf = vmalloc(1024);
++        if (!empty_buf) {
++		printk(KERN_WARNING "Failed to allocate 1024 bytes for dummy buffer\n");
++		return -ENOMEM;
++        }
++	memset (empty_buf, 0, 1024);
++#endif
++
+ 	/* first copy the parameters from user space */
+ 	memset(&psinfo, 0, sizeof(psinfo));
+ 	{
+@@ -1154,7 +1326,15 @@
+ 	has_dumped = 1;
+ 	current->flags |= PF_DUMPCORE;
+ 
++#ifdef CONFIG_GZIP_COREDUMPS
++	/* write gzip header */
++	DUMP_WRITE(gz_magic, 10);
++
++	/* write elf header */
++	DUMP_GZ(&elf, sizeof(elf), &crc, &gz_stream);
++#else
+ 	DUMP_WRITE(&elf, sizeof(elf));
++#endif
+ 	offset += sizeof(elf);				/* Elf header */
+ 	offset += (segs+1) * sizeof(struct elf_phdr);	/* Program headers */
+ 
+@@ -1239,7 +1419,12 @@
+ 		phdr.p_align = 0;
+ 
+ 		offset += phdr.p_filesz;
++
++#ifdef CONFIG_GZIP_COREDUMPS
++		DUMP_GZ(&phdr, sizeof(phdr), &crc, &gz_stream);
++#else
+ 		DUMP_WRITE(&phdr, sizeof(phdr));
++#endif
+ 	}
+ 
+ 	/* Page-align dumped data */
+@@ -1264,14 +1449,27 @@
+ 		if (vma->vm_flags & VM_EXEC) phdr.p_flags |= PF_X;
+ 		phdr.p_align = ELF_EXEC_PAGESIZE;
+ 
++#ifdef CONFIG_GZIP_COREDUMPS
++		DUMP_GZ(&phdr, sizeof(phdr), &crc, &gz_stream);
++#else
+ 		DUMP_WRITE(&phdr, sizeof(phdr));
++#endif
+ 	}
+ 
+-	for(i = 0; i < numnote; i++)
++	for(i = 0; i < numnote; i++) {
++#ifdef CONFIG_GZIP_COREDUMPS	
++		if (!writenote_gz(&notes[i], file, empty_buf, &crc, &gz_stream))
++			goto end_coredump;
++#else
+ 		if (!writenote(&notes[i], file))
+ 			goto end_coredump;
+-
++#endif
++	}
++#ifdef CONFIG_GZIP_COREDUMPS	
++	PAD_GZ (dataoff-gz_stream.total_in, empty_buf, &crc, &gz_stream);
++#else
+ 	DUMP_SEEK(dataoff);
++#endif
+ 
+ 	for(vma = current->mm->mmap; vma != NULL; vma = vma->vm_next) {
+ 		unsigned long addr;
+@@ -1290,16 +1488,28 @@
+ 			struct vm_area_struct *vma;
+ 
+ 			if (get_user_pages(current, current->mm, addr, 1, 0, 1,
+-						&page, &vma) <= 0) {
+-				DUMP_SEEK (file->f_pos + PAGE_SIZE);
++					   &page, &vma) <= 0) {	
++#ifdef CONFIG_GZIP_COREDUMPS
++			  PAD_GZ(PAGE_SIZE, empty_buf, &crc, &gz_stream);
++#else
++			  DUMP_SEEK (file->f_pos + PAGE_SIZE);
++#endif
+ 			} else {
+-				if (page == ZERO_PAGE(addr)) {
+-					DUMP_SEEK (file->f_pos + PAGE_SIZE);
++				if (page == ZERO_PAGE(addr)) {	
++#ifdef CONFIG_GZIP_COREDUMPS
++				  PAD_GZ(PAGE_SIZE, empty_buf, &crc, &gz_stream);
++#else
++				  DUMP_SEEK (file->f_pos + PAGE_SIZE);
++#endif
+ 				} else {
+ 					void *kaddr;
+ 					flush_cache_page(vma, addr);
+ 					kaddr = kmap(page);
++#ifdef CONFIG_GZIP_COREDUMPS
++					DUMP_GZ(kaddr, PAGE_SIZE, &crc, &gz_stream);
++#else
+ 					DUMP_WRITE(kaddr, PAGE_SIZE);
++#endif
+ 					flush_page_to_ram(page);
+ 					kunmap(page);
+ 				}
+@@ -1308,15 +1518,37 @@
+ 		}
+ 	}
+ 
++#ifndef CONFIG_GZIP_COREDUMPS
+ 	if ((off_t) file->f_pos != offset) {
+ 		/* Sanity check */
+ 		printk("elf_core_dump: file->f_pos (%ld) != offset (%ld)\n",
+ 		       (off_t) file->f_pos, offset);
+ 	}
++#endif
+ 
+- end_coredump:
++end_coredump:
++#ifdef CONFIG_GZIP_COREDUMPS
++	gz_finish (file, &gz_stream);
++	zlib_deflateEnd (&gz_stream);
++
++	gz_magic[0] = (~crc & 0x000000FF);
++	gz_magic[1] = (~crc & 0x0000FF00) >> 8;
++	gz_magic[2] = (~crc & 0x00FF0000) >> 16;
++	gz_magic[3] = (~crc & 0xFF000000) >> 24;
++	gz_magic[4] = (gz_stream.total_in & 0x000000FF);
++	gz_magic[5] = (gz_stream.total_in & 0x0000FF00) >> 8;
++	gz_magic[6] = (gz_stream.total_in & 0x00FF0000) >> 16;
++	gz_magic[7] = (gz_stream.total_in & 0xFF000000) >> 24;
++	dump_write (file, gz_magic, 8);
++#endif
+ 	set_fs(fs);
+ 	up_write(&current->mm->mmap_sem);
++
++#ifdef CONFIG_GZIP_COREDUMPS
++	vfree (deflate_workspace);
++	vfree (empty_buf);
++#endif
++
+ 	return has_dumped;
+ }
+ #endif		/* USE_ELF_CORE_DUMP */
+diff -ur linux-2.4.28/lib/Config.in linux-2.4.28-gzip-coredump/lib/Config.in
+--- linux-2.4.28/lib/Config.in	2003-11-28 19:26:21.000000000 +0100
++++ linux-2.4.28-gzip-coredump/lib/Config.in	2005-01-10 08:46:00.000000000 +0100
+@@ -27,7 +27,8 @@
+   fi
+ fi
+ 
+-if [ "$CONFIG_PPP_DEFLATE" = "y" -o \
++if [ "$CONFIG_GZIP_COREDUMPS" = "y" -o \
++     "$CONFIG_PPP_DEFLATE" = "y" -o \
+      "$CONFIG_CRYPTO_DEFLATE" = "y" -o \
+      "$CONFIG_JFFS2_FS" = "y" ]; then
+    define_tristate CONFIG_ZLIB_DEFLATE y

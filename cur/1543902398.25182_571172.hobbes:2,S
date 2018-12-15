@@ -1,0 +1,170 @@
+Date: Wed, 18 Jul 2007 20:46:35 +0530
+From: "Satyam Sharma" <>
+Subject: Re: [PATCH] sysfs: kill an extra put in sysfs_create_link() failure path
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2007/7/18/234
+
+Hi,
+On 7/18/07, Tejun Heo <htejun@gmail.com> wrote:
+> Satyam Sharma wrote:
+> > On 7/18/07, Tejun Heo <htejun@gmail.com> wrote:
+> >> There is a subtle bug in sysfs_create_link() failure path.  When
+> >> symlink creation fails because there's already a node with the same
+> >> name, the target sysfs_dirent is put twice - once by failure path of
+> >> sysfs_create_link() and once more when the symlink is released.
+> >
+> > The "symlink" is released? But the creation of the symlink is
+> > precisely what failed here ... did it not?
+> >
+> >> Fix it by making only the symlink node responsible for putting
+> >> target_sd.
+> >
+> > And again ... the changelog sounds confusing indeed, perhaps I'm
+> > not familiar enough with sysfs symlink-related terminology/semantics.
+> > Care to elaborate?
+> >
+> >>         sd = sysfs_new_dirent(name, S_IFLNK|S_IRWXUGO, SYSFS_KOBJ_LINK);
+> >>         if (!sd)
+> >>                 goto out_put;
+> >> +
+> >>         sd->s_elem.symlink.target_sd = target_sd;
+> >> +       target_sd = NULL;       /* reference is now owned by the
+> >> symlink */
+> >
+> > Wow. This looks like a very mysterious way to fix a mysterious bug :-)
+> > BTW I just looked over at sysfs_create_link() and ... it looks quite ...
+> > unnecessarily complicated/obfuscated ...
+>
+> Well, I dunno.  Probably my taste just sucks.  Please feel free to
+> submit patches and/or suggest better ideas.
+OK, for example:
+sysfs_find_dirent() -- to check for -EEXIST -- should be called
+*before* we create the new dentry for the to-be-created symlink
+in the first place. [ It's weird to grab a reference on the target
+for ourselves (and in fact even allocate the new dirent for the
+to-be-created symlink) and /then/ check for erroneous usage,
+and then go about undoing all that we should never have done
+at all. ] So this test could, and should, be made earlier, IMHO.
+And some similar others ... so attached (sorry, Gmail web
+interface) please find an attempt to make sysfs_create_link look
+a trifle more like what it should look like, IMHO. The code cleanup
+also leads to fewer LOC, smaller kernel image (lesser by 308 bytes),
+and even speeding up the no-error common case of this function,
+apart from the obvious readability benefits ... it's diffed on _top_ of
+your bugfix here, but not the other patch. [ Compile-tested only. ]
+BTW this bug was clearly *very* subtle. I spent a couple of hours or
+so yesterday night on the same resulting use-after-free (which actually
+gets triggered in a completely different codepath, and which is
+completely temporally disconnected from its actual cause over here).
+Thanks,
+Satyam
+Signed-off-by: Satyam Sharma <ssatyam@cse.iitk.ac.in>
+---
+ fs/sysfs/symlink.c |   74 +++++++++++++++++++++++----------------------------
+ 1 files changed, 33 insertions(+), 41 deletions(-)
+diff --git a/fs/sysfs/symlink.c b/fs/sysfs/symlink.c
+index d056e96..bec477d 100644
+--- a/fs/sysfs/symlink.c
++++ b/fs/sysfs/symlink.c
+@@ -50,65 +50,57 @@ static void fill_object_path(struct sysfs_dirent *sd, char *buffer, int length)
+  *	@target:	object we're pointing to.
+  *	@name:		name of the symlink.
+  */
+-int sysfs_create_link(struct kobject * kobj, struct kobject * target, const char * name)
++int sysfs_create_link(struct kobject *kobj, struct kobject *target, const char *name)
+ {
+-	struct sysfs_dirent *parent_sd = NULL;
+-	struct sysfs_dirent *target_sd = NULL;
+-	struct sysfs_dirent *sd = NULL;
++	struct sysfs_dirent *parent_sd;
++	struct sysfs_dirent *sd;
+ 	struct sysfs_addrm_cxt acxt;
+-	int error;
++	int error = 0;
+ 
+ 	BUG_ON(!name);
+ 
+-	if (!kobj) {
+-		if (sysfs_mount && sysfs_mount->mnt_sb)
+-			parent_sd = sysfs_mount->mnt_sb->s_root->d_fsdata;
+-	} else
++	if (kobj)
+ 		parent_sd = kobj->sd;
++	else if (sysfs_mount && sysfs_mount->mnt_sb)
++		parent_sd = sysfs_mount->mnt_sb->s_root->d_fsdata;
++	else {
++		error = -EFAULT;
++		goto out;
++	}
+ 
+-	error = -EFAULT;
+-	if (!parent_sd)
+-		goto out_put;
++	if (sysfs_find_dirent(parent_sd, name)) {
++		error = -EEXIST;
++		goto out;
++	}
++
++	sd = sysfs_new_dirent(name, S_IFLNK | S_IRWXUGO, SYSFS_KOBJ_LINK);
++	if (!sd) {
++		error = -ENOMEM;
++		goto out;
++	}
+ 
+ 	/* target->sd can go away beneath us but is protected with
+-	 * sysfs_assoc_lock.  Fetch target_sd from it.
++	 * sysfs_assoc_lock. Grab us a reference on it.
+ 	 */
+ 	spin_lock(&sysfs_assoc_lock);
+ 	if (target->sd)
+-		target_sd = sysfs_get(target->sd);
++		sd->s_elem.symlink.target_sd = sysfs_get(target->sd);
++	else {
++		spin_unlock(&sysfs_assoc_lock);
++		sysfs_put(sd);
++		error = -ENOENT;
++		goto out;
++	}
+ 	spin_unlock(&sysfs_assoc_lock);
+ 
+-	error = -ENOENT;
+-	if (!target_sd)
+-		goto out_put;
+-
+-	error = -ENOMEM;
+-	sd = sysfs_new_dirent(name, S_IFLNK|S_IRWXUGO, SYSFS_KOBJ_LINK);
+-	if (!sd)
+-		goto out_put;
+-
+-	sd->s_elem.symlink.target_sd = target_sd;
+-	target_sd = NULL;	/* reference is now owned by the symlink */
+-
+ 	sysfs_addrm_start(&acxt, parent_sd);
+-
+-	if (!sysfs_find_dirent(parent_sd, name)) {
+-		sysfs_add_one(&acxt, sd);
+-		sysfs_link_sibling(sd);
+-	}
+-
+-	if (sysfs_addrm_finish(&acxt))
+-		return 0;
+-
+-	error = -EEXIST;
+-	/* fall through */
+- out_put:
+-	sysfs_put(target_sd);
+-	sysfs_put(sd);
++	sysfs_add_one(&acxt, sd);
++	sysfs_link_sibling(sd);
++	sysfs_addrm_finish(&acxt);
++out:
+ 	return error;
+ }
+ 
+-
+ /**
+  *	sysfs_remove_link - remove symlink in object's directory.
+  *	@kobj:	object we're acting for.

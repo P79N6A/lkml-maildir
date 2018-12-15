@@ -1,0 +1,171 @@
+Date: Wed, 24 Dec 2008 10:36:23 -0800
+From: Andrew Morton <>
+Subject: Re: [mmotm 2008-12-22-16-14] NULL pointer dereference in dma_alloc_from_coherent().
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2008/12/24/64
+
+On Wed, 24 Dec 2008 16:45:02 +0100 Johannes Weiner <hannes@cmpxchg.org> wrote:
+> > 
+> > This thing was rather stupidly coded.  Rework it all prior to making
+> > changes.
+> > 
+> > Also, rename local variable `page': kernel readers expect something called
+> > `page' to have type `struct page *'.
+> > 
+> > Cc: Guennadi Liakhovetski <lg@denx.de>
+> > Cc: Johannes Weiner <hannes@cmpxchg.org>
+> > Cc: Pekka Enberg <penberg@cs.helsinki.fi>
+> > Cc: Dmitry Baryshkov <dbaryshkov@gmail.com>
+> > Cc: Jesse Barnes <jbarnes@virtuousgeek.org>
+> > Cc: Tetsuo Handa <penguin-kernel@i-love.sakura.ne.jp>
+> > Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+> > ---
+> > 
+> >  kernel/dma-coherent.c |   27 ++++++++++++++++-----------
+> >  1 file changed, 16 insertions(+), 11 deletions(-)
+> > 
+> > diff -puN kernel/dma-coherent.c~dma_alloc_coherent-clean-it-up kernel/dma-coherent.c
+> > --- a/kernel/dma-coherent.c~dma_alloc_coherent-clean-it-up
+> > +++ a/kernel/dma-coherent.c
+> > @@ -109,20 +109,25 @@ EXPORT_SYMBOL(dma_mark_declared_memory_o
+> >  int dma_alloc_from_coherent(struct device *dev, ssize_t size,
+> >  				       dma_addr_t *dma_handle, void **ret)
+> >  {
+> > -	struct dma_coherent_mem *mem = dev ? dev->dma_mem : NULL;
+> > +	struct dma_coherent_mem *mem;
+> >  	int order = get_order(size);
+> > +	int pageno;
+> > +
+> > +	if (!dev)
+> > +		return 0;
+> > +	mem = dev->dma_mem;
+> > +	if (!mem)
+> > +		return 0;
+> > 
+> > -	if (mem) {
+> > -		int page = bitmap_find_free_region(mem->bitmap, mem->size,
+> > -						     order);
+> > -		if (page >= 0) {
+> > -			*dma_handle = mem->device_base + (page << PAGE_SHIFT);
+> > -			*ret = mem->virt_base + (page << PAGE_SHIFT);
+> > -			memset(*ret, 0, size);
+> > -		} else if (mem->flags & DMA_MEMORY_EXCLUSIVE)
+> > -			*ret = NULL;
+> > +	pageno = bitmap_find_free_region(mem->bitmap, mem->size, order);
+> > +	if (pageno >= 0) {
+> > +		*dma_handle = mem->device_base + (pageno << PAGE_SHIFT);
+> > +		*ret = mem->virt_base + (pageno << PAGE_SHIFT);
+> > +		memset(*ret, 0, size);
+> > +	} else if (mem->flags & DMA_MEMORY_EXCLUSIVE) {
+> > +		*ret = NULL;
+> >  	}
+> > -	return (mem != NULL);
+> > +	return 1;
+> >  }
+> >  EXPORT_SYMBOL(dma_alloc_from_coherent);
+> 
+> Yep, looks much better.
+> 
+Looking at it again, that function has a bug:
+int dma_alloc_from_coherent(struct device *dev, ssize_t size,
+				       dma_addr_t *dma_handle, void **ret)
+{
+	struct dma_coherent_mem *mem = dev ? dev->dma_mem : NULL;
+	int order = get_order(size);
+	if (mem) {
+		int page = bitmap_find_free_region(mem->bitmap, mem->size,
+						     order);
+		if (page >= 0) {
+			*dma_handle = mem->device_base + (page << PAGE_SHIFT);
+			*ret = mem->virt_base + (page << PAGE_SHIFT);
+			memset(*ret, 0, size);
+		} else if (mem->flags & DMA_MEMORY_EXCLUSIVE)
+			*ret = NULL;
+	}
+	return (mem != NULL);
+}
+if bitmap_find_free_region() fails and DMA_MEMORY_EXCLUSIVE is not set,
+the function will fail to write anything to *ret and will return 1. 
+This will cause dma_alloc_coherent() to return an uninitialised value,
+crashing the kernel, perhaps via DMA to a random address (ugh).
+So I think it should do this:
+int dma_alloc_from_coherent(struct device *dev, ssize_t size,
+				       dma_addr_t *dma_handle, void **ret)
+{
+	struct dma_coherent_mem *mem = dev ? dev->dma_mem : NULL;
+	int order = get_order(size);
+	if (mem) {
+		int page = bitmap_find_free_region(mem->bitmap, mem->size,
+						     order);
+		if (page >= 0) {
+			/*
+			 * Memory was found in the per-device arena.
+			 */
+			*dma_handle = mem->device_base + (page << PAGE_SHIFT);
+			*ret = mem->virt_base + (page << PAGE_SHIFT);
+			memset(*ret, 0, size);
+		} else if (mem->flags & DMA_MEMORY_EXCLUSIVE) {
+			/*
+			 * The per-device arena is exhausted and we are not
+			 * permitted to fall back to generic memory.
+			 */
+			*ret = NULL;
+		} else {
+			/*
+			 * The per-device arena is exhausted and we are
+			 * permitted to fall back to generic memory.
+			 */
+			 return 0;
+		}
+	}
+	return (mem != NULL);
+}
+Can I have some review of this, please?
+From: Andrew Morton <akpm@linux-foundation.org>
+If bitmap_find_free_region() fails and DMA_MEMORY_EXCLUSIVE is not set,
+the function will fail to write anything to *ret and will return 1.             This will cause dma_alloc_coherent() to return an uninitialised value,
+crashing the kernel, perhaps via DMA to a random address.
+Fix that by changing it to return zero in this case, so the caller will
+proceed to allocate the memory from the generic memory allocator.
+Cc: Tetsuo Handa <penguin-kernel@i-love.sakura.ne.jp>
+Cc: Dmitry Baryshkov <dbaryshkov@gmail.com>
+Cc: Ingo Molnar <mingo@elte.hu>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+ kernel/dma-coherent.c |   16 +++++++++++++++-
+ 1 file changed, 15 insertions(+), 1 deletion(-)
+diff -puN kernel/dma-coherent.c~dma_alloc_from_coherent-fix-fallback-to-generic-memory kernel/dma-coherent.c
+--- a/kernel/dma-coherent.c~dma_alloc_from_coherent-fix-fallback-to-generic-memory
++++ a/kernel/dma-coherent.c
+@@ -116,11 +116,25 @@ int dma_alloc_from_coherent(struct devic
+ 		int page = bitmap_find_free_region(mem->bitmap, mem->size,
+ 						     order);
+ 		if (page >= 0) {
++			/*
++			 * Memory was found in the per-device arena.
++			 */
+ 			*dma_handle = mem->device_base + (page << PAGE_SHIFT);
+ 			*ret = mem->virt_base + (page << PAGE_SHIFT);
+ 			memset(*ret, 0, size);
+-		} else if (mem->flags & DMA_MEMORY_EXCLUSIVE)
++		} else if (mem->flags & DMA_MEMORY_EXCLUSIVE) {
++			/*
++			 * The per-device arena is exhausted and we are not
++			 * permitted to fall back to generic memory.
++			 */
+ 			*ret = NULL;
++		} else {
++			/*
++			 * The per-device arena is exhausted and we are
++			 * permitted to fall back to generic memory.
++			 */
++			 return 0;
++		}
+ 	}
+ 	return (mem != NULL);
+ }
+_

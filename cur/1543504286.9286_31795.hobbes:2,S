@@ -1,0 +1,467 @@
+Date: Thu, 29 Jul 1999 09:19:29 -0400
+From: Philip Gladstone <>
+Subject: Re: clone, mm->count, and coredumps [PATCH]
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/7/29/56
+
+This problem annoyed me -- so I hacked up the core dumper to
+generate multithreaded core dumps that gdb can then process.
+I attach a patch file that does this for x86 architecture under 2.2.9
+(This is actually a converted patch file from 2.0.36 which is where it
+works well). 
+I've been trying to get this into the kernel for a couple of years now,
+but .... [I must confess that now having it work on other architectures
+would be a problems -- although it should be trivial]
+Philip
+Peter Desnoyers wrote:
+> 
+> I've been spending a lot of time debugging a threaded program lately,
+> and have been bitten by the feature in the ELF coredump logic which
+> disables corefile generation when current->mm->count != 1.  (i.e. when
+> any child processes have been created with CLONE_VM)
+> 
+> For the moment I've found a satisfactory (although ugly) workaround
+> involving forking in a sigsegv handler and then faulting again.
+> 
+> However, I've been wondering at the logic behind this test.  Is it
+> assuming that mm->count is always 0 or 1, and so could be replaced
+> with "->count == 0"?  Is it because coredumps for threaded programs
+> would otherwise be awfully lame, or is it just that my knowledge of
+> using gdb on threaded corefiles is poor?  (before I found this trick,
+> I was able to generate corefiles on child threads, but they tended to
+> always have the wrong stack as far as I could tell.)  Is it some
+> inscrutable reason related to devious virtual memory algorithms?
+> 
+> It strikes me that coredumps are as useful on threaded programs as on
+> any other, and I wonder what would need to be done (in the kernel and
+> in gdb) to get them working without application hackery.
+-- 
+Philip Gladstone                           +1 781 530 2461
+Axent Technologies, Waltham, MA--- linux22/arch/i386/kernel/ptrace.c.zz	Tue May 18 17:54:34 1999
++++ linux22/arch/i386/kernel/ptrace.c	Wed May 19 10:41:07 1999
+@@ -694,3 +694,11 @@
+ 		current->exit_code = 0;
+ 	}
+ }
++
++void get_pt_regs_for_task(struct pt_regs *regs, struct task_struct *task)
++{
++        /* *regs = *(struct pt_regs *) (((unsigned char *) task->tss.esp0) - (EFL * 4 - EFL_OFFSET)); */
++        *regs = ((struct pt_regs *) task->tss.esp0)[-1];
++}
++
++
+--- linux22/fs/binfmt_elf.c.zz	Tue May 18 17:01:00 1999
++++ linux22/fs/binfmt_elf.c	Tue May 18 18:08:28 1999
+@@ -1063,22 +1063,62 @@
+ 	struct elfhdr elf;
+ 	off_t offset = 0, dataoff;
+ 	unsigned long limit = current->rlim[RLIMIT_CORE].rlim_cur;
+-	int numnote = 4;
+-	struct memelfnote notes[4];
+-	struct elf_prstatus prstatus;	/* NT_PRSTATUS */
++	int numnote;
++	struct memelfnote *notes;
++	struct elf_prstatus *prstatus;	/* NT_PRSTATUS */
+ 	elf_fpregset_t fpu;		/* NT_PRFPREG */
+ 	struct elf_prpsinfo psinfo;	/* NT_PRPSINFO */
++        int n_pids, this_pid;
++        struct task_struct *p;
+ 
+-	if (!current->dumpable ||
+-	    limit < ELF_EXEC_PAGESIZE ||
+-	    atomic_read(&current->mm->count) != 1)
++	/* The very first thing is to grab the semaphore on the mmap */
++	if (!current->mm)
++	    return 0;
++	down(&current->mm->mmap_sem);
++	
++	if (!current->dumpable) {
++		up(&current->mm->mmap_sem);
+ 		return 0;
++	}
+ 	current->dumpable = 0;
+ 
++	/* See if we are alone in this process, or if other people
++	 * share our mm
++	 */
++	n_pids = 0;
++	for_each_task(p) {
++	        if (current->mm == p->mm) {
++		        p->dumpable = 0;
++		        n_pids++;
++			if (current != p) {
++			        force_sig(signr, p);
++			}
++		}
++	}
++
++        if (limit < PAGE_SIZE) {
++		up(&current->mm->mmap_sem);
++		return 0;
++        }
++
+ #ifndef CONFIG_BINFMT_ELF
+ 	MOD_INC_USE_COUNT;
+ #endif
+ 
++	notes = (struct memelfnote *) kmalloc(sizeof(*notes) * (n_pids + 3), GFP_KERNEL);
++	if (!notes) {
++		up(&current->mm->mmap_sem);
++		goto exit_dump;
++	}
++	memset((char *) notes, 0, sizeof(*notes) * (n_pids + 3));
++	prstatus = (struct elf_prstatus *) kmalloc(sizeof(*prstatus) * n_pids, GFP_KERNEL);
++	if (!prstatus) {
++		up(&current->mm->mmap_sem);
++		kfree(notes);
++		goto exit_dump;
++	}
++	memset((char *) prstatus, 0, sizeof(*prstatus) * n_pids);
++
+ 	/* Count what's needed to dump, up to the limit of coredump size */
+ 	segs = 0;
+ 	size = 0;
+@@ -1123,67 +1163,40 @@
+ 	fs = get_fs();
+ 	set_fs(KERNEL_DS);
+ 
+-	memcpy(corefile,"core.",5);
+-#if 0
+-	memcpy(corefile+5,current->comm,sizeof(current->comm));
+-#else
+-	corefile[4] = '\0';
+-#endif
+-	file = filp_open(corefile, O_CREAT | 2 | O_TRUNC | O_NOFOLLOW, 0600);
+-	if (IS_ERR(file))
+-		goto end_coredump;
+-	dentry = file->f_dentry;
+-	inode = dentry->d_inode;
+-	if (inode->i_nlink > 1)
+-		goto close_coredump;	/* multiple links - don't dump */
+-
+-	if (!S_ISREG(inode->i_mode))
+-		goto close_coredump;
+-	if (!inode->i_op || !inode->i_op->default_file_ops)
+-		goto close_coredump;
+-	if (!file->f_op->write)
+-		goto close_coredump;
+-
+-	has_dumped = 1;
+-	current->flags |= PF_DUMPCORE;
+-
+-	DUMP_WRITE(&elf, sizeof(elf));
+-	offset += sizeof(elf);				/* Elf header */
+-	offset += (segs+1) * sizeof(struct elf_phdr);	/* Program headers */
+-
+ 	/*
+ 	 * Set up the notes in similar form to SVR4 core dumps made
+ 	 * with info from their /proc.
+ 	 */
+ 	memset(&psinfo, 0, sizeof(psinfo));
+-	memset(&prstatus, 0, sizeof(prstatus));
++
++        numnote = 4;
+ 
+ 	notes[0].name = "CORE";
+ 	notes[0].type = NT_PRSTATUS;
+-	notes[0].datasz = sizeof(prstatus);
+-	notes[0].data = &prstatus;
+-	prstatus.pr_info.si_signo = prstatus.pr_cursig = signr;
+-	prstatus.pr_sigpend = current->signal.sig[0];
+-	prstatus.pr_sighold = current->blocked.sig[0];
+-	psinfo.pr_pid = prstatus.pr_pid = current->pid;
+-	psinfo.pr_ppid = prstatus.pr_ppid = current->p_pptr->pid;
+-	psinfo.pr_pgrp = prstatus.pr_pgrp = current->pgrp;
+-	psinfo.pr_sid = prstatus.pr_sid = current->session;
+-	prstatus.pr_utime.tv_sec = CT_TO_SECS(current->times.tms_utime);
+-	prstatus.pr_utime.tv_usec = CT_TO_USECS(current->times.tms_utime);
+-	prstatus.pr_stime.tv_sec = CT_TO_SECS(current->times.tms_stime);
+-	prstatus.pr_stime.tv_usec = CT_TO_USECS(current->times.tms_stime);
+-	prstatus.pr_cutime.tv_sec = CT_TO_SECS(current->times.tms_cutime);
+-	prstatus.pr_cutime.tv_usec = CT_TO_USECS(current->times.tms_cutime);
+-	prstatus.pr_cstime.tv_sec = CT_TO_SECS(current->times.tms_cstime);
+-	prstatus.pr_cstime.tv_usec = CT_TO_USECS(current->times.tms_cstime);
++	notes[0].datasz = sizeof(prstatus[0]);
++	notes[0].data = &prstatus[0];
++	prstatus[0].pr_info.si_signo = prstatus[0].pr_cursig = signr;
++	prstatus[0].pr_sigpend = current->signal.sig[0];
++	prstatus[0].pr_sighold = current->blocked.sig[0];
++	psinfo.pr_pid = prstatus[0].pr_pid = current->pid;
++	psinfo.pr_ppid = prstatus[0].pr_ppid = current->p_pptr->pid;
++	psinfo.pr_pgrp = prstatus[0].pr_pgrp = current->pgrp;
++	psinfo.pr_sid = prstatus[0].pr_sid = current->session;
++	prstatus[0].pr_utime.tv_sec = CT_TO_SECS(current->times.tms_utime);
++	prstatus[0].pr_utime.tv_usec = CT_TO_USECS(current->times.tms_utime);
++	prstatus[0].pr_stime.tv_sec = CT_TO_SECS(current->times.tms_stime);
++	prstatus[0].pr_stime.tv_usec = CT_TO_USECS(current->times.tms_stime);
++	prstatus[0].pr_cutime.tv_sec = CT_TO_SECS(current->times.tms_cutime);
++	prstatus[0].pr_cutime.tv_usec = CT_TO_USECS(current->times.tms_cutime);
++	prstatus[0].pr_cstime.tv_sec = CT_TO_SECS(current->times.tms_cstime);
++	prstatus[0].pr_cstime.tv_usec = CT_TO_USECS(current->times.tms_cstime);
+ 
+ 	/*
+ 	 * This transfers the registers from regs into the standard
+ 	 * coredump arrangement, whatever that is.
+ 	 */
+ #ifdef ELF_CORE_COPY_REGS
+-	ELF_CORE_COPY_REGS(prstatus.pr_reg, regs)
++	ELF_CORE_COPY_REGS(prstatus[0].pr_reg, regs)
+ #else
+ 	if (sizeof(elf_gregset_t) != sizeof(struct pt_regs))
+ 	{
+@@ -1191,12 +1204,12 @@
+ 			(long)sizeof(elf_gregset_t), (long)sizeof(struct pt_regs));
+ 	}
+ 	else
+-		*(struct pt_regs *)&prstatus.pr_reg = *regs;
++		*(struct pt_regs *)&prstatus[0].pr_reg = *regs;
+ #endif
+ 
+ #ifdef DEBUG
+ 	dump_regs("Passed in regs", (elf_greg_t *)regs);
+-	dump_regs("prstatus regs", (elf_greg_t *)&prstatus.pr_reg);
++	dump_regs("prstatus regs", (elf_greg_t *)&prstatus[0].pr_reg);
+ #endif
+ 
+ 	notes[1].name = "CORE";
+@@ -1236,8 +1249,8 @@
+ 	notes[2].data = current;
+ 
+ 	/* Try to dump the FPU. */
+-	prstatus.pr_fpvalid = dump_fpu (regs, &fpu);
+-	if (!prstatus.pr_fpvalid)
++	prstatus[0].pr_fpvalid = dump_fpu (regs, &fpu);
++	if (!prstatus[0].pr_fpvalid)
+ 	{
+ 		numnote--;
+ 	}
+@@ -1249,6 +1262,87 @@
+ 		notes[3].data = &fpu;
+ 	}
+ 	
++	this_pid = 1;
++	for_each_task(p) {
++	        if (this_pid >= n_pids)
++		        break;
++
++	        if (current->mm == p->mm && p != current) {
++			extern void get_pt_regs_for_task(struct pt_regs *, struct task_struct *p);
++
++			notes[numnote].name = "CORE";
++			notes[numnote].type = NT_PRSTATUS;
++			notes[numnote].datasz = sizeof(*prstatus);
++			notes[numnote].data = &prstatus[this_pid];
++			prstatus[this_pid].pr_sigpend = p->signal.sig[0];
++			prstatus[this_pid].pr_sighold = p->blocked.sig[0];
++			prstatus[this_pid].pr_pid = p->pid;
++			prstatus[this_pid].pr_ppid = p->p_pptr->pid;
++			prstatus[this_pid].pr_pgrp = p->pgrp;
++			prstatus[this_pid].pr_sid = p->session;
++			prstatus[this_pid].pr_utime.tv_sec = CT_TO_SECS(p->times.tms_utime);
++			prstatus[this_pid].pr_utime.tv_usec = CT_TO_USECS(p->times.tms_utime);
++			prstatus[this_pid].pr_stime.tv_sec = CT_TO_SECS(p->times.tms_stime);
++			prstatus[this_pid].pr_stime.tv_usec = CT_TO_USECS(p->times.tms_stime);
++			prstatus[this_pid].pr_cutime.tv_sec = CT_TO_SECS(p->times.tms_cutime);
++			prstatus[this_pid].pr_cutime.tv_usec = CT_TO_USECS(p->times.tms_cutime);
++			prstatus[this_pid].pr_cstime.tv_sec = CT_TO_SECS(p->times.tms_cstime);
++			prstatus[this_pid].pr_cstime.tv_usec = CT_TO_USECS(p->times.tms_cstime);
++
++			/*
++			 * This transfers the registers from regs into the standard
++			 * coredump arrangement, whatever that is.
++			 */
++#ifdef ELF_CORE_COPY_REGS
++			{
++				struct pt_regs pregs;
++				get_pt_regs_for_task(&pregs, p);
++				ELF_CORE_COPY_REGS(prstatus[this_pid].pr_reg, (&pregs))
++			}
++#else
++			if (sizeof(elf_gregset_t) != sizeof(struct pt_regs))
++			{
++				printk("sizeof(elf_gregset_t) (%d) != sizeof(struct pt_regs) (%d)\n",
++					sizeof(elf_gregset_t), sizeof(struct pt_regs));
++			}
++			else
++				get_pt_regs_for_task((struct pt_regs *)&prstatus[this_pid].pr_reg, p);
++#endif
++			numnote++;
++			this_pid++;
++		}
++	}
++
++	up(&current->mm->mmap_sem);
++	
++	memcpy(corefile,"core.",5);
++#if 0
++	memcpy(corefile+5,current->comm,sizeof(current->comm));
++#else
++	corefile[4] = '\0';
++#endif
++	file = filp_open(corefile, O_CREAT | 2 | O_TRUNC | O_NOFOLLOW, 0600);
++	if (IS_ERR(file))
++		goto end_coredump;
++	dentry = file->f_dentry;
++	inode = dentry->d_inode;
++	if (inode->i_nlink > 1)
++		goto close_coredump;	/* multiple links - don't dump */
++
++	if (!S_ISREG(inode->i_mode))
++		goto close_coredump;
++	if (!inode->i_op || !inode->i_op->default_file_ops)
++		goto close_coredump;
++	if (!file->f_op->write)
++		goto close_coredump;
++
++	has_dumped = 1;
++	current->flags |= PF_DUMPCORE;
++
++	DUMP_WRITE(&elf, sizeof(elf));
++	offset += sizeof(elf);				/* Elf header */
++	offset += (segs+1) * sizeof(struct elf_phdr);	/* Program headers */
++
+ 	/* Write notes phdr entry */
+ 	{
+ 		struct elf_phdr phdr;
+@@ -1332,6 +1426,11 @@
+ 
+  end_coredump:
+ 	set_fs(fs);
++
++        kfree(prstatus);
++        kfree(notes);
++
++ exit_dump:
+ #ifndef CONFIG_BINFMT_ELF
+ 	MOD_DEC_USE_COUNT;
+ #endif
+--- linux22/fs/super.c.zz	Wed May 19 15:59:20 1999
++++ linux22/fs/super.c	Wed May 19 16:00:10 1999
+@@ -986,6 +986,18 @@
+ 	i = vma->vm_end - (unsigned long) data;
+ 	if (PAGE_SIZE <= (unsigned long) i)
+ 		i = PAGE_SIZE-1;
++        else {
++            /* Rather short, maybe the next vma butts up against this one ... */
++            vma = find_vma(current->mm, i + (unsigned long) data);
++            if (vma && i + (unsigned long) data >= vma->vm_start &&
++                (vma->vm_flags & VM_READ)) {
++                /* It does butt up, and we can read the next memory ... */
++                i = vma->vm_end - (unsigned long) data;
++                if (PAGE_SIZE <= (unsigned long) i)
++                    i = PAGE_SIZE-1;
++            }
++        }
++
+ 	if (!(page = __get_free_page(GFP_KERNEL))) {
+ 		return -ENOMEM;
+ 	}
+--- linux22/fs/inode.c.zz	Wed May 19 15:58:08 1999
++++ linux22/fs/inode.c	Wed May 19 15:58:10 1999
+@@ -799,7 +799,7 @@
+ {
+     if ( IS_NOATIME (inode) ) return;
+     if ( IS_NODIRATIME (inode) && S_ISDIR (inode->i_mode) ) return;
+-    if ( IS_RDONLY (inode) ) return;
++    if ( IS_NOATIMEFS (inode) ) return;
+     inode->i_atime = CURRENT_TIME;
+     mark_inode_dirty (inode);
+ }   /*  End Function update_atime  */
+--- linux22/include/linux/skbuff.h.zz	Wed May 19 11:48:20 1999
++++ linux22/include/linux/skbuff.h	Wed May 19 11:49:08 1999
+@@ -21,6 +21,8 @@
+ #include <asm/types.h>
+ #include <asm/spinlock.h>
+ 
++#include <linux/raptor.h>
++
+ #define HAVE_ALLOC_SKB		/* For the drivers to know */
+ #define HAVE_ALIGNABLE_SKB	/* Ditto 8)		   */
+ #define SLAB_SKB 		/* Slabified skbuffs 	   */
+@@ -76,6 +78,8 @@
+ 	struct  dst_entry *dst;
+ 
+ 	char		cb[48];	 
++
++        struct tunnel_info tunnel_info;         /* more qualification about device */
+ 
+ 	unsigned int 	len;			/* Length of actual data			*/
+ 	unsigned int	csum;			/* Checksum 					*/
+--- linux22/include/linux/fs.h.zz	Wed May 19 15:56:44 1999
++++ linux22/include/linux/fs.h	Wed May 19 15:58:43 1999
+@@ -128,6 +128,7 @@
+ 				|| (inode)->i_flags & (flg))
+ 
+ #define IS_RDONLY(inode) (((inode)->i_sb) && ((inode)->i_sb->s_flags & MS_RDONLY))
++#define IS_NOATIMEFS(inode) (((inode)->i_sb) && ((inode)->i_sb->s_flags & (MS_NOATIME|MS_RDONLY)))
+ #define IS_NOSUID(inode)	__IS_FLG(inode, MS_NOSUID)
+ #define IS_NODEV(inode)		__IS_FLG(inode, MS_NODEV)
+ #define IS_NOEXEC(inode)	__IS_FLG(inode, MS_NOEXEC)
+--- linux22/include/net/sock.h.zz	Wed May 19 11:49:21 1999
++++ linux22/include/net/sock.h	Wed May 19 15:17:09 1999
+@@ -525,6 +525,8 @@
+ 
+ 	/* RPC layer private data */
+ 	void			*user_data;
++
++        struct tunnel_info      tunnel_info;    /* Which tunnel this sock is bound to */
+   
+ 	/* Callbacks */
+ 	void			(*state_change)(struct sock *sk);
+--- linux22/net/core/dev.c.zz	Wed May 19 11:41:19 1999
++++ linux22/net/core/dev.c	Wed May 19 15:48:43 1999
+@@ -76,6 +76,7 @@
+ #include <linux/etherdevice.h>
+ #include <linux/notifier.h>
+ #include <linux/skbuff.h>
++#include <linux/firewall.h>
+ #include <net/sock.h>
+ #include <linux/rtnetlink.h>
+ #include <net/slhc.h>
+@@ -583,6 +584,12 @@
+ 	NET_PROFILE_ENTER(dev_queue_xmit);
+ #endif
+ 
++#ifdef CONFIG_FIREWALL
++        if (call_out_firewall(PF_UNSPEC, dev, skb->data, 0, &skb) < FW_ACCEPT) {
++                goto drop_and_exit;
++        }
++#endif
++
+ 	start_bh_atomic();
+ 	q = dev->qdisc;
+ 	if (q->enqueue) {
+@@ -624,6 +631,7 @@
+ 	}
+ 	end_bh_atomic();
+ 
++ drop_and_exit:
+ 	kfree_skb(skb);
+ 
+ #ifdef CONFIG_NET_PROFILE
+@@ -951,6 +959,21 @@
+ 				pt_prev=ptype;
+ 			}
+ 		}
++
++#ifdef CONFIG_FIREWALL
++#ifdef CONFIG_NET_FASTROUTE
++#error CONFIG_NET_FASTROUTE and CONFIG_FIREWALL are incompatible
++#endif
++#ifdef CONFIG_BRIDGE
++#error CONFIG_BRIDGE and CONFIG_FIREWALL are incompatible
++#endif
++
++                if (call_in_firewall(PF_UNSPEC, skb->dev, skb->data, 0, &skb) < FW_ACCEPT) {
++                        kfree_skb(skb);
++                        continue;
++                }
++
++#endif
+ 
+ 		for (ptype = ptype_base[ntohs(type)&15]; ptype != NULL; ptype = ptype->next) 
+ 		{[unhandled content-type:application/x-pkcs7-signature]

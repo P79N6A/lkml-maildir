@@ -1,0 +1,109 @@
+Date: Thu, 2 Dec 1999 10:13:03 -0500 (EST)
+From: Eric Lowe <>
+Subject: Extending zero copy I/O and page locking -- RFC
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/12/2/58
+
+Hello,
+I'm currently working on a plan to implement asynchronous I/O page
+locking in later kernels (2.5.x) and am experimenting with Stephen
+Tweedie's raw I/O patches as the basis (as I have been for
+a while).  There are some fundamental design considerations that I
+have come up with, and am currently looking at the following issues.
+I would like any feedback that you all can provide as to the best
+course of action to take from here.  Most of this is based
+on IO-Lite.
+See 
+http://cs-tr.cs.rice.edu/Dienst/UI/2.0/Describe/ncstrl.rice_cs/TR97-294
+I have a copy converted to .PDF; e-mail me if you want it.
+Issue #1 -- handling of copy on write pages relating to shared memory
+  (and contention for buffer pages if async I/O is permitted)
+This is an issue that has turned up in my experimentation with SCT's
+code, modified to work directly with user buffers.  When multiple
+kernel scheduled threads are created with the POSIX threads API,
+you get contention for a buffer.  The original code deals with this
+poorly, and often half-locks a buffer before having to back out
+discovering that somebody else has already locked the other half
+of the buffer for I/O-- but only on reads.  On writes, this doesn't
+happen because handle_mm_fault() already copied the page.
+The following is my idea for dealing with this (independent of r/w access):
+ - Write protect the page, saving the previous write protect flag
+ - Increment the page count
+ - Lock the page
+ - Increment the lock count (something that doesn't exist right now)
+The reverse case then looks like this:
+ - Decrement the lock count
+ - If lock count == 0 unlock the page
+ - If the page count == 1 free the page, since we now own it (e.g.
+   a copy on write fault occurred), otherwise decrement the
+   page count
+A little analysis shows a couple of things:
+ 1. In the optimized case, a user program will "flip-flop" between
+    two buffers.  In this case, no copies occur since there is
+    no contention for the page.
+ 2. In the worst case, a user program will contend for every page
+    by trying to write to it immediately after returning from
+    an asynchronous rw request.  In the synchronous case,
+    this could be multiple threads trying to write to the same
+    buffer at once (what I'm currently working with).  In this
+    worst case, a copy-on-demand will occur for each write access.
+Case 1 ends up with _zero_ copies, except for buffer boundaries
+that are not page aligned (which must be copied for obvious reasons).
+Our unlock algorithm absorbs the freeing of these pages since the
+page count will always be 1 on them.
+Case 2 ends up copying the pages _when they need to be copied_,
+rather than when a program first makes an I/O request -- the
+device driver is not forced to block the application while it copies
+all of the data into I/O bounce buffers.
+Another interesting side effect is that we can extend this
+algorithm even to bounce buffers, transparent of the driver
+model.  If the user is trying to do ISA DMA, we just make sure
+that we handle the copies into ISA reachable bounce buffers.
+The same is true for buffers >4GB with 32-bit PCI devices.
+(i.e. you just pass a set of flags into the lock call,
+and specify if you want an s/g list or a contiguous buffer).
+Issue #2 -- unifying the zero-copy stuff with the buffer cache
+  (HINT: this looks like IO-Lite)
+This is a biggie (IMHO).  If we enforce page alignment by using
+page copies on unaligned data (as in the above), and leaving
+the rest in place, we can avoid copies for most pages
+between the network stack, disk, and userland.  This is starting
+to look at lot like IO-Lite (and it's meant to).  This is where
+I have no idea how to go about it either, though mutable buffers
+are going to be required.  The following scenario shows my motivation
+for wanting to do this:
+The user has a FibreChannel card that speaks IP and SCSI
+The user receives data over IP
+The user saves the data to disk over SCSI
+The user looks at the data and does something with it
+This could be very cool, since FibreChannel cards do hardware
+checksums and automatically page align the data streams separate
+from the headers..  E.g. on an SMP system with two PCI busses,
+you could receive data at 90MB/second, display it, and
+write it out to a JBOD at 90MB/second _in real time_.  The
+closest I've come to this is 65MB/second in real time on
+an SGI Octane.
+A further explanation:
+If the data comes in and remains in the buffer cache, the disk
+access ends up with the same pages, and then those pages
+are later mapped into the user buffer by copy-on-demand.  There
+is no interference since, if one thread modifies a page,
+they have their own copy of that page.  The mutable buffer
+concept then takes that page and merges it with the rest
+of the old pages when they are needed by other layers.
+It saves CPU time, it saves cache dirtying, and it
+ends up doing copy-on-demand (lazy copies, to use the IO-lite
+term) in the worst case.
+--
+Eric Lowe
+FibreChannel Software Engineer, Systran Corporation
+elowe@systran.com
+"You can't spell failure without U-R-A."  -Dispair.com
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

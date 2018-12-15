@@ -1,0 +1,277 @@
+Date: Sat, 6 Mar 1999 19:50:55 +0100 (CET)
+From: Andrea Arcangeli <>
+Subject: Re: select()/socket has problems under 2.2.x.
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/3/6/57
+
+On Sat, 6 Mar 1999, Andrea Arcangeli wrote:
+>16:09:06.947418 localhost.1048 > localhost.telnet: S 2378452431:2378452431(0) win 31072 <mss 3884,sackOK,timestamp 567981 0,nop,wscale 0> (DF)
+>										  ^^^^^      ^^^^
+>16:09:06.947478 localhost.telnet > localhost.1048: S 2374855488:2374855488(0) ack 2378452432 win 31072 <mss 3884,sackOK,timestamp 567981 567981,nop,wscale 0> (DF)
+>16:09:06.947509 localhost.1048 > localhost.telnet: . ack 1 win 31072 <nop,nop,timestamp 567981 567981> (DF)
+>							       ^^^^^
+>16:09:06.993209 localhost.telnet > localhost.1048: P 1:4(3) ack 1 win 31072 <nop,nop,timestamp 567985 567981> (DF)
+I was wrong, until here it's fine because at this time the rcvbuf is still
+the default. But _here_ I set the rcvbuf to 1008.
+>16:09:07.005029 localhost.1048 > localhost.telnet: . ack 4 win 31069 <nop,nop,timestamp 567987 567985> (DF)
+								^^^^^
+And here the window get not updated correctly taking care of the rcvbuf
+change. I think it's due this code in tcp.h:
+extern __inline__ u16 tcp_select_window(struct sock *sk)
+{
+	struct tcp_opt *tp = &(sk->tp_pinfo.af_tcp);
+	u32 cur_win = tcp_receive_window(tp);
+	u32 new_win = __tcp_select_window(sk);
+	/* Never shrink the offered window */
+	if(new_win < cur_win) {
+	   ^^^^^^^^^^^^^^^^^
+		/* Danger Will Robinson!
+		 * Don't update rcv_wup/rcv_wnd here or else
+		 * we will not be able to advertise a zero
+		 * window in time.  --DaveM
+		 */
+		new_win = cur_win;
+		^^^^^^^^^^^^^^^^^ so the next advertised window become the
+				  current window
+	} else {
+		tp->rcv_wnd = new_win;
+		tp->rcv_wup = tp->rcv_nxt;
+	}
+	/* RFC1323 scaling applied */
+	return new_win >> tp->rcv_wscale;
+}
+So what's happening here? It seems that it's impossible to decrease the
+receiver window under the current value.
+Andi, are you going to develop your `avoid to set a rcvbuf lower than the
+minimal truesize' patch? You must also include in it the `check that the
+rcvbuf is not too low at MTU size increase', I really don't like a lazy
+not clean approch that could cause a TCP connection to deadlock upon MTU
+change.
+And are we checking that the incoming skb data size is not > of our
+advertised mss before queueing it in the receive queue? If so my fix looks
+still safe to me. I also changed tcp_queue to wakeup the waiter only if we
+received in order data. Note I didn't had the time to try out this last
+change, it's just something I thought about and I implemented.
+Here my latest snapshot against 2.2.2.
+Index: tcp_input.c
+===================================================================
+RCS file: /var/cvs/linux/net/ipv4/tcp_input.c,v
+retrieving revision 1.1.1.6
+retrieving revision 1.1.2.20
+diff -u -r1.1.1.6 -r1.1.2.20
+--- tcp_input.c	1999/02/23 16:48:26	1.1.1.6
++++ tcp_input.c	1999/03/06 18:47:13	1.1.2.20
+@@ -55,6 +55,15 @@
+  *					work without delayed acks. 
+  *		Andi Kleen:		Process packets with PSH set in the
+  *					fast path.
++ *		Andrea Arcangeli:	TCP_NODELAY disable delacks.
++ *		Andrea Arcangeli:	Delay also the first ack to be able to
++ *					join the ack in the first data packet.
++ *		Andrea Arcangeli:	Always queue a packet from the other
++ *					end if all receive queues are empty,
++ *					this avoid the receiver to deadlock
++ *					if rcvbuf < packet truesize.
++ *		Andrea Arcangeli:	Don't wakeup waiters if we get out of
++ *					order packets.
+  */
+ 
+ #include <linux/config.h>
+@@ -99,12 +108,11 @@
+ 	if(tp->ato == 0) {
+ 		tp->lrcvtime = jiffies;
+ 
+-		/* Help sender leave slow start quickly,
+-		 * and also makes sure we do not take this
+-		 * branch ever again for this connection.
++		/*
++		 * Don't enter quickack mode to be able to join the first
++		 * ack with a data packet. -arca
+ 		 */
+-		tp->ato = 1;
+-		tcp_enter_quickack_mode(tp);
++		tp->ato = (HZ+49)/50;
+ 	} else {
+ 		int m = jiffies - tp->lrcvtime;
+ 
+@@ -135,9 +143,9 @@
+ 	 */
+ 	if(th->psh && (skb->len < (tp->mss_cache >> 1))) {
+ 		/* Preserve the quickack state. */
+-		if((tp->ato & 0x7fffffff) > HZ/50)
++		if((tp->ato & 0x7fffffff) > (HZ+49)/50)
+ 			tp->ato = ((tp->ato & 0x80000000) |
+-				   (HZ/50));
++				   ((HZ+49)/50));
+ 	}
+ } 
+ 
+@@ -241,7 +249,7 @@
+ extern __inline__ int tcp_paws_discard(struct tcp_opt *tp, struct tcphdr *th, unsigned len)
+ {
+ 	/* ts_recent must be younger than 24 days */
+-	return (((jiffies - tp->ts_recent_stamp) >= PAWS_24DAYS) ||
++	return (((s32)(jiffies - tp->ts_recent_stamp) >= PAWS_24DAYS) ||
+ 		(((s32)(tp->rcv_tsval-tp->ts_recent) < 0) &&
+ 		 /* Sorry, PAWS as specified is broken wrt. pure-ACKs -DaveM */
+ 		 (len != (th->doff * 4))));
+@@ -1354,7 +1362,7 @@
+ 	}
+ }
+ 
+-static void tcp_data_queue(struct sock *sk, struct sk_buff *skb)
++static int tcp_data_queue(struct sock *sk, struct sk_buff *skb)
+ {
+ 	struct sk_buff *skb1;
+ 	struct tcp_opt *tp = &(sk->tp_pinfo.af_tcp);
+@@ -1384,7 +1392,7 @@
+ 			tp->pred_flags = htonl(((tp->tcp_header_len >> 2) << 28) |
+ 					       (0x10 << 16) |
+ 					       tp->snd_wnd);
+-		return;
++		return 0;
+ 	}
+ 	
+ 	/* An old packet, either a retransmit or some packet got lost. */
+@@ -1393,7 +1401,7 @@
+ 		SOCK_DEBUG(sk, "retransmit received: seq %X\n", TCP_SKB_CB(skb)->seq);
+ 		tcp_enter_quickack_mode(tp);
+ 		kfree_skb(skb);
+-		return;
++		return 1;
+ 	}
+ 
+ 	if (before(TCP_SKB_CB(skb)->seq, tp->rcv_nxt)) {
+@@ -1415,7 +1423,7 @@
+ 	SOCK_DEBUG(sk, "out of order segment: rcv_next %X seq %X - %X\n",
+ 		   tp->rcv_nxt, TCP_SKB_CB(skb)->seq, TCP_SKB_CB(skb)->end_seq);
+ 
+-	if (skb_peek(&tp->out_of_order_queue) == NULL) {
++	if (!skb_queue_len(&tp->out_of_order_queue)) {
+ 		/* Initial out of order segment, build 1 SACK. */
+ 		if(tp->sack_ok) {
+ 			tp->num_sacks = 1;
+@@ -1458,6 +1466,7 @@
+ 			}
+ 		}
+ 	}
++	return 1;
+ }
+ 
+ 
+@@ -1471,6 +1480,7 @@
+ {
+ 	struct tcphdr *th;
+ 	struct tcp_opt *tp = &(sk->tp_pinfo.af_tcp);
++	int ret;
+ 
+ 	th = skb->h.th;
+ 	skb_pull(skb, th->doff*4);
+@@ -1484,8 +1494,11 @@
+ 	 *	Make sure to do this before moving snd_nxt, otherwise
+ 	 *	data might be acked for that we don't have enough room.
+ 	 */
+-	if (atomic_read(&sk->rmem_alloc) > sk->rcvbuf) { 
+-		if (prune_queue(sk) < 0) { 
++	if (atomic_read(&sk->rmem_alloc) >= sk->rcvbuf &&
++	    (skb_queue_len(&tp->out_of_order_queue) ||
++	     skb_queue_len(&tp->receive_queue))) { 
++		if (prune_queue(sk) < 0 &&
++		    skb_queue_len(&tp->receive_queue)) { 
+ 			/* Still not enough room. That can happen when
+ 			 * skb->true_size differs significantly from skb->len.
+ 			 */
+@@ -1493,7 +1506,7 @@
+ 		}
+ 	}
+ 
+-	tcp_data_queue(sk, skb);
++	ret = tcp_data_queue(sk, skb);
+ 
+ 	if (before(tp->rcv_nxt, tp->copied_seq)) {
+ 		printk(KERN_DEBUG "*** tcp.c:tcp_data bug acked < copied\n");
+@@ -1503,7 +1516,7 @@
+ 	/* Above, tcp_data_queue() increments delayed_acks appropriately.
+ 	 * Now tell the user we may have some data.
+ 	 */
+-	if (!sk->dead) {
++	if (!sk->dead && !ret) {
+ 		SOCK_DEBUG(sk, "Data wakeup.\n");
+ 		sk->data_ready(sk,0);
+ 	}
+@@ -1580,7 +1593,9 @@
+ 	    /* We entered "quick ACK" mode or... */
+ 	    tcp_in_quickack_mode(tp) ||
+ 	    /* We have out of order data */
+-	    (skb_peek(&tp->out_of_order_queue) != NULL)) {
++	    skb_queue_len(&tp->out_of_order_queue) ||
++	    /* TCP_NODELAY is set */
++	    sk->nonagle == 1) {
+ 		/* Then ack it now */
+ 		tcp_send_ack(sk);
+ 	} else {
+@@ -1821,7 +1836,8 @@
+ 				goto discard;
+ 			}
+ 		} else if (TCP_SKB_CB(skb)->ack_seq == tp->snd_una &&
+-			   atomic_read(&sk->rmem_alloc) <= sk->rcvbuf) {
++			   (atomic_read(&sk->rmem_alloc) <= sk->rcvbuf ||
++			    !skb_queue_len(&sk->receive_queue))) {
+ 			/* Bulk data transfer: receiver */
+ 			__skb_pull(skb,th->doff*4);
+ 
+Index: tcp_output.c
+===================================================================
+RCS file: /var/cvs/linux/net/ipv4/tcp_output.c,v
+retrieving revision 1.1.1.5
+diff -u -r1.1.1.5 tcp_output.c
+--- tcp_output.c	1999/02/23 16:48:26	1.1.1.5
++++ tcp_output.c	1999/03/02 16:53:50
+@@ -580,6 +580,19 @@
+ 	if(tp->af_specific->rebuild_header(sk))
+ 		return 1; /* Routing failure or similar. */
+ 
++	/* Solaris sucks. */
++	if(skb->len > 0 &&
++	   (TCP_SKB_CB(skb)->flags & TCPCB_FLAG_FIN) &&
++	   tp->snd_una == (TCP_SKB_CB(skb)->end_seq - 1)) {
++#if 1
++		printk("TCP: Doing Solaris hack for [%p:%08x:%04x:%08x]\n",
++		       skb, sk->daddr, sk->dport, tp->snd_una);
++#endif
++		TCP_SKB_CB(skb)->seq = TCP_SKB_CB(skb)->end_seq - 1;
++		skb_trim(skb, 0);
++		skb->csum = 0;
++	}
++
+ 	/* Ok, we're gonna send it out, update state. */
+ 	TCP_SKB_CB(skb)->sacked |= TCPCB_SACKED_RETRANS;
+ 	tp->retrans_out++;
+@@ -973,6 +986,8 @@
+ 	timeout = tp->ato;
+ 	if (timeout > max_timeout)
+ 		timeout = max_timeout;
++	if (timeout < (HZ+49)/50)
++		timeout = (HZ+49)/50;
+ 	timeout += jiffies;
+ 
+ 	/* Use new timeout only if there wasn't a older one earlier. */
+@@ -980,7 +995,7 @@
+ 		tp->delack_timer.expires = timeout;
+ 		add_timer(&tp->delack_timer);
+         } else {
+-		if (timeout < tp->delack_timer.expires)
++		if (time_before(timeout, tp->delack_timer.expires))
+ 			mod_timer(&tp->delack_timer, timeout);
+ 	}
+ }
+Comments?
+Andrea Arcangeli
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

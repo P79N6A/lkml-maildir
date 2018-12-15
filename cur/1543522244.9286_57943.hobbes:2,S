@@ -1,0 +1,355 @@
+Date: Sun, 16 Jan 2000 16:17:05 +0100
+From:  almesber@lrc ...
+Subject: umount-root-1
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/1/16/105
+
+Added the device name prefix to /proc/mounts and fixed a few minor bugs.
+I'm having second thoughts about /proc/mount/*, because of its potential
+security problems. Making it technically secure should be easy (add a
+capability to access /proc/mount (off by default), and another one
+authorizing a process to enable the former (on by default)), but it
+would be quite confusing, and therefore de facto insecure.
+Anyway, besides the few quota printks, I've pretty much exhausted my to
+do list for this patch. Comments ?
+- Werner
+-- 
+  _________________________________________________________________________
+ / Werner Almesberger, ICA, EPFL, CH       werner.almesberger@ica.epfl.ch /
+/_IN_N_032__Tel_+41_21_693_6621__Fax_+41_21_693_6610_____________________/
+Unmount root patch, version 1 (16-JAN-2000)
+-----------------------------
+Patch for kernel 2.3.38.
+What does it change ?
+---------------------
+- /proc/mounts shows mount points relative to the root of the current process
+- umount <block_device>  unmounts the block device if it is "busy" but all
+  references are mount points (in particular, root and pwd of all processes
+  are on other file systems)
+Changes since version 0
+-----------------------
+- fixed race condition in d_umount. Can somebody please check if moving
+  sb->s_root = NULL;
+  towards the end of d_umount was okay ?
+- /proc/mounts now prefixes unreachable path names with the device on which
+  the path name begins, e.g. 03:01/foo/bar
+- made check for root device in do_umount independent from (possibly invalid)
+  ROOT_DEV
+Example
+-------
+My / is on /dev/hda1. /var is on a separate partition /dev/hda5.
+1) apply the unmount-root patch and build the kernel
+2) make sure there's a chroot in /sbin:
+   [ -x /sbin/chroot ] || cp /usr/sbin/chroot /sbin
+3) create a minimum system environment on a non-root partition, e.g.
+   mkdir /var/test
+   (cd / && tar cfl - bin lib sbin etc dev) | (cd /var/test && tar xf -)
+4) reboot with init=/bin/sh
+5) make the test environment your new root (assume /var has its own partition):
+   mount /var
+   exec /sbin/chroot /var/test /bin/sh \
+     </var/test/dev/console >/var/test/dev/console 2>&1
+6) get rid of the old root (assume it's on /dev/hda1):
+   umount /dev/hda1
+7) for kicks, return to the old root FS (assume /var is on /dev/hda5):
+   mkdir /mnt
+   mount /dev/hda1 /mnt
+   exec /sbin/chroot /mnt /bin/sh </mnt/dev/console >/mnt/dev/console 2>&1
+   umount /dev/hda5
+8) bring up the system:
+   mount -o remount,ro /
+   exec /sbin/init
+Known problems and anomalies
+----------------------------
+- mount points in /proc/mounts may be outside of the directory tree underneath
+  the current process' root. In this case, the path name is prefixed with the
+  device number on which the path begins. This may confuse programs reading
+  /proc/mounts
+- if multiple file systems were mounted on old root, each of them becomes a
+  potential root. This can be considered to be a feature ;-)
+- if anonymous block devices are detached this way, it can be difficult to
+  unmount them (work-around: unmout everything that's not needed while the old
+  root is still accessible)
+- umount <old_root_dev>  is overloaded. Therefore, if the umount fails for some
+  reason, it will still appear to succeed, but actually just set the old root
+  read-only (do we need a new mount option ?)
+- the content of ROOT_DEV is meaningless after a root directory change
+- disk quota support also uses mnt_dirname and still prints the original path
+  names (see below)
+- changing the root changes /dev/root to the real device, which confuses the
+  RH 6.1 halt script (which explicitly checks for /dev/root), causing it to
+  hang.
+Discussion of problems
+----------------------
+The main problem is certainly tmp_dirname, which shows up in /proc/mounts and
+in disk quota messages. The semantics of a mount point's path name are
+inherently ambiguous from the perspective of a process that uses a different
+root than the one under which the mount point was made. This ambiguity is
+aggravated if the mount point is not below the process' root. Things get even
+worse if already the normal system environment is chrooted (which this
+extension encourages to do).
+One problem of using d_path to construct path names with respect to the
+current root is that mount points outside the current root yield paths that
+are not only meaningless, but that may also change as a side-effect of mount
+operations.
+The current solution of constructing as much of the path as possible and
+then adding the device number as a prefix is unambiguous but changes the
+syntax of /proc/mounts. Therefore, this needs input from people with
+programs using /proc/mounts.
+The second major problem are "lost" unnamed block devices. In principle,
+all such problems are caused by user errors. Considering that interactive
+use of this facility will be rare, we may just decide to live with this
+problem. Furthermore, recovery is possible by trying to manually construct
+the right device numbers. A clean solution would involve exposing the
+minor numbers assigned by the kernel. E.g. /proc/mounts could use
+kdevname instead of mnt_devname in such cases. Again, the feasibility of
+this depends on what users of /proc/mounts expect.
+Concerning the overloading of umount <root_dev>: since umount(8) will try to
+translate the device name to the mount point, the new behaviour is only
+selected if the root FS is already inaccessible. Therefore, the only
+ambiguity occurs when the new behaviour is desired, but due to some
+mistake the umount fails and (if the file system happens to be the old
+root) is silently turned into a  mount -o remount,ro. A umount option to
+specificly indicate that we intend to unmount an inaccessible file system
+may be cleaner, but I'm not sure if it's worth the effort.
+--- linux/fs/dcache.c.orig	Sun Jan 16 00:41:21 2000
++++ linux/fs/dcache.c	Sun Jan 16 14:26:05 2000
+@@ -302,7 +302,7 @@
+  * child dentries were freed. This allows a non-destructive
+  * test for unmounting a device.
+  */
+-int is_root_busy(struct dentry *root)
++int __is_root_busy(struct dentry *root,int ignore_mount_points)
+ {
+ 	struct dentry *this_parent = root;
+ 	struct list_head *next;
+@@ -314,15 +314,20 @@
+ 	while (next != &this_parent->d_subdirs) {
+ 		struct list_head *tmp = next;
+ 		struct dentry *dentry = list_entry(tmp, struct dentry, d_child);
++		int effective_count;
+ 		next = tmp->next;
++		/* Mount points may not count */
++		effective_count = dentry->d_count;
++		if (ignore_mount_points && dentry->d_mounts != dentry)
++			effective_count--;
+ 		/* Decrement count for unused children */
+-		count += (dentry->d_count - 1);
++		count += (effective_count - 1);
+ 		if (!list_empty(&dentry->d_subdirs)) {
+ 			this_parent = dentry;
+ 			goto repeat;
+ 		}
+ 		/* root is busy if any leaf is busy */
+-		if (dentry->d_count)
++		if (effective_count)
+ 			return 1;
+ 	}
+ 	/*
+@@ -336,6 +341,11 @@
+ 	return (count > 1); /* remaining users? */
+ }
+ 
++int is_root_busy(struct dentry *root)
++{
++	return __is_root_busy(root,0);
++}
++
+ /*
+  * Search the dentry child list for the specified parent,
+  * and move any unused dentries to the end of the unused
+@@ -704,7 +714,8 @@
+ /*
+  * "buflen" should be PAGE_SIZE or more.
+  */
+-char * d_path(struct dentry *dentry, char *buffer, int buflen)
++static char * __d_path(struct dentry *dentry, char *buffer, int buflen,
++    kdev_t *need_dev)
+ {
+ 	char * end = buffer+buflen;
+ 	char * retval;
+@@ -712,6 +723,8 @@
+ 
+ 	*--end = '\0';
+ 	buflen--;
++	if (need_dev) *need_dev = 0;
++
+ 	if (!IS_ROOT(dentry) && list_empty(&dentry->d_hash)) {
+ 		buflen -= 10;
+ 		end -= 10;
+@@ -730,8 +743,10 @@
+ 			break;
+ 		dentry = dentry->d_covers;
+ 		parent = dentry->d_parent;
+-		if (dentry == parent)
++		if (dentry == parent) {
++			if (need_dev) *need_dev = dentry->d_sb->s_dev;
+ 			break;
++		}
+ 		namelen = dentry->d_name.len;
+ 		buflen -= namelen + 1;
+ 		if (buflen < 0)
+@@ -743,6 +758,28 @@
+ 		dentry = parent;
+ 	}
+ 	return retval;
++}
++
++char * d_path(struct dentry *dentry, char *buffer, int buflen)
++{
++	return __d_path(dentry,buffer,buflen,NULL);
++}
++
++char * d_dev_path(struct dentry *dentry, char *buffer, int buflen)
++{
++	char *path,*prefix;
++	kdev_t need_dev;
++	int length;
++
++	path = __d_path(dentry,buffer,buflen,&need_dev);
++	if (!need_dev) return path;
++	prefix = kdevname(need_dev);
++	length = strlen(prefix);
++	if (path >= buffer+length) {
++		path -= length;
++		memcpy(path,prefix,length);
++	}
++	return path;
+ }
+ 
+ /*
+--- linux/fs/super.c.orig	Sat Jan 15 12:53:27 2000
++++ linux/fs/super.c	Sun Jan 16 14:52:28 2000
+@@ -307,11 +307,15 @@
+ 	struct proc_nfs_info *nfs_infop;
+ 	struct nfs_server *nfss;
+ 	int len = 0;
++	char *path,*buffer = (char *) __get_free_page(GFP_KERNEL);
+ 
++	if (!buffer) return 0;
+ 	while ( tmp && len < PAGE_SIZE - 160)
+ 	{
++		path = d_dev_path(tmp->mnt_sb->s_root,buffer,PAGE_SIZE);
+ 		len += sprintf( buf + len, "%s %s %s %s",
+-			tmp->mnt_devname, tmp->mnt_dirname, tmp->mnt_sb->s_type->name,
++			tmp->mnt_devname, path,
++			tmp->mnt_sb->s_type->name,
+ 			tmp->mnt_flags & MS_RDONLY ? "ro" : "rw" );
+ 		for (fs_infop = fs_info; fs_infop->flag; fs_infop++) {
+ 		  if (tmp->mnt_flags & fs_infop->flag) {
+@@ -368,6 +372,7 @@
+ 		tmp = tmp->mnt_next;
+ 	}
+ 
++	free_page((unsigned long) buffer);
+ 	return len;
+ }
+ 
+@@ -467,6 +472,34 @@
+ 	return NULL;
+ }
+ 
++static void detach_mount_points(struct super_block *sb)
++{
++	struct super_block *s;
++
++	for (s = sb_entry(super_blocks.next); s != sb_entry(&super_blocks); 
++	    s = sb_entry(s->s_list.next)) {
++		struct dentry *root,*covered;
++
++		if (!s->s_dev || s == sb) continue;
++		root = s->s_root;
++ 		covered = root->d_covers;
++		if (covered->d_sb != sb) continue;
++		if (covered->d_inode->i_count != 1) {
++			printk(KERN_CRIT "detach_mount_points: inode %ld on %s "
++			    "count %d (must be 1)\n",covered->d_inode->i_ino,
++			    kdevname(sb->s_dev),covered->d_inode->i_count);
++			continue;
++		}
++		covered->d_mounts = covered; /* l'art pour l'art ... */
++		dput(covered);
++		root->d_covers = root;
++		printk(KERN_DEBUG "detached %s (count %d)",kdevname(s->s_dev),
++		    root->d_count);
++		printk(" from %s (count %d)\n",kdevname(sb->s_dev),
++		    sb->s_root->d_count);
++	}
++}
++
+ asmlinkage long sys_ustat(dev_t dev, struct ustat * ubuf)
+ {
+         struct super_block *s;
+@@ -612,19 +645,28 @@
+ 	struct dentry * root = sb->s_root;
+ 	struct dentry * covered = root->d_covers;
+ 
+-	if (root->d_count != 1)
++	printk(KERN_DEBUG "d_umount: ref %d\n",root->d_count);
++	if (root->d_count != 1 && __is_root_busy(sb->s_root,1))
+ 		return -EBUSY;
+ 
+ 	if (root->d_inode->i_state)
+ 		return -EBUSY;
+ 
+-	sb->s_root = NULL;
+-
+ 	if (covered != root) {
+ 		root->d_covers = root;
+ 		covered->d_mounts = covered;
+ 		dput(covered);
+ 	}
++
++	/* fsync_dev may sleep, so we must disconnect the dentries first */
++	if (root->d_count != 1) {
++		detach_mount_points(sb);
++		shrink_dcache_sb(sb);
++		fsync_dev(sb->s_dev);
++	}
++
++	sb->s_root = NULL;
++
+ 	dput(root);
+ 	return 0;
+ }
+@@ -681,7 +723,9 @@
+ 	shrink_dcache_sb(sb);
+ 	fsync_dev(dev);
+ 
+-	if (dev==ROOT_DEV && !unmount_root) {
++	printk(KERN_DEBUG "do_umount: ref %d\n",sb->s_root->d_count);
++	if (sb->s_root == sb->s_root->d_parent && !unmount_root &&
++	    __is_root_busy(sb->s_root,1)) {
+ 		/*
+ 		 * Special case for "unmounting" root ...
+ 		 * we just try to remount it readonly.
+@@ -1273,7 +1317,7 @@
+ 			}
+ 			return 0;
+ 		}
+-		printk(KERN_ERR "error %d\n",PTR_ERR(bdev));
++		printk(KERN_ERR "error %ld\n",PTR_ERR(bdev));
+ 		return error;
+ 	}
+ 	remove_vfsmnt(old_root_dev);
+--- linux/include/linux/dcache.h.orig	Fri Jan  7 01:21:23 2000
++++ linux/include/linux/dcache.h	Sun Jan 16 14:16:26 2000
+@@ -150,6 +150,7 @@
+ 
+ /* test whether root is busy without destroying dcache */
+ extern int is_root_busy(struct dentry *);
++extern int __is_root_busy(struct dentry *,int ignore_mount_points);
+ 
+ /*
+  * This adds the entry to the hash queues.
+@@ -176,6 +177,7 @@
+ 
+ /* write full pathname into buffer and return start of pathname */
+ extern char * d_path(struct dentry *, char *, int);
++extern char * d_dev_path(struct dentry *dentry, char *buffer, int buflen);
+ 
+ /* Allocation counts.. */
+ static __inline__ struct dentry * dget(struct dentry *dentry)

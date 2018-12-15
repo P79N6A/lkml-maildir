@@ -1,0 +1,121 @@
+Date: Fri, 25 Jan 2008 13:23:18 -0800
+From: Jeremy Fitzhardinge <>
+Subject: [PATCH 09 of 11] x86: preallocate pmds at pgd creation time
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2008/1/25/542
+
+In PAE mode, an update to the pgd requires a cr3 reload to make sure
+the processor notices the changes.  Since this also has the
+side-effect of flushing the tlb, its an expensive operation which we
+want to avoid where possible.
+This patch mitigates the cost of installing the initial set of pmds on
+process creation by preallocating them when the pgd is allocated.
+This avoids up to three tlb flushes during exec, as it creates the new
+process address space while the pagetable is in active use.
+The pmds will be freed as part of the normal pagetable teardown in
+free_pgtables, which is called in munmap and process exit.  However,
+free_pgtables will only free parts of the pagetable which actually
+contain mappings, so stray pmds may still be attached to the pgd at
+pgd_free time.  We must mop them up to prevent a memory leak.
+Signed-off-by: Jeremy Fitzhardinge <jeremy@xensource.com>
+Cc: Andi Kleen <ak@suse.de>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: H. Peter Anvin <hpa@zytor.com>
+Cc: William Irwin <wli@holomorphy.com>
+---
+ arch/x86/mm/pgtable_32.c |   70 ++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 70 insertions(+)
+diff --git a/arch/x86/mm/pgtable_32.c b/arch/x86/mm/pgtable_32.c
+--- a/arch/x86/mm/pgtable_32.c
++++ b/arch/x86/mm/pgtable_32.c
+@@ -258,17 +258,87 @@ static void pgd_dtor(void *pgd)
+ 	spin_unlock_irqrestore(&pgd_lock, flags);
+ }
+ 
++#ifdef CONFIG_X86_PAE
++/*
++ * Mop up any pmd pages which may still be attached to the pgd.
++ * Normally they will be freed by munmap/exit_mmap, but any pmd we
++ * preallocate which never got a corresponding vma will need to be
++ * freed manually.
++ */
++static void pgd_mop_up_pmds(pgd_t *pgdp)
++{
++	int i;
++
++	for(i = 0; i < USER_PTRS_PER_PGD; i++) {
++		pgd_t pgd = pgdp[i];
++
++		if (pgd_val(pgd) != 0) {
++			pmd_t *pmd = (pmd_t *)pgd_page_vaddr(pgd);
++
++			pgdp[i] = native_make_pgd(0);
++
++			paravirt_release_pd(pgd_val(pgd) >> PAGE_SHIFT);
++			pmd_free(pmd);
++		}
++	}
++}
++
++/*
++ * In PAE mode, we need to do a cr3 reload (=tlb flush) when
++ * updating the top-level pagetable entries to guarantee the
++ * processor notices the update.  Since this is expensive, and
++ * all 4 top-level entries are used almost immediately in a
++ * new process's life, we just pre-populate them here.
++ */
++static int pgd_prepopulate_pmd(struct mm_struct *mm, pgd_t *pgd)
++{
++	pud_t *pud;
++	unsigned long addr;
++	int i;
++
++	pud = pud_offset(pgd, 0);
++ 	for (addr = i = 0; i < USER_PTRS_PER_PGD; i++, pud++, addr += PUD_SIZE) {
++		pmd_t *pmd = pmd_alloc_one(mm, addr);
++
++		if (!pmd) {
++			pgd_mop_up_pmds(pgd);
++			return 0;
++		}
++
++		pud_populate(mm, pud, pmd);
++	}
++
++	return 1;
++}
++#else  /* !CONFIG_X86_PAE */
++/* No need to prepopulate any pagetable entries in non-PAE modes. */
++static int pgd_prepopulate_pmd(struct mm_struct *mm, pgd_t *pgd)
++{
++	return 1;
++}
++
++static void pgd_mop_up_pmds(pgd_t *pgd)
++{
++}
++#endif	/* CONFIG_X86_PAE */
++
+ pgd_t *pgd_alloc(struct mm_struct *mm)
+ {
+ 	pgd_t *pgd = quicklist_alloc(0, GFP_KERNEL, pgd_ctor);
+ 
+ 	mm->pgd = pgd;		/* so that alloc_pd can use it */
+ 
++	if (pgd && !pgd_prepopulate_pmd(mm, pgd)) {
++		quicklist_free(0, pgd_dtor, pgd);
++		pgd = NULL;
++	}
++
+ 	return pgd;
+ }
+ 
+ void pgd_free(pgd_t *pgd)
+ {
++	pgd_mop_up_pmds(pgd);
+ 	quicklist_free(0, pgd_dtor, pgd);
+ }
+ 

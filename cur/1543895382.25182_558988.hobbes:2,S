@@ -1,0 +1,175 @@
+Date: Mon, 18 Jun 2007 11:38:48 +0200
+From: Ingo Molnar <>
+Subject: Re: [BUG] long freezes on thinkpad t60
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2007/6/18/86
+
+* Ingo Molnar <mingo@elte.hu> wrote:
+> > > > > This change causes the memory access of the "easy" spin-loop 
+> > > > > portion to be more agressive: after the REP; NOP we'd not do 
+> > > > > the 'easy-loop' with a simple CMPB, but we'd re-attempt the 
+> > > > > atomic op.
+> > > > 
+> > > > It looks as if this is going to overflow of the lock counter, 
+> > > > no?
+> > > 
+> > > hm, what do you mean? There's no lock counter.
+> > 
+> > I mean, the repeated calls to decb will pretty soon make lock->slock 
+> > wrap around.
+> 
+> ugh, indeed, bad thinko on my part. I'll rework this.
+how about the patch below? Boot-tested on 32-bit. As a side-effect this 
+change also removes the 255 CPUs limit from the 32-bit kernel.
+	Ingo
+------------------------->
+Subject: [patch] x86: fix spin-loop starvation bug
+From: Ingo Molnar <mingo@elte.hu>
+Miklos Szeredi reported very long pauses (several seconds, sometimes
+more) on his T60 (with a Core2Duo) which he managed to track down to
+wait_task_inactive()'s open-coded busy-loop. He observed that an
+interrupt on one core tries to acquire the runqueue-lock but does not
+succeed in doing so for a very long time - while wait_task_inactive() on
+the other core loops waiting for the first core to deschedule a task
+(which it wont do while spinning in an interrupt handler).
+The problem is: both the spin_lock() code and the wait_task_inactive()
+loop uses cpu_relax()/rep_nop(), so in theory the CPU should have
+guaranteed MESI-fairness to the two cores - but that didnt happen: one
+of the cores was able to monopolize the cacheline that holds the
+runqueue lock, for extended periods of time.
+This patch changes the spin-loop to assert an atomic op after every REP
+NOP instance - this will cause the CPU to express its "MESI interest" in
+that cacheline after every REP NOP.
+Signed-off-by: Ingo Molnar <mingo@elte.hu>
+---
+ include/asm-i386/spinlock.h   |   27 ++++++++++-----------------
+ include/asm-x86_64/spinlock.h |   33 ++++++++++++++++-----------------
+ 2 files changed, 26 insertions(+), 34 deletions(-)
+Index: linux-cfs-2.6.22-rc5.q/include/asm-i386/spinlock.h
+===================================================================
+--- linux-cfs-2.6.22-rc5.q.orig/include/asm-i386/spinlock.h
++++ linux-cfs-2.6.22-rc5.q/include/asm-i386/spinlock.h
+@@ -35,15 +35,12 @@ static inline int __raw_spin_is_locked(r
+ static inline void __raw_spin_lock(raw_spinlock_t *lock)
+ {
+ 	asm volatile("\n1:\t"
+-		     LOCK_PREFIX " ; decb %0\n\t"
+-		     "jns 3f\n"
+-		     "2:\t"
+-		     "rep;nop\n\t"
+-		     "cmpb $0,%0\n\t"
+-		     "jle 2b\n\t"
++		     LOCK_PREFIX " ; btrl %[zero], %[slock]\n\t"
++		     "jc 3f\n"
++		     "rep; nop\n\t"
+ 		     "jmp 1b\n"
+ 		     "3:\n\t"
+-		     : "+m" (lock->slock) : : "memory");
++		     : [slock] "+m" (lock->slock) : [zero] "Ir" (0) : "memory");
+ }
+ 
+ /*
+@@ -59,27 +56,23 @@ static inline void __raw_spin_lock_flags
+ {
+ 	asm volatile(
+ 		"\n1:\t"
+-		LOCK_PREFIX " ; decb %[slock]\n\t"
++		LOCK_PREFIX " ; btrl %[zero], %[slock]\n\t"
+ 		"jns 5f\n"
+ 		"2:\t"
+ 		"testl $0x200, %[flags]\n\t"
+ 		"jz 4f\n\t"
+ 		STI_STRING "\n"
+-		"3:\t"
+-		"rep;nop\n\t"
+-		"cmpb $0, %[slock]\n\t"
+-		"jle 3b\n\t"
++		"rep; nop\n\t"
+ 		CLI_STRING "\n\t"
+ 		"jmp 1b\n"
+ 		"4:\t"
+-		"rep;nop\n\t"
+-		"cmpb $0, %[slock]\n\t"
+-		"jg 1b\n\t"
++		"rep; nop\n\t"
+ 		"jmp 4b\n"
+ 		"5:\n\t"
+ 		: [slock] "+m" (lock->slock)
+-		: [flags] "r" (flags)
+-	 	  CLI_STI_INPUT_ARGS
++		: [zero] "Ir" (0),
++		  [flags] "r" (flags)
++		  CLI_STI_INPUT_ARGS
+ 		: "memory" CLI_STI_CLOBBERS);
+ }
+ #endif
+Index: linux-cfs-2.6.22-rc5.q/include/asm-x86_64/spinlock.h
+===================================================================
+--- linux-cfs-2.6.22-rc5.q.orig/include/asm-x86_64/spinlock.h
++++ linux-cfs-2.6.22-rc5.q/include/asm-x86_64/spinlock.h
+@@ -26,14 +26,15 @@ static inline void __raw_spin_lock(raw_s
+ {
+ 	asm volatile(
+ 		"\n1:\t"
+-		LOCK_PREFIX " ; decl %0\n\t"
++		LOCK_PREFIX " ; btrl %[zero], %[slock]\n\t"
+ 		"jns 2f\n"
+-		"3:\n"
+-		"rep;nop\n\t"
+-		"cmpl $0,%0\n\t"
+-		"jle 3b\n\t"
++		"rep; nop\n\t"
+ 		"jmp 1b\n"
+-		"2:\t" : "=m" (lock->slock) : : "memory");
++		"2:\t"
++		: [slock] "+m" (lock->slock)
++		: [zero] "Ir" (0)
++		: "memory"
++	);
+ }
+ 
+ /*
+@@ -44,24 +45,22 @@ static inline void __raw_spin_lock_flags
+ {
+ 	asm volatile(
+ 		"\n1:\t"
+-		LOCK_PREFIX " ; decl %0\n\t"
++		LOCK_PREFIX " ; btrl %[zero], %[slock]\n\t"
+ 		"jns 5f\n"
+-		"testl $0x200, %1\n\t"	/* interrupts were disabled? */
++		"testl $0x200, %[flags]\n\t"	/* were interrupts disabled? */
+ 		"jz 4f\n\t"
+ 	        "sti\n"
+-		"3:\t"
+-		"rep;nop\n\t"
+-		"cmpl $0, %0\n\t"
+-		"jle 3b\n\t"
++		"rep; nop\n\t"
+ 		"cli\n\t"
+ 		"jmp 1b\n"
+-		"4:\t"
+-		"rep;nop\n\t"
+-		"cmpl $0, %0\n\t"
+-		"jg 1b\n\t"
++		"rep; nop\n\t"
+ 		"jmp 4b\n"
+ 		"5:\n\t"
+-		: "+m" (lock->slock) : "r" ((unsigned)flags) : "memory");
++		: [slock] "+m" (lock->slock)
++		: [zero] "Ir" (0),
++		  [flags] "r" ((unsigned)flags)
++		: "memory"
++	);
+ }
+ #endif
+ 
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+More majordomo info at  
+http://vger.kernel.org/majordomo-info.html
+Please read the FAQ at  
+http://www.tux.org/lkml/

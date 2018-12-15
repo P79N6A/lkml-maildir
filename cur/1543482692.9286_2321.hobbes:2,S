@@ -1,0 +1,230 @@
+Date: Wed, 27 Jan 1999 17:29:27 +0100
+From: Eric PAIRE <>
+Subject: [PATCH] for 2 kernel bugs due to ptrace_attach() side effects
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/1/27/169
+
+Now that the 2.2.0 is output, perhaps you will have some time to have a look
+at the fixes for the 2 bugs I found last summer when I finalized the gdb
+fixes to debug Linux multithreaded applications.
+They appear with the following architecture : Process A forks process B and
+	process C (gdb, ...) calls ptrace_attach() on process B.
+1) The bug here appears in process A: if process A does a wait4(), then it
+	blocks or receives "ECHILD" (depending on WNOHANG option) because
+	it does not have any child process, which I think is an error
+	because gdb should not modify the behaviour of system calls of
+	process A.
+2) if process C (gdb) exits without calling ptrace_detach() on process B,
+	then a) process B is inherited by init task (instead if process A),
+	     b) if process A is blocked in wait4(), then it will not be
+		awaken if process B dies (since process B is now child of
+		init).
+I have written a WEB page describing these two problems and their proposed
+fixes at 
+http://www.gr.opengroup.org/java/jdk/linux/kernel1.htm
+Best regards,
+-Eric
+P.S. The fixes for 2.2.0 are also attached to this mail
++=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+ Eric PAIRE
+Web  : 
+http://www.gr.opengroup.org/~paire
+ | THE Open GROUP - Research Institute
+Email: e.paire@gr.opengroup.org           | 2, avenue de Vignate
+Phone: +33 (0) 476 63 48 71               | F-38610 Gieres
+Fax  : +33 (0) 476 51 05 32               | FRANCE
+------  Cut Here  ------  Cut Here  ------  Cut Here  ------  Cut Here  ------
+--- include/linux/sched.h.OLD	Tue Jan 26 10:01:58 1999
++++ include/linux/sched.h	Wed Jan 27 11:58:28 1999
+@@ -251,11 +251,12 @@
+ 	/* boolean value for session group leader */
+ 	int leader;
+ 	/* 
+-	 * pointers to (original) parent process, youngest child, younger sibling,
+-	 * older sibling, respectively.  (p->father can be replaced with 
+-	 * p->p_pptr->pid)
++	 * pointers to (original) parent process, youngest child,
++	 * younger sibling, older sibling, respectively.
++	 * (p->father can be replaced with p->p_pptr->pid)
+ 	 */
+ 	struct task_struct *p_opptr, *p_pptr, *p_cptr, *p_ysptr, *p_osptr;
++	unsigned int nchildren;	/* number of original children */
+ 
+ 	/* PID hash table linkage. */
+ 	struct task_struct *pidhash_next;
+@@ -352,7 +353,7 @@
+ /* binfmt */	NULL, \
+ /* ec,brk... */	0,0,0,0,0,0, \
+ /* pid etc.. */	0,0,0,0,0, \
+-/* proc links*/ &init_task,&init_task,NULL,NULL,NULL, \
++/* proc links*/ &init_task,&init_task,NULL,NULL,NULL,0, \
+ /* pidhash */	NULL, NULL, \
+ /* tarray */	&task[0], \
+ /* chld wait */	NULL, NULL, \
+--- kernel/exit.c.OLD	Mon Jan 18 18:55:31 1999
++++ kernel/exit.c	Wed Jan 27 11:59:38 1999
+@@ -47,6 +47,7 @@
+ 		add_free_taskslot(p->tarray_ptr);
+ 
+ 		write_lock_irq(&tasklist_lock);
++		current->nchildren--;
+ 		unhash_pid(p);
+ 		REMOVE_LINKS(p);
+ 		write_unlock_irq(&tasklist_lock);
+@@ -138,19 +139,16 @@
+ 	return retval;
+ }
+ 
+-static inline void forget_original_parent(struct task_struct * father)
++static inline void forget_original_parent(struct task_struct * tsk)
+ {
+-	struct task_struct * p;
+-
+-	read_lock(&tasklist_lock);
+-	for_each_task(p) {
+-		if (p->p_opptr == father) {
+-			p->exit_signal = SIGCHLD;
+-			p->p_opptr = child_reaper; /* init */
+-			if (p->pdeath_signal) send_sig(p->pdeath_signal, p, 0);
+-		}
+-	}
+-	read_unlock(&tasklist_lock);
++	if (current != child_reaper) {
++		current->nchildren--;
++		tsk->p_opptr = child_reaper;	/* init */
++		child_reaper->nchildren++;
++	}
++	tsk->exit_signal = SIGCHLD;
++	if (tsk->pdeath_signal)
++		send_sig(tsk->pdeath_signal, tsk, 0);
+ }
+ 
+ static inline void close_files(struct files_struct * files)
+@@ -276,7 +274,6 @@
+ {
+ 	struct task_struct * p;
+ 
+-	forget_original_parent(current);
+ 	/*
+ 	 * Check to see if any process groups have become orphaned
+ 	 * as a result of our exiting, and if they have any stopped
+@@ -313,6 +310,8 @@
+ 		p->p_ysptr = NULL;
+ 		p->flags &= ~(PF_PTRACED|PF_TRACESYS);
+ 
++		if (p->p_opptr == current)
++			forget_original_parent(p);
+ 		p->p_pptr = p->p_opptr;
+ 		p->p_osptr = p->p_pptr->p_cptr;
+ 		if (p->p_osptr)
+@@ -338,6 +337,19 @@
+ 			write_lock_irq(&tasklist_lock);
+ 		}
+ 	}
++
++	if (current->nchildren > 0) {
++		/* There are still children dynamicly attached by ptrace() */
++		for_each_task(p) {
++			if (p->p_opptr == current) {
++				forget_original_parent(p);
++				if (p->state == TASK_ZOMBIE)
++					notify_parent(p, p->exit_signal);
++				if (current->nchildren == 0)
++					break;
++			}
++		}
++	}
+ 	write_unlock_irq(&tasklist_lock);
+ 
+ 	if (current->leader)
+@@ -408,6 +420,7 @@
+ 	int flag, retval;
+ 	struct wait_queue wait = { current, NULL };
+ 	struct task_struct *p;
++	unsigned int nchildren;
+ 
+ 	if (options & ~(WNOHANG|WUNTRACED|__WCLONE))
+ 		return -EINVAL;
+@@ -416,8 +429,11 @@
+ repeat:
+ 	flag = 0;
+ 	read_lock(&tasklist_lock);
++	nchildren = current->nchildren;
+  	for (p = current->p_cptr ; p ; p = p->p_osptr) {
+-		if (pid>0) {
++		if (p->p_opptr == p->p_pptr)
++			nchildren--;
++		if (pid > 0) {
+ 			if (p->pid != pid)
+ 				continue;
+ 		} else if (!pid) {
+@@ -473,7 +489,44 @@
+ 				continue;
+ 		}
+ 	}
++
++	if (nchildren > 0 && flag == 0) {
++		/* There are still children dynamicly attached by ptrace() */
++		for_each_task(p) {
++			if (p->p_opptr != current || p->p_opptr == p->p_pptr)
++				continue;
++			nchildren--;
++			if (pid > 0) {
++				if (p->pid != pid)
++					if (nchildren == 0)
++						break;
++					else
++						continue;
++			} else if (!pid) {
++				if (p->pgrp != current->pgrp)
++					if (nchildren == 0)
++						break;
++					else
++						continue;
++			} else if (pid != -1) {
++				if (p->pgrp != -pid)
++					if (nchildren == 0)
++						break;
++					else
++						continue;
++			}
++			/* wait for cloned processes iff the __WCLONE flag is set */
++			if ((p->exit_signal != SIGCHLD) ^ ((options & __WCLONE) != 0))
++				if (nchildren == 0)
++					break;
++				else
++					continue;
++			flag = 1;
++			break;
++		}
++	}
+ 	read_unlock(&tasklist_lock);
++
+ 	if (flag) {
+ 		retval = 0;
+ 		if (options & WNOHANG)
+--- kernel/fork.c.OLD	Mon Jan 18 18:55:50 1999
++++ kernel/fork.c	Wed Jan 27 12:01:44 1999
+@@ -550,6 +550,7 @@
+ 
+ 	p->p_pptr = p->p_opptr = current;
+ 	p->p_cptr = NULL;
++	p->nchildren = 0;
+ 	init_waitqueue(&p->wait_chldexit);
+ 	p->vfork_sem = NULL;
+ 
+@@ -621,6 +622,7 @@
+ 		write_lock_irq(&tasklist_lock);
+ 		SET_LINKS(p);
+ 		hash_pid(p);
++		current->nchildren++;
+ 		write_unlock_irq(&tasklist_lock);
+ 
+ 		nr_tasks++;
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

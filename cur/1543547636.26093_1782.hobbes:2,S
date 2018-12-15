@@ -1,0 +1,1108 @@
+Date: Mon, 4 Sep 2000 20:11:47 +0200 (CEST)
+From: Andrea Arcangeli <>
+Subject: spin_lock forgets to clobber memory and other smp fixes [was Re: [patch] waitqueue optimization, 2.4.0-test7]
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/9/4/137
+
+On Tue, 29 Aug 2000, Andrea Arcangeli wrote:
+>I'd prefer to have things like UnlockPage implemented as the architecture
+>prefers (with a safe SMP common code default) instead of exporting zillons
+I changed idea. I'd preferred to implement a mechanism that allows to
+implement common code taking care of the implied barrier that some arch
+can have but still without having to implement zillons of mb_clear_bit_mb
+and all the variants (there are too many considering also the cases where
+we need a barrier() or not).
+>And surprise: I found a SMP race in UnlockPage. What we're doing now it's
+If found some other race of that same kind (missing mb before releasing a
+lock) in tasklet_unlock and net_tx_action.
+>Furthmore what we need aren't really mb() but smb_mb() that are noops in
+>an UP compilation.
+Furthmore things like spin_unlock doesn't even need mb() (as alpha was
+doing) but just an asm mb instruction that only must not be reordered.
+spin_unlock doesn't need to clobber "memory" (no need of a compiler
+barrier()). I also noticed __sti()/__save_flags() doesn't need to clobber
+"memory".
+Instead all spin_lock in 2.2.x and 2.4.x are implemented wrong and they
+should clobber "memory".
+Think at the below code:
+int * p;
+spinlock_t lock = SPIN_LOCK_UNLOCKED;
+extern void dummy(int, int);
+myfunc() {
+	int a, b;
+	spin_lock(&lock);
+	a = *p;
+	spin_unlock(&lock);
+	spin_lock(&lock);
+	b = *p;
+	spin_unlock(&lock);
+	dummy(a,b);
+}
+The spin_lock isn't declaring "memory" as a clobber. However the spin_lock
+operation _definitely_ imply a random change in all the memory because any
+memory contents can have a new completly different meaning as soon as we
+acquired the lock (and we don't have any interface to make dependences on
+which memory is protected by the spinlock or not to allow the compiler to
+only reload the memory contents that change meaning once we acquire the
+lock).
+Actually GCC is a little underoptimized because adding an asm that
+clobbers "memory" (aka barrier()) the address of p is reloaded into the
+register. p is a constant as far I can tell and nothing should be able to
+change it, only self modifying code would be able to change it, but if the
+code is been changed then as well the reload of p can not be there
+anymore, and in general C must never suppose anything about self modifying
+code. Thus gcc shouldn't cause the address of p to be reloaded into
+registers too.
+Without "memory" clobber gcc would be allowed to cache the value of *p and
+to reuse it also for the second critical section.
+mb()/cli() are just adding "memory" as clobber and they were infact
+implemented right infact. The fact mb() clobbers "memory" pretty much
+proof the current spin_lock is implemented wrong.
+The documentation I have is from gcc info pages:
+	   If your assembler instruction modifies memory in an unpredictable
+	fashion, add `memory' to the list of clobbered registers.  This will
+	cause GNU CC to not keep memory values cached in registers across the
+	assembler instruction.
+and spin_lock as said definitely changes the memory in an unpredictable
+fascion (as cli and restore_flags do too), since the memory contents after
+the lock is acquired will have a completly different meaning.
+Also test_and_set_* are missing "memory" as clobber.
+The below patch fixes all that race conditions in spinlocks (that probably
+doesn't trigger because of -fno-strict-aliasing) and regarding clear_bit
+that doesn't imply memory barriers. test_and_set_* still imply an mb() in
+case the memory is been changed because too much code depends on this
+behaviour (even the alpha tree itself internally depends on it). Anyway
+alpha just puts the mb() only in the case the memory is been changed so it
+would not be optimized by extracting the mb() out of the test_and_bit*.
+I also added very lightweight non atomic and reordinable
+__set_bit/__test_and_set* for ext2 and minix that are protected by the big
+kernel lock and they only need to efficiently set bitflags beyond the
+sizeof(unsigned long) limit.
+The patch fixes also an SMP race in the read_unlock of alpha (missing
+mb). BTW, the backport to 2.2.x of this single bugfix is here:
+	
+ftp://ftp
+.*.kernel.org/pub/linux/kernel/people/andrea/patches/v2.2/2.2.17pre20/alpha-read-unlock-SMP-race-1
+(I'll submit it to Alan shortly together with other 2.2.x stuff)
+Then I simplified the set_bit and clear_bit asm implementation of alpha to
+remove a conditional branch in the fast path (this may cause some more
+dirty cacheline if somebody is doing a set_bit of a bit just set but it's
+faster in the userspace simulation and it takes less space in memory). In
+any case I added a #define that you can #unset to return to the previous
+implementation of clear_bit/set_bit. I also removed a mb() from the
+chmxchg in case none changes to memory is done (if nothing memory changes
+there's no need of mb). There's also some compile/obvious bugfix for the
+alpha.
+It speedup the sparc64 rmb()/wmb() plus it fixes a common code race
+condition in br_read_lock.
+It adds some if (waitqueue_active()) optimization, and a first smb_mb
+usage in run_task_queue.
+Patch applies cleanly to test8-pre2.
+Index: linux/arch/alpha/Makefile
+diff -u linux/arch/alpha/Makefile:1.1.1.1 linux/arch/alpha/Makefile:1.1.1.1.4.1
+--- linux/arch/alpha/Makefile:1.1.1.1	Tue Aug 29 16:32:51 2000
++++ linux/arch/alpha/Makefile	Sun Sep  3 20:58:22 2000
+@@ -117,6 +117,10 @@
+ 
+ archdep:
+ 	@$(MAKEBOOT) dep
++
++vmlinux: arch/alpha/vmlinux.lds
++
++arch/alpha/vmlinux.lds: arch/alpha/vmlinux.lds.in
+ 	$(CPP) $(CPPFLAGS) -xc -P arch/alpha/vmlinux.lds.in -o arch/alpha/vmlinux.lds
+ 
+ bootpfile:
+Index: linux/arch/alpha/kernel/pci_iommu.c
+diff -u linux/arch/alpha/kernel/pci_iommu.c:1.1.1.1 linux/arch/alpha/kernel/pci_iommu.c:1.1.1.1.4.1
+--- linux/arch/alpha/kernel/pci_iommu.c:1.1.1.1	Tue Aug 29 16:32:51 2000
++++ linux/arch/alpha/kernel/pci_iommu.c	Sun Sep  3 20:58:25 2000
+@@ -416,7 +416,9 @@
+ 	ptes = &arena->ptes[dma_ofs];
+ 	sg = leader;
+ 	do {
++#if DEBUG_ALLOC > 0
+ 		struct scatterlist *last_sg = sg;
++#endif
+ 
+ 		size = sg->length;
+ 		paddr = virt_to_phys(sg->address);
+Index: linux/arch/alpha/kernel/smp.c
+diff -u linux/arch/alpha/kernel/smp.c:1.1.1.1 linux/arch/alpha/kernel/smp.c:1.1.1.1.4.1
+--- linux/arch/alpha/kernel/smp.c:1.1.1.1	Tue Aug 29 16:32:51 2000
++++ linux/arch/alpha/kernel/smp.c	Sun Sep  3 20:58:25 2000
+@@ -1005,7 +1005,7 @@
+ void
+ spin_unlock(spinlock_t * lock)
+ {
+-	mb();
++	__mb();
+ 	lock->lock = 0;
+ 
+ 	lock->on_cpu = -1;
+@@ -1047,7 +1047,7 @@
+ 	"	br	1b\n"
+ 	".previous"
+ 	: "=r" (tmp), "=m" (__dummy_lock(lock)), "=r" (stuck)
+-	: "1" (__dummy_lock(lock)), "2" (stuck));
++	: "1" (__dummy_lock(lock)), "2" (stuck) : "memory");
+ 
+ 	if (stuck < 0) {
+ 		printk(KERN_WARNING
+@@ -1126,7 +1126,7 @@
+ 	".previous"
+ 	: "=m" (__dummy_lock(lock)), "=&r" (regx), "=&r" (regy),
+ 	  "=&r" (stuck_lock), "=&r" (stuck_reader)
+-	: "0" (__dummy_lock(lock)), "3" (stuck_lock), "4" (stuck_reader));
++	: "0" (__dummy_lock(lock)), "3" (stuck_lock), "4" (stuck_reader) : "memory");
+ 
+ 	if (stuck_lock < 0) {
+ 		printk(KERN_WARNING "write_lock stuck at %p\n", inline_pc);
+@@ -1164,7 +1164,7 @@
+ 	"	br	1b\n"
+ 	".previous"
+ 	: "=m" (__dummy_lock(lock)), "=&r" (regx), "=&r" (stuck_lock)
+-	: "0" (__dummy_lock(lock)), "2" (stuck_lock));
++	: "0" (__dummy_lock(lock)), "2" (stuck_lock) : "memory");
+ 
+ 	if (stuck_lock < 0) {
+ 		printk(KERN_WARNING "read_lock stuck at %p\n", inline_pc);
+Index: linux/arch/alpha/mm/extable.c
+diff -u linux/arch/alpha/mm/extable.c:1.1.1.1 linux/arch/alpha/mm/extable.c:1.1.1.1.4.1
+--- linux/arch/alpha/mm/extable.c:1.1.1.1	Tue Aug 29 16:32:52 2000
++++ linux/arch/alpha/mm/extable.c	Sun Sep  3 20:58:25 2000
+@@ -88,7 +88,7 @@
+ 	 */
+ 	ret = search_exception_table_without_gp(addr);
+ 	if (ret) {
+-		printk(KERN_ALERT, "%s: [%lx] EX_TABLE search fail with"
++		printk(KERN_ALERT "%s: [%lx] EX_TABLE search fail with"
+ 		       "exc frame GP, success with raw GP\n",
+ 		       current->comm, addr);
+ 		return ret;
+Index: linux/include/asm-alpha/bitops.h
+diff -u linux/include/asm-alpha/bitops.h:1.1.1.1 linux/include/asm-alpha/bitops.h:1.1.1.1.4.1
+--- linux/include/asm-alpha/bitops.h:1.1.1.1	Tue Aug 29 16:34:10 2000
++++ linux/include/asm-alpha/bitops.h	Sun Sep  3 20:58:31 2000
+@@ -1,6 +1,8 @@
+ #ifndef _ALPHA_BITOPS_H
+ #define _ALPHA_BITOPS_H
+ 
++#include <linux/config.h>
++
+ /*
+  * Copyright 1994, Linus Torvalds.
+  */
+@@ -17,14 +19,19 @@
+  * bit 0 is the LSB of addr; bit 64 is the LSB of (addr+1).
+  */
+ 
++#define BITOPS_NO_BRANCH
++
+ extern __inline__ void set_bit(unsigned long nr, volatile void * addr)
+ {
++#ifndef BITOPS_NO_BRANCH
+ 	unsigned long oldbit;
++#endif
+ 	unsigned long temp;
+ 	unsigned int * m = ((unsigned int *) addr) + (nr >> 5);
+ 
++#ifndef BITOPS_NO_BRANCH
+ 	__asm__ __volatile__(
+-	"1:	ldl_l %0,%1\n"
++	"1:	ldl_l %0,%4\n"
+ 	"	and %0,%3,%2\n"
+ 	"	bne %2,2f\n"
+ 	"	xor %0,%3,%0\n"
+@@ -36,16 +43,67 @@
+ 	".previous"
+ 	:"=&r" (temp), "=m" (*m), "=&r" (oldbit)
+ 	:"Ir" (1UL << (nr & 31)), "m" (*m));
++#else
++	__asm__ __volatile__(
++	"1:	ldl_l %0,%3\n"
++	"	bis %0,%2,%0\n"
++	"	stl_c %0,%1\n"
++	"	beq %0,2f\n"
++	".subsection 2\n"
++	"2:	br 1b\n"
++	".previous"
++	:"=&r" (temp), "=m" (*m)
++	:"Ir" (1UL << (nr & 31)), "m" (*m));
++#endif
+ }
+ 
++/*
++ * WARNING: non atomic version, runs many times faster
++ * than the atomic version and it doesn't enforce any memory
++ * barrier or ordering.
++ */
++extern __inline__ void __set_bit(unsigned long nr, volatile void * addr)
++{
++	unsigned int * m = ((unsigned int *) addr) + (nr >> 5);
++	/*
++	 * I first implemented it in asm then I tried the C version
++	 * and they where producing the same asm so let's
++	 * the compiler to do its good work.
++	 */
++#if 0
++	int tmp;
++
++	__asm__("ldl %0,%3\n\t"
++		"bis %0,%2,%0\n\t"
++		"stl %0,%1"
++		: "=&r" (tmp), "=m" (*m)
++		: "Ir" (1UL << (nr & 31)), "m" (*m));
++#else
++	*m |= 1UL << (nr & 31);
++#endif
++}
++
++/*
++ * The reason of the non barrier version makes sense is because we may not need
++ * to throw away all registers that are caching memory contents, but we may want
++ * to be a barrier only in respect to the memory changes done by the assembler code
++ * in clear_bit() and we know that such changes won't be cached into registers.
++ */
++#define smp_mb__before_clear_bit()	smp_mb()
++#define smp_mb__after_clear_bit()	smp_mb()
++#define __smp_mb__before_clear_bit()	__smp_mb()
++#define __smp_mb__after_clear_bit()	__smp_mb()
+ extern __inline__ void clear_bit(unsigned long nr, volatile void * addr)
+ {
++#ifndef BITOPS_NO_BRANCH
+ 	unsigned long oldbit;
++#endif
+ 	unsigned long temp;
+ 	unsigned int * m = ((unsigned int *) addr) + (nr >> 5);
+ 
++#ifndef BITOPS_NO_BRANCH
+ 	__asm__ __volatile__(
+-	"1:	ldl_l %0,%1\n"
++	"1:	ldl_l %0,%4\n"
+ 	"	and %0,%3,%2\n"
+ 	"	beq %2,2f\n"
+ 	"	xor %0,%3,%0\n"
+@@ -57,6 +115,18 @@
+ 	".previous"
+ 	:"=&r" (temp), "=m" (*m), "=&r" (oldbit)
+ 	:"Ir" (1UL << (nr & 31)), "m" (*m));
++#else
++	__asm__ __volatile__(
++	"1:	ldl_l %0,%3\n"
++	"	and %0,%2,%0\n"
++	"	stl_c %0,%1\n"
++	"	beq %0,2f\n"
++	".subsection 2\n"
++	"2:	br 1b\n"
++	".previous"
++	:"=&r" (temp), "=m" (*m)
++	:"Ir" (~(1UL << (nr & 31))), "m" (*m));
++#endif
+ }
+ 
+ extern __inline__ void change_bit(unsigned long nr, volatile void * addr)
+@@ -65,12 +135,12 @@
+ 	unsigned int * m = ((unsigned int *) addr) + (nr >> 5);
+ 
+ 	__asm__ __volatile__(
+-	"1:	ldl_l %0,%1\n"
++	"1:	ldl_l %0,%3\n"
+ 	"	xor %0,%2,%0\n"
+ 	"	stl_c %0,%1\n"
+-	"	beq %0,3f\n"
++	"	beq %0,2f\n"
+ 	".subsection 2\n"
+-	"3:	br 1b\n"
++	"2:	br 1b\n"
+ 	".previous"
+ 	:"=&r" (temp), "=m" (*m)
+ 	:"Ir" (1UL << (nr & 31)), "m" (*m));
+@@ -84,18 +154,45 @@
+ 	unsigned int * m = ((unsigned int *) addr) + (nr >> 5);
+ 
+ 	__asm__ __volatile__(
+-	"1:	ldl_l %0,%1\n"
++	"1:	ldl_l %0,%4\n"
+ 	"	and %0,%3,%2\n"
+ 	"	bne %2,2f\n"
+ 	"	xor %0,%3,%0\n"
+ 	"	stl_c %0,%1\n"
+ 	"	beq %0,3f\n"
++#ifdef CONFIG_SMP
+ 	"	mb\n"
++#endif
+ 	"2:\n"
+ 	".subsection 2\n"
+ 	"3:	br 1b\n"
+ 	".previous"
+ 	:"=&r" (temp), "=m" (*m), "=&r" (oldbit)
++	:"Ir" (1UL << (nr & 31)), "m" (*m) : "memory");
++
++	return oldbit != 0;
++}
++
++/*
++ * WARNING: non atomic version, runs around 10 times faster
++ * than the atomic version and it doesn't enforce any memory
++ * barrier or ordering.
++ */
++extern __inline__ int __test_and_set_bit(unsigned long nr,
++					 volatile void * addr)
++{
++	unsigned long oldbit;
++	unsigned long temp;
++	unsigned int * m = ((unsigned int *) addr) + (nr >> 5);
++
++	__asm__(
++	"	ldl %0,%4\n"
++	"	and %0,%3,%2\n"
++	"	bne %2,1f\n"
++	"	xor %0,%3,%0\n"
++	"	stl %0,%1\n"
++	"1:\n"
++	:"=&r" (temp), "=m" (*m), "=&r" (oldbit)
+ 	:"Ir" (1UL << (nr & 31)), "m" (*m));
+ 
+ 	return oldbit != 0;
+@@ -109,18 +206,45 @@
+ 	unsigned int * m = ((unsigned int *) addr) + (nr >> 5);
+ 
+ 	__asm__ __volatile__(
+-	"1:	ldl_l %0,%1\n"
++	"1:	ldl_l %0,%4\n"
+ 	"	and %0,%3,%2\n"
+ 	"	beq %2,2f\n"
+ 	"	xor %0,%3,%0\n"
+ 	"	stl_c %0,%1\n"
+ 	"	beq %0,3f\n"
++#ifdef CONFIG_SMP
+ 	"	mb\n"
++#endif
+ 	"2:\n"
+ 	".subsection 2\n"
+ 	"3:	br 1b\n"
+ 	".previous"
+ 	:"=&r" (temp), "=m" (*m), "=&r" (oldbit)
++	:"Ir" (1UL << (nr & 31)), "m" (*m) : "memory");
++
++	return oldbit != 0;
++}
++
++/*
++ * WARNING: non atomic version, runs around 10 times faster
++ * than the atomic version and it doesn't enforce any memory
++ * barrier or ordering.
++ */
++extern __inline__ int __test_and_clear_bit(unsigned long nr,
++					   volatile void * addr)
++{
++	unsigned long oldbit;
++	unsigned long temp;
++	unsigned int * m = ((unsigned int *) addr) + (nr >> 5);
++
++	__asm__ __volatile__(
++	"	ldl %0,%4\n"
++	"	and %0,%3,%2\n"
++	"	beq %2,1f\n"
++	"	xor %0,%3,%0\n"
++	"	stl %0,%1\n"
++	"1:\n"
++	:"=&r" (temp), "=m" (*m), "=&r" (oldbit)
+ 	:"Ir" (1UL << (nr & 31)), "m" (*m));
+ 
+ 	return oldbit != 0;
+@@ -134,17 +258,19 @@
+ 	unsigned int * m = ((unsigned int *) addr) + (nr >> 5);
+ 
+ 	__asm__ __volatile__(
+-	"1:	ldl_l %0,%1\n"
++	"1:	ldl_l %0,%4\n"
+ 	"	and %0,%3,%2\n"
+ 	"	xor %0,%3,%0\n"
+ 	"	stl_c %0,%1\n"
+ 	"	beq %0,3f\n"
++#ifdef CONFIG_SMP
+ 	"	mb\n"
++#endif
+ 	".subsection 2\n"
+ 	"3:	br 1b\n"
+ 	".previous"
+ 	:"=&r" (temp), "=m" (*m), "=&r" (oldbit)
+-	:"Ir" (1UL << (nr & 31)), "m" (*m));
++	:"Ir" (1UL << (nr & 31)), "m" (*m) : "memory");
+ 
+ 	return oldbit != 0;
+ }
+@@ -285,16 +411,16 @@
+ 
+ #ifdef __KERNEL__
+ 
+-#define ext2_set_bit                 test_and_set_bit
+-#define ext2_clear_bit               test_and_clear_bit
++#define ext2_set_bit                 __test_and_set_bit
++#define ext2_clear_bit               __test_and_clear_bit
+ #define ext2_test_bit                test_bit
+ #define ext2_find_first_zero_bit     find_first_zero_bit
+ #define ext2_find_next_zero_bit      find_next_zero_bit
+ 
+ /* Bitmap functions for the minix filesystem.  */
+-#define minix_test_and_set_bit(nr,addr) test_and_set_bit(nr,addr)
+-#define minix_set_bit(nr,addr) set_bit(nr,addr)
+-#define minix_test_and_clear_bit(nr,addr) test_and_clear_bit(nr,addr)
++#define minix_test_and_set_bit(nr,addr) __test_and_set_bit(nr,addr)
++#define minix_set_bit(nr,addr) __set_bit(nr,addr)
++#define minix_test_and_clear_bit(nr,addr) __test_and_clear_bit(nr,addr)
+ #define minix_test_bit(nr,addr) test_bit(nr,addr)
+ #define minix_find_first_zero_bit(addr,size) find_first_zero_bit(addr,size)
+ 
+Index: linux/include/asm-alpha/elf.h
+diff -u linux/include/asm-alpha/elf.h:1.1.1.1 linux/include/asm-alpha/elf.h:1.1.1.1.4.1
+--- linux/include/asm-alpha/elf.h:1.1.1.1	Tue Aug 29 16:34:10 2000
++++ linux/include/asm-alpha/elf.h	Sun Sep  3 20:58:31 2000
+@@ -127,7 +127,7 @@
+ 
+ #ifdef __KERNEL__
+ #define SET_PERSONALITY(EX, IBCS2)				\
+-	set_personality((EX).e_flags & EF_ALPHA_32BIT		\
++	set_personality(((EX).e_flags & EF_ALPHA_32BIT)		\
+ 	   ? PER_LINUX_32BIT : (IBCS2) ? PER_SVR4 : PER_LINUX)
+ #endif
+ 
+Index: linux/include/asm-alpha/spinlock.h
+diff -u linux/include/asm-alpha/spinlock.h:1.1.1.1 linux/include/asm-alpha/spinlock.h:1.1.1.1.4.1
+--- linux/include/asm-alpha/spinlock.h:1.1.1.1	Tue Aug 29 16:34:09 2000
++++ linux/include/asm-alpha/spinlock.h	Sun Sep  3 20:58:31 2000
+@@ -60,7 +60,7 @@
+ #else
+ static inline void spin_unlock(spinlock_t * lock)
+ {
+-	mb();
++	__mb();
+ 	lock->lock = 0;
+ }
+ 
+@@ -84,7 +84,7 @@
+ 	"	br	1b\n"
+ 	".previous"
+ 	: "=r" (tmp), "=m" (__dummy_lock(lock))
+-	: "m"(__dummy_lock(lock)));
++	: "m"(__dummy_lock(lock)) : "memory");
+ }
+ 
+ #define spin_trylock(lock) (!test_and_set_bit(0,(lock)))
+@@ -120,7 +120,7 @@
+ 	"	br	1b\n"
+ 	".previous"
+ 	: "=m" (__dummy_lock(lock)), "=&r" (regx)
+-	: "0" (__dummy_lock(lock))
++	: "0" (__dummy_lock(lock) : "memory")
+ 	);
+ }
+ 
+@@ -141,14 +141,14 @@
+ 	"	br	1b\n"
+ 	".previous"
+ 	: "=m" (__dummy_lock(lock)), "=&r" (regx)
+-	: "m" (__dummy_lock(lock))
++	: "m" (__dummy_lock(lock) : "memory")
+ 	);
+ }
+ #endif /* DEBUG_RWLOCK */
+ 
+ static inline void write_unlock(rwlock_t * lock)
+ {
+-	mb();
++	__mb();
+ 	*(volatile int *)lock = 0;
+ }
+ 
+@@ -156,6 +156,7 @@
+ {
+ 	long regx;
+ 	__asm__ __volatile__(
++	"	mb\n"
+ 	"1:	ldl_l	%1,%0\n"
+ 	"	addl	%1,2,%1\n"
+ 	"	stl_c	%1,%0\n"
+Index: linux/include/asm-alpha/system.h
+diff -u linux/include/asm-alpha/system.h:1.1.1.1 linux/include/asm-alpha/system.h:1.1.1.1.4.2
+--- linux/include/asm-alpha/system.h:1.1.1.1	Tue Aug 29 16:34:10 2000
++++ linux/include/asm-alpha/system.h	Mon Sep  4 19:37:54 2000
+@@ -137,12 +137,34 @@
+ #define wmb() \
+ __asm__ __volatile__("wmb": : :"memory")
+ 
++#define __mb() \
++__asm__ __volatile__("mb" : :)
++
++#define __rmb() \
++__asm__ __volatile__("mb" : :)
++
++#define __wmb() \
++__asm__ __volatile__("wmb" : :)
++
++#ifdef __SMP__
++#define smp_mb()	mb()
++#define smp_rmb()	rmb()
++#define smp_wmb()	wmb()
++#define __smp_mb()	__mb()
++#define __smp_rmb()	__rmb()
++#define __smp_wmb()	__wmb()
++#else
++#define smp_mb()	barrier()
++#define smp_rmb()	barrier()
++#define smp_wmb()	barrier()
++#define __smp_mb()	do { } while(0)
++#define __smp_rmb()	do { } while(0)
++#define __smp_wmb()	do { } while(0)
++#endif
++
+ #define set_mb(var, value) \
+ do { var = value; mb(); } while (0)
+ 
+-#define set_rmb(var, value) \
+-do { var = value; rmb(); } while (0)
+-
+ #define set_wmb(var, value) \
+ do { var = value; wmb(); } while (0)
+ 
+@@ -284,11 +306,11 @@
+ #define getipl()		(rdps() & 7)
+ #define setipl(ipl)		((void) swpipl(ipl))
+ 
+-#define __cli()			setipl(IPL_MAX)
++#define __cli()			do { setipl(IPL_MAX); barrier(); } while(0)
+ #define __sti()			setipl(IPL_MIN)
+ #define __save_flags(flags)	((flags) = rdps())
+-#define __save_and_cli(flags)	((flags) = swpipl(IPL_MAX))
+-#define __restore_flags(flags)	setipl(flags)
++#define __save_and_cli(flags)	do { (flags) = swpipl(IPL_MAX); barrier(); } while(0)
++#define __restore_flags(flags)	do { setipl(flags); barrier(); } while(0)
+ 
+ #define local_irq_save(flags)		__save_and_cli(flags)
+ #define local_irq_restore(flags)	__restore_flags(flags)
+@@ -344,6 +366,8 @@
+ 
+ /*
+  * Atomic exchange.
++ * Since it can be used to implement critical sections
++ * it must clobber "memory" (also for interrupts in UP).
+  */
+ 
+ extern __inline__ unsigned long
+@@ -352,16 +376,18 @@
+ 	unsigned long dummy;
+ 
+ 	__asm__ __volatile__(
+-	"1:	ldl_l %0,%2\n"
++	"1:	ldl_l %0,%4\n"
+ 	"	bis $31,%3,%1\n"
+ 	"	stl_c %1,%2\n"
+ 	"	beq %1,2f\n"
++#ifdef CONFIG_SMP
+ 	"	mb\n"
++#endif
+ 	".subsection 2\n"
+ 	"2:	br 1b\n"
+ 	".previous"
+ 	: "=&r" (val), "=&r" (dummy), "=m" (*m)
+-	: "rI" (val), "m" (*m));
++	: "rI" (val), "m" (*m) : "memory");
+ 
+ 	return val;
+ }
+@@ -372,16 +398,18 @@
+ 	unsigned long dummy;
+ 
+ 	__asm__ __volatile__(
+-	"1:	ldq_l %0,%2\n"
++	"1:	ldq_l %0,%4\n"
+ 	"	bis $31,%3,%1\n"
+ 	"	stq_c %1,%2\n"
+ 	"	beq %1,2f\n"
++#ifdef CONFIG_SMP
+ 	"	mb\n"
++#endif
+ 	".subsection 2\n"
+ 	"2:	br 1b\n"
+ 	".previous"
+ 	: "=&r" (val), "=&r" (dummy), "=m" (*m)
+-	: "rI" (val), "m" (*m));
++	: "rI" (val), "m" (*m) : "memory");
+ 
+ 	return val;
+ }
+@@ -416,6 +444,11 @@
+  * Atomic compare and exchange.  Compare OLD with MEM, if identical,
+  * store NEW in MEM.  Return the initial value in MEM.  Success is
+  * indicated by comparing RETURN with OLD.
++ *
++ * The memory barrier should be placed in SMP only when we actually
++ * make the change. If we don't change anything (so if the returned
++ * prev is equal to old) then we aren't acquiring anything new and
++ * we don't need any memory barrier as far I can tell.
+  */
+ 
+ #define __HAVE_ARCH_CMPXCHG 1
+@@ -426,18 +459,21 @@
+ 	unsigned long prev, cmp;
+ 
+ 	__asm__ __volatile__(
+-	"1:	ldl_l %0,%2\n"
++	"1:	ldl_l %0,%5\n"
+ 	"	cmpeq %0,%3,%1\n"
+ 	"	beq %1,2f\n"
+ 	"	mov %4,%1\n"
+ 	"	stl_c %1,%2\n"
+ 	"	beq %1,3f\n"
+-	"2:	mb\n"
++#ifdef CONFIG_SMP
++	"	mb\n"
++#endif
++	"2:\n"
+ 	".subsection 2\n"
+ 	"3:	br 1b\n"
+ 	".previous"
+ 	: "=&r"(prev), "=&r"(cmp), "=m"(*m)
+-	: "r"((long) old), "r"(new), "m"(*m));
++	: "r"((long) old), "r"(new), "m"(*m) : "memory");
+ 
+ 	return prev;
+ }
+@@ -448,18 +484,21 @@
+ 	unsigned long prev, cmp;
+ 
+ 	__asm__ __volatile__(
+-	"1:	ldq_l %0,%2\n"
++	"1:	ldq_l %0,%5\n"
+ 	"	cmpeq %0,%3,%1\n"
+ 	"	beq %1,2f\n"
+ 	"	mov %4,%1\n"
+ 	"	stq_c %1,%2\n"
+ 	"	beq %1,3f\n"
+-	"2:	mb\n"
++#ifdef CONFIG_SMP
++	"	mb\n"
++#endif
++	"2:\n"
+ 	".subsection 2\n"
+ 	"3:	br 1b\n"
+ 	".previous"
+ 	: "=&r"(prev), "=&r"(cmp), "=m"(*m)
+-	: "r"((long) old), "r"(new), "m"(*m));
++	: "r"((long) old), "r"(new), "m"(*m) : "memory");
+ 
+ 	return prev;
+ }
+Index: linux/include/asm-i386/bitops.h
+diff -u linux/include/asm-i386/bitops.h:1.1.1.1 linux/include/asm-i386/bitops.h:1.1.1.1.4.1
+--- linux/include/asm-i386/bitops.h:1.1.1.1	Tue Aug 29 16:34:13 2000
++++ linux/include/asm-i386/bitops.h	Sun Sep  3 20:58:31 2000
+@@ -25,10 +25,13 @@
+  * Function prototypes to keep gcc -Wall happy
+  */
+ extern void set_bit(int nr, volatile void * addr);
++extern void __set_bit(int nr, volatile void * addr);
+ extern void clear_bit(int nr, volatile void * addr);
+ extern void change_bit(int nr, volatile void * addr);
+ extern int test_and_set_bit(int nr, volatile void * addr);
++extern int __test_and_set_bit(int nr, volatile void * addr);
+ extern int test_and_clear_bit(int nr, volatile void * addr);
++extern int __test_and_clear_bit(int nr, volatile void * addr);
+ extern int test_and_change_bit(int nr, volatile void * addr);
+ extern int __constant_test_bit(int nr, const volatile void * addr);
+ extern int __test_bit(int nr, volatile void * addr);
+@@ -51,6 +54,24 @@
+ 		:"Ir" (nr));
+ }
+ 
++/* WARNING: non atomic and it can be reordered! */
++extern __inline__ void __set_bit(int nr, volatile void * addr)
++{
++	__asm__(
++		"btsl %1,%0"
++		:"=m" (ADDR)
++		:"Ir" (nr));
++}
++
++/*
++ * Yes, _even_ IA32 must implement those because clear_bit()
++ * doesn't provide any barrier for the compiler instruction
++ * reordering.
++ */
++#define smp_mb__before_clear_bit()	smp_mb()
++#define smp_mb__after_clear_bit()	smp_mb()
++#define __smp_mb__before_clear_bit()	__smp_mb()
++#define __smp_mb__after_clear_bit()	__smp_mb()
+ extern __inline__ void clear_bit(int nr, volatile void * addr)
+ {
+ 	__asm__ __volatile__( LOCK_PREFIX
+@@ -67,6 +88,11 @@
+ 		:"Ir" (nr));
+ }
+ 
++/*
++ * It will also imply a memory barrier, thus it must clobber memory
++ * to make sure to reload anything that was cached into registers
++ * outside _this_ critical section.
++ */
+ extern __inline__ int test_and_set_bit(int nr, volatile void * addr)
+ {
+ 	int oldbit;
+@@ -74,6 +100,18 @@
+ 	__asm__ __volatile__( LOCK_PREFIX
+ 		"btsl %2,%1\n\tsbbl %0,%0"
+ 		:"=r" (oldbit),"=m" (ADDR)
++		:"Ir" (nr) : "memory");
++	return oldbit;
++}
++
++/* WARNING: non atomic and it can be reordered! */
++extern __inline__ int __test_and_set_bit(int nr, volatile void * addr)
++{
++	int oldbit;
++
++	__asm__(
++		"btsl %2,%1\n\tsbbl %0,%0"
++		:"=r" (oldbit),"=m" (ADDR)
+ 		:"Ir" (nr));
+ 	return oldbit;
+ }
+@@ -85,6 +123,18 @@
+ 	__asm__ __volatile__( LOCK_PREFIX
+ 		"btrl %2,%1\n\tsbbl %0,%0"
+ 		:"=r" (oldbit),"=m" (ADDR)
++		:"Ir" (nr) : "memory");
++	return oldbit;
++}
++
++/* WARNING: non atomic and it can be reordered! */
++extern __inline__ int __test_and_clear_bit(int nr, volatile void * addr)
++{
++	int oldbit;
++
++	__asm__(
++		"btrl %2,%1\n\tsbbl %0,%0"
++		:"=r" (oldbit),"=m" (ADDR)
+ 		:"Ir" (nr));
+ 	return oldbit;
+ }
+@@ -96,19 +146,19 @@
+ 	__asm__ __volatile__( LOCK_PREFIX
+ 		"btcl %2,%1\n\tsbbl %0,%0"
+ 		:"=r" (oldbit),"=m" (ADDR)
+-		:"Ir" (nr));
++		:"Ir" (nr) : "memory");
+ 	return oldbit;
+ }
+ 
+ /*
+  * This routine doesn't need to be atomic.
+  */
+-extern __inline__ int __constant_test_bit(int nr, const volatile void * addr)
++extern __inline__ int constant_test_bit(int nr, const volatile void * addr)
+ {
+ 	return ((1UL << (nr & 31)) & (((const volatile unsigned int *) addr)[nr >> 5])) != 0;
+ }
+ 
+-extern __inline__ int __test_bit(int nr, volatile void * addr)
++extern __inline__ int dynamic_test_bit(int nr, volatile void * addr)
+ {
+ 	int oldbit;
+ 
+@@ -121,8 +171,8 @@
+ 
+ #define test_bit(nr,addr) \
+ (__builtin_constant_p(nr) ? \
+- __constant_test_bit((nr),(addr)) : \
+- __test_bit((nr),(addr)))
++ constant_test_bit((nr),(addr)) : \
++ dynamic_test_bit((nr),(addr)))
+ 
+ /*
+  * Find-bit routines..
+@@ -222,16 +272,16 @@
+ 
+ #ifdef __KERNEL__
+ 
+-#define ext2_set_bit                 test_and_set_bit
+-#define ext2_clear_bit               test_and_clear_bit
++#define ext2_set_bit                 __test_and_set_bit
++#define ext2_clear_bit               __test_and_clear_bit
+ #define ext2_test_bit                test_bit
+ #define ext2_find_first_zero_bit     find_first_zero_bit
+ #define ext2_find_next_zero_bit      find_next_zero_bit
+ 
+ /* Bitmap functions for the minix filesystem.  */
+-#define minix_test_and_set_bit(nr,addr) test_and_set_bit(nr,addr)
+-#define minix_set_bit(nr,addr) set_bit(nr,addr)
+-#define minix_test_and_clear_bit(nr,addr) test_and_clear_bit(nr,addr)
++#define minix_test_and_set_bit(nr,addr) __test_and_set_bit(nr,addr)
++#define minix_set_bit(nr,addr) __set_bit(nr,addr)
++#define minix_test_and_clear_bit(nr,addr) __test_and_clear_bit(nr,addr)
+ #define minix_test_bit(nr,addr) test_bit(nr,addr)
+ #define minix_find_first_zero_bit(addr,size) find_first_zero_bit(addr,size)
+ 
+Index: linux/include/asm-i386/rwlock.h
+diff -u linux/include/asm-i386/rwlock.h:1.1.1.1 linux/include/asm-i386/rwlock.h:1.1.1.1.4.1
+--- linux/include/asm-i386/rwlock.h:1.1.1.1	Tue Aug 29 16:34:14 2000
++++ linux/include/asm-i386/rwlock.h	Sun Sep  3 20:58:32 2000
+@@ -44,7 +44,7 @@
+ 		     "popl %%eax\n\t" \
+ 		     "jmp 1b\n" \
+ 		     ".previous" \
+-		     :"=m" (__dummy_lock(rw)))
++		     :"=m" (__dummy_lock(rw)) : : "memory")
+ 
+ #define __build_read_lock(rw, helper)	do { \
+ 						if (__builtin_constant_p(rw)) \
+@@ -74,7 +74,7 @@
+ 		     "popl %%eax\n\t" \
+ 		     "jmp 1b\n" \
+ 		     ".previous" \
+-		     :"=m" (__dummy_lock(rw)))
++		     :"=m" (__dummy_lock(rw)) : : "memory")
+ 
+ #define __build_write_lock(rw, helper)	do { \
+ 						if (__builtin_constant_p(rw)) \
+Index: linux/include/asm-i386/spinlock.h
+diff -u linux/include/asm-i386/spinlock.h:1.1.1.1 linux/include/asm-i386/spinlock.h:1.1.1.1.4.2
+--- linux/include/asm-i386/spinlock.h:1.1.1.1	Tue Aug 29 16:34:14 2000
++++ linux/include/asm-i386/spinlock.h	Mon Sep  4 15:42:00 2000
+@@ -71,7 +71,7 @@
+ 	__asm__ __volatile__(
+ 		"xchgb %b0,%1"
+ 		:"=q" (oldval), "=m" (__dummy_lock(lock))
+-		:"0" (0));
++		:"0" (0) : "memory");
+ 	return oldval > 0;
+ }
+ 
+@@ -87,7 +87,7 @@
+ #endif
+ 	__asm__ __volatile__(
+ 		spin_lock_string
+-		:"=m" (__dummy_lock(lock)));
++		:"=m" (__dummy_lock(lock)) : : "memory");
+ }
+ 
+ extern inline void spin_unlock(spinlock_t *lock)
+Index: linux/include/asm-i386/system.h
+diff -u linux/include/asm-i386/system.h:1.1.1.1 linux/include/asm-i386/system.h:1.1.1.1.4.2
+--- linux/include/asm-i386/system.h:1.1.1.1	Tue Aug 29 16:34:14 2000
++++ linux/include/asm-i386/system.h	Mon Sep  4 19:37:57 2000
+@@ -271,22 +271,43 @@
+ #define mb() 	__asm__ __volatile__ ("lock; addl $0,0(%%esp)": : :"memory")
+ #define rmb()	mb()
+ #define wmb()	__asm__ __volatile__ ("": : :"memory")
++
++#define __mb() 	__asm__ __volatile__ ("lock; addl $0,0(%%esp)")
++#define __rmb()	__mb()
++#define __wmb()	do {} while(0)
++
++#ifdef __SMP__
++#define smp_mb()	mb()
++#define smp_rmb()	rmb()
++#define smp_wmb()	wmb()
++#define __smp_mb()	__mb()
++#define __smp_rmb()	__rmb()
++#define __smp_wmb()	__wmb()
++#else
++#define smp_mb()	barrier()
++#define smp_rmb()	barrier()
++#define smp_wmb()	barrier()
++#define __smp_mb()	do {} while(0)
++#define __smp_rmb()	do {} while(0)
++#define __smp_wmb()	do {} while(0)
++#endif
++
+ #define set_mb(var, value) do { xchg(&var, value); } while (0)
+ #define set_wmb(var, value) do { var = value; wmb(); } while (0)
+ 
+ /* interrupt control.. */
+-#define __save_flags(x)		__asm__ __volatile__("pushfl ; popl %0":"=g" (x): /* no input */ :"memory")
++#define __save_flags(x)		__asm__ __volatile__("pushfl ; popl %0":"=g" (x): /* no input */)
+ #define __restore_flags(x) 	__asm__ __volatile__("pushl %0 ; popfl": /* no output */ :"g" (x):"memory")
+ #define __cli() 		__asm__ __volatile__("cli": : :"memory")
+-#define __sti()			__asm__ __volatile__("sti": : :"memory")
++#define __sti()			__asm__ __volatile__("sti")
+ /* used in the idle loop; sti takes one instruction cycle to complete */
+-#define safe_halt()		__asm__ __volatile__("sti; hlt": : :"memory")
++#define safe_halt()		__asm__ __volatile__("sti; hlt")
+ 
+ /* For spinlocks etc */
+ #define local_irq_save(x)	__asm__ __volatile__("pushfl ; popl %0 ; cli":"=g" (x): /* no input */ :"memory")
+-#define local_irq_restore(x)	__asm__ __volatile__("pushl %0 ; popfl": /* no output */ :"g" (x):"memory")
+-#define local_irq_disable()	__asm__ __volatile__("cli": : :"memory")
+-#define local_irq_enable()	__asm__ __volatile__("sti": : :"memory")
++#define local_irq_restore(x)	__restore_flags(x)
++#define local_irq_disable()	__cli()
++#define local_irq_enable()	__sti()
+ 
+ #ifdef CONFIG_SMP
+ 
+Index: linux/include/asm-sparc64/system.h
+diff -u linux/include/asm-sparc64/system.h:1.1.1.1 linux/include/asm-sparc64/system.h:1.1.1.1.4.1
+--- linux/include/asm-sparc64/system.h:1.1.1.1	Tue Aug 29 16:34:22 2000
++++ linux/include/asm-sparc64/system.h	Sun Sep  3 20:58:32 2000
+@@ -100,8 +100,8 @@
+ #define nop() 		__asm__ __volatile__ ("nop")
+ 
+ #define membar(type)	__asm__ __volatile__ ("membar " type : : : "memory");
+-#define rmb()		membar("#LoadLoad | #LoadStore")
+-#define wmb()		membar("#StoreLoad | #StoreStore")
++#define rmb()		membar("#LoadLoad")
++#define wmb()		membar("#StoreStore")
+ #define set_mb(__var, __value) \
+ 	do { __var = __value; membar("#StoreLoad | #StoreStore"); } while(0)
+ #define set_wmb(__var, __value) \
+Index: linux/include/linux/brlock.h
+diff -u linux/include/linux/brlock.h:1.1.1.1 linux/include/linux/brlock.h:1.1.1.1.4.1
+--- linux/include/linux/brlock.h:1.1.1.1	Tue Aug 29 16:34:24 2000
++++ linux/include/linux/brlock.h	Sun Sep  3 20:58:32 2000
+@@ -114,10 +114,23 @@
+ 	lock = &__br_write_locks[idx].lock;
+ again:
+ 	(*ctr)++;
+-	rmb();
++	mb();
+ 	if (spin_is_locked(lock)) {
+ 		(*ctr)--;
+-		rmb();
++		wmb(); /*
++			* The release of the ctr must become visible
++			* to the other cpus eventually thus wmb(),
++			* we don't care if spin_is_locked is reordered
++			* before the releasing of the ctr.
++			* However IMHO this wmb() is superflous even in theory.
++			* It would not be superflous only if on the
++			* other CPUs doing a ldl_l instead of an ldl
++			* would make a difference and I don't think this is
++			* the case.
++			* I'd like to clarify this issue further
++			* but for now this is a slow path so adding the
++			* wmb() will keep us on the safe side.
++			*/
+ 		while (spin_is_locked(lock))
+ 			barrier();
+ 		goto again;
+Index: linux/include/linux/interrupt.h
+diff -u linux/include/linux/interrupt.h:1.1.1.1 linux/include/linux/interrupt.h:1.1.1.1.4.1
+--- linux/include/linux/interrupt.h:1.1.1.1	Tue Aug 29 16:34:28 2000
++++ linux/include/linux/interrupt.h	Sun Sep  3 20:58:32 2000
+@@ -147,7 +147,19 @@
+ #ifdef CONFIG_SMP
+ #define tasklet_trylock(t) (!test_and_set_bit(TASKLET_STATE_RUN, &(t)->state))
+ #define tasklet_unlock_wait(t) while (test_bit(TASKLET_STATE_RUN, &(t)->state)) { /* NOTHING */ }
+-#define tasklet_unlock(t) clear_bit(TASKLET_STATE_RUN, &(t)->state)
++#define tasklet_unlock(t)						\
++do {									\
++	/*								\
++	 * talklet_trylock() uses test_and_set_bit that imply		\
++	 * an mb when it returns zero, thus we need the explicit	\
++	 * mb only here: while closing the critical section.		\
++	 * It doesn't need to be a compiler memory barrier		\
++	 * because the stuff we're protecting lives in			\
++	 * extern functions.						\
++	 */								\
++	__smp_mb__before_clear_bit();					\
++	clear_bit(TASKLET_STATE_RUN, &(t)->state);			\
++} while(0)
+ #else
+ #define tasklet_trylock(t) 1
+ #define tasklet_unlock_wait(t) do { } while (0)
+Index: linux/include/linux/locks.h
+diff -u linux/include/linux/locks.h:1.1.1.1 linux/include/linux/locks.h:1.1.1.1.4.1
+--- linux/include/linux/locks.h:1.1.1.1	Tue Aug 29 16:34:25 2000
++++ linux/include/linux/locks.h	Sun Sep  3 20:58:32 2000
+@@ -29,7 +29,9 @@
+ extern inline void unlock_buffer(struct buffer_head *bh)
+ {
+ 	clear_bit(BH_Lock, &bh->b_state);
+-	wake_up(&bh->b_wait);
++	smp_mb__after_clear_bit();
++	if (waitqueue_active(&bh->b_wait))
++		wake_up(&bh->b_wait);
+ }
+ 
+ /*
+@@ -55,7 +57,18 @@
+ extern inline void unlock_super(struct super_block * sb)
+ {
+ 	sb->s_lock = 0;
+-	wake_up(&sb->s_wait);
++	/*
++	 * In UP this really is a NOOP because only schedule
++	 * could change the meaning of s_wait because we're protected
++	 * by the big kernel lock, and schedule is an external function.
++	 * Without the #ifdef CONFIG_SMP smp_mb() would be expanded as
++	 * barrier() instead.
++	 */
++#ifdef CONFIG_SMP
++	smp_mb();
++#endif
++	if (waitqueue_active(&sb->s_wait))
++		wake_up(&sb->s_wait);
+ }
+ 
+ #endif /* _LINUX_LOCKS_H */
+Index: linux/include/linux/mm.h
+diff -u linux/include/linux/mm.h:1.1.1.1 linux/include/linux/mm.h:1.1.1.1.4.1
+--- linux/include/linux/mm.h:1.1.1.1	Tue Aug 29 16:34:27 2000
++++ linux/include/linux/mm.h	Sun Sep  3 20:58:32 2000
+@@ -189,9 +189,18 @@
+ #define PageLocked(page)	test_bit(PG_locked, &(page)->flags)
+ #define LockPage(page)		set_bit(PG_locked, &(page)->flags)
+ #define TryLockPage(page)	test_and_set_bit(PG_locked, &(page)->flags)
++/*
++ * The first mb is necessary to safely close the critical section opened by the
++ * TryLockPage(), the second mb is necessary to enforce ordering between
++ * the clear_bit and the read of the waitqueue (to avoid SMP races with a
++ * parallel wait_on_page).
++ */
+ #define UnlockPage(page)	do { \
++					smp_mb__before_clear_bit(); \
+ 					clear_bit(PG_locked, &(page)->flags); \
+-					wake_up(&page->wait); \
++					__smp_mb__after_clear_bit(); \
++					if (waitqueue_active(&page->wait)) \
++						wake_up(&page->wait); \
+ 				} while (0)
+ #define PageError(page)		test_bit(PG_error, &(page)->flags)
+ #define SetPageError(page)	set_bit(PG_error, &(page)->flags)
+Index: linux/include/linux/tqueue.h
+diff -u linux/include/linux/tqueue.h:1.1.1.1 linux/include/linux/tqueue.h:1.1.1.1.4.1
+--- linux/include/linux/tqueue.h:1.1.1.1	Tue Aug 29 16:34:28 2000
++++ linux/include/linux/tqueue.h	Sun Sep  3 20:58:32 2000
+@@ -114,7 +114,7 @@
+ 			f      = p -> routine;
+ 			save_p = p;
+ 			p      = p -> next;
+-			mb();
++			smp_mb();
+ 			save_p -> sync = 0;
+ 			if (f)
+ 				(*f)(arg);
+Index: linux/net/core/dev.c
+diff -u linux/net/core/dev.c:1.1.1.1 linux/net/core/dev.c:1.1.1.1.4.1
+--- linux/net/core/dev.c:1.1.1.1	Tue Aug 29 16:34:34 2000
++++ linux/net/core/dev.c	Sun Sep  3 20:58:33 2000
+@@ -1178,6 +1178,8 @@
+ 			struct net_device *dev = head;
+ 			head = head->next_sched;
+ 
++			/* No need of a compiler memory barrier */
++			__smp_mb__before_clear_bit();
+ 			clear_bit(__LINK_STATE_SCHED, &dev->state);
+ 
+ 			if (spin_trylock(&dev->queue_lock)) {
+Andrea
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+Please read the FAQ at 
+http://www.tux.org/lkml/

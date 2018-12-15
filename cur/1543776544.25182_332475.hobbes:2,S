@@ -1,0 +1,252 @@
+Date: Sat, 9 Jul 2005 11:30:21 +0530
+From: <>
+Subject: USB serial driver - data loss issue.
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2005/7/9/6
+
+Hello,
+I am facing this issue when i am testing my USB serial driver on Redhat
+Linux 2.6.9 , EL version 4  with my application. The driver is written
+for OXUSB950 and OXUSB954 devices.
+ This application executes a set of transfer for one usb -serial port to
+another . I have various combinations of transfers - unidirectional ,
+bidirectional . The applications also tries to compare the data that was
+sent is actually received on the other port . For bidirectional , a
+window of data(1000 bytes)is written and read one byte at a time.
+Basically read is slow as compared to writes.  This application gets
+incorrect byte . The transfer where the application gets a mismatch is
+most of the times the bidirectional test. Application is attached.
+My observations - 
+With this application , even when I do tty_flip_buffer_push() in the
+bottom half  of the usb serial driver the flip count does not become
+zero . I find the TTY_DONT_FLIP bit is also remaining set. The point
+when the flip count crosses 512  I get an erroneous byte at the
+application . This erroneous byte is the byte that is inserted by the
+driver when the flip buffer is flipped some time later. Not sure
+who/when/why this flip happens. This should be because later the
+TTY_DONT_FLIP bit is reset when the line disc is no longer processing
+data from the flip buffer.
+The bottom half is meant to process the data recieved from the device
+and push it to the tty and ldisc above . I have verified that i get
+corect data in the bottom half of the driver. However the time when
+tty_flip_buffer_push() does not flip the buffer and i do
+tty_insert_flip_char() which causes the flip buffer to drop the data.
+Note : the driver has the low_latency flag set .
+Is this issue related to high baud rate , nature of the application (
+read slower than writes) that causes the layer above the driver to go in
+this scenario.
+Is there any bug/race condition happening in the tty /ldisc layer for
+the mentioned kernel version.
+I am looking for some pointers to debug this issue. i am novice with the
+intricacies of the tty and ldisc layer. I have taken help of Greg's
+documents on the linux journal to understand the basics required when
+writing usb-serial driver.
+How should the usb-serial driver handle this - if for unknown reason the
+flip buffer cannot be flipped and the data being that has been pushed
+can overrun the buffer. Any inputs ?  
+Thanks and Regards,
+Monali
+relevant Driver code - bottom half 
+void rx_work_softint(void *private)
+{
+	struct usb_serial_port *port;
+	struct oxsemi_port *port_info;
+	struct usb_serial *serial;
+	unsigned char *data;
+	struct urb *urb = NULL;
+	unsigned long flags;
+	unsigned char notification_mask;
+	int length;
+	int i = 0;
+	int throttled;
+	struct tty_struct *tty;
+	int status = 0;
+	int port_number = 0;
+	struct oxsemi_serial *device_info;
+   
+	oxsemi_dbg("[ENTRY]", TRACE);
+	port = (struct usb_serial_port *)private;
+	
+	urb  = port->interrupt_in_urb;
+	data = urb->transfer_buffer;
+	tty = port->tty;
+	port_info = usb_get_serial_port_data(port);
+	serial = port->serial;
+	device_info = usb_get_serial_data(serial);
+	port_number = port_info->port->number %
+device_info->num_interfaces;
+	oxsemi_dbg("Port Number = %d ", TRACE, port_number );
+	oxsemi_dbg("Length of URB on INTERRUPT IN : %d", TRACE,
+			urb->actual_length);
+	oxsemi_debug_data(&port->dev, __FUNCTION__, urb->actual_length,
+data);
+	if (port->open_count == 0) {
+		oxsemi_dbg("No ports are opened ", CRITICAL);
+		goto continue_read;
+	}
+	 
+	spin_lock_irqsave(&port_info->port_lock, flags);
+	throttled = port_info->throttled;
+	notification_mask = data[NOTIFICATION_BYTE_OFFSET]; 
+	oxsemi_dbg("Notification byte = 0x%x",
+CRITICAL,notification_mask);
+	/* Check if Transmit busy bit is set. */
+	/* If set,stop_tx is marked as 1 so that we pause sending to the
+port
+	 * since the firmware is busy transmitting data to the device
+	 */
+	if (notification_mask & TRANSMIT_BUSY_MASK) {
+		port_info->stop_tx = 1;
+	}
+	else {
+		port_info->stop_tx = 0;
+	}
+	oxsemi_dbg("port_info->stop_tx = %d ", TRACE,
+port_info->stop_tx);
+	spin_unlock_irqrestore(&port_info->port_lock, flags);
+	
+	/* Process the notification byte received */
+	oxsemi_process_notifications(notification_mask,port);
+	/* If there is data along with the notification byte 
+	 * ( i.e urb->actual length > 1) the read data needs to be
+pushed 
+	 * into the tty layer's receive buffer ( flip buffer)
+	 */
+	
+	if (urb->actual_length > 1)  
+	{
+		
+		/* Check if close is pending.
+		 * If close is pending on the port on which data is
+received 
+		 * then drop data else	send the data to the tty flip
+buffer 
+		 */
+		
+		if (port_info->close_pending) {
+			oxsemi_dbg("Close is pending, dropping data on
+the floor.",
+	
+CRITICAL);
+		} 
+		else 
+		{
+			if( throttled ) {
+				/* We are buffering data in our receive
+buffer 
+				 * as much as possible during the
+throttle time
+				 */
+				
+				length = urb->actual_length - 1;
+				length = min((int)length,
+				(int)(OXSEMI_RX_BUFFER_SIZE -
+port_info->rx_buffer_length));
+				oxsemi_dbg("Buffered %d bytes during
+throttle time",
+					    CRITICAL, length);
+				if( length > 0 ) {
+					memcpy(
+					port_info->rx_buffer +
+port_info->rx_buffer_length,
+					data + 1,length);
+					port_info->rx_buffer_length +=
+length;
+				}
+			} else {
+		 		
+				/* These are the typical steps required
+to place the data 
+				 * received from the  dongle  in the tty
+device's flip buffer.
+				 */
+				/* Just for debugging */
+				 if (tty->ldisc.receive_room(tty) -
+tty->flip.count < urb->actual_length) {
+						oxsemi_dbg (" PORT
+%d",CRITICAL,port_info->port->number );
+						oxsemi_dbg ("Available
+room =%d ", 
+	
+CRITICAL,(tty->ldisc.receive_room(tty) - tty->flip.count) );
+						oxsemi_dbg ("Cannot
+accomodate data in FLIP, FLIP COUNT =%d, length=%d", 
+	
+CRITICAL,tty->flip.count,urb->actual_length );
+				}
+					if
+(tty->flip.count+urb->actual_length >= TTY_FLIPBUF_SIZE) {
+						oxsemi_dbg (" PORT
+%d",CRITICAL,port_info->port->number );
+						if
+(test_bit(TTY_DONT_FLIP, &tty->flags)) 
+							oxsemi_dbg ("TTY
+DONT FLIP IS SET\n ",CRITICAL);
+						oxsemi_dbg ("Available
+room =%d ", 
+	
+CRITICAL,(tty->ldisc.receive_room(tty) - tty->flip.count) );
+						oxsemi_dbg ("Cannot
+accomodate data in FLIP, FLIP COUNT =%d, length=%d", 
+	
+CRITICAL,tty->flip.count,urb->actual_length );
+						oxsemi_dbg (" Port0:
+bytes received = %d,Port1: bytes received = %d",CRITICAL, np0,np1);
+					}
+				for (i = 1; i < urb->actual_length; i++)
+{
+					if (tty->flip.count >=
+TTY_FLIPBUF_SIZE) {
+					  tty_flip_buffer_push(tty);
+						 if (tty->flip.count !=
+0) {
+                                             oxsemi_dbg ("after push
+flip count = %d exists on port = %d \n",CRITICAL,tty->
+flip.count,port_info->port->number);
+                                                }
+					}
+					oxsemi_dbg ("data inserted in
+flip buffer =0x%x",
+						    TRACE, data[i]);
+					tty_insert_flip_char(tty,
+data[i], 0);
+					
+				}
+				tty_flip_buffer_push(tty);
+				 if (tty->flip.count != 0) {
+                                 oxsemi_dbg ("after push flip count =%d
+exists on port =%d  \n",CRITICAL,tty->
+flip.count,port_info->port->number);
+                                 }
+				
+			} /* End of else of if(throttled) */
+		}
+	}
+	continue_read:
+		/* continue read unless stopped */
+		oxsemi_dbg ("Continue read unless stopped", TRACE);
+		oxsemi_dbg ("port_info->throttled = %d", CRITICAL,
+						port_info->throttled);
+		oxsemi_dbg ("port->open_count = %d",
+TRACE,port->open_count);
+		spin_lock_irqsave(&port_info->port_lock,flags);
+		
+		if (port_info->throttled == 0 && port->open_count > 0) {
+			oxsemi_dbg("Resubmiting URB on INTERRUPT IN",
+CRITICAL);
+			status = usb_submit_urb(urb, GFP_ATOMIC);
+			if (status) {
+				oxsemi_dbg("usb_submit_urb failed with
+value %d",
+	
+CRITICAL,status);
+			}
+		}
+		spin_unlock_irqrestore(&port_info->port_lock,flags);
+		oxsemi_dbg("[EXIT]", TRACE);
+}
+ 
+[unhandled content-type:application/octet-stream]

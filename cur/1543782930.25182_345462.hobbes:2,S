@@ -1,0 +1,282 @@
+Date: Tue, 30 Aug 2005 13:50:00 +0900
+From: "Machida, Hiroyuki" <>
+Subject: [PATCH][FAT] FAT dirent scan with hin take #2
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2005/8/30/17
+
+Here is a revised version of dirent scan patch,  mentioned at
+following E-mail.
+This patch addresses performance damages on "ls | xargs xxx" and
+reverse order scan which are reported to the previous patch.
+With this patch, fat_search_long() and fat_scan() use hint value
+as start of scan. For each directory holds multiple hint value entries.
+The entry would be selected by hash value based on scan target name and
+PID. Hint value would be calculated based on the entry previously found
+entry, so that the hint can cover backward neighborhood.
+This patch is for 2.6.12, because I tested it at the last weekend...
+Machida, Hiroyuki wrote:
+> 
+> As I said in "[RFC] FAT dirent scan with hint"
+> 	<43024977.7020101@sm.sony.co.jp>, we realized that FAT/VFAT has
+> poor performance with scanning directory entries.
+> 
+> Per discussions with Ogawa-san, VFAT maintainer, I took profiling data
+> to seek better solution. Here are results attached.
+> 
+> In short, I would say we need to reduce following factors.
+> 	a) number of iterations inside fat_search_long()
+> 	b) number of callings to uni16_to_x8()
+> 	c) number of callings to fat__get_entry(), for short name scan.
+> 
+> In another E-mail, I'll send revised version patch which use hint
+> values to scan dirent. That patch would reduce number of iterations
+> inside fat_search_long() and fat_scan(). Those contributes reductions
+> above a)-c) factors.
+> 
+	:
+	snip
+	:
+-- 
+Hiroyuki Machida		machida@sm.sony.co.jp		
+SSW Dept. HENC, Sony Corp.
+This patch enables using hint nformation on scanning dir.
+It reaches excelent performance with "ls -l" for over 1000 entries.
+* fat-dirscan-with-hint.patch
+ fs/fat/dir.c             |  133 ++++++++++++++++++++++++++++++++++++++++++++---
+ fs/fat/inode.c           |   13 ++++
+ include/linux/msdos_fs.h |    2 
+ 3 files changed, 140 insertions(+), 8 deletions(-)
+Signed-off-by: Hiroyuki Machida <machida@sm.sony.co.jp> for CELF
+* modified files
+--- old/include/linux/msdos_fs.h	2005-08-29 09:38:53.308587787 +0900
++++ new/include/linux/msdos_fs.h	2005-08-29 09:39:33.889555606 +0900
+@@ -255,6 +255,8 @@ struct msdos_inode_info {
+ 	/* for avoiding the race between fat_free() and fat_get_cluster() */
+ 	unsigned int cache_valid_id;
+ 
++	struct semaphore *scan_lock;	/* lock for dirscan hints */
++	loff_t *scan_hints;	/* dirscan hints */
+ 	loff_t mmu_private;
+ 	int i_start;		/* first cluster or 0 */
+ 	int i_logstart;		/* logical first cluster */
+--- old/fs/fat/dir.c	2005-08-29 09:38:53.158584210 +0900
++++ new/fs/fat/dir.c	2005-08-29 09:39:33.889555606 +0900
+@@ -201,6 +201,91 @@ fat_shortname2uni(struct nls_table *nls,
+  * Return values: negative -> error, 0 -> not found, positive -> found,
+  * value is the total amount of slots, including the shortname entry.
+  */
++
++#define FAT_SCAN_SHIFT	4			/* 2x8 way scan hints  */
++#define FAT_SCAN_NWAY	(1<<FAT_SCAN_SHIFT)
++
++
++DECLARE_MUTEX(hint_alloc_lock);
++
++inline
++static int hint_allocate(struct inode *dir)
++{
++	void *hints;
++	int err = 0;
++
++	if (!MSDOS_I(dir)->scan_hints) {
++		hints = kmalloc(FAT_SCAN_NWAY*sizeof(loff_t),GFP_KERNEL);
++		if (hints) 
++			memset(hints, 0, FAT_SCAN_NWAY*sizeof(loff_t));
++		else 
++			err = -ENOMEM;
++
++		down(&MSDOS_I(dir)->scan_lock);
++		if (MSDOS_I(dir)->scan_hints) err = -EINVAL;
++		if (!err) MSDOS_I(dir)->scan_hints = hints;
++		up(&MSDOS_I(dir)->scan_lock);
++		if (err == -EINVAL) {
++			if (hints) kfree(hints);
++			err = 0;
++		}
++	}
++	return err;
++}
++
++
++inline
++static void hint_record(struct inode *dir, struct fat_slot_info *sinfo, 
++			  int hindex)
++{
++	loff_t under_scan_off, nent;
++
++	nent = (dir->i_size > PAGE_SIZE ? dir->i_size : PAGE_SIZE)
++		/ sizeof(struct msdos_dir_entry);
++
++	/* educational guess; try to cover 1/4 previous range */
++	nent >>= (FAT_SCAN_SHIFT + 2);
++	under_scan_off = nent * sizeof(struct msdos_dir_entry);
++
++	if (sinfo->slot_off > under_scan_off) 
++		MSDOS_I(dir)->scan_hints[hindex] =
++			sinfo->slot_off - under_scan_off;  
++	else
++		MSDOS_I(dir)->scan_hints[hindex] = 0;  
++}
++
++
++inline 
++static int hint_index_body(const unsigned char *name, int name_len, int check_null)
++{
++	int i;
++	int val = 0;
++	unsigned char *p = (unsigned char *) name;
++	int id = current->pid;
++	
++	for (i=0; i<name_len; i++) {
++		if (check_null && !*p) break;
++		val = ((val << 1) & 0xfe) | ((val&0x80)?1:0);
++		val ^= *p;
++		p ++;
++	}
++	id = ((id >> 8) & 0xf) ^ (id & 0xf);
++	val = (val << 1) | (id & 1);
++	return val & (FAT_SCAN_NWAY-1);
++}
++
++inline 
++static int lfn_hint_index(const unsigned char *name, int name_len)
++{
++	return hint_index_body(name, name_len, 0);
++}
++
++inline 
++static int hint_index(const unsigned char *name)
++{
++	return hint_index_body(name, MSDOS_NAME, 1);
++}
++
+ int fat_search_long(struct inode *inode, const unsigned char *name,
+ 		    int name_len, struct fat_slot_info *sinfo)
+ {
+@@ -218,13 +303,26 @@ int fat_search_long(struct inode *inode,
+ 	int utf8 = sbi->options.utf8;
+ 	int anycase = (sbi->options.name_check != 's');
+ 	unsigned short opt_shortname = sbi->options.shortname;
+-	loff_t cpos = 0;
+ 	int chl, i, j, last_u, err;
++	loff_t cpos, start_off;
++	int reach_bottom = 0;
++	int hindex;
++	int ret;
++
++	ret = hint_allocate(inode); 
++	if (ret < 0) return ret;
++	hindex = lfn_hint_index(name, name_len);
++	start_off = cpos =  MSDOS_I(inode)->scan_hints[hindex];
+ 
+ 	err = -ENOENT;
+ 	while(1) {
+-		if (fat_get_entry(inode, &cpos, &bh, &de) == -1)
+-			goto EODir;
++Top:
++		if (reach_bottom && cpos >= start_off) goto EODir;
++		if (fat_get_entry(inode, &cpos, &bh, &de) == -1) {
++			if (!start_off) goto EODir;
++			reach_bottom ++; cpos = 0;
++			continue;
++		}
+ parse_record:
+ 		nr_slots = 0;
+ 		if (de->name[0] == DELETED_FLAG)
+@@ -274,8 +372,11 @@ parse_long:
+ 				if (ds->id & 0x40) {
+ 					unicode[offset + 13] = 0;
+ 				}
+-				if (fat_get_entry(inode, &cpos, &bh, &de) < 0)
+-					goto EODir;
++				if (fat_get_entry(inode, &cpos, &bh, &de) <0 ) {
++					if (!start_off) goto EODir;
++					reach_bottom ++; cpos = 0;
++					goto Top;
++				}
+ 				if (slot == 0)
+ 					break;
+ 				ds = (struct msdos_dir_slot *) de;
+@@ -363,6 +464,7 @@ Found:
+ 	sinfo->de = de;
+ 	sinfo->bh = bh;
+ 	sinfo->i_pos = fat_make_i_pos(sb, sinfo->bh, sinfo->de);
++	hint_record(inode, sinfo, hindex);
+ 	err = 0;
+ EODir:
+ 	if (unicode)
+@@ -838,17 +940,32 @@ int fat_scan(struct inode *dir, const un
+ 	     struct fat_slot_info *sinfo)
+ {
+ 	struct super_block *sb = dir->i_sb;
++	loff_t	start_off;
++	int	hindex;
++	int	ret;
++	int reach_bottom = 0;
++
++	ret = hint_allocate(dir); 
++	if (ret < 0) return ret;
++	hindex = hint_index(name);
+ 
+-	sinfo->slot_off = 0;
++	sinfo->slot_off = start_off = MSDOS_I(dir)->scan_hints[hindex];
+ 	sinfo->bh = NULL;
+-	while (fat_get_short_entry(dir, &sinfo->slot_off, &sinfo->bh,
+-				   &sinfo->de) >= 0) {
++	while (1) {
++		if (fat_get_short_entry(dir, &sinfo->slot_off, 
++				        &sinfo->bh, &sinfo->de) <0 ) { 
++			if (!start_off) break;
++			sinfo->slot_off = 0LL; reach_bottom ++;
++			continue;
++		}
+ 		if (!strncmp(sinfo->de->name, name, MSDOS_NAME)) {
+ 			sinfo->slot_off -= sizeof(*sinfo->de);
+ 			sinfo->nr_slots = 1;
+ 			sinfo->i_pos = fat_make_i_pos(sb, sinfo->bh, sinfo->de);
++			hint_record(dir, sinfo, hindex);
+ 			return 0;
+ 		}
++		if (reach_bottom && (start_off <= sinfo->slot_off)) break;
+ 	}
+ 	return -ENOENT;
+ }
+--- old/fs/fat/inode.c	2005-08-29 09:38:53.308587787 +0900
++++ new/fs/fat/inode.c	2005-08-29 09:39:33.889555606 +0900
+@@ -242,6 +242,8 @@ static int fat_fill_inode(struct inode *
+ 	inode->i_version++;
+ 	inode->i_generation = get_seconds();
+ 
++	init_MUTEX(&(MSDOS_I(inode)->scan_lock);
++	MSDOS_I(inode)->scan_hints = 0;
+ 	if ((de->attr & ATTR_DIR) && !IS_FREE(de->name)) {
+ 		inode->i_generation &= ~1;
+ 		inode->i_mode = MSDOS_MKMODE(de->attr,
+@@ -345,6 +347,15 @@ static void fat_delete_inode(struct inod
+ static void fat_clear_inode(struct inode *inode)
+ {
+ 	struct msdos_sb_info *sbi = MSDOS_SB(inode->i_sb);
++	void *hints;
++
++	down(&(MSDOS_I(inode)->scan_lock);
++	hints = (void *)(MSDOS_I(inode)->scan_hints);
++	if (hints) {
++		MSDOS_I(inode)->scan_hints = 0;
++	}
++	up(&(MSDOS_I(inode)->scan_lock);
++	if (hints) kfree(hints);
+ 
+ 	if (is_bad_inode(inode))
+ 		return;
+@@ -1011,6 +1022,8 @@ static int fat_read_root(struct inode *i
+ 	struct msdos_sb_info *sbi = MSDOS_SB(sb);
+ 	int error;
+ 
++	init_MUTEX(&(MSDOS_I(inode)->scan_lock);
++	MSDOS_I(inode)->scan_hints = 0;
+ 	MSDOS_I(inode)->i_pos = 0;
+ 	inode->i_uid = sbi->options.fs_uid;
+ 	inode->i_gid = sbi->options.fs_gid;

@@ -1,0 +1,155 @@
+Date: Fri, 16 Jul 1999 16:57:00 +0200 (CEST)
+From: Andrea Arcangeli <>
+Subject: [patch] 2.2.10 i386 semaphore fixes
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/7/16/53
+
+There's a subtle races in the down_trylock and down_interruptible i386
+calls.
+The problem is that we can't trust the sem->count in wake_one_more(). This
+because even if the semaphore count is <= 0 the semaphore could be just
+owned from a different process. This because not only up() increases the
+semaphore count, but also the trylock/interruptible calls will increase
+the semaphore count while giving up. This mean that the semaphore count
+could go to 1 and return to 0 because a down() got the semaphore. This
+between up() and wake_one_more().
+IMO the fix is to unconditionally increase the waking field in wake_one_more.
+So every up() that will be run whith some waiter sleeping will increase
+waking of 1 some time soon (note wake_one_more() can run a lot after
+up()). Then if one of the waiters will give up before wake_one_more will
+run, the waiter will increase the count, it will notice that the count is
+greater than zero and so it will decrease the waking count in the critical
+section (so the waking count will be -1 for some time). But then
+wake_one_more will unconditionally run setting the waking count to 0
+again.
+Patch against 2.2.10:
+--- /tmp/linux-2.2.10/include/asm-i386/semaphore-helper.h	Sat Feb 20 16:41:42 1999
++++ linux-2.2.10/include/asm-i386/semaphore-helper.h	Fri Jul 16 16:41:30 1999
+@@ -13,14 +13,19 @@
+  *
+  * This is trivially done with load_locked/store_cond,
+  * but on the x86 we need an external synchronizer.
++ *
++ * NOTE: we can't look at the semaphore count here since it can be
++ * unreliable. Even if the count is minor than 1, the semaphore
++ * could be just owned by another process (this because not only up() increases
++ * the semaphore count, also the interruptible/trylock call can increment
++ * the semaphore count when they fails).
+  */
+ static inline void wake_one_more(struct semaphore * sem)
+ {
+ 	unsigned long flags;
+ 
+ 	spin_lock_irqsave(&semaphore_wake_lock, flags);
+-	if (atomic_read(&sem->count) <= 0)
+-		sem->waking++;
++	sem->waking++;
+ 	spin_unlock_irqrestore(&semaphore_wake_lock, flags);
+ }
+ 
+@@ -44,9 +49,11 @@
+  *	0	go to sleep
+  *	-EINTR	interrupted
+  *
+- * We must undo the sem->count down_interruptible() increment while we are
+- * protected by the spinlock in order to make atomic this atomic_inc() with the
+- * atomic_read() in wake_one_more(), otherwise we can race. -arca
++ * If we give up we must undo our count-decrease we previously did in down().
++ * Subtle: up() can continue to happens and increase the semaphore count
++ * even during our critical section protected by the spinlock. So
++ * we must remeber to undo the sem->waking that will be run from
++ * wake_one_more() some time soon, if the semaphore count become > 0.
+  */
+ static inline int waking_non_zero_interruptible(struct semaphore *sem,
+ 						struct task_struct *tsk)
+@@ -59,7 +66,8 @@
+ 		sem->waking--;
+ 		ret = 1;
+ 	} else if (signal_pending(tsk)) {
+-		atomic_inc(&sem->count);
++		if (atomic_inc_and_test_greater_zero(&sem->count))
++			sem->waking--;
+ 		ret = -EINTR;
+ 	}
+ 	spin_unlock_irqrestore(&semaphore_wake_lock, flags);
+@@ -71,9 +79,7 @@
+  *	1	failed to lock
+  *	0	got the lock
+  *
+- * We must undo the sem->count down_trylock() increment while we are
+- * protected by the spinlock in order to make atomic this atomic_inc() with the
+- * atomic_read() in wake_one_more(), otherwise we can race. -arca
++ * Implementation details are the same of the interruptible case.
+  */
+ static inline int waking_non_zero_trylock(struct semaphore *sem)
+ {
+@@ -82,8 +88,10 @@
+ 
+ 	spin_lock_irqsave(&semaphore_wake_lock, flags);
+ 	if (sem->waking <= 0)
+-		atomic_inc(&sem->count);
+-	else {
++	{
++		if (atomic_inc_and_test_greater_zero(&sem->count))
++			sem->waking--;
++	} else {
+ 		sem->waking--;
+ 		ret = 0;
+ 	}
+--- /tmp/linux-2.2.10/include/asm-i386/atomic.h	Mon Jan 18 02:27:16 1999
++++ linux-2.2.10/include/asm-i386/atomic.h	Thu Jul 15 18:02:06 1999
+@@ -73,6 +73,17 @@
+ 	return c != 0;
+ }
+ 
++extern __inline__ int atomic_inc_and_test_greater_zero(volatile atomic_t *v)
++{
++	unsigned char c;
++
++	__asm__ __volatile__(
++		LOCK "incl %0; setg %1"
++		:"=m" (__atomic_fool_gcc(v)), "=qm" (c)
++		:"m" (__atomic_fool_gcc(v)));
++	return c; /* can be only 0 or 1 */
++}
++
+ /* These are x86-specific, used by some header files */
+ #define atomic_clear_mask(mask, addr) \
+ __asm__ __volatile__(LOCK "andl %0,%1" \
+Andrea
+I quote here the email in which Ulrich showed me the subtle race:
+---------------------------------------------------------------------------
+[down_trylock could be replaced by down_interruptible with a pending
+signal]
+task A          task B          task C          task D          count
+waking
+down()                                                          0       0
+                down_trylock()                                  -1      0
+                waking_non_zero_trylock()
+                spin_lock_irqsave()
+up()                                                            0       0
+wake_one_more()
+spin_lock_irqsave() [blocked]
+                if (sem->waking > 0) ...
+                atomic_inc(&sem->count)                         1       0
+                                down() [acquires sem.]          0       0
+                spin_unlock_irqrestore()
+spin_lock_irqsave() [gets lock]
+if (atomic_read(&sem->count) <= 0)
+sem->waking++                                                   0       1
+                                                down()          -1      1
+                                                if (sem->waking > 0)
+                                                acquires semaphore !
+The problem here is that atomic_inc(&sem->count) and
+(atomic_read(&sem->count) <= 0) are done in two different
+operations. I guess that it is necessary to bring them together like
+it is done in up().
+--------------------------------------------------------------------------
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

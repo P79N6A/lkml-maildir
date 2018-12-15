@@ -1,0 +1,185 @@
+Date: 07 May 2002 10:53:57 -0700
+From: Robert Love <>
+Subject: [PATCH] 2.4-ac: migration_init improvements
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2002/5/7/172
+
+Alan,
+The attached patch simplifies the migration_init code (an ugly lot) with
+a simpler mechanism.  This is Erich Focht's version which is now in
+2.5.  It has proved stable both there and in my testing.
+The new method is to bring up the first migration_thread, and then use
+it to migrate the remaining threads to their respective CPUs.  The
+method makes sense and removes a lot of code.
+This patch also includes a boot hang fix demonstrated on arches where
+logical CPU mapping != physical CPU mapping.  The bug was reported and
+fixed by James Bottomley in 2.5.
+Patch is against 2.4.19-pre7-ac4, please apply.
+	Robert Love
+diff -urN linux-2.4.19-pre7-ac4/kernel/sched.c linux/kernel/sched.c
+--- linux-2.4.19-pre7-ac4/kernel/sched.c	Mon Apr 29 12:33:23 2002
++++ linux/kernel/sched.c	Mon Apr 29 12:57:00 2002
+@@ -1536,80 +1536,34 @@
+ 	down(&req.sem);
+ }
+ 
+-/*
+- * Treat the bits of migration_mask as lock bits.
+- * If the bit corresponding to the cpu a migration_thread is
+- * running on then we have failed to claim our cpu and must
+- * yield in order to find another.
+- */
+-static volatile unsigned long migration_mask;
+-static atomic_t migration_threads_seeking_cpu;
+-static struct completion migration_complete
+-			= COMPLETION_INITIALIZER(migration_complete);
+-
+-static int migration_thread(void * unused)
++static int migration_thread(void * bind_cpu)
+ {
+-	struct sched_param param = { sched_priority: MAX_RT_PRIO - 1 };
++	int cpu = cpu_logical_map((int) (long) bind_cpu);
++	struct sched_param param = { sched_priority: MAX_RT_PRIO-1 };
+ 	runqueue_t *rq;
+ 	int ret;
+ 
+ 	daemonize();
+ 	sigfillset(&current->blocked);
+ 	set_fs(KERNEL_DS);
+-	ret = setscheduler(0, SCHED_FIFO, &param);
+ 
+ 	/*
+-	 * We have to migrate manually - there is no migration thread
+-	 * to do this for us yet :-)
+-	 *
+-	 * We use the following property of the Linux scheduler. At
+-	 * this point no other task is running, so by keeping all
+-	 * migration threads running, the load-balancer will distribute
+-	 * them between all CPUs equally. At that point every migration
+-	 * task binds itself to the current CPU.
++	 * The first migration thread is started on CPU #0. This one can
++	 * migrate the other migration threads to their destination CPUs.
+ 	 */
++	if (cpu != 0) {
++		while (!cpu_rq(cpu_logical_map(0))->migration_thread)
++			yield();
++		set_cpus_allowed(current, 1UL << cpu);
++	}
++	printk("migration_task %d on cpu=%d\n", cpu, smp_processor_id());
++	ret = setscheduler(0, SCHED_FIFO, &param);
+ 
+-	/*
+-	 * Enter the loop with preemption disabled so that
+-	 * smp_processor_id() remains valid through the check. The
+-	 * interior of the wait loop re-enables preemption in an
+-	 * attempt to get scheduled off the current cpu. When the
+-	 * loop is exited the lock bit in migration_mask is acquired
+-	 * and preemption is disabled on the way out. This way the
+-	 * cpu acquired remains valid when ->cpus_allowed is set.
+-	 */
+-	while (test_and_set_bit(smp_processor_id(), &migration_mask))
+-		yield();
+-
+-	current->cpus_allowed = 1 << smp_processor_id();
+ 	rq = this_rq();
+ 	rq->migration_thread = current;
+ 
+-	/*
+-	 * Now that we've bound ourselves to a cpu, post to
+-	 * migration_threads_seeking_cpu and wait for everyone else.
+-	 * Preemption should remain disabled and the cpu should remain
+-	 * in busywait. Yielding the cpu will allow the livelock
+-	 * where where a timing pattern causes an idle task seeking a
+-	 * migration_thread to always find the unbound migration_thread 
+-	 * running on the cpu's it tries to steal tasks from.
+-	 */
+-	atomic_dec(&migration_threads_seeking_cpu);
+-	while (atomic_read(&migration_threads_seeking_cpu))
+-		cpu_relax();
+-
+ 	sprintf(current->comm, "migration_CPU%d", smp_processor_id());
+ 
+-	/*
+-	 * Everyone's found their cpu, so now wake migration_init().
+-	 * Multiple wakeups are harmless; removal from the waitqueue
+-	 * has locking built-in, and waking an empty queue is valid.
+-	 */
+-	complete(&migration_complete);
+-
+-	/*
+-	 * Initiate the event loop.
+-	 */
+ 	for (;;) {
+ 		runqueue_t *rq_src, *rq_dest;
+ 		struct list_head *head;
+@@ -1634,25 +1588,25 @@
+ 		cpu_dest = __ffs(p->cpus_allowed);
+ 		rq_dest = cpu_rq(cpu_dest);
+ repeat:
+-		cpu_src = p->cpu;
++		cpu_src = p->thread_info->cpu;
+ 		rq_src = cpu_rq(cpu_src);
+ 
+ 		local_irq_save(flags);
+ 		double_rq_lock(rq_src, rq_dest);
+-		if (p->cpu != cpu_src) {
+-			local_irq_restore(flags);
++		if (p->thread_info->cpu != cpu_src) {
+ 			double_rq_unlock(rq_src, rq_dest);
++			local_irq_restore(flags);
+ 			goto repeat;
+ 		}
+ 		if (rq_src == rq) {
+-			p->cpu = cpu_dest;
++			p->thread_info->cpu = cpu_dest;
+ 			if (p->array) {
+ 				deactivate_task(p, rq_src);
+ 				activate_task(p, rq_dest);
+ 			}
+ 		}
+-		local_irq_restore(flags);
+ 		double_rq_unlock(rq_src, rq_dest);
++		local_irq_restore(flags);
+ 
+ 		up(&req->sem);
+ 	}
+@@ -1660,28 +1614,19 @@
+ 
+ void __init migration_init(void)
+ {
+-	unsigned long orig_cache_decay_ticks;
+ 	int cpu;
+ 
+-	atomic_set(&migration_threads_seeking_cpu, smp_num_cpus);
+-
+-	orig_cache_decay_ticks = cache_decay_ticks;
+-	cache_decay_ticks = 0;
+-
+-	for (cpu = 0; cpu < smp_num_cpus; cpu++)
+-		if (kernel_thread(migration_thread, NULL,
++	current->cpus_allowed = 1UL << cpu_logical_map(0);
++	for (cpu = 0; cpu < smp_num_cpus; cpu++) {
++		if (kernel_thread(migration_thread, (void *) (long) cpu,
+ 				CLONE_FS | CLONE_FILES | CLONE_SIGNAL) < 0)
+ 			BUG();
++	}
++	current->cpus_allowed = -1L;
+ 
+-	/*
+-	 * We cannot have missed the wakeup for the migration_thread
+-	 * bound for the cpu migration_init() is running on cannot
+-	 * acquire this cpu until migration_init() has yielded it by
+-	 * means of wait_for_completion().
+-	 */
+-	wait_for_completion(&migration_complete);
+-
+-	cache_decay_ticks = orig_cache_decay_ticks;
++	for (cpu = 0; cpu < smp_num_cpus; cpu++)
++		while (!cpu_rq(cpu_logical_map(cpu))->migration_thread)
++			schedule_timeout(2);
+ }
+ 
+ #endif /* CONFIG_SMP */

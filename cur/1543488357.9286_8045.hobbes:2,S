@@ -1,0 +1,417 @@
+Date: Wed, 3 Mar 1999 22:45:34 +0100 (CET)
+From: Andrea Arcangeli <>
+Subject: Re: [patch] af_unix fix for a panic a DoS and a memory leak [Re:
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/3/3/159
+
+On Wed, 3 Mar 1999 kuznet@ms2.inr.ac.ru wrote:
+>and wake_up_interruptible(&unix_global_ack_queue) on all --ack_backlog
+We must wake_up_interruptible only when ack_backlog == max_ack_backlog,
+and always when we close a listening socket.
+Here a new patch against 2.2.2:
+Index: include/net/sock.h
+===================================================================
+RCS file: /var/cvs/linux/include/net/sock.h,v
+retrieving revision 1.1.1.3
+diff -u -r1.1.1.3 sock.h
+--- sock.h	1999/02/20 15:42:53	1.1.1.3
++++ linux/include/net/sock.h	1999/03/03 20:59:54
+@@ -99,8 +99,7 @@
+ 	struct semaphore	readsem;
+ 	struct sock *		other;
+ 	struct sock **		list;
+-	int 			marksweep;
+-#define MARKED			1
++	struct sock *		gc_next;
+ 	int			inflight;
+ };
+ 
+Index: net/unix//af_unix.c
+===================================================================
+RCS file: /var/cvs/linux/net/unix/af_unix.c,v
+retrieving revision 1.1.1.2
+retrieving revision 1.1.2.7
+diff -u -r1.1.1.2 -r1.1.2.7
+--- af_unix.c	1999/01/18 13:41:22	1.1.1.2
++++ af_unix.c	1999/03/03 21:37:42	1.1.2.7
+@@ -33,6 +33,16 @@
+  *					Lots of bug fixes.
+  *	     Alexey Kuznetosv	:	Repaired (I hope) bugs introduces
+  *					by above two patches.
++ *	     Andrea Arcangeli	:	If possible we block in connect(2)
++ *					if the max backlog of the listen socket
++ *					is been reached. This won't break
++ *					old apps and it will avoid huge amount
++ *					of socks hashed (this for unix_gc()
++ *					performances reasons).
++ *					Security fix that limits the max
++ *					number of socks to 2*max_files and
++ *					the number of skb queueable in the
++ *					dgram receiver.
+  *
+  * Known differences from reference BSD that was tested:
+  *
+@@ -100,8 +110,12 @@
+ 
+ int sysctl_unix_delete_delay = HZ;
+ int sysctl_unix_destroy_delay = 10*HZ;
++int sysctl_unix_max_dgram_qlen = 10;
+ 
+ unix_socket *unix_socket_table[UNIX_HASH_SIZE+1];
++static atomic_t unix_nr_socks = ATOMIC_INIT(0);
++static struct wait_queue * unix_ack_wqueue = NULL;
++static struct wait_queue * unix_dgram_wqueue = NULL;
+ 
+ #define unix_sockets_unbound	(unix_socket_table[UNIX_HASH_SIZE])
+ 
+@@ -263,6 +277,8 @@
+ 	unix_socket *sk=(unix_socket *)data;
+ 	if(!unix_locked(sk) && atomic_read(&sk->wmem_alloc) == 0)
+ 	{
++		atomic_dec(&unix_nr_socks);
++
+ 		sk_free(sk);
+ 	
+ 		/* socket destroyed, decrement count		      */
+@@ -295,6 +311,11 @@
+ 	sk->dead=1;
+ 	sk->socket = NULL;
+ 
++	if (sk->state == TCP_LISTEN && waitqueue_active(&unix_ack_wqueue))
++		wake_up_interruptible(&unix_ack_wqueue);
++	if (sk->type == SOCK_DGRAM && waitqueue_active(&unix_dgram_wqueue))
++		wake_up_interruptible(&unix_dgram_wqueue);
++
+ 	skpair=unix_peer(sk);
+ 
+ 	if (skpair!=NULL)
+@@ -347,6 +368,8 @@
+ 	
+ 	if(!unix_locked(sk) && atomic_read(&sk->wmem_alloc) == 0)
+ 	{
++		atomic_dec(&unix_nr_socks);
++		
+ 		sk_free(sk);
+ 	
+ 		/* socket destroyed, decrement count		      */
+@@ -371,6 +394,8 @@
+ 		return -EOPNOTSUPP;		/* Only stream sockets accept */
+ 	if (!sk->protinfo.af_unix.addr)
+ 		return -EINVAL;			/* No listens on an unbound socket */
++	if ((unsigned) backlog > SOMAXCONN)
++		backlog = SOMAXCONN;
+ 	sk->max_ack_backlog=backlog;
+ 	sk->state=TCP_LISTEN;
+ 	sock->flags |= SO_ACCEPTCON;
+@@ -388,6 +413,9 @@
+ {
+ 	struct sock *sk;
+ 
++	if (atomic_read(&unix_nr_socks) >= 2*max_files)
++		return NULL;
++
+ 	MOD_INC_USE_COUNT;
+ 	sk = sk_alloc(PF_UNIX, GFP_KERNEL, 1);
+ 	if (!sk) {
+@@ -395,6 +423,8 @@
+ 		return NULL;
+ 	}
+ 
++	atomic_inc(&unix_nr_socks);
++
+ 	sock_init_data(sock,sk);
+ 
+ 	if (stream)
+@@ -673,9 +703,27 @@
+ 	   we will have to recheck all again in any case.
+ 	 */
+ 
++restart:
+ 	/*  Find listening sock */
+ 	other=unix_find_other(sunaddr, addr_len, sk->type, hash, &err);
+ 
++	if (!other)
++		return -ECONNREFUSED;
++
++	while (other->ack_backlog >= other->max_ack_backlog) {
++		if (other->dead || other->state != TCP_LISTEN)
++		{
++			unix_unlock(other);
++			return -ECONNREFUSED;
++		}
++		if (flags & O_NONBLOCK)
++			return -EAGAIN;
++		interruptible_sleep_on(&unix_ack_wqueue);
++		if (signal_pending(current))
++			return -ERESTARTSYS;
++		goto restart;
++        }
++
+ 	/* create new sock for complete connection */
+ 	newsk = unix_create1(NULL, 1);
+ 
+@@ -704,7 +752,7 @@
+ 
+ 	/* Check that listener is in valid state. */
+ 	err = -ECONNREFUSED;
+-	if (other == NULL || other->dead || other->state != TCP_LISTEN)
++	if (other->dead || other->state != TCP_LISTEN)
+ 		goto out;
+ 
+ 	err = -ENOMEM;
+@@ -815,11 +863,11 @@
+ 			continue;
+ 		}
+ 		tsk = skb->sk;
+-		sk->ack_backlog--;
++		if (sk->max_ack_backlog == sk->ack_backlog-- &&
++		    waitqueue_active(&unix_ack_wqueue))
++			wake_up_interruptible(&unix_ack_wqueue);
+ 		kfree_skb(skb);
+-		if (!tsk->dead) 
+-			break;
+-		unix_release_sock(tsk);
++		break;
+ 	}
+ 
+ 
+@@ -947,6 +995,7 @@
+ 		 *	Check with 1003.1g - what should
+ 		 *	datagram error
+ 		 */
++	dead:
+ 		unix_unlock(other);
+ 		unix_peer(sk)=NULL;
+ 		other = NULL;
+@@ -964,6 +1013,19 @@
+ 			goto out_unlock;
+ 	}
+ 
++	while (skb_queue_len(&other->receive_queue) >=
++	       sysctl_unix_max_dgram_qlen)
++	{
++		if (sock->file->f_flags & O_NONBLOCK)
++		{
++			err = -EAGAIN;
++			goto out_unlock;
++		}
++		interruptible_sleep_on(&unix_dgram_wqueue);
++		if (other->dead)
++			goto dead;
++	}
++
+ 	skb_queue_tail(&other->receive_queue, skb);
+ 	other->data_ready(other,len);
+ 	
+@@ -1125,6 +1187,14 @@
+ 	skb = skb_recv_datagram(sk, flags, noblock, &err);
+ 	if (!skb)
+ 		goto out;
++
++	/*
++	 * sysctl_unix_max_dgram_qlen may change over the time we blocked
++	 * in the waitqueue so we must wakeup every time we shrink the
++	 * receiver queue. -arca
++	 */
++	if (waitqueue_active(&unix_dgram_wqueue))
++		wake_up_interruptible(&unix_dgram_wqueue);
+ 
+ 	if (msg->msg_name)
+ 	{
+Index: net/unix//garbage.c
+===================================================================
+RCS file: /var/cvs/linux/net/unix/garbage.c,v
+retrieving revision 1.1.1.1
+retrieving revision 1.1.2.3
+diff -u -r1.1.1.1 -r1.1.2.3
+--- garbage.c	1999/01/18 01:27:46	1.1.1.1
++++ linux/include/net/garbage.c	1999/03/01 13:11:33	1.1.2.3
+@@ -17,11 +17,12 @@
+  *
+  *  - explicit stack instead of recursion
+  *  - tail recurse on first born instead of immediate push/pop
++ *  - we gather the stuff that should not be killed into list
++ *    and stack is just a path from root to the current pointer.
+  *
+  *  Future optimizations:
+  *
+  *  - don't just push entire root set; process in place
+- *  - use linked list for internal stack
+  *
+  *	This program is free software; you can redistribute it and/or
+  *	modify it under the terms of the GNU General Public License
+@@ -51,6 +52,14 @@
+  *		That might be the reason of random oopses on close_fp() in
+  *		unrelated processes.
+  *
++ *	AV		28 Feb 1999
++ *		Kill the explicit allocation of stack. Now we keep the marked
++ *		socks in the list with root in gc_current to one of the nodes.
++ *		Stack is represented as path from gc_current to the last elem.
++ *		Unmark now means "add to list". Push == "make it a son of
++ *		gc_current". Pop == "move gc_current to parent". We keep only
++ *		pointers to parents (->gc_next).
++ *
+  */
+  
+ #include <linux/kernel.h>
+@@ -65,7 +74,6 @@
+ #include <linux/netdevice.h>
+ #include <linux/file.h>
+ #include <linux/proc_fs.h>
+-#include <linux/vmalloc.h>
+ 
+ #include <net/sock.h>
+ #include <net/tcp.h>
+@@ -74,9 +82,8 @@
+ 
+ /* Internal data structures and random procedures: */
+ 
+-static unix_socket **stack;	/* stack of objects to mark */
+-static int in_stack = 0;	/* first free entry in stack */
+-static int max_stack;		/* Top of stack */
++#define	GC_HEAD	((unix_socket *) -1)
++static unix_socket *gc_current=GC_HEAD;	/* stack of objects to mark */
+ 
+ extern inline unix_socket *unix_get_socket(struct file *filp)
+ {
+@@ -122,32 +129,25 @@
+ /*
+  *	Garbage Collector Support Functions
+  */
+- 
+-extern inline void push_stack(unix_socket *x)
+-{
+-	if (in_stack == max_stack)
+-		panic("can't push onto full stack");
+-	stack[in_stack++] = x;
+-}
+ 
+ extern inline unix_socket *pop_stack(void)
+ {
+-	if (in_stack == 0)
+-		panic("can't pop empty gc stack");
+-	return stack[--in_stack];
++	unix_socket *p=gc_current;
++	gc_current = p->protinfo.af_unix.gc_next;
++	return p;
+ }
+ 
+ extern inline int empty_stack(void)
+ {
+-	return in_stack == 0;
++	return gc_current == GC_HEAD;
+ }
+ 
+ extern inline void maybe_unmark_and_push(unix_socket *x)
+ {
+-	if (!(x->protinfo.af_unix.marksweep&MARKED))
++	if (x->protinfo.af_unix.gc_next)
+ 		return;
+-	x->protinfo.af_unix.marksweep&=~MARKED;
+-	push_stack(x);
++	x->protinfo.af_unix.gc_next = gc_current;
++	gc_current = x;
+ }
+ 
+ 
+@@ -169,23 +169,9 @@
+ 		return;
+ 	in_unix_gc=1;
+ 	
+-	if(stack==NULL || max_files>max_stack)
+-	{
+-		if(stack)
+-			vfree(stack);
+-		stack=(unix_socket **)vmalloc(max_files*sizeof(struct unix_socket *));
+-		if(stack==NULL)
+-		{
+-			printk(KERN_NOTICE "unix_gc: deferred due to low memory.\n");
+-			in_unix_gc=0;
+-			return;
+-		}
+-		max_stack=max_files;
+-	}
+-	
+ 	forall_unix_sockets(i, s)
+ 	{
+-		s->protinfo.af_unix.marksweep|=MARKED;
++		s->protinfo.af_unix.gc_next=NULL;
+ 	}
+ 	/*
+ 	 *	Everything is now marked 
+@@ -276,9 +262,9 @@
+ 
+ 		if (f) 
+ 		{
+-			if ((f->protinfo.af_unix.marksweep&MARKED))
++			if (!f->protinfo.af_unix.gc_next)
+ 			{
+-				f->protinfo.af_unix.marksweep&=~MARKED;
++				f->protinfo.af_unix.gc_next=GC_HEAD;
+ 				x=f;
+ 				f=NULL;
+ 				goto tail;
+@@ -290,7 +276,7 @@
+ 
+ 	forall_unix_sockets(i, s)
+ 	{
+-		if (s->protinfo.af_unix.marksweep&MARKED)
++		if (!s->protinfo.af_unix.gc_next)
+ 		{
+ 			struct sk_buff *nextsk;
+ 			skb=skb_peek(&s->receive_queue);
+Index: net/unix//sysctl_net_unix.c
+===================================================================
+RCS file: /var/cvs/linux/net/unix/sysctl_net_unix.c,v
+retrieving revision 1.1.1.1
+retrieving revision 1.1.2.2
+diff -u -r1.1.1.1 -r1.1.2.2
+--- sysctl_net_unix.c	1999/01/18 01:27:46	1.1.1.1
++++ linux/include/net/sysctl_net_unix.c	1999/03/03 21:37:42	1.1.2.2
+@@ -19,6 +19,7 @@
+ 
+ extern int sysctl_unix_destroy_delay;
+ extern int sysctl_unix_delete_delay;
++extern int sysctl_unix_max_dgram_qlen;
+ 
+ ctl_table unix_table[] = {
+ 	{NET_UNIX_DESTROY_DELAY, "destroy_delay",
+@@ -26,6 +27,9 @@
+ 	 &proc_dointvec_jiffies},
+ 	{NET_UNIX_DELETE_DELAY, "delete_delay",
+ 	&sysctl_unix_delete_delay, sizeof(int), 0644, NULL, 
++	 &proc_dointvec_jiffies},
++	{NET_UNIX_MAX_DGRAM_QLEN, "max_dgram_qlen",
++	&sysctl_unix_max_dgram_qlen, sizeof(int), 0600, NULL, 
+ 	 &proc_dointvec_jiffies},
+ 	{0}
+ };
+Index: include/linux/sysctl.h
+===================================================================
+RCS file: /var/cvs/linux/include/linux/sysctl.h,v
+retrieving revision 1.1.1.1
+diff -u -r1.1.1.1 sysctl.h
+--- sysctl.h	1999/01/18 01:27:10	1.1.1.1
++++ linux/include/linux/sysctl.h	1999/03/03 20:13:51
+@@ -161,7 +162,8 @@
+ enum
+ {
+ 	NET_UNIX_DESTROY_DELAY=1,
+-	NET_UNIX_DELETE_DELAY=2
++	NET_UNIX_DELETE_DELAY=2,
++	NET_UNIX_MAX_DGRAM_QLEN=3,
+ };
+ 
+ /* /proc/sys/net/ipv4 */
+Tomasz could you try it heavily and feedback? I just did some test here
+for both the dgram and ack queue and everything worked as expected.
+Andrea Arcangeli
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

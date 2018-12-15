@@ -1,0 +1,567 @@
+Date: Fri, 22 Oct 2004 13:19:08 -0400
+From: Jon Smirl <>
+Subject: Re: [Linux-fbdev-devel] Re: Generic VESA framebuffer driver and Video card BOOT?
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2004/10/22/237
+
+On Fri, 22 Oct 2004 09:36:40 -0700, Pallipadi, Venkatesh
+<venkatesh.pallipadi@intel.com> wrote:
+> Actually I sent the kernel patch to call some userlevel vgapost utility
+> on this same thread around a week back. I am sending it here again.
+It is more complex to restart the VGA system when there are multiple
+cards. You have to disable all of the other VGA devices before
+reseting one otherwise you will end up with two enabled VGA devices
+and address ownership conflicts. You also have to move the PCI bus
+routing around so that it points to the correct card.
+There is a pending patch in mm, bk-pci, that exposes video ROMs via
+sysfs. That makes writing the reset program cleaner. You should not
+play with the ROM or the PIC bus routine from user space, that needs
+to be done in the kernel.
+Another proposal is that basic VGA control be moved to a separate
+driver. I'll attach some code I started for this driver but I never
+finished.
+In a complete driver VGAcon should move to the active VGA device if
+sysfs is used to change it.
+-- 
+Jon Smirl
+jonsmirl@gmail.com
+===== arch/i386/pci/fixup.c 1.21 vs edited =====
+--- 1.21/arch/i386/pci/fixup.c	Sun Aug 29 00:21:23 2004
++++ edited/arch/i386/pci/fixup.c	Fri Sep 10 01:03:06 2004
+@@ -225,7 +225,7 @@
+  * issue another HALT within 80 ns of the initial HALT, the failure condition
+  * is avoided.
+  */
+-static void __init pci_fixup_nforce2(struct pci_dev *dev)
++static void __devinit pci_fixup_nforce2(struct pci_dev *dev)
+ {
+ 	u32 val, fixed_val;
+ 	u8 rev;
+@@ -290,6 +290,6 @@
+ 		}
+ 		bus = bus->parent;
+ 	}
+-	pdev->resource[PCI_ROM_RESOURCE].flags |= IORESOURCE_ROM_SHADOW;
++	pdev->resource[PCI_ROM_RESOURCE].flags |= IORESOURCE_ROM_SHADOW | IORESOURCE_VGA_ENABLE;
+ }
+ DECLARE_PCI_FIXUP_HEADER(PCI_ANY_ID, PCI_ANY_ID, pci_fixup_video);
+===== drivers/pci/Kconfig 1.6 vs edited =====
+--- 1.6/drivers/pci/Kconfig	Mon Aug  2 04:00:43 2004
++++ edited/drivers/pci/Kconfig	Fri Sep 10 01:03:06 2004
+@@ -47,3 +47,13 @@
+ 
+ 	  When in doubt, say Y.
+ 
++config VGA_CONTROL
++	bool "VGA Control Device"
++	depends on PCI
++	---help---
++	  Provides a VGA Control Device for ensuring that only a single VGA
++	  device can be enabled per PCI domain. If a VGA device is removed
++	  via hotplug, display is routed to another VGA device if available.
++
++	  If you have more than one VGA device, say Y.
++
+===== drivers/pci/Makefile 1.41 vs edited =====
+--- 1.41/drivers/pci/Makefile	Sun Aug 29 00:21:23 2004
++++ edited/drivers/pci/Makefile	Sat Sep 11 22:44:22 2004
+@@ -28,6 +28,7 @@
+ obj-$(CONFIG_MIPS) += setup-bus.o setup-irq.o
+ obj-$(CONFIG_X86_VISWS) += setup-irq.o
+ obj-$(CONFIG_PCI_MSI) += msi.o
++obj-$(CONFIG_VGA_CONTROL) += vga.o
+ 
+ # Cardbus & CompactPCI use setup-bus
+ obj-$(CONFIG_HOTPLUG) += setup-bus.o
+===== drivers/pci/bus.c 1.9 vs edited =====
+--- 1.9/drivers/pci/bus.c	Sat Apr 10 18:27:59 2004
++++ edited/drivers/pci/bus.c	Sat Sep 11 22:48:04 2004
+@@ -100,7 +100,9 @@
+ 
+ 		pci_proc_attach_device(dev);
+ 		pci_create_sysfs_dev_files(dev);
+-
++#if CONFIG_VGA_DEVICE
++		pci_vga_add_device(dev);
++#endif
+ 	}
+ 
+ 	list_for_each_entry(dev, &bus->devices, bus_list) {
+===== drivers/pci/pci.h 1.13 vs edited =====
+--- 1.13/drivers/pci/pci.h	Sun Aug 29 00:21:23 2004
++++ edited/drivers/pci/pci.h	Fri Sep 10 01:03:08 2004
+@@ -11,6 +11,7 @@
+ 				  void (*alignf)(void *, struct resource *,
+ 					  	 unsigned long, unsigned long),
+ 				  void *alignf_data);
++int pci_vga_add_device(struct pci_dev *pdev);
+ /* PCI /proc functions */
+ #ifdef CONFIG_PROC_FS
+ extern int pci_proc_attach_device(struct pci_dev *dev);
+===== drivers/pci/setup-bus.c 1.25 vs edited =====
+--- 1.25/drivers/pci/setup-bus.c	Sun Jul 11 08:41:20 2004
++++ edited/drivers/pci/setup-bus.c	Fri Sep 10 01:03:09 2004
+@@ -51,16 +51,8 @@
+ 	struct resource_list head, *list, *tmp;
+ 	int idx;
+ 
+-	bus->bridge_ctl &= ~PCI_BRIDGE_CTL_VGA;
+-
+ 	head.next = NULL;
+ 	list_for_each_entry(dev, &bus->devices, bus_list) {
+-		u16 class = dev->class >> 8;
+-
+-		if (class == PCI_CLASS_DISPLAY_VGA
+-				|| class == PCI_CLASS_NOT_DEFINED_VGA)
+-			bus->bridge_ctl |= PCI_BRIDGE_CTL_VGA;
+-
+ 		pdev_sort_resources(dev, &head);
+ 	}
+ 
+@@ -499,12 +491,6 @@
+ 
+ 	pbus_assign_resources_sorted(bus);
+ 
+-	if (bus->bridge_ctl & PCI_BRIDGE_CTL_VGA) {
+-		/* Propagate presence of the VGA to upstream bridges */
+-		for (b = bus; b->parent; b = b->parent) {
+-			b->bridge_ctl |= PCI_BRIDGE_CTL_VGA;
+-		}
+-	}
+ 	list_for_each_entry(dev, &bus->devices, bus_list) {
+ 		b = dev->subordinate;
+ 		if (!b)
+===== drivers/pci/vga.c 1.1 vs edited =====
+--- 1.1/drivers/pci/vga.c	Fri Sep 10 01:01:47 2004
++++ edited/drivers/pci/vga.c	Sat Sep 11 01:05:37 2004
+@@ -1 +1,381 @@
++/*
++ * linux/drivers/char/vga.c
++ *
++ * (C) Copyright 2004 Jon Smirl <jonsmirl@gmail.com>
++ *
++ * VGA control device for ensuring only a single enabled VGA device
++ *
++ * Reuses the DRM major 226, starts minors at VGA_MINOR_BASE, 0x200
++ */
++
++#include <linux/init.h>
++#include <linux/fs.h>
++#include <linux/cdev.h>
++#include <linux/pci.h>
++#include <linux/major.h>
++#include <linux/vga.h>
++
++struct vga_dev {
++	struct class_device class_dev;
++	struct list_head node;
++	dev_t dev;
++	int enabled;
++};
++#define to_vga_dev(d) container_of(d, struct vga_dev, class_dev)
++
++static struct class *vga_class;
++static struct vga_dev *vga_device;
++static DECLARE_MUTEX(vga_mutex);
++static int vga_initialized;	/* = 0 */
++
++/*
++ * Open/close code for vga IO.
++ */
++static int vga_open(struct inode *inode, struct file *filp)
++{
++//	const int minor = iminor(inode);
++
++	down(&vga_mutex);
++	up(&vga_mutex);
++
++	return 0;
++}
++
++/*
++ */
++static int vga_release(struct inode *inode, struct file *filp)
++{
++	down(&vga_mutex);
++	up(&vga_mutex);
++
++	return 0;
++}
++
++/*
++ */
++static int
++vga_ioctl(struct inode *inode, struct file *filp,
++		  unsigned int command, unsigned long arg)
++{
++	return 0;
++}
++
++static struct file_operations vga_fops = {
++	.open	=	vga_open,
++	.release=	vga_release,
++	.ioctl	=	vga_ioctl,
++	.owner	=	THIS_MODULE,
++};
++
++static struct cdev vga_cdev = {
++	.kobj	=	{.name = "vga", },
++	.owner	=	THIS_MODULE,
++};
++
++static void bridge_yes(drm_device_t *dev)
++{
++	struct pci_dev *bridge;
++	struct pci_bus *bus;
++	
++	/* Make sure the bridges route to us */
++	bus = dev->pdev->bus;
++	while (bus) {
++		bridge = bus->self;
++		if (bridge) {
++			pci_read_config_word(bridge, PCI_BRIDGE_CONTROL, &pbus->bridge_ctl);
++			pbus->bridge_ctl |= PCI_BRIDGE_CTL_VGA;
++			pci_write_config_word(bridge, PCI_BRIDGE_CONTROL, pbus->bridge_ctl);
++		}
++		bus = bus->parent;
++	}
++}
++
++static void bridge_no(drm_device_t *dev)
++{
++	struct pci_dev *bridge;
++	struct pci_bus *bus;
++	
++	/* Make sure the bridges don't route to us */
++	bus = dev->pdev->bus;
++	while (bus) {
++		bridge = bus->self;
++		if (bridge) {
++			pci_read_config_word(bridge, PCI_BRIDGE_CONTROL, &pbus->bridge_ctl);
++			pbus->bridge_ctl &= ~PCI_BRIDGE_CTL_VGA;
++			pci_write_config_word(bridge, PCI_BRIDGE_CONTROL, pbus->bridge_ctl);
++		}
++		bus = bus->parent;
++	}
++}
++
++
++/* sysfs for VGA device */
++static ssize_t vga_device_show(struct device *dev, char *buf)
++{
++	struct pci_dev *pdev = to_pci_dev(dev);
++	return sprintf(bus, "%d\n", (pdev->resource[PCI_ROM_RESOURCE].flags & IORESOURCE_VGA_ENABLE) != 0);
++}
++static ssize_t vga_device_store(struct device *dev, const char *buf, size_t count)
++{
++	return count;
++}
++static struct device_attribute vga_device_attr = __ATTR(vga, S_IRUGO|S_IWUSR, vga_device_show, vga_device_store);
++
++/* sysfs for VGA routing bridge */
++static ssize_t vga_bridge_show(struct device *dev, char *buf)
++{
++	struct pci_dev *pdev = to_pci_dev(dev);
++	u16 l;
++
++	/* don't trust the shadow PCI_BRIDGE_CTL_VGA in pdev */
++	/* user space may change hardware without telling the kernel */
++	pci_read_config_word(pdev, PCI_BRIDGE_CONTROL, &l);
++	return sprintf(buf, "%d\n", (l & PCI_BRIDGE_CTL_VGA) != 0);
++}
++static struct device_attribute vga_bridge_attr = __ATTR(vga, S_IRUGO, vga_bridge_show, NULL);
++
++/* sysfs for VGA root legacy space */
++static ssize_t vga_root_show(struct class_device *class_dev, char *buf)
++{
++	struct vga_dev *vga = to_vga_dev(class_dev);
++	return sprintf(buf, "%d\n", vga->enabled);
++}
++static ssize_t vga_root_store(struct class_device *class_dev, const char *buf, size_t count)
++{
++	char *endp;
++	struct vga_dev *vga = to_vga_dev(class_dev);
++	
++	vga->enabled =  (simple_strtoul(buf, &endp, 0) != 0);
++	return count;
++}
++static struct class_device_attribute vga_root_attr = __ATTR(vga, S_IRUGO|S_IWUSR, vga_root_show, vga_root_store);
++
++/* sysfs for /class/vga/vga0/dev */
++static ssize_t show_dev(struct class_device *class_dev, char *buf)
++{
++	struct vga_dev *vga = to_vga_dev(class_dev);
++	return print_dev_t(buf, vga->dev);
++}
++CLASS_DEVICE_ATTR(dev, S_IRUGO, show_dev, NULL);
++
++int pci_vga_add_device(struct pci_dev *pdev)
++{
++	char name[20];
++	int class = pdev->class >> 8;
++
++	if (!vga_initialized)
++		return -EACCES;
++
++	if (class == PCI_CLASS_DISPLAY_VGA) {
++		device_create_file(&pdev->dev, &vga_device_attr);
++		snprintf(name, sizeof(name), "%04x:%02x:%02x.%d", pci_domain_nr(pdev->bus), 
++			pdev->bus->number, PCI_SLOT(pdev->devfn), PCI_FUNC(pdev->devfn));
++		sysfs_create_link(&vga_device->class_dev.kobj, &pdev->dev.kobj, name);
++		return 0;
++	}
++
++	if ((class == PCI_CLASS_BRIDGE_PCI) || (class == PCI_CLASS_BRIDGE_CARDBUS)) {
++		device_create_file(&pdev->dev, &vga_bridge_attr);
++	}
++
++	return 0;
++}
++
++static int __init vga_init(void)
++{
++	int ret;
++	dev_t dev;
++	int minor = 0;
++	struct pci_dev *pdev = NULL;
++
++	vga_initialized = 1;
++	dev = MKDEV(DRM_MAJOR, VGA_MINOR_BASE);
++
++	if (register_chrdev_region(dev, VGA_MINOR_MAX, "vga"))
++		goto err_i1;
++
++	cdev_init(&vga_cdev, &vga_fops);
++	if (cdev_add(&vga_cdev, dev, VGA_MINOR_MAX)) {
++		kobject_put(&vga_cdev.kobj);
++		goto err_i2;
++	}
++
++	vga_class = kmalloc(sizeof(*vga_class), GFP_KERNEL);
++	if (!vga_class)
++		goto err_i3;
++	memset(vga_class, 0x00, sizeof(*vga_class));
++
++	vga_class->name = "vga";
++	if ((ret = class_register(vga_class)))
++		goto err_i4;
++
++	vga_device = kmalloc(sizeof(*vga_device), GFP_KERNEL);
++	if (!vga_device)
++		goto err_i5;
++	memset(vga_device, 0x00, sizeof(*vga_device));
++
++	vga_device->dev = MKDEV(DRM_MAJOR, VGA_MINOR_BASE + minor);
++	vga_device->class_dev.dev = NULL;
++	vga_device->class_dev.class = vga_class;
++	snprintf(vga_device->class_dev.class_id, BUS_ID_SIZE, "vga%d", minor);
++	
++	if ((ret = class_device_register(&vga_device->class_dev)))
++		goto err_i6;
++
++	class_device_create_file(&vga_device->class_dev, &class_device_attr_dev);
++	class_device_create_file(&vga_device->class_dev, &vga_root_attr);
++
++	while ((pdev = pci_find_device(PCI_ANY_ID, PCI_ANY_ID, pdev)) != NULL)
++		pci_vga_add_device(pdev);
++		
++	printk(KERN_INFO "VGA control device 1.0 initialized\n");
++
++	return 0;
++
++err_i6:
++	kfree(vga_device);
++err_i5:
++	class_unregister(vga_class);
++err_i4:
++	kfree(vga_class);
++err_i3:
++	cdev_del(&vga_cdev);
++err_i2:
++	unregister_chrdev_region(dev, VGA_MINOR_MAX);
++err_i1:
++	printk(KERN_ERR "error initializing VGA control device\n");
++	return 1;
++}
++
++static void __exit vga_exit(void)
++{
++	class_device_unregister(&vga_device->class_dev);
++	kfree(vga_device);
++	class_unregister(vga_class);
++	kfree(vga_class);
++	cdev_del(&vga_cdev);
++	unregister_chrdev_region(MKDEV(DRM_MAJOR, VGA_MINOR_BASE), VGA_MINOR_MAX);
++}
++
++__initcall(vga_init);
++__exitcall(vga_exit);
++
++
++
++/*
++ * 0 - Disable all VGA and cards
++ * 1 - Enable only active card and VGA (assumes other devices are disabled)
++ * 2 - Enable all pci devices
++ *
++ * This is a driver specific function accessed via DRM(stub)
++ * doing it this way allows for driver specific overrides if needed
++ */
++#define VE_DISABLE 0
++#define VE_ACTIVE 1
++#define VE_ENABLE 2
++int DRM(vgaenable)(int enable, int clear_active) {
++	int i;
++	drm_device_t *dev;
++	
++	switch (enable) {	
++	case VE_DISABLE:
++		/* disable all VGA and all devices */
++		/* loop over all the driver's cards */
++		for (i = 0; i < DRM(numdevs); i++) {
++			dev = &DRM(device)[i];
++			if (clear_active)
++				dev->vga_active = FALSE;
++		
++			bridge_yes(dev);
++			/* 0x3CC and 0x3C2 are correct, it's not a typo */
++			outb(~0x03 & inb(0x3CC),  0x3C2);
++			outb(~0x01 & inb(0x3C3),  0x3C3);
++			outb(~0x08 & inb(0x46e8), 0x46e8);
++			outb(~0x01 & inb(0x102),  0x102);
++			pci_disable_device(dev->pdev);
++			bridge_no(dev);
++		}
++		return 0;
++	case VE_ACTIVE:
++		/* enable device and VGA on active device */	
++		/* loop over all the driver's cards */
++		for (i = 0; i < DRM(numdevs); i++) {
++			dev = &DRM(device)[i];
++			if (!dev->vga_active)
++				continue;
++			/* this assumes all other potential VGA devices are disabled */
++			bridge_yes(dev);
++			pci_enable_device(dev->pdev);
++			/* 0x3CC and 0x3C2 are correct, it's not a typo */
++			outb(0x03 | inb(0x3CC),  0x3C2);
++			outb(0x01 | inb(0x3C3),  0x3C3);
++			outb(0x08 | inb(0x46e8), 0x46e8);
++			outb(0x01 | inb(0x102),  0x102);
++			return 0;
++		}
++		return 0;
++	case VE_ENABLE:
++		/* loop over all the driver's cards */
++		for (i = 0; i < DRM(numdevs); i++) {
++			dev = &DRM(device)[i];
++			pci_enable_device(dev->pdev);
++		}
++		return 0;
++	default:
++		return -1;
++	}
++}
++
++/*
++ * VGA_ENABLE_ACTIVE=0 - Make sure all DRM VGAs are disabled, if this one not active reenable active VGA
++ * VGA_ENABLE_THIS=1 - Make sure all DRM VGAs are disabled and enable this DRM VGA, mark as active VGA
++ * Used while resetting a board
++ * VGA_DISABLE_ALL=2 - Disable all DRM VGA and devices, remember active VGA
++ */
++int DRM(vga_enable)( DRM_IOCTL_ARGS ) {
++	DRM_DEVICE;
++	drm_file_t *filp_priv;
++	drm_vga_enable_t ve;
++	struct drm_stub_info *pStub;
++	
++	DRM_GET_PRIV_WITH_RETURN( filp_priv, filp );
++
++	DRM_COPY_FROM_USER_IOCTL( ve, ( drm_vga_enable_t* )data, sizeof( ve ) );
++
++	if ((ve.enable < VGA_ENABLE_ACTIVE) || (ve.enable > VGA_DISABLE_ALL))
++		return -1;
++
++	/* First disable all VGA and all devices */
++	/* loop over all drivers */
++	pStub = &DRM(stub_info);
++	do {
++		/* clear the active device if enable 1 */
++		pStub->vgaenable(VE_DISABLE, (ve.enable == VGA_ENABLE_THIS));
++		pStub = pStub->next;
++	} while (pStub != &DRM(stub_info));
++	
++	if (ve.enable == VGA_DISABLE_ALL)
++		return 0;
++
++	/* Mark us active if requested */	
++	if (ve.enable == VGA_ENABLE_THIS)
++		dev->vga_active = TRUE;
++		
++	/* Now enable VGA on the target device */
++	/* loop over all drivers; don't know where the device is */
++	pStub = &DRM(stub_info);
++	do {
++		pStub->vgaenable(VE_ACTIVE, 0);
++		pStub = pStub->next;
++	} while (pStub != &DRM(stub_info));
++	
++	/* Reenable all PCI devices but don't touch VGA state */
++	pStub = &DRM(stub_info);
++	do {
++		pStub->vgaenable(VE_ENABLE, 0);
++		pStub = pStub->next;
++	} while (pStub != &DRM(stub_info));
++	
++	return 0;
++}
+===== include/linux/ioport.h 1.15 vs edited =====
+--- 1.15/include/linux/ioport.h	Sun Aug 29 00:21:23 2004
++++ edited/include/linux/ioport.h	Fri Sep 10 01:03:10 2004
+@@ -41,7 +41,6 @@
+ #define IORESOURCE_CACHEABLE	0x00004000
+ #define IORESOURCE_RANGELENGTH	0x00008000
+ #define IORESOURCE_SHADOWABLE	0x00010000
+-#define IORESOURCE_BUS_HAS_VGA	0x00080000
+ 
+ #define IORESOURCE_DISABLED	0x10000000
+ #define IORESOURCE_UNSET	0x20000000
+@@ -86,6 +85,7 @@
+ #define IORESOURCE_ROM_ENABLE		(1<<0)	/* ROM is enabled, same as PCI_ROM_ADDRESS_ENABLE */
+ #define IORESOURCE_ROM_SHADOW		(1<<1)	/* ROM is copy at C000:0 */
+ #define IORESOURCE_ROM_COPY		(1<<2)	/* ROM is alloc'd copy, resource field overlaid */
++#define IORESOURCE_VGA_ENABLE		(1<<3)	/* VGA device is active */
+ 
+ /* PC/ISA/whatever - the normal PC address spaces: IO and memory */
+ extern struct resource ioport_resource;
+===== include/linux/major.h 1.12 vs edited =====
+--- 1.12/include/linux/major.h	Fri Mar 19 00:59:29 2004
++++ edited/include/linux/major.h	Fri Sep 10 21:29:53 2004
+@@ -160,6 +160,7 @@
+ 
+ #define OSST_MAJOR		206	/* OnStream-SCx0 SCSI tape */
+ 
++#define DRM_MAJOR		226	/* Direct Rendering Manager */
+ #define IBM_TTY3270_MAJOR	227
+ #define IBM_FS3270_MAJOR	228
+ 
+===== include/linux/vga.h 1.1 vs edited =====
+--- 1.1/include/linux/vga.h	Fri Sep 10 01:01:47 2004
++++ edited/include/linux/vga.h	Fri Sep 10 21:41:00 2004
+@@ -1 +1,14 @@
++/*
++ * include/linux/vga.h
++ *
++ * (C) Copyright 2004 Jon Smirl <jonsmirl@yahoo.com>
++ *
++ * VGA control device for ensuring only a single enabled VGA device
++ */
++/* VGA device shares it's major device number with the DRM devices */
++/* DRM_MAJOR defines the major number in major.h */
++
++#define VGA_MINOR_BASE	0x200	/* First VGA minor starts here */
++#define VGA_MINOR_MAX	16 
++

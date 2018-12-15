@@ -1,0 +1,258 @@
+Date: Sat, 18 Dec 1999 23:57:07 +0100
+From: Jamie Lokier <>
+Subject: Re: [patch] idle and entry.S fixes. [was: Re: scheduling problem?]
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/12/18/108
+
+Jamie Lokier wrote:
+>   - The idle loops are fixed, ACPI and non-ACPI.  That part is against
+>     2.3.34-pre1.
+> 
+>   - Interrupts that set need_resched or deliver signals will always get
+>     noticed.  It is done by fixing up the return path in critical cases,
+>     no cli needed, no special case for vm86 either.
+> 
+>   - need_resched is checked after do_signal (Ingo's patch with changes).
+This patch supercedes the previous one with APM support and a comment fix.
+-- Jamie
+diff -u linux-2.3/arch/i386/kernel/apm.c.schedfix linux-2.3/arch/i386/kernel/apm.c
+--- linux-2.3/arch/i386/kernel/apm.c.schedfix	Sat Dec 18 20:50:31 1999
++++ linux-2.3/arch/i386/kernel/apm.c	Sat Dec 18 20:48:45 1999
+@@ -524,7 +524,11 @@
+ 					continue;
+ 				if (hlt_counter)
+ 					continue;
+-				asm volatile("sti ; hlt" : : : "memory");
++				asm volatile("cli" : : : "memory");
++				if (!current->need_resched)
++					asm volatile("sti ; hlt" : : : "memory");
++				else
++					asm volatile("sti" : : : "memory");
+ 				continue;
+ 			}
+ 
+diff -u linux-2.3/arch/i386/kernel/entry.S.schedfix linux-2.3/arch/i386/kernel/entry.S
+--- linux-2.3/arch/i386/kernel/entry.S.schedfix	Sat Dec 18 17:49:01 1999
++++ linux-2.3/arch/i386/kernel/entry.S	Sat Dec 18 21:12:25 1999
+@@ -80,8 +80,7 @@
+ ENOSYS = 38
+ 
+ 
+-#define SAVE_ALL \
+-	cld; \
++#define __SAVE_ALL \
+ 	pushl %es; \
+ 	pushl %ds; \
+ 	pushl %eax; \
+@@ -95,7 +94,9 @@
+ 	movl %dx,%ds; \
+ 	movl %dx,%es;
+ 
+-#define RESTORE_ALL	\
++#define SAVE_ALL cld; __SAVE_ALL
++
++#define __RESTORE_ALL	\
+ 	popl %ebx;	\
+ 	popl %ecx;	\
+ 	popl %edx;	\
+@@ -106,12 +107,22 @@
+ 1:	popl %ds;	\
+ 2:	popl %es;	\
+ 	addl $4,%esp;	\
+-3:	iret;		\
+ .section .fixup,"ax";	\
+ 4:	movl $0,(%esp);	\
+ 	jmp 1b;		\
+ 5:	movl $0,(%esp);	\
+ 	jmp 2b;		\
++.previous;		\
++.section __ex_table,"a";\
++	.align 4;	\
++	.long 1b,4b;	\
++	.long 2b,5b;	\
++.previous
++
++#define RESTORE_ALL	\
++	__RESTORE_ALL;	\
++3:	iret;		\
++.section .fixup,"ax";	\
+ 6:	pushl %ss;	\
+ 	popl %ds;	\
+ 	pushl %ss;	\
+@@ -120,9 +131,6 @@
+ 	call do_exit;	\
+ .previous;		\
+ .section __ex_table,"a";\
+-	.align 4;	\
+-	.long 1b,4b;	\
+-	.long 2b,5b;	\
+ 	.long 3b,6b;	\
+ .previous
+ 
+@@ -208,11 +216,13 @@
+ 	jne handle_bottom_half
+ ret_with_reschedule:
+ 	cmpl $0,need_resched(%ebx)
++resched_critical_start:
+ 	jne reschedule
+ 	cmpl $0,sigpending(%ebx)
+ 	jne signal_return
+-restore_all:
++resched_restore_all:
+ 	RESTORE_ALL
++resched_critical_end:
+ 
+ 	ALIGN
+ signal_return:
+@@ -222,7 +232,20 @@
+ 	jne v86_signal_return
+ 	xorl %edx,%edx
+ 	call SYMBOL_NAME(do_signal)
+-	jmp restore_all
++signal_resched:
++	cmpl $0,need_resched(%ebx)
++signal_critical_start:
++	jne signal_critical_end
++signal_restore_all:
++	RESTORE_ALL
++signal_critical_end:
++	/*
++	 * check need_resched but not sigpending.
++	 * do not recurse signal handlers.  This is the slow path.
++	 */
++	sti
++	call SYMBOL_NAME(schedule)
++	jmp signal_resched
+ 
+ 	ALIGN
+ v86_signal_return:
+@@ -230,7 +253,7 @@
+ 	movl %eax,%esp
+ 	xorl %edx,%edx
+ 	call SYMBOL_NAME(do_signal)
+-	jmp restore_all
++	jmp signal_resched
+ 
+ 	ALIGN
+ tracesys:
+@@ -260,7 +283,12 @@
+ 	movb CS(%esp),%al
+ 	testl $(VM_MASK | 3),%eax	# return to VM86 mode or non-supervisor?
+ 	jne ret_with_reschedule
+-	jmp restore_all
++	movl EIP(%esp),%eax		# interrupted critical return path?
++	subl $signal_critical_end,%eax
++	cmpl $(resched_critical_start-signal_critical_end),%eax
++	jae maybe_interrupted_critical
++restore_all:
++	RESTORE_ALL
+ 
+ 	ALIGN
+ handle_bottom_half:
+@@ -271,6 +299,63 @@
+ reschedule:
+ 	call SYMBOL_NAME(schedule)    # test
+ 	jmp ret_from_sys_call
++
++/*
++ * This is reached when we may have interrupted supervisor code inside
++ * something_critical_{start,end} and we may want to reschedule or
++ * deliver a signal.
++ */
++	ALIGN
++maybe_interrupted_critical:
++	cmpl $(signal_critical_start-signal_critical_end),%eax
++	jae interrupted_signal_return
++	addl $(signal_critical_end-resched_critical_end),%eax
++	jc restore_all
++	movl need_resched(%ebx),%ecx
++	orl sigpending(%ebx),%ecx
++	je restore_all
++	cmpl $(resched_restore_all-resched_critical_end),%eax
++	ja resched_critical_intercept
++	movl $ret_with_reschedule,EIP(%esp)	# simply restart the checks.
++	jmp restore_all
++	ALIGN
++resched_critical_intercept:
++	addl $(resched_fixup-resched_restore_all+resched_critical_end),%eax
++	movl %eax,EIP(%esp)
++	jmp restore_all			# the iret jumps into resched_fixup.
++	ALIGN
++interrupted_signal_return:
++	cmpl $0,need_resched(%ebx)
++	je restore_all
++	cmpl $(signal_restore_all-signal_critical_end),%eax
++	ja signal_critical_intercept
++	movl $signal_resched,EIP(%esp)	# simply restart the checks.
++	jmp restore_all
++	ALIGN
++signal_critical_intercept:
++	addl $(signal_fixup-signal_restore_all+signal_critical_end),%eax
++	movl %eax,EIP(%esp)
++	jmp restore_all
++
++/*
++ * These are the fixup code for interrupted xxx_restore_all.  They must have
++ * *exactly* the same code layout as xxx_restore_all, up to the iret.
++ *
++ * These are used very rarely, and the only symptom of not doing this
++ * is extra scheduling and signal delivery latency.
++ */
++resched_fixup:
++	__RESTORE_ALL			# complete resched_restore_all.
++	pushl %eax			# undo it.
++	__SAVE_ALL
++	GET_CURRENT(%ebx)
++	jmp ret_with_reschedule
++signal_fixup:
++	__RESTORE_ALL			# complete signal_restore_all.
++	pushl %eax			# undo it.
++	__SAVE_ALL
++	GET_CURRENT(%ebx)
++	jmp signal_resched
+ 
+ ENTRY(divide_error)
+ 	pushl $0		# no error code
+diff -u linux-2.3/arch/i386/kernel/process.c.schedfix linux-2.3/arch/i386/kernel/process.c
+--- linux-2.3/arch/i386/kernel/process.c.schedfix	Sat Dec 18 17:48:29 1999
++++ linux-2.3/arch/i386/kernel/process.c	Sat Dec 18 17:49:28 1999
+@@ -74,8 +74,13 @@
+  */
+ static void default_idle(void)
+ {
+-	if (current_cpu_data.hlt_works_ok && !hlt_counter)
+-		asm volatile("sti ; hlt" : : : "memory");
++	if (current_cpu_data.hlt_works_ok && !hlt_counter) {
++		asm volatile("cli" : : : "memory");
++		if (!current->need_resched)
++			asm volatile("sti ; hlt" : : : "memory");
++		else
++			asm volatile("sti" : : : "memory");
++	}
+ }
+ 
+ /*
+diff -u linux-2.3/drivers/misc/acpi.c.schedfix linux-2.3/drivers/misc/acpi.c
+--- linux-2.3/drivers/misc/acpi.c.schedfix	Sat Dec 18 17:48:29 1999
++++ linux-2.3/drivers/misc/acpi.c	Sat Dec 18 17:49:28 1999
+@@ -673,7 +673,11 @@
+ 	// sleep
+ 	switch (sleep_level) {
+ 	case 1:
+-		__asm__ __volatile__("sti ; hlt": : :"memory");
++		asm volatile("cli" : : : "memory");
++		if (!current->need_resched)
++			asm volatile("sti ; hlt" : : : "memory");
++		else
++			asm volatile("sti" : : : "memory");
+ 		break;
+ 	case 2:
+ 		inb(acpi_p_blk + ACPI_P_LVL2);
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

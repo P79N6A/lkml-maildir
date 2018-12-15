@@ -1,0 +1,230 @@
+Date: Fri, 18 Feb 2000 10:33:50 +0000 (GMT)
+From: Tigran Aivazian <>
+Subject: [patch-2.3.47-pre3] P6 microcode driver v1.01
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/2/18/84
+
+Hi Linus,
+I made these changes:
+  a) removed if(!capable()) check from write() method as it breaks the
+     classical UNIX philosophy (if a process had enough privilege to open
+     a file it does not matter what privilege he has at the time of
+     writing, it may have received a descriptor from some other privileged
+     "open file" server)
+  b) general cleanup of messages, priorities, dropped CONFIG_M686 check
+     etc.
+  c) implemented read() method and the size for /proc/driver/microcode
+   file. If the update has taken place the size is adjusted to
+   smp_num_cpus*sizeof(struct microcode) and the file contains the binary 
+   form of the actual microcode data (last successfuly) written.
+http://www.ocston.org/~tigran/patches/microcode/microcode-2.3.47-p3.patch
+Regards,
+------
+Tigran A. Aivazian           | 
+http://www.sco.com
+Escalations Research Group   | tel: +44-(0)1923-813796
+Santa Cruz Operation Ltd     | 
+http://www.ocston.org/~tigran
+diff -urN -X dontdiff linux/arch/i386/config.in linux-mc/arch/i386/config.in
+--- linux/arch/i386/config.in	Wed Feb 16 22:36:52 2000
++++ linux-mc/arch/i386/config.in	Fri Feb 18 06:54:32 2000
+@@ -49,7 +49,7 @@
+    define_bool CONFIG_X86_USE_3DNOW y
+ fi
+ 
+-if [ "$CONFIG_M686" = "y" -a "$CONFIG_PROC_FS" = "y" ]; then
++if [ "$CONFIG_PROC_FS" = "y" ]; then
+    tristate '/proc/driver/microcode - Intel P6 CPU microcode support' CONFIG_MICROCODE
+ fi
+ 
+diff -urN -X dontdiff linux/arch/i386/kernel/microcode.c linux-mc/arch/i386/kernel/microcode.c
+--- linux/arch/i386/kernel/microcode.c	Wed Feb 16 22:39:53 2000
++++ linux-mc/arch/i386/kernel/microcode.c	Fri Feb 18 08:11:04 2000
+@@ -18,6 +18,8 @@
+  *
+  *	1.0	16 February 2000, Tigran Aivazian <tigran@sco.com>
+  *		Initial release.
++ *	1.01	18 February 2000, Tigran Aivazian <tigran@sco.com>
++ *		Added read() support + cleanups.
+  */
+ 
+ #include <linux/init.h>
+@@ -31,7 +33,7 @@
+ #include <asm/uaccess.h>
+ #include <asm/processor.h>
+ 
+-#define MICROCODE_VERSION 	"1.0"
++#define MICROCODE_VERSION 	"1.01"
+ 
+ MODULE_DESCRIPTION("CPU (P6) microcode update driver");
+ MODULE_AUTHOR("Tigran Aivazian <tigran@ocston.org>");
+@@ -40,11 +42,12 @@
+ /* VFS interface */
+ static int microcode_open(struct inode *, struct file *);
+ static int microcode_release(struct inode *, struct file *);
++static ssize_t microcode_read(struct file *, char *, size_t, loff_t *);
+ static ssize_t microcode_write(struct file *, const char *, size_t, loff_t *);
+ 
+ 
+ /* internal helpers to do the work */
+-static void do_microcode_update(void);
++static int do_microcode_update(void);
+ static void do_update_one(void *);
+ 
+ /*
+@@ -56,8 +59,10 @@
+ /* the actual array of microcode blocks, each 2048 bytes */
+ static struct microcode * microcode = NULL;
+ static unsigned int microcode_num = 0;
++static char *mc_applied = NULL; /* holds an array of applied microcode blocks */
+ 
+ static struct file_operations microcode_fops = {
++	read:		microcode_read,
+ 	write:		microcode_write,
+ 	open:		microcode_open,
+ 	release:	microcode_release,
+@@ -71,21 +76,26 @@
+ 
+ static int __init microcode_init(void)
+ {
+-	/* write-only /proc/driver/microcode file, one day may become read-write.. */
+-	proc_microcode = create_proc_entry("microcode", S_IWUSR, proc_root_driver);
++	proc_microcode = create_proc_entry("microcode", S_IWUSR|S_IRUSR, proc_root_driver);
+ 	if (!proc_microcode) {
+-		printk(KERN_ERR "microcode: can't create /proc/driver/microcode entry\n");
++		printk(KERN_ERR "microcode: can't create /proc/driver/microcode\n");
+ 		return -ENOMEM;
+ 	}
+ 	proc_microcode->ops = &microcode_inops;
+-	printk(KERN_ERR "P6 Microcode Update Driver v%s registered\n", MICROCODE_VERSION);
++	mc_applied = kmalloc(smp_num_cpus * sizeof(struct microcode), GFP_KERNEL);
++	if (!mc_applied) {
++		printk(KERN_ERR "microcode: can't allocate memory to hold applied microcode\n");
++		return -ENOMEM;
++	}
++	printk(KERN_INFO "P6 Microcode Update Driver v%s registered\n", MICROCODE_VERSION);
+ 	return 0;
+ }
+ 
+ static void __exit microcode_exit(void)
+ {
+ 	remove_proc_entry("microcode", proc_root_driver);
+-	printk(KERN_ERR "P6 Microcode Update Driver v%s unregistered\n", MICROCODE_VERSION);
++	kfree(mc_applied);
++	printk(KERN_INFO "P6 Microcode Update Driver v%s unregistered\n", MICROCODE_VERSION);
+ }
+ 
+ module_init(microcode_init);
+@@ -117,22 +127,27 @@
+ }
+ 
+ 
+-static void do_microcode_update(void)
++static int do_microcode_update(void)
+ {
+-	if (smp_call_function(do_update_one, NULL, 1, 0) != 0)
++	int err;
++
++	if (smp_call_function(do_update_one, &err, 1, 1) != 0)
+ 		panic("do_microcode_update(): timed out waiting for other CPUs\n");
+-	do_update_one(NULL);
++	do_update_one(&err);
++
++	return err;
+ }
+ 
+-static void do_update_one(void *unused)
++static void do_update_one(void *arg)
+ {
++	int *err = (int *)arg;
+ 	struct cpuinfo_x86 * c;
+ 	unsigned int pf = 0, val[2], rev, sig;
+ 	int i, id;
+ 
+ 	id = smp_processor_id();
+ 	c = cpu_data + id;
+-
++	*err = 1; /* be pessimistic */
+ 
+ 	if (c->x86_vendor != X86_VENDOR_INTEL || c->x86 < 6)
+ 		return;
+@@ -156,9 +171,11 @@
+ 					" %d (current=%d)\n", id, microcode[i].rev, rev);
+ 			} else { 
+ 				int sum = 0;
+-				struct microcode *m = &microcode[i];
+-				unsigned int *sump = (unsigned int *)(m+1);
++				struct microcode *m, *mcslot;
++				unsigned int *sump;
+ 
++				m = &microcode[i];
++				sump = (unsigned int *)(m+1);
+ 				while (--sump >= (unsigned int *)m)
+ 					sum += *sump;
+ 				if (sum != 0) {
+@@ -169,23 +186,39 @@
+ 				wrmsr(0x79, (unsigned int)(m->bits), 0);
+ 				__asm__ __volatile__ ("cpuid");
+ 				rdmsr(0x8B, val[0], val[1]);
+-				printk(KERN_ERR "microcode: CPU%d microcode updated "
+-						"from revision %d to %d\n", id, rev, val[1]);
++				*err = 0;
++				mcslot = (struct microcode *)mc_applied + id;
++				memcpy(mcslot, m, sizeof(struct microcode));
++				printk(KERN_ERR "microcode: CPU%d updated from revision "
++					"%d to %d, date=%08x\n", id, rev, val[1], m->date);
+ 			}
+ 			break;
+ 		}
+ }
+ 
++static ssize_t microcode_read(struct file *file, char *buf, size_t len, loff_t *ppos)
++{
++	size_t fsize = smp_num_cpus * sizeof(struct microcode);
++
++	if (!proc_microcode->size || *ppos >= fsize)
++		return 0; /* EOF */
++	if (*ppos + len > fsize)
++		len = fsize - *ppos;
++	if (copy_to_user(buf, mc_applied + *ppos, len))
++		return -EFAULT;
++	*ppos += len;
++	return len;
++}
++
+ static ssize_t microcode_write(struct file *file, const char *buf, size_t len, loff_t *ppos)
+ {
++	int err;
++
+ 	if (len % sizeof(struct microcode) != 0) {
+ 		printk(KERN_ERR "microcode: can only write in N*%d bytes units\n", 
+ 			sizeof(struct microcode));
+ 		return -EINVAL;
+-		return -EINVAL;
+ 	}
+-	if (!capable(CAP_SYS_RAWIO))
+-		return -EPERM;
+ 	lock_kernel();
+ 	microcode_num = len/sizeof(struct microcode);
+ 	microcode = vmalloc(len);
+@@ -198,7 +231,11 @@
+ 		unlock_kernel();
+ 		return -EFAULT;
+ 	}
+-	do_microcode_update();
++	err = do_microcode_update();
++	if (err)
++		len = (size_t)err;
++	else
++		proc_microcode->size = smp_num_cpus * sizeof(struct microcode);
+ 	vfree(microcode);
+ 	unlock_kernel();
+ 	return len;
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

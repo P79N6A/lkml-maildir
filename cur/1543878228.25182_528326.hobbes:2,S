@@ -1,0 +1,134 @@
+Date: Sat, 7 Apr 2007 10:12:44 +0200
+From: Ingo Molnar <>
+Subject: [patch] high-res timers: UP resume fix
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2007/4/7/25
+
+* Linus Torvalds <torvalds@linux-foundation.org> wrote:
+> In fact,  I have a theory.. Your backtrace is:
+> 
+>  [<c0119637>] smp_apic_timer_interrupt+0x57/0x90
+>  [<c0142d30>] retrigger_next_event+0x0/0xb0
+>  [<c0104d30>] apic_timer_interrupt+0x28/0x30
+>  [<c0142d30>] retrigger_next_event+0x0/0xb0
+>  [<c0140068>] __kfifo_put+0x8/0x90
+>  [<c0130fe5>] on_each_cpu+0x35/0x60
+>  [<c0143538>] clock_was_set+0x18/0x20
+>  [<c0135cdc>] timekeeping_resume+0x7c/0xa0
+>  [<c02aabe1>] __sysdev_resume+0x11/0x80
+>  [<c02ab0c7>] sysdev_resume+0x47/0x80
+>  [<c02b0b05>] device_power_up+0x5/0x10
+> 
+> and the thing is, I don't think we should have interrupt enabled at 
+> this point in time! I susect that the timer resume enables interrupts 
+> too early! We should be doing the whole "device_power_up()" sequence 
+> with irq's off, I think..
+yeah, i think you are right. timekeeping_resume() itself does not 
+re-enable interrupts, it's clock_was_set() that does it implicitly:
+void clock_was_set(void)
+{
+        /* Retrigger the CPU local events everywhere */
+        on_each_cpu(retrigger_next_event, NULL, 0, 1);
+}
+on_each_cpu() is safe on SMP during resume 'bootup', because we only 
+have a single CPU at that point, and smp_call_function() does:
+        spin_lock(&call_lock);
+        cpus = num_online_cpus() - 1;
+        if (!cpus) {
+                spin_unlock(&call_lock);
+so we just return. Note that the built-in warning of smp_call_function() 
+does not trigger because it's done too late:
+        /* Can deadlock when called with interrupts disabled */
+        WARN_ON(irqs_disabled());
+we should move this up to the head of the function. But for this bug in 
+question to trigger we'd have to use an UP kernel, which has this code 
+for on_each_cpu():
+#define on_each_cpu(func,info,retry,wait)       \
+        ({                                      \
+                local_irq_disable();            \
+                func(info);                     \
+                local_irq_enable();             \
+ouch!
+the solution is this: what we want to call here in timekeeping_resume is 
+not clock_was_set() but retrigger_next_event() for the current CPU. The 
+patch below should fix it. Soeren, can you confirm that you are using a 
+!CONFIG_SMP kernel, and if yes, does the patch below fix the resume 
+problem for you?
+	Ingo
+---------------------------->
+Subject: [patch] high-res timers: UP resume fix
+From: Ingo Molnar <mingo@elte.hu>
+Soeren Sonnenburg reported that upon resume he is getting
+this backtrace:
+ [<c0119637>] smp_apic_timer_interrupt+0x57/0x90
+ [<c0142d30>] retrigger_next_event+0x0/0xb0
+ [<c0104d30>] apic_timer_interrupt+0x28/0x30
+ [<c0142d30>] retrigger_next_event+0x0/0xb0
+ [<c0140068>] __kfifo_put+0x8/0x90
+ [<c0130fe5>] on_each_cpu+0x35/0x60
+ [<c0143538>] clock_was_set+0x18/0x20
+ [<c0135cdc>] timekeeping_resume+0x7c/0xa0
+ [<c02aabe1>] __sysdev_resume+0x11/0x80
+ [<c02ab0c7>] sysdev_resume+0x47/0x80
+ [<c02b0b05>] device_power_up+0x5/0x10
+it turns out that on UP we mistakenly re-enable interrupts,
+so do the timer retrigger only on the current CPU.
+Signed-off-by: Ingo Molnar <mingo@elte.hu>
+---
+ include/linux/hrtimer.h |    3 +++
+ kernel/hrtimer.c        |   12 ++++++++++++
+ 2 files changed, 15 insertions(+)
+Index: linux/include/linux/hrtimer.h
+===================================================================
+--- linux.orig/include/linux/hrtimer.h
++++ linux/include/linux/hrtimer.h
+@@ -206,6 +206,7 @@ struct hrtimer_cpu_base {
+ struct clock_event_device;
+ 
+ extern void clock_was_set(void);
++extern void hres_timers_resume(void);
+ extern void hrtimer_interrupt(struct clock_event_device *dev);
+ 
+ /*
+@@ -236,6 +237,8 @@ static inline ktime_t hrtimer_cb_get_tim
+  */
+ static inline void clock_was_set(void) { }
+ 
++static inline void hres_timers_resume(void) { }
++
+ /*
+  * In non high resolution mode the time reference is taken from
+  * the base softirq time variable.
+Index: linux/kernel/hrtimer.c
+===================================================================
+--- linux.orig/kernel/hrtimer.c
++++ linux/kernel/hrtimer.c
+@@ -459,6 +459,18 @@ void clock_was_set(void)
+ }
+ 
+ /*
++ * During resume we might have to reprogram the high resolution timer
++ * interrupt (on the local CPU):
++ */
++void hres_timers_resume(void)
++{
++	WARN_ON_ONCE(num_online_cpus() > 1);
++
++	/* Retrigger the CPU local events: */
++	retrigger_next_event(NULL);
++}
++
++/*
+  * Check, whether the timer is on the callback pending list
+  */
+ static inline int hrtimer_cb_pending(const struct hrtimer *timer)
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+More majordomo info at  
+http://vger.kernel.org/majordomo-info.html
+Please read the FAQ at  
+http://www.tux.org/lkml/

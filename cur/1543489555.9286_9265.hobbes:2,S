@@ -1,0 +1,168 @@
+Date: Thu, 11 Mar 1999 00:55:43 +0100 (CET)
+From: Andrea Arcangeli <>
+Subject: [patch] semaphore fixes for a second race (fwd)
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/3/11/5
+
+Hi Linus,
+	I seen that this my further semaphore fix for a new still more
+subtle race is not been included in 2.2.3.  The description of the
+race-fix is in the old email.
+Now I cleaned up it as much as possible (removed the s/static
+inline/extern inline/) and I rediffed against 2.2.3. It's working fine
+here since I posted it the first time.
+Ah the return c instead of c != 0 looks safe according to Intel specs. `c'
+should be set only as 0 or 1 by the asm.
+Index: atomic.h
+===================================================================
+RCS file: /var/cvs/linux/include/asm-i386/atomic.h,v
+retrieving revision 1.1.1.1
+diff -u -r1.1.1.1 atomic.h
+--- atomic.h	1999/01/18 01:27:16	1.1.1.1
++++ linux/include/asm-i386/atomic.h	1999/03/10 23:38:28
+@@ -70,7 +70,7 @@
+ 		LOCK "decl %0; sete %1"
+ 		:"=m" (__atomic_fool_gcc(v)), "=qm" (c)
+ 		:"m" (__atomic_fool_gcc(v)));
+-	return c != 0;
++	return c;
+ }
+ 
+ /* These are x86-specific, used by some header files */
+@@ -81,5 +81,16 @@
+ #define atomic_set_mask(mask, addr) \
+ __asm__ __volatile__(LOCK "orl %0,%1" \
+ : : "r" (mask),"m" (__atomic_fool_gcc(addr)) : "memory")
++
++static __inline__ int atomic_inc_and_test_greater_zero(volatile atomic_t *v)
++{
++	unsigned char c;
++
++	__asm__ __volatile__(
++		LOCK "incl %0; setg %1"
++		:"=m" (__atomic_fool_gcc(v)), "=qm" (c)
++		:"m" (__atomic_fool_gcc(v)));
++	return c;
++}
+ 
+ #endif
+Index: semaphore-helper.h
+===================================================================
+RCS file: /var/cvs/linux/include/asm-i386/Attic/semaphore-helper.h,v
+retrieving revision 1.1.1.1
+diff -u -r1.1.1.1 semaphore-helper.h
+--- semaphore-helper.h	1999/02/20 15:41:42	1.1.1.1
++++ linux/include/asm-i386/semaphore-helper.h	1999/03/10 23:38:18
+@@ -19,8 +19,7 @@
+ 	unsigned long flags;
+ 
+ 	spin_lock_irqsave(&semaphore_wake_lock, flags);
+-	if (atomic_read(&sem->count) <= 0)
+-		sem->waking++;
++	sem->waking++;
+ 	spin_unlock_irqrestore(&semaphore_wake_lock, flags);
+ }
+ 
+@@ -44,9 +43,9 @@
+  *	0	go to sleep
+  *	-EINTR	interrupted
+  *
+- * We must undo the sem->count down_interruptible() increment while we are
+- * protected by the spinlock in order to make atomic this atomic_inc() with the
+- * atomic_read() in wake_one_more(), otherwise we can race. -arca
++ * In the interrupted case we must make sure that there isn't an underlying
++ * up() that will increase waking unconditionally a bit after us. This is
++ * handled with the atomic_inc_and_test_greater_zero() atomic operation. -arca
+  */
+ static inline int waking_non_zero_interruptible(struct semaphore *sem,
+ 						struct task_struct *tsk)
+@@ -59,7 +58,8 @@
+ 		sem->waking--;
+ 		ret = 1;
+ 	} else if (signal_pending(tsk)) {
+-		atomic_inc(&sem->count);
++		if (atomic_inc_and_test_greater_zero(&sem->count))
++			sem->waking--;
+ 		ret = -EINTR;
+ 	}
+ 	spin_unlock_irqrestore(&semaphore_wake_lock, flags);
+@@ -71,9 +71,7 @@
+  *	1	failed to lock
+  *	0	got the lock
+  *
+- * We must undo the sem->count down_trylock() increment while we are
+- * protected by the spinlock in order to make atomic this atomic_inc() with the
+- * atomic_read() in wake_one_more(), otherwise we can race. -arca
++ * Implementation details are the same as in the interruptible case. -arca
+  */
+ static inline int waking_non_zero_trylock(struct semaphore *sem)
+ {
+@@ -82,8 +80,10 @@
+ 
+ 	spin_lock_irqsave(&semaphore_wake_lock, flags);
+ 	if (sem->waking <= 0)
+-		atomic_inc(&sem->count);
+-	else {
++	{
++		if (atomic_inc_and_test_greater_zero(&sem->count))
++			sem->waking--;
++	} else {
+ 		sem->waking--;
+ 		ret = 0;
+ 	}
+Andrea Arcangeli
+---------- Forwarded message ----------
+Date: Sun, 21 Feb 1999 21:45:02 +0100 (CET)
+From: Andrea Arcangeli <andrea@e-mind.com>
+To: Linus Torvalds <torvalds@transmeta.com>
+Cc: linux-kernel@vger.rutgers.edu, Ulrich Schmid <uschmid@mail.hh.provi.de>
+Subject: [patch] semaphore fixes for a second race
+Ulrich discovered a new subtle race in my semaphore patch (the one in
+pre5). Even if my patch was fixing the previous race it was not fixing all
+kind of races and now I understand why.
+I quote here the email in which Ulrich showed me the bug:
+---------------------------------------------------------------------------
+[down_trylock could be replaced by down_interruptible with a pending
+signal]
+task A          task B          task C          task D          count
+waking
+down()                                                          0       0
+                down_trylock()                                  -1      0
+                waking_non_zero_trylock()
+                spin_lock_irqsave()
+up()                                                            0       0
+wake_one_more()
+spin_lock_irqsave() [blocked]
+                if (sem->waking > 0) ...
+                atomic_inc(&sem->count)                         1       0
+                                down() [acquires sem.]          0       0
+                spin_unlock_irqrestore()
+spin_lock_irqsave() [gets lock]
+if (atomic_read(&sem->count) <= 0)
+sem->waking++                                                   0       1
+                                                down()          -1      1
+                                                if (sem->waking > 0)
+                                                acquires semaphore !
+The problem here is that atomic_inc(&sem->count) and
+(atomic_read(&sem->count) <= 0) are done in two different
+operations. I guess that it is necessary to bring them together like
+it is done in up().
+--------------------------------------------------------------------------
+Just to repeat what Ulrich said above: the problem is that we must always
+_modify_ the count field of the semaphore with atomic_and_test operations
+and do clever things if our change on such field will impact the `down()'
+behavior, because the spinlock only protect us only in the `waking'
+handling.
+I agree with Urlich proposal of using an
+atomic_inc_and_test_greater_zero() to handle the semaphore increment in
+the interrupted down(), so I implemented the whole thing and it's working
+fine here so far.
+***** rest of the old email cutted out because not relevant *****
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

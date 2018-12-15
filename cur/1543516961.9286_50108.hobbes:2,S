@@ -1,0 +1,107 @@
+Date: Thu, 25 Nov 1999 02:21:04 +0100 (CET)
+From: Andrea Arcangeli <>
+Subject: Re: spin_unlock optimization(i386)
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/11/24/139
+
+On Wed, 24 Nov 1999, Erich Boleyn wrote:
+>If I understand what you're doing, there appears to be a race after
+>"add_wait_queue(&WAKE_LIST)" and before "xchg(TASK_UNINTERRUPTIBLE,
+>&current->state)" where "wake_up(&WAKE_LIST)" may have executed and set
+>our "current->state"...
+Since I added the strong memory barrier the wait event interface is SMP
+safe all over the place. NOTE: it's not obvious how it works.
+The scenario you are pointing out is this. (supposing starting with I_LOCK
+set of course ;)
+	CPU 0					CPU 1
+	----------------			--------------------
+time zero (big bang)
+	add_wait_queue(&wait_q);
+						wakeup(&wait_q);
+	xchg(TASK_UNINTERRUPTIBLE, &current->state)
+	if (inode->i_state & I_LOCK)
+		schedule();	
+The reason you think it may deadlock is that deadlock is because you miss
+what happened before the "time zero" on CPU 1. Let's see the whole
+picture:
+	CPU 0					CPU 1
+	----------------			--------------------
+						inode->i_state &= ~I_LOCK;
+time zero (big bang)
+	add_wait_queue(&wait_q);
+						wakeup(&wait_q);
+	xchg(TASK_UNINTERRUPTIBLE, &current->state)
+	if (inode->i_state & I_LOCK)
+		schedule(); /* never run schedule as I_LOCK bitfield
+			       is _not_ set */
+The event callback (on CPU1 in the example above) always mark the event as
+happened _before_ running the wakeup on the waitqueue where potential
+waiters may be registered.
+>...so, maybe I'm confused, but it looks like you may end up with either
+>"TASK_INTERRUPTIBLE" or "TASK_RUNNING".
+If it's TASK_INTERRUPTIBLE and the event just happened then the check on
+the event will skip the schedule. That's _why_ the check on the event
+(it's the read) must happen _after_ setting the task as interruptible
+(thus strong memory barrier is necessary before the read in CPU like
+Alpha). Suppose this sequence gets reordered this way by Alpha (supposing 
+the xchg doesn't enforce ordering of course!).
+	CPU 0					CPU 1
+	----------------			--------------------
+	add_wait_queue(&wait_q);
+	register = inode->i_state (speculative read)
+						inode->i_state &= ~I_LOCK;
+						wakeup(&wait_q);
+	xchg(TASK_UNINTERRUPTIBLE, &current->state)
+	if (register & I_LOCK)
+		schedule();
+As you can see the i_state read happened before the current->state write.
+In the middle the other CPU issued the event callback in-order.
+What happens now is that CPU0 will run schedule() with current->state set
+to TASK_INTERRUPTIBLE -> event missed -> deadlock.
+The only issue to avoid races in SMP is to make the write to happens
+before the read.
+>This is quite independent of the use of "xchg" to set "current->state" in
+>the list for CPU1.  That is arguably semantically equivalent to any old
+>store into "current->state".
+That's what I understood by reading your previous posts. It seems we don't
+need to enforce any ordering in IA32 as the hardware is doing that for us.
+Right? Of course the current code can't hurt, it's only slower (like what
+we have with spin_unlock right now).
+>I'd want to be sure that any changes to our "current->state" were made
+>before "add_wait_queue(&WAKE_LIST)" to be sure no such race was possible.
+>So, the safe thing for CPU1 seems to be (again, assuming I've understood
+>correctly):
+>
+>	current->state = TASK_UNINTERRUPTIBLE;
+>	add_wait_queue(&WAKE_LIST);
+>	if (inode->i_state & I_LOCK) {
+>		schedule();
+>			/* this function only returns if current->state
+>			   is TASK_RUNNING */
+>	}
+Also the previous code was equally safe. The only necessary thing is that
+the task is added to the waitqueue and its state is marked to
+task_*interruptible _before_ checking if the event we are waiting just
+happend or not. I doesn't matter if we first add the task to the waitqueue
+or if we first mark the task as *INTERRUPTIBLE.
+Your code doesn't need a mb() (so it's more efficient) because
+add_wait_queue will spin_lock/unlock and so you don't need the mb()
+anymore by putting add_wait_queue in the middle.
+But usually you want to return from the wait_event only when schedule()
+returns. But usually you want to check that the event by hand (this
+because in most cases when schedule returns somebody waiting with you but
+wakenup before you, may have just handled the event before you and so you
+may have to wait for the same event again in loop). For this reason often
+is not optimal to add/del the the event from the waitqueue inside the loop
+and you may want to put the add_to_wait_queue stuff outside the loop and
+to take the current->state = TASK_xxx inside the loop (with a memory
+barrier between the write and the read).
+Andrea
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

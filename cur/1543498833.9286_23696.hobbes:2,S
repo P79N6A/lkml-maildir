@@ -1,0 +1,328 @@
+Date: Sat, 12 Jun 1999 17:46:02 +0200 (CEST)
+From: Andrea Arcangeli <>
+Subject: reschedule_idle
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/6/12/47
+
+I changed reschedule idle this way:
+o	check if the preferred CPU of the task is idle and in such case
+	send the task to such CPU and return. (as in stock reschedule_idle)
+o	check if the new task that we are going to reschedule needs the
+	big kernel lock.
+	If the new task needs the big kernel lock then check how many CPU
+	are currently running with tsk->lock_depth >= 0 and:
+	o	If more than one CPU is grabbing the big kernel lock then exit
+		from reschedule_idle().
+	o	If exactly one CPU is grabbing the big kernel lock do:
+		o	if the "related_cpu" is also our preferred CPU
+			or the new task is a new forked-not-yet-scheduled
+			task then try rescheduling the new task over the
+			related cpu and then return.
+ 		o	if the related_cpu is not our preferred CPU then
+			reschedule the new task over the related cpu 
+			_only_ if the avg_slice of the
+			new task is long enough. It worth to take the very
+			iteractive task always in their preferred CPU.
+	o	If none CPU is grabbing the big kernel lock then
+		o	if the avg_slice of the new task is very short
+			and the new task is not returning from fork then
+			try to reschedule only over the preferred CPU.
+		o	if the avg_slice is long enough feel free
+			to reschedule on the best CPU (goodness
+			will take care of the preferred CPU of the task).
+The old reschedule_idle according to me this is really wrong (see my 
+old email nobody replied me yet):
+-	if ((p->processor == cpu) && related(cpu_curr(cpu), p))
+-		return;
+The current way to use the related in reschedule_idle_slow seems just a
+random way to use related(). There's no point in _not_ rescheduling a new
+task that needs the big kernel lock over a "related" task if such task is
+the _only_ task that needs the big kernel lock in the system. This is
+still more true if the related_cpu is the preferred CPU of the task!
+If we instead have more then one task running with lock_depth >= 0, then
+it's better to not reschedule more tasks that needs the big kernel lock in
+the hope to reschedule some of the "related" task with future not related
+tasks.
+Here it is the patch against 2.3.6:
+Index: kernel/sched.c
+===================================================================
+RCS file: /var/cvs/linux/kernel/sched.c,v
+retrieving revision 1.1.1.14
+diff -u -r1.1.1.14 sched.c
+--- kernel/sched.c	1999/05/16 20:55:52	1.1.1.14
++++ kernel/sched.c	1999/06/12 14:19:18
+@@ -210,88 +209,72 @@
+ {
+ 	return goodness(prev, p, cpu) - goodness(prev, prev, cpu);
+ }
+-
+-/*
+- * If there is a dependency between p1 and p2,
+- * don't be too eager to go into the slow schedule.
+- * In particular, if p1 and p2 both want the kernel
+- * lock, there is no point in trying to make them
+- * extremely parallel..
+- *
+- * (No lock - lock_depth < 0)
+- *
+- * There are two additional metrics here:
+- *
+- * first, a 'cutoff' interval, currently 0-200 usecs on
+- * x86 CPUs, depending on the size of the 'SMP-local cache'.
+- * If the current process has longer average timeslices than
+- * this, then we utilize the idle CPU.
+- *
+- * second, if the wakeup comes from a process context,
+- * then the two processes are 'related'. (they form a
+- * 'gang')
+- *
+- * An idle CPU is almost always a bad thing, thus we skip
+- * the idle-CPU utilization only if both these conditions
+- * are true. (ie. a 'process-gang' rescheduling with rather
+- * high frequency should stay on the same CPU).
+- *
+- * [We can switch to something more finegrained in 2.3.]
+- *
+- * do not 'guess' if the to-be-scheduled task is RT.
+- */
+-#define related(p1,p2) (((p1)->lock_depth >= 0) && (p2)->lock_depth >= 0) && \
+-	(((p2)->policy == SCHED_OTHER) && ((p1)->avg_slice < cacheflush_time))
+ 
+-static inline void reschedule_idle_slow(struct task_struct * p)
++static void reschedule_idle(struct task_struct * p)
+ {
+ #ifdef __SMP__
+-/*
+- * (see reschedule_idle() for an explanation first ...)
+- *
+- * Pass #2
+- *
+- * We try to find another (idle) CPU for this woken-up process.
+- *
+- * On SMP, we mostly try to see if the CPU the task used
+- * to run on is idle.. but we will use another idle CPU too,
+- * at this point we already know that this CPU is not
+- * willing to reschedule in the near future.
+- *
+- * An idle CPU is definitely wasted, especially if this CPU is
+- * running long-timeslice processes. The following algorithm is
+- * pretty good at finding the best idle CPU to send this process
+- * to.
+- *
+- * [We can try to preempt low-priority processes on other CPUs in
+- * 2.3. Also we can try to use the avg_slice value to predict
+- * 'likely reschedule' events even on other CPUs.]
+- */
+ 	int this_cpu = smp_processor_id(), target_cpu;
+ 	struct task_struct *tsk, *target_tsk;
+-	int cpu, best_cpu, weight, best_weight, i;
++	int i, weight, best_weight, start, stop;
+ 	unsigned long flags;
+ 
+-	best_weight = 0; /* prevents negative weight */
+-
+ 	spin_lock_irqsave(&runqueue_lock, flags);
+ 
+-	/*
+-	 * shortcut if the woken up task's last CPU is
+-	 * idle now.
+-	 */
+-	best_cpu = p->processor;
+-	target_tsk = idle_task(best_cpu);
+-	if (cpu_curr(best_cpu) == target_tsk)
+-		goto send_now;
+-
+ 	target_tsk = NULL;
+ 	for (i = 0; i < smp_num_cpus; i++) {
+-		cpu = cpu_logical_map(i);
+-		tsk = cpu_curr(cpu);
+-		if (related(tsk, p))
++		tsk = cpu_curr(i);
++		if (tsk == idle_task(i))
++		{
++			target_tsk = tsk;
++			if (i == p->processor)
++				goto send_now;
++		}
++	}
++
++	if (target_tsk)
++		goto send_now;
++
++	start = 0;
++	stop = smp_num_cpus;
++	if (p->lock_depth >= 0)
++	{
++		int related = 0, related_cpu = 0;
++		for (i = 0; i < smp_num_cpus; i++)
++		{
++			tsk = cpu_curr(i);
++			if (tsk->lock_depth >= 0)
++			{
++				related++;
++				related_cpu = i;
++			}
++		}
++
++		switch (related)
++		{
++		case 0:
++			break;
++		case 1:
++			if (p->avg_slice < cacheflush_time &&
++			    p->processor != related_cpu &&
++			    p->processor != NO_PROC_ID)
++				goto out_no_target;
++			start = related_cpu;
++			stop = start + 1;
++			goto after_avg_slice_check;
++		default:
+ 			goto out_no_target;
+-		weight = preemption_goodness(tsk, p, cpu);
++		}
++	}
++	if (p->avg_slice < cacheflush_time && p->processor != NO_PROC_ID)
++	{
++		start = p->processor;
++		stop = start + 1;
++	}
++ after_avg_slice_check:
++	best_weight = 0;
++	for (i = start; i < stop; i++) {
++		tsk = cpu_curr(i);
++		weight = preemption_goodness(tsk, p, i);
+ 		if (weight > best_weight) {
+ 			best_weight = weight;
+ 			target_tsk = tsk;
+@@ -328,35 +311,6 @@
+ #endif
+ }
+ 
+-static void reschedule_idle(struct task_struct * p)
+-{
+-#ifdef __SMP__
+-	int cpu = smp_processor_id();
+-	/*
+-	 * ("wakeup()" should not be called before we've initialized
+-	 * SMP completely.
+-	 * Basically a not-yet initialized SMP subsystem can be
+-	 * considered as a not-yet working scheduler, simply dont use
+-	 * it before it's up and running ...)
+-	 *
+-	 * SMP rescheduling is done in 2 passes:
+-	 *  - pass #1: faster: 'quick decisions'
+-	 *  - pass #2: slower: 'lets try and find a suitable CPU'
+-	 */
+-
+-	/*
+-	 * Pass #1. (subtle. We might be in the middle of __switch_to, so
+-	 * to preserve scheduling atomicity we have to use cpu_curr)
+-	 */
+-	if ((p->processor == cpu) && related(cpu_curr(cpu), p))
+-		return;
+-#endif /* __SMP__ */
+-	/*
+-	 * Pass #2
+-	 */
+-	reschedule_idle_slow(p);
+-}
+-
+ /*
+  * Careful!
+  *
+Here it is some number using the thread.c proggy I found on the list
+yesterday.
+2.2.9 clean + sched_yield patch below:
+andrea@laser:/tmp$ ./threads 20 10
+Creating 20 threads ... OK !
+Waiting for all threads to start ...Go !
+20              182751          9137            0               0.012732
+andrea@laser:/tmp$ ./threads 2 10
+Creating 2 threads ... OK !
+Waiting for all threads to start ...Go !
+2               16              8               0               0.064091
+andrea@laser:/tmp$ ./threads 200 10
+Creating 200 threads ... OK !
+Waiting for all threads to start ...Go !
+200             19154           95              0               0.284081
+2.2.9 + reschedule_idle patch + sched_yield patch below:
+andrea@laser:/tmp$ ./threads 20 10
+Creating 20 threads ... OK !
+Waiting for all threads to start ...Go !
+20              180867          9043            0               0.009867
+andrea@laser:/tmp$ ./threads 2 10
+Creating 2 threads ... OK !
+Waiting for all threads to start ...Go !
+2               57132           28566           0               0.000000
+andrea@laser:/tmp$ ./threads 200 10
+Creating 200 threads ... OK !
+Waiting for all threads to start ...Go !
+200             19364           96              0               0.271291
+I don't know what happened at 2.2.9 in the 2 thread experiment, maybe the
+proggy is not very precise (I didn't tried two times to see if the number
+varies). I also noticed in the thread.c proggy there are some usleep() in
+the thread-start-path that may confuse the results...
+Anyway the thread.c test isn't very interesting for benchmarking
+the reschedule_idle patch. (if somebody is going to do some other bench
+let me know the results)
+And here instead another scheduler patch (this one is been developed from
+Ingo). This patch will avoid to reschedule a SCHED_YIELD process in
+schedule_tail (problem noticed by Ingo). It will also avoids to forget the
+SHED_YIELD bit after a recalculate of the timers (this problem was noticed
+by me).
+Index: kernel/sched.c
+===================================================================
+RCS file: /var/cvs/linux/kernel/sched.c,v
+retrieving revision 1.1.1.14
+diff -u -r1.1.1.14 sched.c
+--- kernel/sched.c	1999/05/16 20:55:52	1.1.1.14
++++ kernel/sched.c	1999/06/12 14:19:18
+@@ -194,10 +195,8 @@
+ static inline int prev_goodness (struct task_struct * prev,
+ 					struct task_struct * p, int this_cpu)
+ {
+-	if (p->policy & SCHED_YIELD) {
+-		p->policy &= ~SCHED_YIELD;
++	if (p->policy & SCHED_YIELD)
+ 		return 0;
+-	}
+ 	return goodness(prev, p, this_cpu);
+ }
+ 
+@@ -659,10 +613,16 @@
+  */
+ static inline void __schedule_tail (struct task_struct *prev)
+ {
++	if (prev->policy & SCHED_YIELD)
++		prev->policy &= ~SCHED_YIELD;
++	else {
++#ifdef __SMP__
++		if ((prev->state == TASK_RUNNING) &&
++				(prev != idle_task(smp_processor_id())))
++			reschedule_idle(prev);
++#endif
++	}
+ #ifdef __SMP__
+-	if ((prev->state == TASK_RUNNING) &&
+-			(prev != idle_task(smp_processor_id())))
+-		reschedule_idle(prev);
+ 	wmb();
+ 	prev->has_cpu = 0;
+ #endif /* __SMP__ */
+Comments?
+Andrea Arcangeli
+PS. When the big kernel lock will be minimal it will be _trivial_ to
+remove such part of the heuristic from my reschedule_idle patch. An #if 0
+#endif will do the trick. If you don't like the "related" stuff let me
+know and I'll remove it.
+PPS. With my reschedule_idle() patch applyed a `for(;;);' loop will stay
+on the same CPU even with xosview and with other iteractive tasks running
+at the same time. And I like really a lot this nice behaviour.
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

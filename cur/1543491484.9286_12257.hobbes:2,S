@@ -1,0 +1,218 @@
+Date: Wed, 31 Mar 1999 01:17:37 +0200
+From: Manfred Spraul <>
+Subject: [PATCH] swapon /dev/<root> crashes linux
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/3/30/175
+
+Problem:
+set_blocksize() is a destructive operation.
+If you call set_blocksize(4096) on a mounted block device,
+the filesystem can't read its (e.g.) 1024 byts blocks anymore.
+But set_blocksize() is required in order to read
+the signature/magic value during mount/swapon.
+The swappartition and vfs have their own <device busy>
+implementations to prevent this, but without this patch the
+information is not shared.
+This patch:
+1) fixes the bug described. It adds 2 new functions:
+is_device_busy() and set_device_busy()
+2) fixes 2 minor problems in is_read_only()/set_device_ro():
+* the functions uses an array of "long", but use only 32
+bits (wastes memory on 64 bit CPUs).
+* the old implementation uses an 8 kB static array (16 kB on 64 bits
+systems)
+TODO:
+the raid drivers should use this as well.
+(I'll ask Ingo to do that after the patch is in the main kernel)diff -r -u -P -x CVS -x *,v 2.2.5/drivers/block/ll_rw_blk.c current/drivers/block/ll_rw_blk.c
+--- 2.2.5/drivers/block/ll_rw_blk.c	Wed Mar 31 00:56:57 1999
++++ current/drivers/block/ll_rw_blk.c	Wed Mar 31 00:21:25 1999
+@@ -16,6 +16,7 @@
+ #include <linux/config.h>
+ #include <linux/locks.h>
+ #include <linux/mm.h>
++#include <linux/slab.h>
+ #include <linux/init.h>
+ 
+ #include <asm/system.h>
+@@ -241,8 +242,24 @@
+ }
+ 
+ /* RO fail safe mechanism */
++/* device busy: (C) Manfred Spraul masp0008@stud.uni-sb.de */
+ 
+-static long ro_bits[MAX_BLKDEV][8];
++struct kdev_bits {
++	unsigned char ro_bits[(1U << MINORBITS)/8];
++	unsigned char busy_bits[(1U << MINORBITS)/8];
++};
++
++static struct kdev_bits* kdev_info[MAX_BLKDEV] = { NULL, NULL };
++
++#define ALLOC_KDEV_BITS(major) \
++	if (kdev_info[major] == NULL) { \
++		kdev_info[major] = kmalloc(sizeof(struct kdev_bits),GFP_KERNEL); \
++		if(kdev_info[major] == NULL) { \
++			printk("ALLOC_KDEV_BITS() failed due to ENOMEM.\n"); \
++			return; \
++		} \
++		memset(kdev_info[major],0,sizeof(struct kdev_bits)); \
++	}
+ 
+ int is_read_only(kdev_t dev)
+ {
+@@ -251,7 +268,8 @@
+ 	major = MAJOR(dev);
+ 	minor = MINOR(dev);
+ 	if (major < 0 || major >= MAX_BLKDEV) return 0;
+-	return ro_bits[major][minor >> 5] & (1 << (minor & 31));
++	if (kdev_info[major] == NULL) return 0;
++     	return kdev_info[major]->ro_bits[minor >> 3] & (1 << (minor & 7));
+ }
+ 
+ void set_device_ro(kdev_t dev,int flag)
+@@ -261,10 +279,39 @@
+ 	major = MAJOR(dev);
+ 	minor = MINOR(dev);
+ 	if (major < 0 || major >= MAX_BLKDEV) return;
+-	if (flag) ro_bits[major][minor >> 5] |= 1 << (minor & 31);
+-	else ro_bits[major][minor >> 5] &= ~(1 << (minor & 31));
++	ALLOC_KDEV_BITS(major)
++	if (flag)
++		kdev_info[major]->ro_bits[minor >> 3] |= 1 << (minor & 7);
++	 else
++		kdev_info[major]->ro_bits[minor >> 3] &= ~(1 << (minor & 7));
++}
++
++int is_device_busy(kdev_t dev)
++{
++	int minor,major;
++
++	major = MAJOR(dev);
++	minor = MINOR(dev);
++	if (major < 0 || major >= MAX_BLKDEV) return 0;
++	if (kdev_info[major] == NULL) return 0;
++	return kdev_info[major]->busy_bits[minor >> 3] & (1 << (minor & 7));
+ }
+ 
++void set_device_busy(kdev_t dev,int flag)
++{
++	int minor,major;
++	
++	major = MAJOR(dev);
++	minor = MINOR(dev);
++	if (major < 0 || major >= MAX_BLKDEV) return;
++	ALLOC_KDEV_BITS(major)
++	if (flag)
++		kdev_info[major]->busy_bits[minor >> 3] |= 1 << (minor & 7);
++	 else
++		kdev_info[major]->busy_bits[minor >> 3] &= ~(1 << (minor & 7));
++}
++
++
+ static inline void drive_stat_acct(int cmd, unsigned long nr_sectors,
+                                    short disk_index)
+ {
+@@ -731,7 +778,6 @@
+ 		req->rq_status = RQ_INACTIVE;
+ 		req->next = NULL;
+ 	}
+-	memset(ro_bits,0,sizeof(ro_bits));
+ 	memset(max_readahead, 0, sizeof(max_readahead));
+ 	memset(max_sectors, 0, sizeof(max_sectors));
+ #ifdef CONFIG_AMIGA_Z2RAM
+diff -r -u -P -x CVS -x *,v 2.2.5/fs/super.c current/fs/super.c
+--- 2.2.5/fs/super.c	Wed Mar 31 00:56:57 1999
++++ current/fs/super.c	Wed Mar 31 01:10:26 1999
+@@ -131,6 +131,7 @@
+ 		vfsmnttail->mnt_next = lptr;
+ 		vfsmnttail = lptr;
+ 	}
++	set_device_busy(sb->s_dev,1);
+ out:
+ 	return lptr;
+ }
+@@ -165,6 +166,8 @@
+ 	kfree(tofree->mnt_devname);
+ 	kfree(tofree->mnt_dirname);
+ 	kfree_s(tofree, sizeof(struct vfsmount));
++
++	set_device_busy(dev,0);
+ }
+ 
+ int register_filesystem(struct file_system_type * fs)
+@@ -872,6 +875,8 @@
+ 	if (dir_d->d_covers != dir_d)
+ 		goto dput_and_out;
+ 
++	if (is_device_busy(dev))
++		goto dput_and_out;
+ 	/*
+ 	 * Note: If the superblock already exists,
+ 	 * read_super just does a get_super().
+diff -r -u -P -x CVS -x *,v 2.2.5/include/linux/fs.h current/include/linux/fs.h
+--- 2.2.5/include/linux/fs.h	Wed Mar 31 00:56:57 1999
++++ current/include/linux/fs.h	Wed Mar 31 00:59:27 1999
+@@ -830,6 +830,8 @@
+ extern struct buffer_head * find_buffer(kdev_t dev, int block, int size);
+ extern void ll_rw_block(int, int, struct buffer_head * bh[]);
+ extern int is_read_only(kdev_t);
++extern int is_device_busy(kdev_t);
++extern void set_device_busy(kdev_t dev, int flag);
+ extern void __brelse(struct buffer_head *);
+ extern inline void brelse(struct buffer_head *buf)
+ {
+diff -r -u -P -x CVS -x *,v 2.2.5/kernel/ksyms.c current/kernel/ksyms.c
+--- 2.2.5/kernel/ksyms.c	Wed Mar 31 00:56:57 1999
++++ current/kernel/ksyms.c	Tue Mar 30 23:36:20 1999
+@@ -47,7 +47,7 @@
+ #endif
+ 
+ extern char *get_options(char *str, int *ints);
+-extern void set_device_ro(kdev_t dev,int flag);
++extern void set_device_ro(kdev_t dev, int flag);
+ extern struct file_operations * get_blkfops(unsigned int);
+ extern int blkdev_release(struct inode * inode);
+ #if !defined(CONFIG_NFSD) && defined(CONFIG_NFSD_MODULE)
+@@ -209,6 +209,8 @@
+ EXPORT_SYMBOL(blk_dev);
+ EXPORT_SYMBOL(is_read_only);
+ EXPORT_SYMBOL(set_device_ro);
++EXPORT_SYMBOL(is_device_busy);
++EXPORT_SYMBOL(set_device_busy);
+ EXPORT_SYMBOL(bmap);
+ EXPORT_SYMBOL(sync_dev);
+ EXPORT_SYMBOL(get_blkfops);
+diff -r -u -P -x CVS -x *,v 2.2.5/mm/swapfile.c current/mm/swapfile.c
+--- 2.2.5/mm/swapfile.c	Wed Mar 31 00:56:57 1999
++++ current/mm/swapfile.c	Wed Mar 31 00:06:07 1999
+@@ -414,6 +414,7 @@
+ 			filp.f_op->release(dentry->d_inode,&filp);
+ 			filp.f_op->release(dentry->d_inode,&filp);
+ 		}
++		set_device_busy(p->swap_device,0);
+ 	}
+ 	dput(dentry);
+ 
+@@ -531,6 +532,10 @@
+ 
+ 	if (S_ISBLK(swap_dentry->d_inode->i_mode)) {
+ 		p->swap_device = swap_dentry->d_inode->i_rdev;
++		if(is_device_busy(p->swap_device)) {
++			error = -EBUSY;
++			goto bad_swap;
++		}
+ 		set_blocksize(p->swap_device, PAGE_SIZE);
+ 		
+ 		filp.f_dentry = swap_dentry;
+@@ -686,6 +691,8 @@
+ 		swap_info[prev].next = p - swap_info;
+ 	}
+ 	error = 0;
++	if(p->swap_device != 0)
++		set_device_busy(p->swap_device,1);
+ 	goto out;
+ bad_swap:
+ 	if(filp.f_op && filp.f_op->release)

@@ -1,0 +1,379 @@
+Date: Fri, 3 Dec 1999 14:04:31 +0100 (CET)
+From: Ingo Molnar <>
+Subject: [patch] highmem-2.3.30-B4, 64GB/PAE fixes
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/12/3/36
+
+the attached highmem-2.3.30-B4 patch (against 2.3.30-pre5) fixes the bug
+noticed by Stephen: PAE mode must always use atomic 64-bit stores to
+update page table entries, otherwise TLBs might get corrupted. (we do not
+use atomic load-modify-stores because access to pagetables is serialized
+by the pagetable spinlock.)
+this actually was a bit more complex because a number of places within the
+x86 architecture modified ptes directly.
+with this patch the 64GB kernel runs very stable under high load. (2-level
+page table kernels compile cleanly/boot/work as well)
+-- mingo
+--- linux/include/asm-i386/system.h.orig	Fri Dec  3 01:15:27 1999
++++ linux/include/asm-i386/system.h	Fri Dec  3 04:53:39 1999
+@@ -122,11 +122,61 @@
+ 
+ #define nop() __asm__ __volatile__ ("nop")
+ 
+-#define xchg(ptr,x) ((__typeof__(*(ptr)))__xchg((unsigned long)(x),(ptr),sizeof(*(ptr))))
++#define xchg(ptr,v) ((__typeof__(*(ptr)))__xchg((unsigned long)(v),(ptr),sizeof(*(ptr))))
++
+ #define tas(ptr) (xchg((ptr),1))
+ 
+ struct __xchg_dummy { unsigned long a[100]; };
+ #define __xg(x) ((struct __xchg_dummy *)(x))
++
++
++/*
++ * The semantics of XCHGCMP8B are a bit strange, this is why
++ * there is a loop and the loading of %%eax and %%edx has to
++ * be inside. This inlines well in most cases, the cached
++ * cost is around ~38 cycles. (in the future we might want
++ * to do an SIMD/3DNOW!/MMX/FPU 64-bit store here, but that
++ * might have an implicit FPU-save as a cost, so it's not
++ * clear which path to go.)
++ */
++extern inline void __set_64bit (unsigned long long * ptr,
++		unsigned int low, unsigned int high)
++{
++__asm__ __volatile__ (
++	"1:	movl (%0), %%eax;
++		movl 4(%0), %%edx;
++		lock; cmpxchg8b (%0);
++		jnz 1b"
++	::		"D"(ptr),
++			"b"(low),
++			"c"(high)
++	:
++			"ax","dx","memory");
++}
++
++extern void inline __set_64bit_constant (unsigned long long *ptr,
++						 unsigned long long value)
++{
++	__set_64bit(ptr,(unsigned int)(value), (unsigned int)((value)>>32ULL));
++}
++#define ll_low(x)	*(((unsigned int*)&(x))+0)
++#define ll_high(x)	*(((unsigned int*)&(x))+1)
++
++extern void inline __set_64bit_var (unsigned long long *ptr,
++			 unsigned long long value)
++{
++	__set_64bit(ptr,ll_low(value), ll_high(value));
++}
++
++#define set_64bit(ptr,value) \
++(__builtin_constant_p(value) ? \
++ __set_64bit_constant(ptr, value) : \
++ __set_64bit_var(ptr, value) )
++
++#define _set_64bit(ptr,value) \
++(__builtin_constant_p(value) ? \
++ __set_64bit(ptr, (unsigned int)(value), (unsigned int)((value)>>32ULL) ) : \
++ __set_64bit(ptr, ll_low(value), ll_high(value)) )
+ 
+ /*
+  * Note: no "lock" prefix even on SMP: xchg always implies lock anyway
+--- linux/include/asm-i386/pgalloc.h.orig	Fri Dec  3 01:20:16 1999
++++ linux/include/asm-i386/pgalloc.h	Fri Dec  3 03:58:01 1999
+@@ -107,7 +107,7 @@
+ 		
+ 		if (!page)
+ 			return get_pte_kernel_slow(pmd, address);
+-		pmd_val(*pmd) = _KERNPG_TABLE + __pa(page);
++		set_pmd(pmd, __pmd(_KERNPG_TABLE + __pa(page)));
+ 		return page + address;
+ 	}
+ 	if (pmd_bad(*pmd)) {
+@@ -132,7 +132,7 @@
+ 	
+ 	if (!page)
+ 		return get_pte_slow(pmd, address);
+-	pmd_val(*pmd) = _PAGE_TABLE + __pa(page);
++	set_pmd(pmd, __pmd(_PAGE_TABLE + __pa(page)));
+ 	return (pte_t *)page + address;
+ }
+ fix:
+--- linux/include/asm-i386/pgalloc-3level.h.orig	Fri Dec  3 01:20:24 1999
++++ linux/include/asm-i386/pgalloc-3level.h	Fri Dec  3 03:56:34 1999
+@@ -54,7 +54,7 @@
+ 			page = get_pmd_slow();
+ 		if (page) {
+ 			if (pgd_none(*pgd)) {
+-				pgd_val(*pgd) = 1 + __pa(page);
++				set_pgd(pgd, __pgd(1 + __pa(page)));
+ 				__flush_tlb();
+ 				return page + address;
+ 			} else
+--- linux/include/asm-i386/pgtable.h.orig	Fri Dec  3 01:20:46 1999
++++ linux/include/asm-i386/pgtable.h	Fri Dec  3 03:58:01 1999
+@@ -52,13 +52,6 @@
+ #endif
+ #endif
+ 
+-/*
+- * Certain architectures need to do special things when PTEs
+- * within a page table are directly modified.  Thus, the following
+- * hook is made available.
+- */
+-#define set_pte(pteptr, pteval) ((*(pteptr)) = (pteval))
+-
+ #define __beep() asm("movb $0x3,%al; outb %al,$0x61")
+ 
+ #define PMD_SIZE	(1UL << PMD_SHIFT)
+@@ -166,13 +159,13 @@
+ 
+ #define pte_none(x)	(!pte_val(x))
+ #define pte_present(x)	(pte_val(x) & (_PAGE_PRESENT | _PAGE_PROTNONE))
+-#define pte_clear(xp)	do { pte_val(*(xp)) = 0; } while (0)
++#define pte_clear(xp)	do { set_pte(xp, __pte(0)); } while (0)
+ #define pte_pagenr(x)	((unsigned long)((pte_val(x) >> PAGE_SHIFT)))
+ 
+ #define pmd_none(x)	(!pmd_val(x))
+-#define	pmd_bad(x)	((pmd_val(x) & (~PAGE_MASK & ~_PAGE_USER)) != _KERNPG_TABLE)
+ #define pmd_present(x)	(pmd_val(x) & _PAGE_PRESENT)
+-#define pmd_clear(xp)	do { pmd_val(*(xp)) = 0; } while (0)
++#define pmd_clear(xp)	do { set_pmd(xp, __pmd(0)); } while (0)
++#define	pmd_bad(x)	((pmd_val(x) & (~PAGE_MASK & ~_PAGE_USER)) != _KERNPG_TABLE)
+ 
+ /*
+  * Permanent address of a page. Obviously must never be
+@@ -193,16 +186,16 @@
+ extern inline int pte_young(pte_t pte)		{ return pte_val(pte) & _PAGE_ACCESSED; }
+ extern inline int pte_write(pte_t pte)		{ return pte_val(pte) & _PAGE_RW; }
+ 
+-extern inline pte_t pte_rdprotect(pte_t pte)	{ pte_val(pte) &= ~_PAGE_USER; return pte; }
+-extern inline pte_t pte_exprotect(pte_t pte)	{ pte_val(pte) &= ~_PAGE_USER; return pte; }
+-extern inline pte_t pte_mkclean(pte_t pte)	{ pte_val(pte) &= ~_PAGE_DIRTY; return pte; }
+-extern inline pte_t pte_mkold(pte_t pte)	{ pte_val(pte) &= ~_PAGE_ACCESSED; return pte; }
+-extern inline pte_t pte_wrprotect(pte_t pte)	{ pte_val(pte) &= ~_PAGE_RW; return pte; }
+-extern inline pte_t pte_mkread(pte_t pte)	{ pte_val(pte) |= _PAGE_USER; return pte; }
+-extern inline pte_t pte_mkexec(pte_t pte)	{ pte_val(pte) |= _PAGE_USER; return pte; }
+-extern inline pte_t pte_mkdirty(pte_t pte)	{ pte_val(pte) |= _PAGE_DIRTY; return pte; }
+-extern inline pte_t pte_mkyoung(pte_t pte)	{ pte_val(pte) |= _PAGE_ACCESSED; return pte; }
+-extern inline pte_t pte_mkwrite(pte_t pte)	{ pte_val(pte) |= _PAGE_RW; return pte; }
++extern inline pte_t pte_rdprotect(pte_t pte)	{ set_pte(&pte, __pte(pte_val(pte) & ~_PAGE_USER)); return pte; }
++extern inline pte_t pte_exprotect(pte_t pte)	{ set_pte(&pte, __pte(pte_val(pte) & ~_PAGE_USER)); return pte; }
++extern inline pte_t pte_mkclean(pte_t pte)	{ set_pte(&pte, __pte(pte_val(pte) & ~_PAGE_DIRTY)); return pte; }
++extern inline pte_t pte_mkold(pte_t pte)	{ set_pte(&pte, __pte(pte_val(pte) & ~_PAGE_ACCESSED)); return pte; }
++extern inline pte_t pte_wrprotect(pte_t pte)	{ set_pte(&pte, __pte(pte_val(pte) & ~_PAGE_RW)); return pte; }
++extern inline pte_t pte_mkread(pte_t pte)	{ set_pte(&pte, __pte(pte_val(pte) | _PAGE_USER)); return pte; }
++extern inline pte_t pte_mkexec(pte_t pte)	{ set_pte(&pte, __pte(pte_val(pte) | _PAGE_USER)); return pte; }
++extern inline pte_t pte_mkdirty(pte_t pte)	{ set_pte(&pte, __pte(pte_val(pte) | _PAGE_DIRTY)); return pte; }
++extern inline pte_t pte_mkyoung(pte_t pte)	{ set_pte(&pte, __pte(pte_val(pte) | _PAGE_ACCESSED)); return pte; }
++extern inline pte_t pte_mkwrite(pte_t pte)	{ set_pte(&pte, __pte(pte_val(pte) | _PAGE_RW)); return pte; }
+ 
+ /*
+  * Conversion functions: convert a page and protection to a page entry,
+@@ -213,17 +206,17 @@
+ ({									\
+ 	pte_t __pte;							\
+ 									\
+-	pte_val(__pte) = ((page)-mem_map)*(unsigned long long)PAGE_SIZE + \
+-				pgprot_val(pgprot);			\
++	set_pte(&__pte, __pte(((page)-mem_map) * 			\
++		(unsigned long long)PAGE_SIZE + pgprot_val(pgprot)));	\
+ 	__pte;								\
+ })
+ 
+ /* This takes a physical page address that is used by the remapping functions */
+ #define mk_pte_phys(physpage, pgprot) \
+-({ pte_t __pte; pte_val(__pte) = physpage + pgprot_val(pgprot); __pte; })
++({ pte_t __pte; set_pte(&__pte, __pte(physpage + pgprot_val(pgprot))); __pte; })
+ 
+ extern inline pte_t pte_modify(pte_t pte, pgprot_t newprot)
+-{ pte_val(pte) = (pte_val(pte) & _PAGE_CHG_MASK) | pgprot_val(newprot); return pte; }
++{ set_pte(&pte, __pte((pte_val(pte) & _PAGE_CHG_MASK) | pgprot_val(newprot))); return pte; }
+ 
+ #define page_pte(page) page_pte_prot(page, __pgprot(0))
+ 
+--- linux/include/asm-i386/pgtable-2level.h.orig	Fri Dec  3 01:21:34 1999
++++ linux/include/asm-i386/pgtable-2level.h	Fri Dec  3 02:57:05 1999
+@@ -34,6 +34,19 @@
+ extern inline int pgd_present(pgd_t pgd)	{ return 1; }
+ #define pgd_clear(xp)				do { } while (0)
+ 
++/*
++ * Certain architectures need to do special things when PTEs
++ * within a page table are directly modified.  Thus, the following
++ * hook is made available.
++ */
++#define set_pte(pteptr, pteval) (*(pteptr) = pteval)
++/*
++ * (pmds are folded into pgds so this doesnt get actually called,
++ * but the define is needed for a generic inline function.)
++ */
++#define set_pmd(pmdptr, pmdval) (*(pmdptr) = pmdval)
++#define set_pgd(pgdptr, pgdval) (*(pgdptr) = pgdval)
++
+ #define pgd_page(pgd) \
+ ((unsigned long) __va(pgd_val(pgd) & PAGE_MASK))
+ 
+--- linux/include/asm-i386/pgtable-3level.h.orig	Fri Dec  3 01:21:41 1999
++++ linux/include/asm-i386/pgtable-3level.h	Fri Dec  3 03:56:00 1999
+@@ -35,11 +35,22 @@
+ 
+ /*
+  * Subtle, in PAE mode we cannot have zeroes in the top level
+- * page directory, the CPU enforces this.
++ * page directory, the CPU enforces this. (ie. the PGD entry
++ * always has to have the present bit set.) The CPU caches
++ * the 4 pgd entries internally, so there is no extra memory
++ * load on TLB miss, despite one more level of indirection.
+  */
+ #define pgd_none(x)	(pgd_val(x) == 1ULL)
+ extern inline int pgd_bad(pgd_t pgd)		{ return 0; }
+ extern inline int pgd_present(pgd_t pgd)	{ return !pgd_none(pgd); }
++
++#define set_pte(pteptr,pteval) \
++		set_64bit((unsigned long long *)(pteptr),pte_val(pteval))
++#define set_pmd(pmdptr,pmdval) \
++		set_64bit((unsigned long long *)(pmdptr),pmd_val(pmdval))
++#define set_pgd(pgdptr,pgdval) \
++		set_64bit((unsigned long long *)(pgdptr),pgd_val(pgdval))
++
+ /*
+  * Pentium-II errata A13: in PAE mode we explicitly have to flush
+  * the TLB via cr3 if the top-level pgd is changed... This was one tough
+@@ -48,7 +59,7 @@
+  */
+ extern inline void __pgd_clear (pgd_t * pgd)
+ {
+-	pgd_val(*pgd) = 1; // no zero allowed!
++	set_pgd(pgd, __pgd(1ULL));
+ }
+ 
+ extern inline void pgd_clear (pgd_t * pgd)
+--- linux/include/asm-i386/page.h.orig	Fri Dec  3 02:44:09 1999
++++ linux/include/asm-i386/page.h	Fri Dec  3 03:58:01 1999
+@@ -50,6 +50,9 @@
+ #define pgd_val(x)	((x).pgd)
+ #define pgprot_val(x)	((x).pgprot)
+ 
++#define __pte(x) ((pte_t) { (x) } )
++#define __pmd(x) ((pmd_t) { (x) } )
++#define __pgd(x) ((pgd_t) { (x) } )
+ #define __pgprot(x)	((pgprot_t) { (x) } )
+ 
+ #endif /* !__ASSEMBLY__ */
+--- linux/arch/i386/mm/init.c.orig	Fri Dec  3 02:24:22 1999
++++ linux/arch/i386/mm/init.c	Fri Dec  3 02:53:06 1999
+@@ -76,7 +76,7 @@
+ 	pmd_t v;
+ 	int i;
+ 
+-	pmd_val(v) = _PAGE_TABLE + __pa(empty_bad_pte_table);
++	set_pmd(&v, __pmd(_PAGE_TABLE + __pa(empty_bad_pte_table)));
+ 
+ 	for (i = 0; i < PAGE_SIZE/sizeof(pmd_t); i++)
+ 		empty_bad_pmd_table[i] = v;
+@@ -103,13 +103,13 @@
+ void __handle_bad_pmd(pmd_t *pmd)
+ {
+ 	pmd_ERROR(*pmd);
+-	pmd_val(*pmd) = _PAGE_TABLE + __pa(get_bad_pte_table());
++	set_pmd(pmd, __pmd(_PAGE_TABLE + __pa(get_bad_pte_table())));
+ }
+ 
+ void __handle_bad_pmd_kernel(pmd_t *pmd)
+ {
+ 	pmd_ERROR(*pmd);
+-	pmd_val(*pmd) = _KERNPG_TABLE + __pa(get_bad_pte_table());
++	set_pmd(pmd, __pmd(_KERNPG_TABLE + __pa(get_bad_pte_table())));
+ }
+ 
+ pte_t *get_pte_kernel_slow(pmd_t *pmd, unsigned long offset)
+@@ -120,10 +120,10 @@
+ 	if (pmd_none(*pmd)) {
+ 		if (pte) {
+ 			clear_page(pte);
+-			pmd_val(*pmd) = _KERNPG_TABLE + __pa(pte);
++			set_pmd(pmd, __pmd(_KERNPG_TABLE + __pa(pte)));
+ 			return pte + offset;
+ 		}
+-		pmd_val(*pmd) = _KERNPG_TABLE + __pa(get_bad_pte_table());
++		set_pmd(pmd, __pmd(_KERNPG_TABLE + __pa(get_bad_pte_table())));
+ 		return NULL;
+ 	}
+ 	free_page((unsigned long)pte);
+@@ -142,10 +142,10 @@
+ 	if (pmd_none(*pmd)) {
+ 		if (pte) {
+ 			clear_page((void *)pte);
+-			pmd_val(*pmd) = _PAGE_TABLE + __pa(pte);
++			set_pmd(pmd, __pmd(_PAGE_TABLE + __pa(pte)));
+ 			return (pte_t *)pte + offset;
+ 		}
+-		pmd_val(*pmd) = _PAGE_TABLE + __pa(get_bad_pte_table());
++		set_pmd(pmd, __pmd(_PAGE_TABLE + __pa(get_bad_pte_table())));
+ 		return NULL;
+ 	}
+ 	free_page(pte);
+@@ -268,7 +268,7 @@
+ 		printk("Invalid set_fixmap\n");
+ 		return;
+ 	}
+-	set_pte_phys (address,phys);
++	set_pte_phys(address,phys);
+ }
+ 
+ static void __init fixrange_init (unsigned long start, unsigned long end, pgd_t *pgd_base)
+@@ -286,7 +286,7 @@
+ #if CONFIG_X86_PAE
+ 		if (pgd_none(*pgd)) {
+ 			pmd = (pmd_t *) alloc_bootmem_low_pages(PAGE_SIZE);
+-			pgd_val(*pgd) = __pa(pmd) + 0x1;
++			set_pgd(pgd, __pgd(__pa(pmd) + 0x1));
+ 			if (pmd != pmd_offset(pgd, start))
+ 				BUG();
+ 		}
+@@ -297,7 +297,7 @@
+ 		for (; (j < PTRS_PER_PMD) && start; pmd++, j++) {
+ 			if (pmd_none(*pmd)) {
+ 				pte = (pte_t *) alloc_bootmem_low_pages(PAGE_SIZE);
+-				pmd_val(*pmd) = _KERNPG_TABLE + __pa(pte);
++				set_pmd(pmd, __pmd(_KERNPG_TABLE + __pa(pte)));
+ 				if (pte != pte_offset(pmd, 0))
+ 					BUG();
+ 			}
+@@ -326,7 +326,7 @@
+ 		vaddr = i*PGDIR_SIZE;
+ #if CONFIG_X86_PAE
+ 		pmd = (pmd_t *) alloc_bootmem_low_pages(PAGE_SIZE);
+-		pgd_val(*pgd) = __pa(pmd) + 0x1;
++		set_pgd(pgd, __pgd(__pa(pmd) + 0x1));
+ #else
+ 		pmd = (pmd_t *)pgd;
+ #endif
+@@ -345,12 +345,12 @@
+ 					set_in_cr4(X86_CR4_PGE);
+ 					__pe += _PAGE_GLOBAL;
+ 				}
+-				pmd_val(*pmd) = __pe;
++				set_pmd(pmd, __pmd(__pe));
+ 				continue;
+ 			}
+ 
+ 			pte = (pte_t *) alloc_bootmem_low_pages(PAGE_SIZE);
+-			pmd_val(*pmd) = _KERNPG_TABLE + __pa(pte);
++			set_pmd(pmd, __pmd(_KERNPG_TABLE + __pa(pte)));
+ 
+ 			if (pte != pte_offset(pmd, 0))
+ 				BUG();
+@@ -412,7 +412,7 @@
+ #if CONFIG_X86_PAE
+ 		pgd_clear(swapper_pg_dir+i);
+ #else
+-		pgd_val(swapper_pg_dir[i]) = 0;
++		set_pgd(swapper_pg_dir+i, __pgd(0));
+ #endif
+ 	flush_tlb_all();
+ }

@@ -1,0 +1,119 @@
+Date: Thu, 05 Oct 2006 15:31:43 -0400
+From: Jeff Moyer <>
+Subject: Re: [patch] call truncate_inode_pages in the DIO fallback to buffered I/O path
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2006/10/5/276
+
+==> Regarding Re: [patch] call truncate_inode_pages in the DIO fallback to buffered I/O path; Andrew Morton <akpm@osdl.org> adds:
+akpm> On Wed, 04 Oct 2006 16:53:53 -0400
+akpm> Jeff Moyer <jmoyer@redhat.com> wrote:
+>> The man page for open states:
+>> 
+>> O_DIRECT
+>> Try to minimize cache effects of the I/O to and from this file.
+>> 
+>> I think that invalidating the page cache pages we use when falling back to
+>> buffered I/O stays true to the above description.
+akpm> What the manpage forgot to mention is "direct-io is synchronous".
+akpm> Except it isn't, when we fall back to buffered-IO.  So yup, I think
+akpm> we could justify this (sort of) change on those grounds alone:
+akpm> preserving the synchronous semantics.
+akpm> I'd propose that we do this via
+akpm> 	generic_file_buffered_write(...);
+akpm> 	do_sync_file_range(..., SYNC_FILE_RANGE_WAIT_BEFORE|
+akpm> 			SYNC_FILE_RANGE_WRITE|
+akpm> 			SYNC_FILE_RANGE_WAIT_AFTER)
+akpm> 	invalidate_mapping_pages(...);
+OK, patch attached.  It's a bit awkward that some interfaces take a page
+index while others take an offset in bytes.  I tested it with the code I
+sent earlier in this thread.  I'll get results from oast and some dbcreate
+runs comparing kernels with and without this change and post them when
+available (probably in the next day or two).  Feel free to hold off
+comitting this until that data is presented.
+akpm> There is a slight inefficiency here: generic_file_direct_IO() does
+akpm> invalidate_inode_pages2_range(), then we go and instantiate some
+akpm> pagecache, then we strip it away again with
+akpm> invalidate_mapping_pages().  That first
+akpm> invalidate_inode_pages2_range() was somewhat of a waste of cycles.
+akpm> But we expect that the next call to generic_file_direct_IO() won't
+akpm> actually call invalidate_inode_pages2_range(), because
+akpm> mapping->nrpages is usually zero.
+akpm> Well, it would have been, back in the days when we were invalidating
+akpm> the whole file.  Now are more efficient and we only invalidate the
+akpm> specific segment of that file.  So if there's a stray pagecache page
+akpm> somewhere at the far end ofthe file, we'll pointlessly call
+akpm> invalidate_inode_pages2_range() every time.  Oh well.
+I don't think it's worth losing sleep over.  I wonder how many applications
+actually mix buffered and unbuffered I/O to the same file.
+Cheers,
+Jeff
+--- linux-2.6.18.i686/mm/filemap.c.orig	2006-10-02 12:59:25.000000000 -0400
++++ linux-2.6.18.i686/mm/filemap.c	2006-10-05 15:06:26.000000000 -0400
+@@ -2350,13 +2350,13 @@ __generic_file_aio_write_nolock(struct k
+ 				unsigned long nr_segs, loff_t *ppos)
+ {
+ 	struct file *file = iocb->ki_filp;
+-	const struct address_space * mapping = file->f_mapping;
++	struct address_space * mapping = file->f_mapping;
+ 	size_t ocount;		/* original count */
+ 	size_t count;		/* after file limit checks */
+ 	struct inode 	*inode = mapping->host;
+ 	unsigned long	seg;
+ 	loff_t		pos;
+-	ssize_t		written;
++	ssize_t		written, written_direct;
+ 	ssize_t		err;
+ 
+ 	ocount = 0;
+@@ -2386,7 +2386,7 @@ __generic_file_aio_write_nolock(struct k
+ 
+ 	/* We can write back this queue in page reclaim */
+ 	current->backing_dev_info = mapping->backing_dev_info;
+-	written = 0;
++	written = written_direct = 0;
+ 
+ 	err = generic_write_checks(file, &pos, &count, S_ISBLK(inode->i_mode));
+ 	if (err)
+@@ -2413,10 +2413,32 @@ __generic_file_aio_write_nolock(struct k
+ 		 */
+ 		pos += written;
+ 		count -= written;
++
++		written_direct = written;
+ 	}
+ 
+ 	written = generic_file_buffered_write(iocb, iov, nr_segs,
+ 			pos, ppos, count, written);
++
++	/*
++	 *  When falling through to buffered I/O, we need to ensure that the
++	 *  page cache pages are written to disk and invalidated to preserve
++	 *  the expected O_DIRECT semantics.
++	 */
++	if (unlikely(file->f_flags & O_DIRECT)) {
++		pgoff_t endbyte = pos + count - 1;
++
++		err = do_sync_file_range(file, pos, endbyte,
++					 SYNC_FILE_RANGE_WAIT_BEFORE|
++					 SYNC_FILE_RANGE_WRITE|
++					 SYNC_FILE_RANGE_WAIT_AFTER);
++		if (err == 0)
++			invalidate_mapping_pages(mapping,
++						 pos >> PAGE_CACHE_SHIFT,
++						 endbyte >> PAGE_CACHE_SHIFT);
++		else
++			written = written_direct;
++	}
+ out:
+ 	current->backing_dev_info = NULL;
+ 	return written ? written : err;
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+More majordomo info at  
+http://vger.kernel.org/majordomo-info.html
+Please read the FAQ at  
+http://www.tux.org/lkml/

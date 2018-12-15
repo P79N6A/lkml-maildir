@@ -1,0 +1,144 @@
+Date: Mon, 16 Apr 2007 18:11:30 +0200
+From: Andreas Gruenbacher <>
+Subject: [nameidata 1/2] Don't pass NULL nameidata to vfs_create
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2007/4/16/170
+
+On Thursday 12 April 2007 12:06, Christoph Hellwig wrote:
+> Once again very strong NACK.  Every conditional passing of vfsmounts get my
+> veto.  As mentioned last time if you really want this send a patch series
+> first that passed the vfsmount consistantly.
+I don't consider it fair to NACK this patch just because some other part of 
+the kernel uses vfs_create() in the wrong way -- those are really independent 
+issues. The bug is not that hard to fix though; here is a proposed patch on 
+top of the other AppArmor patches.
+The offenders are nfsd and the mqueue filesystem. Instantiate a struct 
+nameidata there.
+The .dentry and .mnt fields can easily be filled in in nfsd. The mqueue 
+filesystem is somewhat special: files that mq_open creates are on an internal 
+mount and the mqueue filesystem is not generally visible (it may or may not 
+be mounted). When passing a regular vfsmount to vfs_create the files would 
+appear disconnected while they actually are kernel-internal objects. Use a 
+NULL vfsmount there to avoid that -- passing the kernel-internal vfsmount 
+there wouldn't help, anyway.
+Signed-off-by: Andreas Gruenbacher <agruen@suse.de>
+---
+ fs/namei.c    |    7 ++++---
+ fs/nfsd/vfs.c |   23 +++++++++++++++++++----
+ ipc/mqueue.c  |    6 +++++-
+ 3 files changed, 28 insertions(+), 8 deletions(-)
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@ -1503,7 +1503,7 @@ int vfs_create(struct inode *dir, struct
+ 		return -EACCES;	/* shouldn't it be ENOSYS? */
+ 	mode &= S_IALLUGO;
+ 	mode |= S_IFREG;
+-	error = security_inode_create(dir, dentry, nd ? nd->mnt : NULL, mode);
++	error = security_inode_create(dir, dentry, nd->mnt, mode);
+ 	if (error)
+ 		return error;
+ 	DQUOT_INIT(dir);
+--- a/fs/nfsd/vfs.c
++++ b/fs/nfsd/vfs.c
+@@ -1108,6 +1108,18 @@ nfsd_commit(struct svc_rqst *rqstp, stru
+ }
+ #endif /* CONFIG_NFSD_V3 */
+ 
++static inline int
++nfsd_do_create(struct inode *dir, struct dentry *child, struct vfsmount *mnt,
++	       int mode)
++{
++	struct nameidata nd = {
++		.dentry = child,
++		.mnt = mnt,
++	};
++
++	return vfs_create(dir, child, mode, &nd);
++}
++
+ /*
+  * Create a file (regular, directory, device, fifo); UNIX sockets 
+  * not yet implemented.
+@@ -1192,7 +1204,8 @@ nfsd_create(struct svc_rqst *rqstp, stru
+ 	err = 0;
+ 	switch (type) {
+ 	case S_IFREG:
+-		host_err = vfs_create(dirp, dchild, iap->ia_mode, NULL);
++		host_err = nfsd_do_create(dirp, dchild, exp->ex_mnt,
++					  iap->ia_mode);
+ 		break;
+ 	case S_IFDIR:
+ 		host_err = vfs_mkdir(dirp, dchild, exp->ex_mnt, iap->ia_mode);
+@@ -1253,6 +1266,7 @@ nfsd_create_v3(struct svc_rqst *rqstp, s
+ 	        int *truncp, int *created)
+ {
+ 	struct dentry	*dentry, *dchild = NULL;
++	struct svc_export *exp;
+ 	struct inode	*dirp;
+ 	__be32		err;
+ 	int		host_err;
+@@ -1271,6 +1285,7 @@ nfsd_create_v3(struct svc_rqst *rqstp, s
+ 		goto out;
+ 
+ 	dentry = fhp->fh_dentry;
++	exp = fhp->fh_export;
+ 	dirp = dentry->d_inode;
+ 
+ 	/* Get all the sanity checks out of the way before
+@@ -1288,7 +1303,7 @@ nfsd_create_v3(struct svc_rqst *rqstp, s
+ 	if (IS_ERR(dchild))
+ 		goto out_nfserr;
+ 
+-	err = fh_compose(resfhp, fhp->fh_export, dchild, fhp);
++	err = fh_compose(resfhp, exp, dchild, fhp);
+ 	if (err)
+ 		goto out;
+ 
+@@ -1334,13 +1349,13 @@ nfsd_create_v3(struct svc_rqst *rqstp, s
+ 		goto out;
+ 	}
+ 
+-	host_err = vfs_create(dirp, dchild, iap->ia_mode, NULL);
++	host_err = nfsd_do_create(dirp, dchild, exp->ex_mnt, iap->ia_mode);
+ 	if (host_err < 0)
+ 		goto out_nfserr;
+ 	if (created)
+ 		*created = 1;
+ 
+-	if (EX_ISSYNC(fhp->fh_export)) {
++	if (EX_ISSYNC(exp)) {
+ 		err = nfserrno(nfsd_sync_dir(dentry));
+ 		/* setattr will sync the child (or not) */
+ 	}
+--- a/ipc/mqueue.c
++++ b/ipc/mqueue.c
+@@ -604,6 +604,10 @@ static int mq_attr_ok(struct mq_attr *at
+ static struct file *do_create(struct dentry *dir, struct dentry *dentry,
+ 			int oflag, mode_t mode, struct mq_attr __user *u_attr)
+ {
++	struct nameidata nd = {
++		.dentry = dentry,
++		/* Not a regular create, so set .mnt to NULL. */
++	};
+ 	struct mq_attr attr;
+ 	int ret;
+ 
+@@ -619,7 +623,7 @@ static struct file *do_create(struct den
+ 	}
+ 
+ 	mode &= ~current->fs->umask;
+-	ret = vfs_create(dir->d_inode, dentry, mode, NULL);
++	ret = vfs_create(dir->d_inode, dentry, mode, &nd);
+ 	dentry->d_fsdata = NULL;
+ 	if (ret)
+ 		goto out;
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+More majordomo info at  
+http://vger.kernel.org/majordomo-info.html
+Please read the FAQ at  
+http://www.tux.org/lkml/

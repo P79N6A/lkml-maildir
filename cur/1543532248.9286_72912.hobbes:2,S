@@ -1,0 +1,328 @@
+Date: Wed, 29 Mar 2000 09:26:22 -0300 (BRST)
+From: Rik van Riel <>
+Subject: Re: locking problems
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/3/29/70
+
+On Tue, 28 Mar 2000, Jun Sun wrote:
+> Rik van Riel wrote:
+> > the attached patch contains the code for a very low overhead
+> > fair share scheduler. Unfortunately it hangs on taking locks
+> > in the recalculation code :(
+> > +                       write_lock(&tasklist_lock);
+> > +                       printk(" . . .\n");
+> 
+> The problem might be the write_lock(&tasklist_lock).  Interrupt
+> handlers sometimes call kernel functions that would require a
+> lock on tasklist_lock.  If that interrupt happens during the
+> time you hold write lock on tasklist_lock, a deadlock would
+> happen.
+> 
+> Try using write_lock_irq() to fix that problem.
+Indeed, that was the problem. I was lucky to get a few good
+traces by the NMI oopser that identified this problem. Now
+things are fixed.
+The new patch is attached, for adventurous users. I'm testing
+it on my SMP system now.
+cheers,
+Rik
+--
+The Internet is not a network of computers. It is a network
+of people. That is its real strength.
+Wanna talk about the kernel?  irc.openprojects.net / #kernelnewbies
+http://www.conectiva.com/
+		
+http://www.surriel.com/
+--- linux-2.3.99-pre3/kernel/sched.c.orig	Mon Mar 27 14:05:25 2000
++++ linux-2.3.99-pre3/kernel/sched.c	Wed Mar 29 08:52:38 2000
+@@ -41,6 +41,10 @@
+ 
+ extern void mem_use(void);
+ 
++#ifdef CONFIG_FAIRSCHED
++int fairsched = 0; /* toggle fair scheduler on/off */
++#endif /* CONFIG_FAIRSCHED */
++
+ /*
+  *	Init task must be ok at boot for the ix86 as we will check its signals
+  *	via the SMP irq return path.
+@@ -61,6 +65,7 @@
+  */
+ spinlock_t runqueue_lock = SPIN_LOCK_UNLOCKED;  /* second */
+ rwlock_t tasklist_lock = RW_LOCK_UNLOCKED;	/* third */
++spinlock_t recalc_lock = SPIN_LOCK_UNLOCKED;
+ 
+ static LIST_HEAD(runqueue_head);
+ 
+@@ -600,10 +605,68 @@
+ 	{
+ 		struct task_struct *p;
+ 		spin_unlock_irq(&runqueue_lock);
+-		read_lock(&tasklist_lock);
+-		for_each_task(p)
+-			p->counter = (p->counter >> 1) + p->priority;
++#ifdef CONFIG_FAIRSCHED
++		if (!fairsched) {
++#endif /* ! CONFIG_FAIRSCHED */
++			read_lock(&tasklist_lock);
++			for_each_task(p)
++				p->counter = (p->counter >> 1) + p->priority;
++			read_unlock(&tasklist_lock);
++#ifdef CONFIG_FAIRSCHED
++	/*
++	 * Simple, low-overhead fair share scheduler. It works by handing
++	 * out CPU time like we do at the normal recalculation.
++	 * The catch is that we move the list head (where the for_each_task()
++	 * loop starts) to _after_ the first task where we ran out of quota.
++	 * This means that if a user has too many runnable processes, his
++	 * tasks will get extra CPU time here in turns. -- Rik
++	 */
++		} else {
++			struct task_struct *ran_out = NULL;
++			struct user_struct *up;
++			long oldcounter;
++			local_irq_disable();
++			if (!spin_trylock(&recalc_lock)) {
++				local_irq_enable();
++				goto repeat_schedule;
++			}
++			write_lock(&tasklist_lock);
++			for_each_task(p) {
++				up = p->user;
++				if (!up) {
++					p->counter = (p->counter >> 1) + p->priority;
++					continue;
++				}
++				if (!up->cpu_ticks)
++					continue;
++				oldcounter = p->counter;
++				p->counter = (p->counter >> 1) + p->priority;
++				up->cpu_ticks += oldcounter;
++				up->cpu_ticks -= p->counter;
++				if (ran_out == NULL && up->cpu_ticks <= 0) {
++					up->cpu_ticks = 0;
++					ran_out = p;
++				}
++			}
++
++			if (ran_out) {
++				move_tq_head(ran_out);
++			}
++			write_unlock(&tasklist_lock);
++
++			read_lock(&uidhash_lock);
++			for_each_user_struct(up) {
++				/* replace DEF_PRIORITY with user quota */
++				up->cpu_ticks = (up->cpu_ticks >> 1) + DEF_PRIORITY;
++			}
++			read_unlock(&uidhash_lock);
++			spin_unlock(&recalc_lock);
++			local_irq_enable();
++		}
++#else /* ! CONFIG_FAIRSCHED */
++		}
+ 		read_unlock(&tasklist_lock);
++#endif /* CONFIG_FAIRSCHED */
+ 		spin_lock_irq(&runqueue_lock);
+ 	}
+ 	goto repeat_schedule;
+--- linux-2.3.99-pre3/kernel/fork.c.orig	Mon Mar 27 16:05:45 2000
++++ linux-2.3.99-pre3/kernel/fork.c	Tue Mar 28 11:49:56 2000
+@@ -17,6 +17,7 @@
+ #include <linux/smp_lock.h>
+ #include <linux/module.h>
+ #include <linux/vmalloc.h>
++#include <linux/sched.h>
+ 
+ #include <asm/pgtable.h>
+ #include <asm/pgalloc.h>
+@@ -44,13 +45,16 @@
+  */
+ #define UIDHASH_SZ	(PIDHASH_SZ >> 2)
+ 
+-static struct user_struct {
+-	atomic_t count;
+-	struct user_struct *next, **pprev;
+-	unsigned int uid;
+-} *uidhash[UIDHASH_SZ];
++struct user_struct *uidhash[UIDHASH_SZ];
++struct user_struct uidhead = {
++	ATOMIC_INIT(0),
++	NULL, (struct user_struct **) NULL,
++	&uidhead, &uidhead,
++	0,
++	0,
++};
+ 
+-spinlock_t uidhash_lock = SPIN_LOCK_UNLOCKED;
++rwlock_t uidhash_lock = RW_LOCK_UNLOCKED;
+ 
+ kmem_cache_t *uid_cachep;
+ 
+@@ -65,6 +69,10 @@
+ 		uidhash[hashent]->pprev = &up->next;
+ 	up->pprev = &uidhash[hashent];
+ 	uidhash[hashent] = up;
++	up->l_next = uidhead.l_next;
++	up->l_prev = &uidhead;
++	uidhead.l_next->l_prev = up;
++	uidhead.l_next = up;
+ }
+ 
+ static inline void uid_hash_remove(struct user_struct *up)
+@@ -72,6 +80,8 @@
+ 	if(up->next)
+ 		up->next->pprev = up->pprev;
+ 	*up->pprev = up->next;
++	up->l_prev->l_next = up->l_prev;
++	up->l_next->l_prev = up->l_next;
+ }
+ 
+ static inline struct user_struct *uid_hash_find(unsigned short uid, unsigned int hashent)
+@@ -111,12 +121,12 @@
+ 	if (up) {
+ 		p->user = NULL;
+ 		if (atomic_dec_and_test(&up->count)) {
+-			spin_lock(&uidhash_lock);
++			write_lock(&uidhash_lock);
+ 			if (uid_hash_free(up)) {
+ 				uid_hash_remove(up);
+ 				kmem_cache_free(uid_cachep, up);
+ 			}
+-			spin_unlock(&uidhash_lock);
++			write_unlock(&uidhash_lock);
+ 		}
+ 	}
+ }
+@@ -126,9 +136,9 @@
+ 	unsigned int hashent = uidhashfn(p->uid);
+ 	struct user_struct *up;
+ 
+-	spin_lock(&uidhash_lock);
++	read_lock(&uidhash_lock);
+ 	up = uid_hash_find(p->uid, hashent);
+-	spin_unlock(&uidhash_lock);
++	read_unlock(&uidhash_lock);
+ 
+ 	if (!up) {
+ 		struct user_struct *new;
+@@ -138,12 +148,13 @@
+ 			return -EAGAIN;
+ 		new->uid = p->uid;
+ 		atomic_set(&new->count, 1);
++		new->cpu_ticks = DEF_PRIORITY;
+ 
+ 		/*
+ 		 * Before adding this, check whether we raced
+ 		 * on adding the same user already..
+ 		 */
+-		spin_lock(&uidhash_lock);
++		write_lock(&uidhash_lock);
+ 		up = uid_hash_find(p->uid, hashent);
+ 		if (up) {
+ 			kmem_cache_free(uid_cachep, new);
+@@ -151,7 +162,7 @@
+ 			uid_hash_insert(new, hashent);
+ 			up = new;
+ 		}
+-		spin_unlock(&uidhash_lock);
++		write_unlock(&uidhash_lock);
+ 
+ 	}
+ 	p->user = up;
+--- linux-2.3.99-pre3/kernel/sysctl.c.orig	Mon Mar 27 16:56:50 2000
++++ linux-2.3.99-pre3/kernel/sysctl.c	Mon Mar 27 17:03:54 2000
+@@ -46,6 +46,7 @@
+ extern int sysctl_overcommit_memory;
+ extern int max_threads;
+ extern int nr_queued_signals, max_queued_signals;
++extern int fairsched;
+ 
+ /* this is needed for the proc_dointvec_minmax for [fs_]overflow UID and GID */
+ static int maxolduid = 65535;
+@@ -222,6 +223,10 @@
+ 	{KERN_OVERFLOWGID, "overflowgid", &overflowgid, sizeof(int), 0644, NULL,
+ 	 &proc_dointvec_minmax, &sysctl_intvec, NULL,
+ 	 &minolduid, &maxolduid},
++#ifdef CONFIG_FAIRSCHED
++	{KERN_FAIRSCHED, "fairsched", &fairsched, sizeof(int),
++	 0644, NULL, &proc_dointvec},
++#endif
+ 	{0}
+ };
+ 
+--- linux-2.3.99-pre3/include/linux/sched.h.orig	Mon Mar 27 14:07:14 2000
++++ linux-2.3.99-pre3/include/linux/sched.h	Tue Mar 28 11:47:12 2000
+@@ -255,7 +255,13 @@
+  * Right now it is only used to track how many processes a
+  * user has, but it has the potential to track memory usage etc.
+  */
+-struct user_struct;
++struct user_struct {
++	atomic_t count;
++	struct user_struct *next, **pprev;
++	struct user_struct *l_next, *l_prev;
++	unsigned int uid;
++	long cpu_ticks;
++};
+ 
+ struct task_struct {
+ /* these are hardcoded - don't touch */
+@@ -448,6 +454,8 @@
+ /* PID hashing. (shouldnt this be dynamic?) */
+ #define PIDHASH_SZ (4096 >> 2)
+ extern struct task_struct *pidhash[PIDHASH_SZ];
++extern struct user_struct uidhead;
++extern rwlock_t uidhash_lock;
+ 
+ #define pid_hashfn(x)	((((x) >> 8) ^ (x)) & (PIDHASH_SZ - 1))
+ 
+@@ -822,6 +830,18 @@
+ #define for_each_task(p) \
+ 	for (p = &init_task ; (p = p->next_task) != &init_task ; )
+ 
++#define for_each_user_struct(up) \
++	for (up = &uidhead ; (up = up->l_next) != &uidhead ; )
++
++static inline void move_tq_head(struct task_struct * ran_out)
++{
++	init_task.prev_task->next_task = init_task.next_task;
++	init_task.next_task->prev_task = init_task.prev_task;
++	init_task.next_task = (ran_out)->next_task;
++	init_task.prev_task = (ran_out);
++	(ran_out)->next_task->prev_task = &init_task;
++	(ran_out)->next_task = &init_task;
++}
+ 
+ static inline void del_from_runqueue(struct task_struct * p)
+ {
+--- linux-2.3.99-pre3/include/linux/sysctl.h.orig	Mon Mar 27 16:55:49 2000
++++ linux-2.3.99-pre3/include/linux/sysctl.h	Mon Mar 27 16:56:41 2000
+@@ -112,6 +112,7 @@
+ 	KERN_OVERFLOWUID=46,	/* int: overflow UID */
+ 	KERN_OVERFLOWGID=47,	/* int: overflow GID */
+ 	KERN_SHMPATH=48,	/* string: path to shm fs */
++	KERN_FAIRSCHED=49,	/* turn fair scheduler on/off */
+ };
+ 
+ 
+--- linux-2.3.99-pre3/arch/i386/config.in.orig	Mon Mar 27 17:04:26 2000
++++ linux-2.3.99-pre3/arch/i386/config.in	Mon Mar 27 17:06:56 2000
+@@ -138,6 +138,9 @@
+    source drivers/pcmcia/Config.in
+ fi
+ 
++if [ "$CONFIG_EXPERIMENTAL" = "y" ] ; then
++   bool 'Fair scheduler' CONFIG_FAIRSCHED
++fi
+ bool 'System V IPC' CONFIG_SYSVIPC
+ bool 'BSD Process Accounting' CONFIG_BSD_PROCESS_ACCT
+ bool 'Sysctl support' CONFIG_SYSCTL
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

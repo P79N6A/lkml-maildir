@@ -1,0 +1,294 @@
+Date: Wed, 21 Jan 2004 18:12:06 -0200 (BRST)
+From: Marcelo Tosatti <>
+Subject: Re: Linux 2.4.25-pre6
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2004/1/21/142
+
+On Wed, 21 Jan 2004, Lukasz Trabinski wrote:
+> On Wed, 21 Jan 2004, David Woodhouse wrote:
+>
+> > Neither do I understand why i_list.prev is corrupt. Not seeing the oops
+> > and knowing what it actually was doesn't help. Rik?
+>
+> I have logs from this host on different machine - no ooops.
+>
+> Emergency Sync and Emergency Remount R/O didn't work.
+>
+> SysRq : HELP : loglevel0-8 reBoot tErm kIll saK showMem showPc unRaw Sync
+> showTa
+> sks Unmount
+> SysRq : Emergency Sync
+> SysRq : Emergency Remount R/O
+Lukasz,
+Lets try the clueless approach and remove the inode reclaim highmem fixes
+from Rik.
+Please revert the attached patch (againts -pre6).
+Thank you for yours efforts helping track the problem down :)diff -Naur -p -X /home/marcelo/lib/dontdiff linux-2.4.24/fs/inode.c linux-2.4.25-pre6/fs/inode.c
+--- linux-2.4.24/fs/inode.c	2004-01-21 19:33:33.000000000 +0000
++++ linux-2.4.25-pre6/fs/inode.c	2004-01-21 19:26:26.000000000 +0000
+@@ -49,8 +49,7 @@ static unsigned int i_hash_shift;
+  * other linked list is the "type" list:
+  *  "in_use" - valid inode, i_count > 0, i_nlink > 0
+  *  "dirty"  - as "in_use" but also dirty
+- *  "unused" - valid inode, i_count = 0, no pages in the pagecache
+- *  "unused_pagecache" - valid inode, i_count = 0, data in the pagecache
++ *  "unused" - valid inode, i_count = 0
+  *
+  * A "dirty" list is maintained for each super block,
+  * allowing for low-overhead inode sync() operations.
+@@ -58,7 +57,6 @@ static unsigned int i_hash_shift;
+ 
+ static LIST_HEAD(inode_in_use);
+ static LIST_HEAD(inode_unused);
+-static LIST_HEAD(inode_unused_pagecache);
+ static struct list_head *inode_hashtable;
+ static LIST_HEAD(anon_hash_chain); /* for inodes with NULL i_sb */
+ 
+@@ -127,10 +125,10 @@ static void destroy_inode(struct inode *
+ {
+ 	if (inode_has_buffers(inode))
+ 		BUG();
+-	/* Reinitialise the waitqueue head because __wait_on_freeing_inode()
+-	   may have left stale entries on it which it can't remove (since
+-	   it knows we're freeing the inode right now */
+-	init_waitqueue_head(&inode->i_wait);
++       /* Reinitialise the waitqueue head because __wait_on_freeing_inode()
++          may have left stale entries on it which it can't remove (since
++          it knows we're freeing the inode right now */
++        init_waitqueue_head(&inode->i_wait);
+ 	if (inode->i_sb->s_op->destroy_inode)
+ 		inode->i_sb->s_op->destroy_inode(inode);
+ 	else
+@@ -254,10 +252,9 @@ static inline void wait_on_inode(struct 
+  * ->read_inode, and we want to be sure that evidence of the deletion is found
+  * by ->read_inode.
+  *
+- * Unlike the 2.6 version, this call call cannot return early, since inodes
+- * do not share wait queue. Therefore, we don't call remove_wait_queue(); it
+- * would be dangerous to do so since the inode may have already been freed, 
+- * and it's unnecessary, since the inode is definitely going to get freed.
++ * This call might return early if an inode which shares the waitq is woken up.
++ * This is most easily handled by the caller which will loop around again
++ * looking for the inode.
+  *
+  * This is called with inode_lock held.
+  */
+@@ -293,36 +290,6 @@ static inline void __iget(struct inode *
+ 	inodes_stat.nr_unused--;
+ }
+ 
+-static inline void __refile_inode(struct inode *inode)
+-{
+-	struct list_head *to;
+-
+-	if (inode->i_state & I_FREEING)
+-		return;
+-	if (list_empty(&inode->i_hash))
+-		return;
+-
+-	if (inode->i_state & I_DIRTY)
+-		to = &inode->i_sb->s_dirty;
+-	else if (atomic_read(&inode->i_count))
+-		to = &inode_in_use;
+-	else if (inode->i_data.nrpages)
+-		to = &inode_unused_pagecache;
+-	else
+-		to = &inode_unused;
+-	list_del(&inode->i_list);
+-	list_add(&inode->i_list, to);
+-}
+-
+-void refile_inode(struct inode *inode)
+-{
+-	if (!inode)
+-		return;
+-	spin_lock(&inode_lock);
+-	__refile_inode(inode);
+-	spin_unlock(&inode_lock);
+-}
+-
+ static inline void __sync_one(struct inode *inode, int sync)
+ {
+ 	unsigned dirty;
+@@ -349,7 +316,17 @@ static inline void __sync_one(struct ino
+ 
+ 	spin_lock(&inode_lock);
+ 	inode->i_state &= ~I_LOCK;
+-	__refile_inode(inode);
++	if (!(inode->i_state & I_FREEING)) {
++		struct list_head *to;
++		if (inode->i_state & I_DIRTY)
++			to = &inode->i_sb->s_dirty;
++		else if (atomic_read(&inode->i_count))
++			to = &inode_in_use;
++		else
++			to = &inode_unused;
++		list_del(&inode->i_list);
++		list_add(&inode->i_list, to);
++	}
+ 	wake_up(&inode->i_wait);
+ }
+ 
+@@ -726,7 +703,6 @@ int invalidate_inodes(struct super_block
+ 	spin_lock(&inode_lock);
+ 	busy = invalidate_list(&inode_in_use, sb, &throw_away);
+ 	busy |= invalidate_list(&inode_unused, sb, &throw_away);
+-	busy |= invalidate_list(&inode_unused_pagecache, sb, &throw_away);
+ 	busy |= invalidate_list(&sb->s_dirty, sb, &throw_away);
+ 	busy |= invalidate_list(&sb->s_locked_inodes, sb, &throw_away);
+ 	spin_unlock(&inode_lock);
+@@ -790,7 +766,7 @@ void prune_icache(int goal)
+ {
+ 	LIST_HEAD(list);
+ 	struct list_head *entry, *freeable = &list;
+-	int count, avg_pages;
++	int count;
+ 	struct inode * inode;
+ 
+ 	spin_lock(&inode_lock);
+@@ -813,7 +789,7 @@ void prune_icache(int goal)
+ 		list_add(tmp, freeable);
+ 		inode->i_state |= I_FREEING;
+ 		count++;
+-		if (--goal <= 0)
++		if (!--goal)
+ 			break;
+ 	}
+ 	inodes_stat.nr_unused -= count;
+@@ -827,71 +803,8 @@ void prune_icache(int goal)
+ 	 * from here or we're either synchronously dogslow
+ 	 * or we deadlock with oom.
+ 	 */
+-	if (goal > 0)
++	if (goal)
+ 		schedule_task(&unused_inodes_flush_task);
+-
+-#ifdef CONFIG_HIGHMEM
+-	/*
+-	 * On highmem machines it is possible to have low memory
+-	 * filled with inodes that cannot be reclaimed because they
+-	 * have page cache pages in highmem attached to them.
+-	 * This could deadlock the system if the memory used by
+-	 * inodes is significant compared to the amount of freeable
+-	 * low memory.  In that case we forcefully remove the page
+-	 * cache pages from the inodes we want to reclaim.
+-	 *
+-	 * Note that this loop doesn't actually reclaim the inodes;
+-	 * once the last pagecache pages belonging to the inode is
+-	 * gone it will be placed on the inode_unused list and the
+-	 * loop above will prune it the next time prune_icache() is
+-	 * called.
+-	 */
+-	if (goal <= 0)
+-		return;
+-	if (inodes_stat.nr_unused * sizeof(struct inode) * 10 <
+-				freeable_lowmem() * PAGE_SIZE)
+-		return;
+-
+-	wakeup_bdflush();
+-
+-	avg_pages = page_cache_size;
+-	avg_pages -= atomic_read(&buffermem_pages) + swapper_space.nrpages;
+-	avg_pages = avg_pages / (inodes_stat.nr_inodes + 1);
+-	spin_lock(&inode_lock);
+-	while (goal-- > 0) {
+-		if (list_empty(&inode_unused_pagecache))
+-			break;
+-		entry = inode_unused_pagecache.prev;
+-		list_del(entry);
+-		list_add(entry, &inode_unused_pagecache);
+-
+-		inode = INODE(entry);
+-		/* Don't nuke inodes with lots of page cache attached. */
+-		if (inode->i_mapping->nrpages > 5 * avg_pages)
+-			continue;
+-		/* Because of locking we grab the inode and unlock the list .*/
+-		if (inode->i_state & I_LOCK)
+-			continue;
+-		inode->i_state |= I_LOCK;
+-		spin_unlock(&inode_lock);
+-
+-		/*
+-		 * If the inode has clean pages only, we can free all its
+-		 * pagecache memory; the inode will automagically be refiled
+-		 * onto the unused_list.  The wakeup_bdflush above makes
+-		 * sure that all inodes become clean eventually.
+-		 */
+-		if (list_empty(&inode->i_mapping->dirty_pages) &&
+-				!inode_has_buffers(inode))
+-			invalidate_inode_pages(inode);
+-
+-		/* Release the inode again. */
+-		spin_lock(&inode_lock);
+-		inode->i_state &= ~I_LOCK;
+-		wake_up(&inode->i_wait);
+-	}
+-	spin_unlock(&inode_lock);
+-#endif /* CONFIG_HIGHMEM */
+ }
+ 
+ int shrink_icache_memory(int priority, int gfp_mask)
+diff -Naur -p -X /home/marcelo/lib/dontdiff linux-2.4.24/include/linux/fs.h linux-2.4.25-pre6/include/linux/fs.h
+--- linux-2.4.24/include/linux/fs.h	2004-01-21 19:33:48.000000000 +0000
++++ linux-2.4.25-pre6/include/linux/fs.h	2004-01-21 18:57:13.000000000 +0000
+@@ -1399,7 +1399,6 @@ extern struct dentry * lookup_hash(struc
+ extern void inode_init_once(struct inode *);
+ extern void __inode_init_once(struct inode *);
+ extern void iput(struct inode *);
+-extern void refile_inode(struct inode *inode);
+ extern void force_delete(struct inode *);
+ extern struct inode * igrab(struct inode *);
+ extern struct inode * ilookup(struct super_block *, unsigned long);
+diff -Naur -p -X /home/marcelo/lib/dontdiff linux-2.4.24/include/linux/swap.h linux-2.4.25-pre6/include/linux/swap.h
+--- linux-2.4.24/include/linux/swap.h	2004-01-21 19:33:49.000000000 +0000
++++ linux-2.4.25-pre6/include/linux/swap.h	2004-01-21 18:57:13.000000000 +0000
+@@ -85,7 +85,6 @@ extern int nr_swap_pages;
+ 
+ extern unsigned int nr_free_pages(void);
+ extern unsigned int nr_free_buffer_pages(void);
+-extern unsigned int freeable_lowmem(void);
+ extern int nr_active_pages;
+ extern int nr_inactive_pages;
+ extern unsigned long page_cache_size;
+diff -Naur -p -X /home/marcelo/lib/dontdiff linux-2.4.24/mm/filemap.c linux-2.4.25-pre6/mm/filemap.c
+--- linux-2.4.24/mm/filemap.c	2004-01-21 19:33:50.000000000 +0000
++++ linux-2.4.25-pre6/mm/filemap.c	2004-01-21 18:57:13.000000000 +0000
+@@ -102,8 +102,6 @@ static inline void remove_page_from_inod
+ 	page->mapping = NULL;
+ 	wmb();
+ 	mapping->nrpages--;
+-	if (!mapping->nrpages)
+-		refile_inode(mapping->host);
+ }
+ 
+ static inline void remove_page_from_hash_queue(struct page * page)
+diff -Naur -p -X /home/marcelo/lib/dontdiff linux-2.4.24/mm/page_alloc.c linux-2.4.25-pre6/mm/page_alloc.c
+--- linux-2.4.24/mm/page_alloc.c	2004-01-21 19:33:50.000000000 +0000
++++ linux-2.4.25-pre6/mm/page_alloc.c	2004-01-21 18:57:13.000000000 +0000
+@@ -534,23 +534,6 @@ unsigned int nr_free_highpages (void)
+ 
+ 	return pages;
+ }
+-
+-unsigned int freeable_lowmem(void)
+-{
+-	unsigned int pages = 0;
+-	pg_data_t *pgdat;
+-
+-	for_each_pgdat(pgdat) {
+-		pages += pgdat->node_zones[ZONE_DMA].free_pages;
+-		pages += pgdat->node_zones[ZONE_DMA].nr_active_pages;
+-		pages += pgdat->node_zones[ZONE_DMA].nr_inactive_pages;
+-		pages += pgdat->node_zones[ZONE_NORMAL].free_pages;
+-		pages += pgdat->node_zones[ZONE_NORMAL].nr_active_pages;
+-		pages += pgdat->node_zones[ZONE_NORMAL].nr_inactive_pages;
+-	}
+-
+-	return pages;
+-}
+ #endif
+ 
+ #define K(x) ((x) << (PAGE_SHIFT-10))

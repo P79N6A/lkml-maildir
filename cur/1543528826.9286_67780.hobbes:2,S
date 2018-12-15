@@ -1,0 +1,363 @@
+Date: Mon, 06 Mar 2000 17:52:40 -0500
+From: Larry Woodman <>
+Subject: Re: very large directories
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/3/6/176
+
+nbecker@fred.net wrote:
+> A coworker has an application that produces 10's of thousands of small
+> files.  It seems the performance of even a simple operation, such as
+> 'rm -rf' or find | xargs rm is very very slow.
+>
+> What are the mechanisms that limit performance?  Is it the type of
+> data structure used to represent directories?
+>
+> -
+> To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+> the body of a message to majordomo@vger.rutgers.edu
+> Please read the FAQ at 
+http://www.tux.org/lkml/
+I think  Anne Milicia <milicia@missioncriticallinux.com> submitted a fix for
+this problem to linux-fsdevel on 1/14/2000.
+Here it is!!!
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+The improvement is most dramatic using dentry->d_fsdata to get directly
+to the directory entry on a remove.  This example shows a good
+improvement
+for creating 4 directories with 40000 files each of size 0 (touch).
+With original 2.3.39 kernel:
+[root@lab1 /tmp]# time /usr/local/bin/mktree tree 2 4 40000 0
+293.82user 3083.60system 55:41.29elapsed
+[root@lab1 /tmp]# time find tree -print | wc -l
+0.28user 0.22system 0:00.54elapsed
+ 160005
+[root@lab1 /tmp]# time rm -rf tree
+0.66user 211.36system 3:36.62elapsed
+With changes to fs/ext2/namei.c:
+[root@lab1 /tmp]# time /usr/local/bin/mktree tree 2 4 40000 0
+291.76user 1577.31system 30:33.83elapsed
+[root@lab1 /tmp]# time find tree -print | wc -l
+0.34user 0.22system 0:00.62elapsed
+ 160005
+[root@lab1 /tmp]# time rm -rf tree
+0.45user 4.34system 0:08.15elapsed
+The changes for the 2.3.39 fs/ext2/namei.c are attached.
+Thanks,
+Anne   milicia@missioncriticallinux.com
+http://www.missioncriticallinux.com
+--- namei.c.orig        Thu Jan 13 13:14:28 2000
++++ namei.c     Thu Jan 13 13:14:20 2000
+@@ -57,23 +57,56 @@
+  * entry - you'll have to do that yourself if you want to.
+  */
+ static struct buffer_head * ext2_find_entry (struct inode * dir,
+-                                            const char * const name, int
+namelen,
++                                            struct dentry * dentry,
+                                             struct ext2_dir_entry_2 **
+res_dir)
+ {
+        struct super_block * sb;
+        struct buffer_head * bh_use[NAMEI_RA_SIZE];
+        struct buffer_head * bh_read[NAMEI_RA_SIZE];
+-       unsigned long offset;
++       const char * name;
++       int namelen;
++       unsigned long offset, first_fit;
++       unsigned short rec_len;
+        int block, toread, i, err;
+        *res_dir = NULL;
+        sb = dir->i_sb;
++       namelen = dentry->d_name.len;
++       name = dentry->d_name.name;
+        if (namelen > EXT2_NAME_LEN)
+                return NULL;
++       if (dentry->d_fsdata && dentry->d_inode) {
++               struct buffer_head * bh;
++               struct ext2_dir_entry_2 * de;
++               offset = (ulong)dentry->d_fsdata;
++               bh = ext2_bread(dir, offset >> EXT2_BLOCK_SIZE_BITS(sb),
++                               0, &err);
++               if (bh) {
++                       de = (struct ext2_dir_entry_2 *)(bh->b_data +
++                             (offset & (EXT2_BLOCK_SIZE(sb) - 1)));
++                       if ((char *)de + namelen <=
++                           bh->b_data + EXT2_BLOCK_SIZE(sb) &&
++                           ext2_match (namelen, name, de) &&
++                           ext2_check_dir_entry("ext2_find_entry", dir, de,
++                                                bh, offset)) {
++                               *res_dir = de;
++                               return bh;
++                       }
++                       printk(KERN_ERR "ext2_find_entry: bad
+dentry->d_fsdata %lu for %s\n",
++                               offset, name);
++                       brelse(bh);
++               } else {
++                       printk(KERN_ERR "ext2_find_entry: bad
+dentry->d_fsdata %lu for %s, buffer not returned\n",
++                               offset, name);
++               }
++       }
++
+        memset (bh_use, 0, sizeof (bh_use));
+        toread = 0;
++       first_fit = 0;
++       rec_len = EXT2_DIR_REC_LEN(namelen);
+        for (block = 0; block < NAMEI_RA_SIZE; ++block) {
+                struct buffer_head * bh;
+@@ -131,12 +164,19 @@
+                                                brelse (bh_use[i]);
+                                }
+                                *res_dir = de;
++                               (ulong)dentry->d_fsdata = offset;
+                                return bh;
+                        }
+                        /* prevent looping on a bad block */
+                        de_len = le16_to_cpu(de->rec_len);
+                        if (de_len <= 0)
+                                goto failure;
++                       if (!first_fit &&
++                           ((le32_to_cpu(de->inode) == 0 &&
++                            de_len >= rec_len) ||
++                           (de_len >= EXT2_DIR_REC_LEN(de->name_len) +
+rec_len))) {
++                               first_fit = offset;
++                       }
+                        offset += de_len;
+                        de = (struct ext2_dir_entry_2 *)
+                                ((char *) de + de_len);
+@@ -156,6 +196,7 @@
+ failure:
+        for (i = 0; i < NAMEI_RA_SIZE; ++i)
+                brelse (bh_use[i]);
++       (ulong)dentry->d_fsdata = first_fit;
+        return NULL;
+ }
+@@ -168,7 +209,7 @@
+        if (dentry->d_name.len > EXT2_NAME_LEN)
+                return ERR_PTR(-ENAMETOOLONG);
+-       bh = ext2_find_entry (dir, dentry->d_name.name, dentry->d_name.len,
+&de);
++       bh = ext2_find_entry (dir, dentry, &de);
+        inode = NULL;
+        if (bh) {
+                unsigned long ino = le32_to_cpu(de->inode);
+@@ -193,15 +234,17 @@
+  * the entry, as someone else might have used it while you slept.
+  */
+ static struct buffer_head * ext2_add_entry (struct inode * dir,
+-                                           const char * name, int namelen,
++                                           struct dentry * dentry,
+                                            struct ext2_dir_entry_2 **
+res_dir,
+                                            int *err)
+ {
+-       unsigned long offset;
++       unsigned long offset, start, end;
+        unsigned short rec_len;
+        struct buffer_head * bh;
+        struct ext2_dir_entry_2 * de, * de1;
+        struct super_block * sb;
++       const char * name;
++       int namelen, create, block;
+        *err = -EINVAL;
+        *res_dir = NULL;
+@@ -209,6 +252,8 @@
+                return NULL;
+        sb = dir->i_sb;
++       namelen = dentry->d_name.len;
++       name = dentry->d_name.name;
+        if (!namelen)
+                return NULL;
+        /*
+@@ -219,18 +264,36 @@
+                *err = -ENOENT;
+                return NULL;
+        }
+-       bh = ext2_bread (dir, 0, 0, err);
++       block = 0;
++       if (dentry->d_fsdata && (ulong)dentry->d_fsdata < dir->i_size)
++               block = (ulong)dentry->d_fsdata >> EXT2_BLOCK_SIZE_BITS(sb);
++       start = offset = block << EXT2_BLOCK_SIZE_BITS(sb);
++       end = dir->i_size;
++       create = 0;
++       (ulong)dentry->d_fsdata = 0;
++
++       bh = ext2_bread (dir, block, 0, err);
+        if (!bh)
+                return NULL;
+        rec_len = EXT2_DIR_REC_LEN(namelen);
+-       offset = 0;
+        de = (struct ext2_dir_entry_2 *) bh->b_data;
+        *err = -ENOSPC;
+        while (1) {
+                if ((char *)de >= sb->s_blocksize + bh->b_data) {
+                        brelse (bh);
++                       if (end <= offset ) {
++                               if (start && offset > start) {
++                                       offset = 0;
++                                       end = start;
++                                       start = 0;
++                               } else {
++                                       offset = dir->i_size;
++                                       create = 1;
++                               }
++                       }
+                        bh = NULL;
+-                       bh = ext2_bread (dir, offset >>
+EXT2_BLOCK_SIZE_BITS(sb), 1, err);
++                       bh = ext2_bread (dir, offset >>
+EXT2_BLOCK_SIZE_BITS(sb),
++                                        create, err);
+                        if (!bh)
+                                return NULL;
+                        if (dir->i_size <= offset) {
+@@ -267,6 +330,7 @@
+                }
+                if ((le32_to_cpu(de->inode) == 0 && le16_to_cpu(de->rec_len)
+>= rec_len) ||
+                    (le16_to_cpu(de->rec_len) >=
+EXT2_DIR_REC_LEN(de->name_len) + rec_len)) {
++                       (ulong)dentry->d_fsdata = offset;
+                        offset += le16_to_cpu(de->rec_len);
+                        if (le32_to_cpu(de->inode)) {
+                                de1 = (struct ext2_dir_entry_2 *) ((char *)
+de +
+@@ -274,6 +338,7 @@
+                                de1->rec_len =
+cpu_to_le16(le16_to_cpu(de->rec_len) -
+                                        EXT2_DIR_REC_LEN(de->name_len));
+                                de->rec_len =
+cpu_to_le16(EXT2_DIR_REC_LEN(de->name_len));
++                               (ulong)dentry->d_fsdata +=
+EXT2_DIR_REC_LEN(de->name_len);
+                                de = de1;
+                        }
+                        de->inode = 0;
+@@ -384,7 +449,7 @@
+        inode->i_op = &ext2_file_inode_operations;
+        inode->i_mode = mode;
+        mark_inode_dirty(inode);
+-       bh = ext2_add_entry (dir, dentry->d_name.name, dentry->d_name.len,
+&de, &err);
++       bh = ext2_add_entry (dir, dentry, &de, &err);
+        if (!bh) {
+                inode->i_nlink--;
+                mark_inode_dirty(inode);
+@@ -417,7 +482,7 @@
+        inode->i_uid = current->fsuid;
+        init_special_inode(inode, mode, rdev);
+-       bh = ext2_add_entry (dir, dentry->d_name.name, dentry->d_name.len,
+&de, &err);
++       bh = ext2_add_entry (dir, dentry, &de, &err);
+        if (!bh)
+                goto out_no_entry;
+        de->inode = cpu_to_le32(inode->i_ino);
+@@ -487,7 +552,7 @@
+        if (dir->i_mode & S_ISGID)
+                inode->i_mode |= S_ISGID;
+        mark_inode_dirty(inode);
+-       bh = ext2_add_entry (dir, dentry->d_name.name, dentry->d_name.len,
+&de, &err);
++       bh = ext2_add_entry (dir, dentry, &de, &err);
+        if (!bh)
+                goto out_no_entry;
+        de->inode = cpu_to_le32(inode->i_ino);
+@@ -584,7 +649,7 @@
+        struct ext2_dir_entry_2 * de;
+        retval = -ENOENT;
+-       bh = ext2_find_entry (dir, dentry->d_name.name, dentry->d_name.len,
+&de);
++       bh = ext2_find_entry (dir, dentry, &de);
+        if (!bh)
+                goto end_rmdir;
+@@ -620,6 +685,7 @@
+        inode->i_ctime = dir->i_ctime = dir->i_mtime = CURRENT_TIME;
+        dir->u.ext2_i.i_flags &= ~EXT2_BTREE_FL;
+        mark_inode_dirty(dir);
++       dentry->d_fsdata = 0;
+        d_delete(dentry);
+ end_rmdir:
+@@ -635,7 +701,7 @@
+        struct ext2_dir_entry_2 * de;
+        retval = -ENOENT;
+-       bh = ext2_find_entry (dir, dentry->d_name.name, dentry->d_name.len,
+&de);
++       bh = ext2_find_entry (dir, dentry, &de);
+        if (!bh)
+                goto end_unlink;
+@@ -668,6 +734,7 @@
+        mark_inode_dirty(inode);
+        inode->i_ctime = dir->i_ctime;
+        retval = 0;
++       dentry->d_fsdata = 0;
+        d_delete(dentry);       /* This also frees the inode */
+ end_unlink:
+@@ -705,7 +772,7 @@
+        }
+        mark_inode_dirty(inode);
+-       bh = ext2_add_entry (dir, dentry->d_name.name, dentry->d_name.len,
+&de, &err);
++       bh = ext2_add_entry (dir, dentry, &de, &err);
+        if (!bh)
+                goto out_no_entry;
+        de->inode = cpu_to_le32(inode->i_ino);
+@@ -743,7 +810,7 @@
+        if (inode->i_nlink >= EXT2_LINK_MAX)
+                return -EMLINK;
+-       bh = ext2_add_entry (dir, dentry->d_name.name, dentry->d_name.len,
+&de, &err);
++       bh = ext2_add_entry (dir, dentry, &de, &err);
+        if (!bh)
+                return err;
+@@ -782,7 +849,7 @@
+        old_bh = new_bh = dir_bh = NULL;
+-       old_bh = ext2_find_entry (old_dir, old_dentry->d_name.name,
+old_dentry->d_name.len, &old_de);
++       old_bh = ext2_find_entry (old_dir, old_dentry, &old_de);
+        /*
+         *  Check for inode number is _not_ due to possible IO errors.
+         *  We might rmdir the source, keep it as pwd of some process
+@@ -795,8 +862,7 @@
+                goto end_rename;
+        new_inode = new_dentry->d_inode;
+-       new_bh = ext2_find_entry (new_dir, new_dentry->d_name.name,
+-                               new_dentry->d_name.len, &new_de);
++       new_bh = ext2_find_entry (new_dir, new_dentry, &new_de);
+        if (new_bh) {
+                if (!new_inode) {
+                        brelse (new_bh);
+@@ -823,9 +889,7 @@
+                        goto end_rename;
+        }
+        if (!new_bh) {
+-               new_bh = ext2_add_entry (new_dir, new_dentry->d_name.name,
+-                                       new_dentry->d_name.len, &new_de,
+-                                       &retval);
++               new_bh = ext2_add_entry (new_dir, new_dentry, &new_de,
+&retval);
+                if (!new_bh)
+                        goto end_rename;
+        }
+@@ -842,6 +906,8 @@
+        ext2_delete_entry (old_de, old_bh);
+        old_dir->i_version = ++event;
++       old_dentry->d_fsdata = 0;
++       new_dentry->d_fsdata = 0;
+        if (new_inode) {
+                new_inode->i_nlink--;
+                new_inode->i_ctime = CURRENT_TIME;begin:vcard 
+n:Woodman;Larry
+x-mozilla-html:TRUE
+org:Mission Critical Linux
+adr:;;;;;;
+version:2.1
+email;internet:woodman@missioncriticallinux.com
+title:Director Of Engineering
+x-mozilla-cpt:;-8928
+fn:Larry Woodman
+end:vcard

@@ -1,0 +1,192 @@
+Date: Wed, 15 Sep 1999 00:02:02 +0200
+From: Henner Eisen <>
+Subject: patch: isdn ppp performace problems
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/9/14/192
+
+Hi,
+as regards the occasionnally observed spurious isdn ppp peformance decrease
+(e.g. the "ping delayed by multiples of a second" and "mppp slow down"
+stuff), I detected a possible problem with isdn_ppp tx timeout recovery that
+might be the reason for this.
+Could people who can reproduce those problems please try the follong patch
+and report whether it helps, does not help, or breaks something else? 
+(please add info about HL driver, ISDN_CONFIG options and ppp options
+in affect to such a report). (I myself have tested with single link ppp
+only). Please also report if you observe "isdn_ppp_xmit: sav_skb timeout"
+warning messages in the syslog.
+The same patch applies against 2.2.12 as well as 2.3.18.
+Short description for those interested in the internals:
+isdn_ppp maintains an internal queue of length 1 (stored in lp->sav_skb)
+which is needed because skbuffs are copied for compression reasons.
+Due to this, network device flow control cannot be done like for
+usual network devices. I now detected a possible problem that a lost
+BSENT statcallback could disturb the standard linux network device
+tx timeout recovery. In therory, a lost BSENT statcallback could disturb
+single link ppp partially and cause whole channels to die with multilink ppp.
+Anyway, the follwing patch adds a timeout recovery to isdn_ppp's
+xmit paths and also prints a warning message if such a timeout condition
+is detected.
+It's currently unclear under which circumstances this error (missed/lost BSENT
+statcallback) could be actually triggered at all. (In therory, it
+should not be possible with the HiSax driver). Thus, I'm very interested
+in reports about the observed warning message.
+Henner
+diff -ur linux/drivers/isdn/isdn_net.c linux-2.3.18-timeout/drivers/isdn/isdn_net.c
+--- linux/drivers/isdn/isdn_net.c	Sun Sep  5 20:28:59 1999
++++ linux-2.3.18-timeout/drivers/isdn/isdn_net.c	Tue Sep 14 22:14:51 1999
+@@ -607,4 +607,11 @@
+ 				    (!lp->dialstate)) {
+ 					lp->stats.tx_packets++;
+ 					lp->stats.tx_bytes += c->parm.length;
++					/* some HL drivers deliver 
++					   ISDN_STAT_BSENT from hw interrupt.
++					   Output routines in isdn_ppp are now
++					   called with irq disabled such that
++					   dequeueing the sav_skb while another
++					   frame is sent will not occur.
++					*/
+ 					if (lp->p_encap == ISDN_NET_ENCAP_SYNCPPP && lp->sav_skb) {
+diff -ur linux/drivers/isdn/isdn_ppp.c linux-2.3.18-timeout/drivers/isdn/isdn_ppp.c
+--- linux/drivers/isdn/isdn_ppp.c	Sun Sep  5 20:28:59 1999
++++ linux-2.3.18-timeout/drivers/isdn/isdn_ppp.c	Tue Sep 14 22:32:16 1999
+@@ -1004,6 +1004,7 @@
+ 			lp->dialstate == 0 &&
+ 		    (lp->flags & ISDN_NET_CONNECTED)) {
+ 			unsigned short hl;
++			unsigned long flags;
+ 			int cnt;
+ 			struct sk_buff *skb;
+ 			/*
+@@ -1027,6 +1028,8 @@
+ 
+ 			isdn_ppp_send_ccp(lp->netdev,lp,skb); /* keeps CCP/compression states in sync */
+ 
++			save_flags(flags);
++			cli();
+ 			if ((cnt = isdn_writebuf_skb_stub(lp->isdn_device, lp->isdn_channel, 1, skb)) != count) {
+ 				if (lp->sav_skb) {
+ 					dev_kfree_skb(lp->sav_skb);
+@@ -1034,7 +1037,9 @@
+ 				} else
+ 					printk(KERN_INFO "isdn_ppp_write: Can't write PPP frame to LL (%d,%d)!\n", cnt, count);
+ 				lp->sav_skb = skb;
++				lp->sav_time = jiffies;
+ 			}
++			restore_flags(flags);
+ 		}
+ 	}
+ 	return count;
+@@ -1459,6 +1464,7 @@
+ 	isdn_net_dev *nd;
+ 	unsigned int proto = PPP_IP;     /* 0x21 */
+ 	struct ippp_struct *ipt,*ipts;
++	unsigned long flags;
+ 
+ 	if (mdev)
+ 		mlp = (isdn_net_local *) (mdev->priv);
+@@ -1511,12 +1517,24 @@
+ 
+ 	lp = nd->queue;         /* get lp on top of queue */
+ 
+-	if (lp->sav_skb) {      /* find a non-busy device */
+-		isdn_net_local *nlp = lp->next;
+-		while (lp->sav_skb) {
++	{      /* find a non-busy device */
++		isdn_net_local *nlp = lp;
++		while (nlp->sav_skb) {
++			/* recover from a missing BSENT statcallback */
++			if( time_after(jiffies,nlp->sav_time+HZ) ){
++				unsigned long flags;
++				printk(KERN_WARNING "isdn_ppp_xmit: sav_skb timeout on %s\n", nlp->name);
++				save_flags(flags);
++				cli();
++				if(nlp->sav_skb){
++					kfree_skb(nlp->sav_skb);
++					nlp->sav_skb = NULL;
++				}
++				restore_flags(flags);
++			}
++			nlp = nd->queue = nd->queue->next;
+ 			if (lp == nlp)
+ 				return 1;
+-			nlp = nd->queue = nd->queue->next;
+ 		}
+ 		lp = nlp;
+ 	}
+@@ -1654,13 +1672,18 @@
+ 		printk(KERN_DEBUG "skb xmit: len: %d\n", (int) skb->len);
+ 		isdn_ppp_frame_log("xmit", skb->data, skb->len, 32,ipt->unit,lp->ppp_slot);
+ 	}
++	save_flags(flags);
++	cli();
+ 	if (isdn_net_send_skb(netdev, lp, skb)) {
+-		if (lp->sav_skb) {	/* whole sav_skb processing with disabled IRQs ?? */
++		if (lp->sav_skb) {	/* should never happen as sav_skb are sent with disabled IRQs) */
+ 			printk(KERN_ERR "%s: whoops .. there is another stored skb!\n", netdev->name);
+ 			dev_kfree_skb(skb);
+-		} else
++		} else {
+ 			lp->sav_skb = skb;
++			lp->sav_time = jiffies;
++		}
+ 	}
++	restore_flags(flags);
+ 	return 0;
+ }
+ 
+@@ -2242,6 +2265,7 @@
+ 	struct sk_buff *skb;
+ 	unsigned char *p;
+ 	int count;
++	unsigned long flags;
+ 	int cnt = 0;
+ 	isdn_net_local *lp = is->lp;
+ 
+@@ -2284,6 +2308,8 @@
+ 	   especially dunno what the sav_skb stuff is good for. */
+ 
+ 	count = skb->len;
++	save_flags(flags);
++	cli();
+ 	if ((cnt = isdn_writebuf_skb_stub(lp->isdn_device, lp->isdn_channel,
+ 					  1, skb)) != count) {
+ 		if (lp->sav_skb) {
+@@ -2296,7 +2322,10 @@
+ 			       "isdn_ppp_write: Can't write PPP frame to LL (%d,%d)!\n",
+ 			       cnt, count);
+ 		lp->sav_skb = skb;
++		lp->sav_time = jiffies;
++
+ 	}
++	restore_flags(flags);
+ }
+ 
+ /* Allocate the reset state vector */
+@@ -3000,5 +3029,3 @@
+ 	}
+ 	return -EINVAL;
+ }
+-
+-
+diff -ur linux/include/linux/isdn.h linux-2.3.18-timeout/include/linux/isdn.h
+--- linux/include/linux/isdn.h	Sun Sep  5 20:29:01 1999
++++ linux-2.3.18-timeout/include/linux/isdn.h	Tue Sep 14 21:34:21 1999
+@@ -591,7 +591,8 @@
+   struct isdn_net_local_s *last;       /* Ptr to last link in bundle       */
+   struct isdn_net_dev_s  *netdev;      /* Ptr to netdev                    */
+   struct sk_buff         *first_skb;   /* Ptr to skb that triggers dialing */
+-  struct sk_buff         *sav_skb;     /* Ptr to skb, rejected by LL-driver*/
++  struct sk_buff *volatile sav_skb;    /* Ptr to skb, rejected by LL-driver*/
++  unsigned long 	  sav_time;    /* time when last sav_skb was set */
+                                        /* Ptr to orig. hard_header_cache   */
+   int                    (*org_hhc)(
+ 				    struct neighbour *neigh,
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

@@ -1,0 +1,323 @@
+Date: Mon, 23 Apr 2007 10:54:11 +0200
+From: Roberto De Ioris <>
+Subject: [ANNOUNCE] UidBind LSM 0.1
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2007/4/23/76
+
+Hi all,
+this is a very simple module that allows bind() to tcp/udp port (>=1024)
+only for the uids defined in a configfs tree.
+It is a first version, it only works for PF_INET sockets and makes no
+difference between tcp and udp (i am working on this)
+For (little) more info see 
+http://projects.unbit.it/uidbind/
+Patch attached is for vanilla 2.6.20.7
+-- 
+Roberto De Ioris
+http://unbit.it
+JID: roberto@jabber.unbit.it
+Wii: 2999 4476 3509 0964
+diff -Naur linux-2.6.20.7/security/Kconfig linux-2.6.20.7-uidbind/security/Kconfig
+--- linux-2.6.20.7/security/Kconfig	2007-04-13 22:48:14.000000000 +0200
++++ linux-2.6.20.7-uidbind/security/Kconfig	2007-04-23 09:32:15.000000000 +0200
+@@ -93,6 +93,18 @@
+ 	  
+ 	  If you are unsure how to answer this question, answer N.
+ 
++config SECURITY_UIDBIND
++	tristate "UidBind"
++	depends on CONFIGFS_FS && SECURITY && SECURITY_NETWORK
++	help
++	  This simple module allows call to bind() function only for
++          uid defined in a configfs tree.
++	  The only supported socket is PF_INET.
++
++	  See  <
+http://projects.unbit.it/uidbind>
+ for more information about
++	  this module
++	  
++
+ source security/selinux/Kconfig
+ 
+ endmenu
+diff -Naur linux-2.6.20.7/security/Makefile linux-2.6.20.7-uidbind/security/Makefile
+--- linux-2.6.20.7/security/Makefile	2007-04-13 22:48:14.000000000 +0200
++++ linux-2.6.20.7-uidbind/security/Makefile	2007-04-23 09:30:37.000000000 +0200
+@@ -16,3 +16,4 @@
+ obj-$(CONFIG_SECURITY_SELINUX)		+= selinux/built-in.o
+ obj-$(CONFIG_SECURITY_CAPABILITIES)	+= commoncap.o capability.o
+ obj-$(CONFIG_SECURITY_ROOTPLUG)		+= commoncap.o root_plug.o
++obj-$(CONFIG_SECURITY_UIDBIND)		+= commoncap.o uidbind.o
+diff -Naur linux-2.6.20.7/security/uidbind.c linux-2.6.20.7-uidbind/security/uidbind.c
+--- linux-2.6.20.7/security/uidbind.c	1970-01-01 01:00:00.000000000 +0100
++++ linux-2.6.20.7-uidbind/security/uidbind.c	2007-04-23 10:47:07.000000000 +0200
+@@ -0,0 +1,263 @@
++/* UidBind 0.1 LSM
++ * Permit bind() function only to one uid
++ *
++ * See <
+http://projects.unbit.it/uidbind/>
+ for (little) more info
++ *
++ *      This program is free software; you can redistribute it and/or modify
++ *      it under the terms of the GNU General Public License as published by
++ *      the Free Software Foundation; either version 2 of the License, or
++ *      (at your option) any later version.
++ *
++*/
++
++
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/init.h>
++#include <linux/security.h>
++#include <linux/socket.h>
++#include <net/ip.h>
++#include <linux/configfs.h>
++
++
++/* flag to keep track of how we were registered */
++static int secondary;
++
++static int debug = 1;
++
++
++#define MY_NAME "uidbind"
++#define UIDBIND_LABEL "[UidBind] "
++
++struct port_config_item {
++	struct config_item item;
++	uid_t uid;
++};
++
++static ssize_t port_attr_show(struct config_item *item, struct configfs_attribute *attr, char *page) {
++        ssize_t ret = 0;
++
++	struct port_config_item *port_config = container_of(item, struct port_config_item, item) ;
++        ret = sprintf(page, "%u\n", port_config->uid ) ;
++
++	if (debug)
++        	printk(KERN_DEBUG UIDBIND_LABEL "Reading uid attr for port %s\n", item->ci_name) ;
++
++        return ret ;
++}
++
++static ssize_t port_attr_store(struct config_item *item, struct configfs_attribute *attr, const char *page, size_t count) {
++        ssize_t ret = -EINVAL;
++	uid_t uid ;
++
++	struct port_config_item *port_config = container_of(item, struct port_config_item, item) ;
++
++	uid = simple_strtoul(page, NULL, 0) ;
++
++	if (!uid)
++		return ret ;
++
++
++	port_config->uid = uid ;
++
++	if (debug)
++        	printk(KERN_DEBUG UIDBIND_LABEL "Assigned uid %u to port %s\n", uid, item->ci_name) ;
++
++	ret = count ;
++	
++        return ret;
++}
++
++static struct configfs_attribute port_uid_attr = { .ca_owner = THIS_MODULE, .ca_name = "uid", .ca_mode = S_IRUSR | S_IWUSR } ;
++
++/* port attributes */
++static struct configfs_attribute *port_attrs[] = { &port_uid_attr , NULL } ;
++
++/* port ops */
++static struct configfs_item_operations port_item_ops = { .show_attribute = port_attr_show, .store_attribute = port_attr_store   } ;
++
++/* port item */
++static struct config_item_type port_type = { .ct_item_ops = &port_item_ops, .ct_attrs = port_attrs, .ct_owner = THIS_MODULE } ;
++
++
++
++
++static struct config_item *port_item_make(struct config_group *group, const char *name) {
++
++	struct port_config_item *portitem ;
++	unsigned short port_num ;
++
++	port_num = simple_strtoul(name,NULL,0) ;
++
++	if (port_num < 1024 || !port_num) {
++		if (debug)
++			printk(KERN_DEBUG UIDBIND_LABEL "Invalid port number: %s\n", name) ;
++
++		return NULL ;
++	}
++
++	portitem = kmalloc(sizeof(struct port_config_item), GFP_KERNEL);
++
++	if (!portitem) return NULL ;
++
++	
++	memset(portitem, 0 , sizeof(struct port_config_item)) ;
++
++	config_item_init_type_name(&portitem->item, name, &port_type) ;
++
++	portitem->uid = 0 ;
++
++	if (debug)
++		printk(KERN_DEBUG UIDBIND_LABEL "Assigned default rule to port %s\n", name) ;
++
++	return &portitem->item ;
++}
++
++
++static struct configfs_group_operations uidbind_group_ops = {
++	.make_item = port_item_make,
++};
++
++/* configfs uidbind */
++static struct config_item_type uidbind_type = { .ct_group_ops = &uidbind_group_ops, .ct_owner = THIS_MODULE } ;
++
++
++
++
++
++/* configfs subsys */
++static struct configfs_subsystem uidbind_subsys = { .su_group = { .cg_item = { .ci_namebuf = "uidbind", .ci_type = &uidbind_type} } } ;
++
++
++static int uidbind_socket_bind_check (struct socket *sock, struct sockaddr *address, int addrlen)
++{
++
++	u16 family ;
++	struct sockaddr_in *addr4 = NULL;
++	struct config_item *portconfig = NULL ;
++	struct port_config_item *portitem = NULL ;
++	unsigned short socket_port;
++	char *strport = "\0" ;
++
++	if (current->uid == 0)
++		return 0 ;
++
++	family = sock->sk->sk_family;
++
++
++	if (family == PF_INET) {
++
++		addr4 = (struct sockaddr_in *)address;
++                socket_port = ntohs(addr4->sin_port);
++
++		if (debug)		
++			printk(KERN_DEBUG UIDBIND_LABEL "bind() attempt on port %d by process [%s] uid [%d]\n", socket_port, current->comm, current->uid) ;
++
++		sprintf(strport,"%u", socket_port) ;
++
++		portconfig = config_group_find_obj(&uidbind_subsys.su_group,strport) ;
++
++		if (!portconfig) {
++			if (debug)
++				printk(KERN_DEBUG UIDBIND_LABEL "Configuration for port %s unavailable\n", strport ) ;
++
++			return -EPERM;
++		}
++
++		portitem = container_of(portconfig, struct port_config_item, item) ;
++
++		if (portitem->uid != current->uid) {
++			if (debug)
++				printk(KERN_DEBUG UIDBIND_LABEL "bind() permitted only to uid %u\n", portitem->uid) ;
++			return -EPERM;
++		}
++		
++	}
++
++	return 0;
++}
++
++static struct security_operations uidbind_security_ops = {
++	/* general capability */
++	.ptrace =                       cap_ptrace,
++        .capget =                       cap_capget,
++        .capset_check =                 cap_capset_check,
++        .capset_set =                   cap_capset_set,
++        .capable =                      cap_capable,
++        .settime =                      cap_settime,
++        .netlink_send =                 cap_netlink_send,
++        .netlink_recv =                 cap_netlink_recv,
++
++        .bprm_apply_creds =             cap_bprm_apply_creds,
++        .bprm_set_security =            cap_bprm_set_security,
++        .bprm_secureexec =              cap_bprm_secureexec,
++
++        .inode_setxattr =               cap_inode_setxattr,
++        .inode_removexattr =            cap_inode_removexattr,
++
++        .task_post_setuid =             cap_task_post_setuid,
++        .task_reparent_to_init =        cap_task_reparent_to_init,
++
++        .syslog =                       cap_syslog,
++
++        .vm_enough_memory =             cap_vm_enough_memory,
++
++
++	/* uidbind hook */
++	.socket_bind =		uidbind_socket_bind_check
++};
++
++
++static int __init uidbind_init (void)
++{
++
++	int ret ;
++
++	if (register_security (&uidbind_security_ops)) {
++		printk (KERN_INFO UIDBIND_LABEL "Failure registering module with the kernel\n");
++		if (mod_reg_security (MY_NAME, &uidbind_security_ops)) {
++			printk (KERN_INFO UIDBIND_LABEL "Failure registering module as secondary\n") ;
++			return -EINVAL;
++		}
++		secondary = 1;
++	}
++
++	config_group_init(&uidbind_subsys.su_group);
++	init_MUTEX(&uidbind_subsys.su_sem);
++	ret = configfs_register_subsystem(&uidbind_subsys);
++
++	if (ret) {
++		printk(KERN_ERR UIDBIND_LABEL "Error while registering configfs subsys\n") ;
++		configfs_unregister_subsystem(&uidbind_subsys);
++		return ret ;
++	}
++
++	printk (KERN_INFO UIDBIND_LABEL "Module initialized\n") ;
++	return 0;
++}
++
++static void __exit uidbind_exit (void)
++{
++	if (secondary) {
++		if (mod_unreg_security (MY_NAME, &uidbind_security_ops))
++			printk (KERN_INFO UIDBIND_LABEL "Failure unregistering module as primary\n") ;
++	} else { 
++		if (unregister_security (&uidbind_security_ops)) {
++			printk (KERN_INFO UIDBIND_LABEL "Failure unregistering module\n") ;
++		}
++	}
++
++	configfs_unregister_subsystem(&uidbind_subsys) ;
++
++	printk (KERN_INFO UIDBIND_LABEL "Module removed\n");
++}
++
++
++
++security_initcall (uidbind_init);
++module_exit (uidbind_exit);
++
++MODULE_DESCRIPTION("UidBind 0.1");
++MODULE_AUTHOR("Roberto De Ioris <roberto@unbit.it>");
++MODULE_LICENSE("GPL");
++[unhandled content-type:application/pgp-signature]

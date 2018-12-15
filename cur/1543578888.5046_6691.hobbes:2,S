@@ -1,0 +1,212 @@
+Date: Mon, 15 Jan 2001 21:47:03 +0100 (CET)
+From: Ingo Molnar <>
+Subject: [patch] sendpath() support, 2.4.0-test3/-ac9
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2001/1/15/55
+
+On 15 Jan 2001, Linus Torvalds wrote:
+> 	int fd = open(..)
+> 	fstat(fd..);
+> 	sendfile(fd..);
+> 	close(fd);
+>
+> is any slower than
+>
+> 	.. cache stat() in user space based on name ..
+> 	sendpath(name, ..);
+>
+> on any real load.
+just for kicks i've implemented sendpath() support. (patch against
+2.4.0-test and sample code attached) It appears to work just fine here.
+With a bit of reorganization in mm/filemap.c it was quite straightforward
+to do.
+Jonathan, is this what Zeus needs? If yes, it could be interesting to run
+a simple benchmark to compare sendpath() to open()+sendfile()?
+	Ingo
+--- linux/mm/filemap.c.orig	Mon Jan 15 22:43:21 2001
++++ linux/mm/filemap.c	Mon Jan 15 23:09:55 2001
+@@ -39,6 +39,8 @@
+  * page-cache, 21.05.1999, Ingo Molnar <mingo@redhat.com>
+  *
+  * SMP-threaded pagemap-LRU 1999, Andrea Arcangeli <andrea@suse.de>
++ *
++ * Started sendpath() support, (C) 2000 Ingo Molnar <mingo@redhat.com>
+  */
+ 
+ atomic_t page_cache_size = ATOMIC_INIT(0);
+@@ -1450,15 +1452,15 @@
+ 	return written;
+ }
+ 
+-asmlinkage ssize_t sys_sendfile(int out_fd, int in_fd, off_t *offset, size_t count)
++/*
++ * Get input file, and verify that it is ok..
++ */
++static struct file * get_verify_in_file (int in_fd, size_t count)
+ {
+-	ssize_t retval;
+-	struct file * in_file, * out_file;
+-	struct inode * in_inode, * out_inode;
++	struct inode * in_inode;
++	struct file * in_file;
++	int retval;
+ 
+-	/*
+-	 * Get input file, and verify that it is ok..
+-	 */
+ 	retval = -EBADF;
+ 	in_file = fget(in_fd);
+ 	if (!in_file)
+@@ -1474,10 +1476,21 @@
+ 	retval = locks_verify_area(FLOCK_VERIFY_READ, in_inode, in_file, in_file->f_pos, count);
+ 	if (retval)
+ 		goto fput_in;
++	return in_file;
++fput_in:
++	fput(in_file);
++out:
++	return ERR_PTR(retval);
++}
++/*
++ * Get output file, and verify that it is ok..
++ */
++static struct file * get_verify_out_file (int out_fd, size_t count)
++{
++	struct file *out_file;
++	struct inode *out_inode;
++	int retval;
+ 
+-	/*
+-	 * Get output file, and verify that it is ok..
+-	 */
+ 	retval = -EBADF;
+ 	out_file = fget(out_fd);
+ 	if (!out_file)
+@@ -1491,6 +1504,29 @@
+ 	retval = locks_verify_area(FLOCK_VERIFY_WRITE, out_inode, out_file, out_file->f_pos, count);
+ 	if (retval)
+ 		goto fput_out;
++	return out_file;
++
++fput_out:
++	fput(out_file);
++fput_in:
++	return ERR_PTR(retval);
++}
++
++asmlinkage ssize_t sys_sendfile(int out_fd, int in_fd, off_t *offset, size_t count)
++{
++	ssize_t retval;
++	struct file * in_file, *out_file;
++
++	in_file = get_verify_in_file(in_fd, count);
++	if (IS_ERR(in_file)) {
++		retval = PTR_ERR(in_file);
++		goto out;
++	}
++	out_file = get_verify_out_file(out_fd, count);
++	if (IS_ERR(out_file)) {
++		retval = PTR_ERR(out_file);
++		goto fput_in;
++	}
+ 
+ 	retval = 0;
+ 	if (count) {
+@@ -1524,6 +1560,56 @@
+ 	fput(in_file);
+ out:
+ 	return retval;
++}
++
++asmlinkage ssize_t sys_sendpath(int out_fd, char *path, off_t *offset, size_t count)
++{
++	struct file in_file, *out_file;
++	read_descriptor_t desc;
++	loff_t pos = 0, *ppos;
++	struct nameidata nd;
++	int ret;
++
++	out_file = get_verify_out_file(out_fd, count);
++	if (IS_ERR(out_file)) {
++		ret = PTR_ERR(out_file);
++		goto err;
++	}
++	ret = user_path_walk(path, &nd);
++	if (ret)
++		goto put_out;
++	ret = -EINVAL;
++	if (!nd.dentry || !nd.dentry->d_inode)
++		goto put_in_out;
++
++	memset(&in_file, 0, sizeof(in_file));
++	in_file.f_dentry = nd.dentry;
++	in_file.f_op = nd.dentry->d_inode->i_fop;
++
++	ppos = &in_file.f_pos;
++	if (offset) {
++		if (get_user(pos, offset))
++			goto put_in_out;
++		ppos = &pos;
++	}
++	desc.written = 0;
++	desc.count = count;
++	desc.buf = (char *) out_file;
++	desc.error = 0;
++	do_generic_file_read(&in_file, ppos, &desc, file_send_actor, 0);
++
++	ret = desc.written;
++	if (!ret)
++		ret = desc.error;
++	if (offset)
++		put_user(pos, offset);
++
++put_in_out:
++	fput(out_file);
++put_out:
++	path_release(&nd);
++err:
++	return ret;
+ }
+ 
+ /*
+--- linux/arch/i386/kernel/entry.S.orig	Mon Jan 15 22:42:47 2001
++++ linux/arch/i386/kernel/entry.S	Mon Jan 15 22:43:12 2001
+@@ -646,6 +646,7 @@
+ 	.long SYMBOL_NAME(sys_getdents64)	/* 220 */
+ 	.long SYMBOL_NAME(sys_fcntl64)
+ 	.long SYMBOL_NAME(sys_ni_syscall)	/* reserved for TUX */
++	.long SYMBOL_NAME(sys_sendpath)
+ 
+ 	/*
+ 	 * NOTE!! This doesn't have to be exact - we just have
+@@ -653,6 +654,6 @@
+ 	 * entries. Don't panic if you notice that this hasn't
+ 	 * been shrunk every time we add a new system call.
+ 	 */
+-	.rept NR_syscalls-221
++	.rept NR_syscalls-223
+ 		.long SYMBOL_NAME(sys_ni_syscall)
+ 	.endr
+/*
+ * Sample sendpath() code. It should mainly be used for sockets.
+ */
+#include <linux/unistd.h>
+#include <sys/sendfile.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <stdio.h>
+#include <fcntl.h>
+#define __NR_sendpath 223
+_syscall4 (int, sendpath, int, out_fd, char *, path, off_t *, off, size_t, size)
+int main (int argc, char **argv)
+{
+	int out_fd;
+	int ret;
+	out_fd = open("./tmpfile", O_RDWR|O_CREAT|O_TRUNC, 0700);
+	ret = sendpath(out_fd, "/usr/include/unistd.h", NULL, 300);
+	printf("sendpath wrote %d bytes into ./tmpfile.\n", ret);
+	return 0;
+}

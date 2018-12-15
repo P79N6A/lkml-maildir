@@ -1,0 +1,108 @@
+Date: Fri, 19 Nov 1999 12:25:21 -0500
+From: Larry Woodman <>
+Subject: 2.3.28 patch for shmat() to lock system V shared memory segment after  mlockall(MCL_FUTURE)
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/11/19/59
+
+This patch locks system V shared memory region in shmat() if
+mlockall(MCL_FUTURE) was called first.
+Example:
+    status=mlockall(MCL_FUTURE);
+    shmat_addr = shmat(shmid, (char *)0, 0))
+Before
+# ps aux | more
+USER       PID %CPU %MEM   VSZ  RSS TTY      STAT START   TIME COMMAND
+ root          5271  0.0       0.2         33824  332 ttyp5
+R       00:19        0:31    shm /tmp/foo 32 1
+After
+#ps aux | more
+USER       PID %CPU %MEM   VSZ   RSS    TTY      STAT START   TIME
+COMMAND
+root           779    2.7      3.6           33824 33100 pts/1
+R         13:10         0:17   ./shm /tmp/foo 32
+The before case shows that the RSS does not include the system V shared
+memory segment.
+The after case shows that the memory was locked in shmat() after the
+call to mlockall(MCL_FUTURE).
+This behavior is needed for database applications.
+Larry Woodman
+http://www.missioncriticallinux.com
+--- ../linux.van/ipc/shm.c	Thu Nov 18 15:49:11 1999
++++ ipc/shm.c	Fri Nov 19 13:02:45 1999
+@@ -590,8 +590,10 @@
+ 	unsigned int id;
+ 	unsigned long addr;
+ 	unsigned long len;
++	struct mm_struct * mm;
+ 
+ 	down(&current->mm->mmap_sem);
++	mm = current->mm;
+ 	spin_lock(&shm_lock);
+ 	if (shmid < 0)
+ 		goto out;
+@@ -629,10 +631,10 @@
+ 	 * If shm segment goes below stack, make sure there is some
+ 	 * space left for the stack to grow (presently 4 pages).
+ 	 */
+-	if (addr < current->mm->start_stack &&
+-	    addr > current->mm->start_stack - PAGE_SIZE*(shp->shm_npages + 4))
++	if (addr < mm->start_stack &&
++	    addr > mm->start_stack - PAGE_SIZE*(shp->shm_npages + 4))
+ 		goto out;
+-	if (!(shmflg & SHM_REMAP) && find_vma_intersection(current->mm, addr, addr + (unsigned long)shp->u.shm_segsz))
++	if (!(shmflg & SHM_REMAP) && find_vma_intersection(mm, addr, addr + (unsigned long)shp->u.shm_segsz))
+ 		goto out;
+ 
+ 	err = -EACCES;
+@@ -642,8 +644,18 @@
+ 	if (shp->u.shm_perm.seq != (unsigned int) shmid / IPCMNI)
+ 		goto out;
+ 
+-	spin_unlock(&shm_lock);
+ 	err = -ENOMEM;
++
++	/* mlock MCL_FUTURE? */
++	if (mm->def_flags & VM_LOCKED) {
++		unsigned long locked = mm->locked_vm << PAGE_SHIFT;
++		locked += len;
++		if (locked > current->rlim[RLIMIT_MEMLOCK].rlim_cur)
++			goto out;
++	}
++
++	spin_unlock(&shm_lock);
++
+ 	shmd = kmem_cache_alloc(vm_area_cachep, SLAB_KERNEL);
+ 	spin_lock(&shm_lock);
+ 	if (!shmd)
+@@ -657,11 +669,12 @@
+ 	shmd->vm_private_data = shm_segs[id];
+ 	shmd->vm_start = addr;
+ 	shmd->vm_end = addr + shp->shm_npages * PAGE_SIZE;
+-	shmd->vm_mm = current->mm;
++	shmd->vm_mm = mm;
+ 	shmd->vm_page_prot = (shmflg & SHM_RDONLY) ? PAGE_READONLY : PAGE_SHARED;
+ 	shmd->vm_flags = VM_SHM | VM_MAYSHARE | VM_SHARED
+ 			 | VM_MAYREAD | VM_MAYEXEC | VM_READ | VM_EXEC
+ 			 | ((shmflg & SHM_RDONLY) ? 0 : VM_MAYWRITE | VM_WRITE);
++	shmd->vm_flags = shmd->vm_flags | mm->def_flags;
+ 	shmd->vm_file = NULL;
+ 	shmd->vm_pgoff = 0;
+ 	shmd->vm_ops = &shm_vm_ops;
+@@ -680,6 +693,14 @@
+ 
+ 	*raddr = addr;
+ 	err = 0;
++	if (shmd->vm_flags & VM_LOCKED) {
++		spin_unlock(&shm_lock);
++		mm->locked_vm += len >> PAGE_SHIFT;
++                make_pages_present(addr, addr + len);
++		up(&current->mm->mmap_sem);
++		return err;
++		
++        }
+ out:
+ 	spin_unlock(&shm_lock);
+ 	up(&current->mm->mmap_sem);

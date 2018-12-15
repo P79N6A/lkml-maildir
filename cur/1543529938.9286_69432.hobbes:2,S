@@ -1,0 +1,3049 @@
+Date: Tue, 14 Mar 2000 12:05:38 -0500
+From: "Eric S. Raymond" <>
+Subject: Bug fix patches for the console driver
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/3/14/201
+
+Here are the first console driver changes from the Linux Console
+Project.  This description applies to both the "Sapphire" patch for
+2.2.14 and the "Emerald" patch for 2.3.51.
+The second patch band changes fix the double off-by-one error which manifests
+itself in the accordion test from vttest.
+The third band is a patch from linux-kernel: it has to do with wrongly
+neglecting the intensity bit in certain operations.
+The other patch bands clean up the code and fix some subtle bugs in
+the escape-sequence state machine.
+The following changes to the terminal emulation depend on the value
+of the VTE_VERSION macro:
+Version 200, bug fixes only:
+Code	Action		Change		Reason
+------	---------------	---------------	----------------------------
+\E[21m	turn off 1	removed		Conflicts with ECMA-48
+\E[s	DECRC		removed		Not in either VT100 or ECMA-48
+\E[u	DECSC		removed		Not in either VT100 or ECMA-48
+All three removed capabilities are redundant with other escape
+sequences supported by the driver (\E[22m, \E7, and \E8 respectively).
+None are or have ever been used by the Linux terminfo/termcap entry.
+Version 210, DEC and ECMA-48 enhancements:
+Code	Action		Change		Reason
+------	---------------	---------------	----------------------------
+\E[6m	blink		added		ECMA-48 conformance
+\E[ n k	VPB		added			:
+\E[ n j	HPB		added			:
+\E[ n I	CHT		added			:
+\E[ n W	CTC		added (n=0, 5)		:
+\E[ n Y	CVT		added			:
+\E[ n Z	CBT		added			:
+0x84	IND		added		Supports VT220 8-bit mode
+0x85	NEL		added			:
+0x88	HTS		added			:
+0x8d	RI		added			:
+\E[?6n	DECXCPR		added		More exact VT100 emulation
+\E[?15n	Printer status	added			:
+\E[?25n	UDK status	added			:
+\E[?26n	Keyboard status	added			:
+\E[?75n	Data integrity	added			:
+\E[x	DECREQTPARM	added			:
+Size of console.o:
+  text	   data	    bss	    dec	    hex	filename
+  23452	    332	   1028	  24812	   60ec	2.2.14, baseline
+  23612	    332	   1028	  24972	   618c	2.2.14, Version 2.0.0
+  25024	    332	   1028	  26384	   6710	2.2.14, Version 2.1.0
+  25211	    416	   1028	  26655	   681f	2.3.51, baseline
+  25595	    416	   1028	  27039	   699f 2.3.51, Version 2.0.0
+  26939	    416	   1028	  28383	   6edf 2.3.51, Version 2.1.0
+The serious work will begin with Ruby 1, when we re-factor the driver
+to pull the terminal emulation code out of console.c.  One of our
+goals for Ruby is to make the emulation code a module that could be
+replaced with other emulations (like, say, if HP wanted the console of
+a Linux distribution to look like an HP terminal).  This change won't
+add features, so we'd like to get it in before 2.4.
+Further down the road, we plan to integrate Vojtech Pavlik's work 
+on re-factoring the input drivers for better cross-platform portability
+and modularity.  James Simmons wants to clean up the interface between
+the console and fbdev; right now they are much too entwined.
+Better support for blind users is in the offing.  Features such
+as multi-head operation, scrollback, and support for different fonts &
+textmodes per VC will also be developed.  These are definitely 2.5.x
+projects.
+Here's the new entry for MAINTAINERS:
+CONSOLE DRIVER
+P:	James Simmons
+M:	jsimmons@acsu.buffalo.edu
+P:	Eric S. Raymond
+M:	esr@thyrsus.com
+L:	linuxconsole-dev@sourceforge.net
+W:	
+http://linuxconsole.sourceforge.net/
+S:	Maintained
+-- 
+		<a href="
+http://www.tuxedo.org/~esr">Eric
+ S. Raymond</a>
+According to the National Crime Survey administered by the Bureau of
+the Census and the National Institute of Justice, it was found that
+only 12 percent of those who use a gun to resist assault are injured,
+as are 17 percent of those who use a gun to resist robbery. These
+percentages are 27 and 25 percent, respectively, if they passively
+comply with the felon's demands. Three times as many were injured if
+they used other means of resistance.
+        -- G. Kleck, "Policy Lessons from Recent Gun Control Research,"
+--- console-2.2.14.c	2000/03/08 01:42:00	1.1
++++ console-2.2.14.c	2000/03/14 16:53:03	1.17
+@@ -66,6 +66,11 @@
+  *
+  * Resurrected character buffers in videoram plus lots of other trickery
+  * by Martin Mares <mj@atrey.karlin.mff.cuni.cz>, July 1998
++ *
++ * ECMA-35 (ISO 2022), ECMA-48 (ISO 6429) and missing DEC VT-series functions
++ * by Dominik Kubla <kubla@uni-mainz.de>, February 1999
++ * Adapted for 2.2.12 and changes conditionalized according to VTE_VERSION
++ * by Eric S. Raymond <esr@thyrsus.com>, March 2000.
+  */
+ 
+ #include <linux/module.h>
+@@ -139,8 +144,8 @@
+ 		    unsigned int cols, int do_clear);
+ static void blank_screen(void);
+ static void gotoxy(int currcons, int new_x, int new_y);
+-static void save_cur(int currcons);
+-static void reset_terminal(int currcons, int do_clear);
++static void vte_decsc(int currcons);
++static void vte_ris(int currcons, int do_clear);
+ static void con_flush_chars(struct tty_struct *tty);
+ static void set_vesa_blanking(unsigned long arg);
+ static void set_cursor(int currcons);
+@@ -224,7 +229,7 @@
+ 	unsigned short *d, *s;
+ 
+ 	if (t+nr >= b)
+-		nr = b - t - 1;
++		nr = b - t;
+ 	if (b > video_num_lines || t >= b || nr < 1)
+ 		return;
+ 	if (IS_VISIBLE && sw->con_scroll(vc_cons[currcons].d, t, b, SM_UP, nr))
+@@ -242,7 +247,7 @@
+ 	unsigned int step;
+ 
+ 	if (t+nr >= b)
+-		nr = b - t - 1;
++		nr = b - t;
+ 	if (b > video_num_lines || t >= b || nr < 1)
+ 		return;
+ 	if (IS_VISIBLE && sw->con_scroll(vc_cons[currcons].d, t, b, SM_DOWN, nr))
+@@ -355,7 +360,7 @@
+ static void update_attr(int currcons)
+ {
+ 	attr = build_attr(currcons, color, intensity, blink, underline, reverse ^ decscnm);
+-	video_erase_char = (build_attr(currcons, color, 1, 0, 0, decscnm) << 8) | ' ';
++	video_erase_char = (build_attr(currcons, color, intensity, 0, 0, decscnm) << 8) | ' ';
+ }
+ 
+ /* Note: inverting the screen twice should revert to the original state */
+@@ -735,11 +740,11 @@
+ 		screenbuf_size = ss;
+ 		set_origin(currcons);
+ 
+-		/* do part of a reset_terminal() */
++		/* do part of a vte_ris() */
+ 		top = 0;
+ 		bottom = video_num_lines;
+ 		gotoxy(currcons, x, y);
+-		save_cur(currcons);
++		vte_decsc(currcons);
+ 
+ 		if (console_table[currcons]) {
+ 			struct winsize ws, *cws = &console_table[currcons]->winsize;
+@@ -774,7 +779,13 @@
+ 
+ /*
+  *	VT102 emulator
++ *
++ * VTE_VERSION selects the version of the emulation
++ *
++ * 20x is bug-fixes only (for the 2.3.x series).
++ * 21x improves VT100 and ECMA-48 conformance. 
+  */
++#define VTE_VERSION	210
+ 
+ #define set_kbd(x) set_vc_kbd_mode(kbd_table+currcons,x)
+ #define clr_kbd(x) clr_vc_kbd_mode(kbd_table+currcons,x)
+@@ -791,6 +802,18 @@
+ #define VT100ID "\033[?1;2c"
+ #define VT102ID "\033[?6c"
+ 
++/*
++ * ISO 6429 has its colors well defined:
++ *
++ * 0: black
++ * 1: red
++ * 2: yellow
++ * 3: green
++ * 4: blue
++ * 5: magenta
++ * 6: cyan
++ * 7: white
++ */
+ unsigned char color_table[] = { 0, 4, 2, 6, 1, 5, 3, 7,
+ 				       8,12,10,14, 9,13,11,15 };
+ 
+@@ -859,11 +882,15 @@
+ 	scrolldelta(lines);
+ }
+ 
+-static void lf(int currcons)
++/*
++ * LINE FEED (LF)
++ */
++static void vte_lf(int currcons)
+ {
+-    	/* don't scroll if above bottom of scrolling region, or
+-	 * if below scrolling region
+-	 */
++        /*
++         * Don't scroll if below top of scrolling region, or if above
++         * scrolling region.
++         */
+     	if (y+1 == bottom)
+ 		scrup(currcons,top,bottom,1);
+ 	else if (y < video_num_lines-1) {
+@@ -873,11 +900,15 @@
+ 	need_wrap = 0;
+ }
+ 
+-static void ri(int currcons)
++/*
++ * REVERSE LINE FEED (RI)
++ */
++static void vte_ri(int currcons)
+ {
+-    	/* don't scroll if below top of scrolling region, or
+-	 * if above scrolling region
+-	 */
++        /*
++         * Don't scroll if below top of scrolling region, or if above
++         * scrolling region.
++         */
+ 	if (y == top)
+ 		scrdown(currcons,top,bottom,1);
+ 	else if (y > 0) {
+@@ -887,13 +918,19 @@
+ 	need_wrap = 0;
+ }
+ 
+-static inline void cr(int currcons)
++/*
++ * CARRIAGE RETURN (CR)
++ */
++static inline void vte_cr(int currcons)
+ {
+ 	pos -= x<<1;
+ 	need_wrap = x = 0;
+ }
+ 
+-static inline void bs(int currcons)
++/*
++ * BACK SPACE (BS)
++ */
++static inline void vte_bs(int currcons)
+ {
+ 	if (x) {
+ 		pos -= 2;
+@@ -902,12 +939,64 @@
+ 	}
+ }
+ 
+-static inline void del(int currcons)
++#if VTE_VERSION >= 210
++/*
++ * CURSOR LINE TABULATION (CVT)
++ *
++ * NOTE:
++ * In accordance with our interpretation of VT as LF we will treat CVT as
++ * (par[0] * LF).  Not very creative, but at least consequent.
++ */
++static void vte_cvt(int currcons, int vpar)
++{
++        int i;
++
++        for (i = 0; i < vpar; i++) {
++		vte_lf(currcons);
++        }
++}
++
++/*
++ * CURSOR BACKWARD TABULATION (CBT)
++ */
++static void vte_cbt(int currcons, int vpar)
+ {
+-	/* ignored */
++        int i;
++
++        for (i = 0; i < vpar; i++) {
++		pos -= (x << 1);
++		while (x > 0) {
++			x--;
++			if (tab_stop[x >> 5] & (1 << (x & 31)))
++			        break;
++		}
++		pos += (x << 1);
++        }
+ }
+ 
+-static void csi_J(int currcons, int vpar)
++/*
++ * CURSOR FORWARD TABULATION (CHT)
++ */
++static void vte_cht(int currcons, int vpar)
++{
++        int i;
++
++        for (i = 0; i < vpar; i++) {
++		pos -= (x << 1);
++		while (x < video_num_columns - 1) {
++			x++;
++			if (tab_stop[x >> 5] & (1 << (x & 31)))
++			        break;
++		}
++		pos += (x << 1);
++        }
++}
++#endif /* VTE_VERSION >= 210 */
++
++/*
++ * ERASE IN PAGE (ED)
++ */
++static void vte_ed(int currcons, int vpar)
+ {
+ 	unsigned int count;
+ 	unsigned short * start;
+@@ -951,7 +1040,10 @@
+ 	need_wrap = 0;
+ }
+ 
+-static void csi_K(int currcons, int vpar)
++/*
++ * ERASE IN LINE (EL)
++ */
++static void vte_el(int currcons, int vpar)
+ {
+ 	unsigned int count;
+ 	unsigned short * start;
+@@ -985,7 +1077,12 @@
+ 	need_wrap = 0;
+ }
+ 
+-static void csi_X(int currcons, int vpar) /* erase the following vpar positions */
++/*
++ * Erase character (ECH)
++ *
++ * NOTE:  This function is not available in DEC VT1xx terminals.
++ */
++static void vte_ech(int currcons, int vpar) /* erase the following vpar positions */
+ {					  /* not vt100? */
+ 	int count;
+ 
+@@ -1008,7 +1105,12 @@
+ 	color = def_color;
+ }
+ 
+-static void csi_m(int currcons)
++/*
++ * SELECT GRAPHIC RENDITION (SGR)
++ *
++ * NOTE: The DEC vt1xx series only implemented attribute values 0,1,4,5 and 7.
++ */
++static void vte_sgr(int currcons)
+ {
+ 	int i;
+ 
+@@ -1017,78 +1119,65 @@
+ 			case 0:	/* all attributes off */
+ 				default_attr(currcons);
+ 				break;
+-			case 1:
++			case 1:	/* bold or increased intensity */
+ 				intensity = 2;
+ 				break;
+-			case 2:
++			case 2:	/* faint or decreased intensity */
+ 				intensity = 0;
+ 				break;
+-			case 4:
++			case 4:	/* singly underlined. */
+ 				underline = 1;
+ 				break;
+-			case 5:
++			case 5:	/* slowly blinking (< 2.5 Hz) */
++#if VTE_VERSION >= 210
++			case 6:	/* rapidly blinking (>= 2.5 Hz) */
++#endif /* VTE_VERSION >= 210 */
+ 				blink = 1;
+ 				break;
+-			case 7:
++			case 7:	/* negative image */
+ 				reverse = 1;
+ 				break;
+-			case 10: /* ANSI X3.64-1979 (SCO-ish?)
+-				  * Select primary font, don't display
+-				  * control chars if defined, don't set
+-				  * bit 8 on output.
+-				  */
++			case 10:	/*  primary (default) font */
+ 				translate = set_translate(charset == 0
+ 						? G0_charset
+ 						: G1_charset,currcons);
+ 				disp_ctrl = 0;
+ 				toggle_meta = 0;
+ 				break;
+-			case 11: /* ANSI X3.64-1979 (SCO-ish?)
+-				  * Select first alternate font, lets
+-				  * chars < 32 be displayed as ROM chars.
+-				  */
++			case 11:	/* first alternative font */
+ 				translate = set_translate(IBMPC_MAP,currcons);
+ 				disp_ctrl = 1;
+ 				toggle_meta = 0;
+ 				break;
+-			case 12: /* ANSI X3.64-1979 (SCO-ish?)
+-				  * Select second alternate font, toggle
+-				  * high bit before displaying as ROM char.
+-				  */
++			case 12:	/* second alternative font */
+ 				translate = set_translate(IBMPC_MAP,currcons);
+ 				disp_ctrl = 1;
+ 				toggle_meta = 1;
+ 				break;
+-			case 21:
+-			case 22:
++#if VTE_VERSION < 199
++			case 21:	/* normal intensity */
++#endif /* VTE_VERSION < 199 */
++			case 22:	/* normal intensity */
+ 				intensity = 1;
+ 				break;
+-			case 24:
++			case 24:	/* not underlined (neither singly nor doubly) */
+ 				underline = 0;
+ 				break;
+-			case 25:
++			case 25:	/* steady (not blinking) */
+ 				blink = 0;
+ 				break;
+-			case 27:
++			case 27:	/* positive image */
+ 				reverse = 0;
+ 				break;
+-			case 38: /* ANSI X3.64-1979 (SCO-ish?)
+-				  * Enables underscore, white foreground
+-				  * with white underscore (Linux - use
+-				  * default foreground).
+-				  */
++			case 38:	/* foreground color (ISO 8613-6/ITU T.416) */
+ 				color = (def_color & 0x0f) | background;
+ 				underline = 1;
+ 				break;
+-			case 39: /* ANSI X3.64-1979 (SCO-ish?)
+-				  * Disable underline option.
+-				  * Reset colour to default? It did this
+-				  * before...
+-				  */
++			case 39:	/* default display color */
+ 				color = (def_color & 0x0f) | background;
+ 				underline = 0;
+ 				break;
+-			case 49:
++			case 49:	/* default background color */
+ 				color = (def_color & 0xf0) | foreground;
+ 				break;
+ 			default:
+@@ -1112,24 +1201,74 @@
+ 	con_schedule_flip(tty);
+ }
+ 
+-static void cursor_report(int currcons, struct tty_struct * tty)
++#if VTE_VERSION >= 210
++/*
++ * Fake a DEC DSR for non-implemented features
++ */
++static void vte_fake_dec_dsr(struct tty_struct *tty, char *reply)
++{
++	char buf[40];
++	sprintf(buf, "\033[?%sn", reply);
++	respond_string(buf, tty);
++}
++#endif /* VTE_VERSION >= 210 */
++
++/*
++ * CURSOR POSITION REPORT (CPR)
++ * DEC EXTENDED CURSOR POSITION REPORT (DECXCPR)
++ */
++static void vte_cpr(int currcons, struct tty_struct *tty, int ext)
+ {
+ 	char buf[40];
+ 
+-	sprintf(buf, "\033[%d;%dR", y + (decom ? top+1 : 1), x+1);
++#if VTE_VERSION >= 210
++	if (ext) {
++		/*
++		 * NOTE:
++		 * Since we don't implement any form of page memory, we will
++		 * always return the cursor position in page 1.
++		 */
++		sprintf(buf, "\033[?%d;%d;1R", y + (decom ? top + 1 : 1), x+1);
++	} else
++#endif /* VTE_VERSION >= 210 */
++		sprintf(buf, "\033[%d;%dR", y + (decom ? top + 1 : 1), x+1);
+ 	respond_string(buf, tty);
+ }
+ 
+-static inline void status_report(struct tty_struct * tty)
++/*
++ * DEVICE STATUS REPORT (DSR)
++ */
++static inline void vte_dsr(struct tty_struct * tty)
+ {
+ 	respond_string("\033[0n", tty);	/* Terminal ok */
+ }
+ 
+-static inline void respond_ID(struct tty_struct * tty)
++/*
++ * DEVICE ATTRIBUTE (DA)
++ */
++static inline void vte_da(struct tty_struct * tty)
+ {
+ 	respond_string(VT102ID, tty);
+ }
+ 
++#if VTE_VERSION >= 210
++/*
++ * DEC REPORT TERMINAL PARAMETERS (DECREPTPARM)
++ *
++ * NOTE:  This function is only available on DEV VT1xx terminals.
++ *
++ * XXX Fixme! Report should reflect actual parameters instead of being hard
++ *      coded.  -dbk
++ */
++static void vte_decreptparm(int currcons, struct tty_struct *tty)
++{
++	char buf[40];
++
++	sprintf(buf, "\033[%d;1;1;120;120;1;0x", par[0] + 2);
++	respond_string(buf, tty);
++}
++#endif /* VTE_VERSION >= 210 */
++
+ void mouse_report(struct tty_struct * tty, int butt, int mrx, int mry)
+ {
+ 	char buf[8];
+@@ -1147,6 +1286,10 @@
+ 	return report_mouse;
+ }
+ 
++/*
++ * Set mode (SM / DECSM)
++ * Reset mode (RM / DECRM)
++ */
+ static void set_mode(int currcons, int on_off)
+ {
+ 	int i;
+@@ -1279,7 +1422,12 @@
+ 	need_wrap = 0;
+ }
+ 
+-static void csi_at(int currcons, unsigned int nr)
++/*
++ * Insert character (ICH)
++ *
++ * NOTE:  This function is not available in DEC VT1xx terminals.
++ */
++static void vte_ich(int currcons, unsigned int nr)
+ {
+ 	if (nr > video_num_columns - x)
+ 		nr = video_num_columns - x;
+@@ -1288,7 +1436,10 @@
+ 	insert_char(currcons, nr);
+ }
+ 
+-static void csi_L(int currcons, unsigned int nr)
++/*
++ * Insert line (IL)
++ */
++static void vte_il(int currcons, unsigned int nr)
+ {
+ 	if (nr > video_num_lines - y)
+ 		nr = video_num_lines - y;
+@@ -1297,7 +1448,10 @@
+ 	insert_line(currcons, nr);
+ }
+ 
+-static void csi_P(int currcons, unsigned int nr)
++/*
++ * Delete character (DCH)
++ */
++static void vte_dch(int currcons, unsigned int nr)
+ {
+ 	if (nr > video_num_columns - x)
+ 		nr = video_num_columns - x;
+@@ -1306,7 +1460,10 @@
+ 	delete_char(currcons, nr);
+ }
+ 
+-static void csi_M(int currcons, unsigned int nr)
++/*
++ * Delete line (DL)
++ */
++static void vte_dl(int currcons, unsigned int nr)
+ {
+ 	if (nr > video_num_lines - y)
+ 		nr = video_num_lines - y;
+@@ -1315,7 +1472,18 @@
+ 	delete_line(currcons, nr);
+ }
+ 
+-static void save_cur(int currcons)
++/*
++ * Save cursor (DECSC)
++ *
++ * This saves the following states:
++ *  - cursor position
++ *  - graphic rendition
++ *  - character set shift state
++ *  - state of wrap flag
++ *  - state of origin mode
++ *  - state of selective erase (not implemented)
++ */
++static void vte_decsc(int currcons)
+ {
+ 	saved_x		= x;
+ 	saved_y		= y;
+@@ -1329,7 +1497,10 @@
+ 	saved_G1	= G1_charset;
+ }
+ 
+-static void restore_cur(int currcons)
++/*
++ * Restore cursor (DECRC)
++ */
++static void vte_decrc(int currcons)
+ {
+ 	gotoxy(currcons,saved_x,saved_y);
+ 	intensity	= s_intensity;
+@@ -1345,15 +1516,29 @@
+ 	need_wrap = 0;
+ }
+ 
+-enum { ESnormal, ESesc, ESsquare, ESgetpars, ESgotpars, ESfunckey,
+-	EShash, ESsetG0, ESsetG1, ESpercent, ESignore, ESnonstd,
++enum { ESinit, ESesc, EScsi, ESgetpars, ESgotpars, ESfunckey,
++	ESscf, ESgzd4, ESg1d4, ESdocs, ESignore, ESosc,
+ 	ESpalette };
+ 
+-static void reset_terminal(int currcons, int do_clear)
++/*
++ * Reset to initial state (RIS)
++ *
++ * On DEC terminals this causes the following:
++ *  - all set-up parameters are replaced by power-up defaults
++ *  - all communications lines are disconnected (should we send SIGHUP?)
++ *  - all user-defined keys are cleared (not implemented)
++ *  - the screen is cleared
++ *  - cursor is place to upper-left corner
++ *  - SGR state is set to normal
++ *  - selective erase attribute write state is set to "non-selective erase"
++ *    (not implemented)
++ *  - all character sets are set to default (not implemented)
++ */
++static void vte_ris(int currcons, int do_clear)
+ {
+ 	top		= 0;
+ 	bottom		= video_num_lines;
+-	vc_state	= ESnormal;
++	vc_state	= ESinit;
+ 	ques		= 0;
+ 	translate	= set_translate(LAT1_MAP,currcons);
+ 	G0_charset	= LAT1_MAP;
+@@ -1399,9 +1584,47 @@
+ 	bell_duration = DEFAULT_BELL_DURATION;
+ 
+ 	gotoxy(currcons,0,0);
+-	save_cur(currcons);
++	vte_decsc(currcons);
+ 	if (do_clear)
+-	    csi_J(currcons,2);
++	    vte_ed(currcons,2);
++}
++
++/*
++ * TABULATION CLEAR (TBC)
++ *
++ * NOTE:
++ * In case of parameters 0 and 2 the number of lines affected depends on the
++ * setting of the Tabulation Stop Mode (TSM).  Since we don't implement TSM,
++ * this is silently ignored.
++ *
++ * Parameters 1 and 4 are similiar to 0 and 3, but affect only line tabulation
++ * stops, which are not implemented.
++ *
++ * Parameter 2 may only be interpreted, when we implement a tabulation stop map
++ * per display line.
++ */
++static void vte_tbc(int currcons, int vpar)
++{
++
++	switch (vpar) {
++	case 0:
++		/*
++		 * The character tabulation stop at the active
++		 * presentation position is cleared.
++		 */
++		tab_stop[x >> 5] &= ~(1 << (x & 31));
++		return;
++	case 3:
++		/*
++		 * All character tabulation stops are cleared.
++		 */
++	case 5:
++		/*
++		 * All tabulation stops are cleared.
++		 */
++		tab_stop[0] = tab_stop[1] = tab_stop[2] = tab_stop[3] =
++		    tab_stop[4] = 0;
++	}
+ }
+ 
+ static void do_con_trol(struct tty_struct *tty, unsigned int currcons, int c)
+@@ -1411,16 +1634,21 @@
+ 	 *  of an escape sequence.
+ 	 */
+ 	switch (c) {
+-	case 0:
++	case 0x00:		/* NUL - Null */
++		return;
++#if 0
++        case 0x05:              /* ENQ - Enquiry */
++		/* XXX Fixme! should implement answerback */
+ 		return;
+-	case 7:
++#endif
++	case 0x07:		/* BEL - Bell */
+ 		if (bell_duration)
+ 			kd_mksound(bell_pitch, bell_duration);
+ 		return;
+-	case 8:
+-		bs(currcons);
++	case 0x08:		/* BS - Backspace */
++		vte_bs(currcons);
+ 		return;
+-	case 9:
++	case 0x09:		/* HT - Character tabulation */
+ 		pos -= (x << 1);
+ 		while (x < video_num_columns - 1) {
+ 			x++;
+@@ -1429,103 +1657,167 @@
+ 		}
+ 		pos += (x << 1);
+ 		return;
+-	case 10: case 11: case 12:
+-		lf(currcons);
++        case 0x0a:              /* LF - Line feed */
++        case 0x0b:              /* VT - Line tabulation */
++		/*
++		 * Since line tabulation is not implemented in the DEC VT
++		 * series (except VT131 ?), the DEC VT series treats any
++		 * VT as LF.
++		 */
++        case 0x0c:              /* FF - Form feed */
++		/*
++		 * DEC VT series processes FF as LF.
++		 */
++		vte_lf(currcons);
+ 		if (!is_kbd(lnm))
+ 			return;
+-	case 13:
+-		cr(currcons);
++	case 0x0d:		/* CR - Carriage return */
++		vte_cr(currcons);
+ 		return;
+-	case 14:
++	case 0x0e:		/* SO - Shift out / LS1 - Locking shift 1 */
+ 		charset = 1;
+ 		translate = set_translate(G1_charset,currcons);
+ 		disp_ctrl = 1;
+ 		return;
+-	case 15:
++	case 0x0f:		/* SI - Shift in / LS0 - Locking shift 0 */
+ 		charset = 0;
+ 		translate = set_translate(G0_charset,currcons);
+ 		disp_ctrl = 0;
+ 		return;
+-	case 24: case 26:
+-		vc_state = ESnormal;
++        case 0x18:              /* CAN - Cancel */
++        case 0x1a:              /* SUB - Substitute */
++		/*
++		 * NOTE:
++		 * On a DEC VT series terminal the reception of SUB will not
++		 * only end the current ESC, CSI or DCS sequence but also
++		 * display the error character, the mirrored (not upside-down!)
++		 * question mark.  Not (yet) implemented.
++		 */
++		vc_state = ESinit;
+ 		return;
+-	case 27:
++	case 0x1b:		/* ESC - Escape */
+ 		vc_state = ESesc;
+ 		return;
+-	case 127:
+-		del(currcons);
++	case 0x7f:		/* DEL - Delete */
++		/*
++		 * This character is ignored, unless a 96-set has been mapped,
++		 * but this is not supported at the moment.
++		 */
+ 		return;
+-	case 128+27:
+-		vc_state = ESsquare;
++	/*
++	 * C1 control functions (8-bit mode).
++	 *
++	 * XXX Fixme! Should only be interpreted if 8-bit controls are enabled.
++	 * XXX Fixme! Should have all C1 controls implemented (acc. to ECMA).
++	 */
++#if VTE_VERSION >= 210
++	case 0x84:		/* IND - Line feed (DEC, dropped by ECMA/ISO) */
++		vte_lf(currcons);
++		return;
++	case 0x85:		/* NEL - Next line */
++		vte_lf(currcons);
++		vte_cr(currcons);
++		return;
++	case 0x88:		/* HTS - Character tabulation set */
++		tab_stop[x >> 5] |= (1 << (x & 31));
++		return;
++	case 0x8d:		/* RI - Reverse line feed */
++		vte_ri(currcons);
++		return;
++#endif /* VTE_VERSION >= 210 */
++	case 0x9b:		/* CSI - Control sequence introducer */
++		vc_state = EScsi;
+ 		return;
+ 	}
++
+ 	switch(vc_state) {
+ 	case ESesc:
+-		vc_state = ESnormal;
++		vc_state = ESinit;
+ 		switch (c) {
+-		case '[':
+-			vc_state = ESsquare;
++		case '#':	/* SCF - Single control functions */
++			vc_state = ESscf;
+ 			return;
+-		case ']':
+-			vc_state = ESnonstd;
++		case '%':	/* DOCS - Designate other coding system */
++			vc_state = ESdocs;
+ 			return;
+-		case '%':
+-			vc_state = ESpercent;
++		case '(':	/* GZD4 - G0-designate 94-set */
++			vc_state = ESgzd4;
+ 			return;
+-		case 'E':
+-			cr(currcons);
+-			lf(currcons);
++		case ')':	/* G1D4 - G1-designate 94-set */
++			vc_state = ESg1d4;
+ 			return;
+-		case 'M':
+-			ri(currcons);
++
++			/* ===== Private control functions ===== */
++
++		case '7':	/* DECSC - Save cursor */
++			vte_decsc(currcons);
+ 			return;
+-		case 'D':
+-			lf(currcons);
++		case '8':	/* DECRC - Restore cursor */
++			vte_decrc(currcons);
+ 			return;
+-		case 'H':
+-			tab_stop[x >> 5] |= (1 << (x & 31));
++		case '=':	/* DECKPAM - Keypad application mode */
++			set_kbd(kbdapplic);
+ 			return;
+-		case 'Z':
+-			respond_ID(tty);
++		case '>':	/* DECKPNM - Keypad numeric mode */
++			clr_kbd(kbdapplic);
+ 			return;
+-		case '7':
+-			save_cur(currcons);
++
++			/* ===== C1 control functions ===== */
++
++		case 'D':	/* IND - Line feed (DEC, but not ISO 6429) */
++			vte_lf(currcons);
+ 			return;
+-		case '8':
+-			restore_cur(currcons);
++		case 'E':	/* NEL - Next line */
++			vte_cr(currcons);
++			vte_lf(currcons);
+ 			return;
+-		case '(':
+-			vc_state = ESsetG0;
++		case 'H':	/* HTS - Character tabulation set */
++			tab_stop[x >> 5] |= (1 << (x & 31));
+ 			return;
+-		case ')':
+-			vc_state = ESsetG1;
++		case 'M':	/* RI - Reverse line feed */
++			vte_ri(currcons);
+ 			return;
+-		case '#':
+-			vc_state = EShash;
++		case 'Z':	/* DECID - Identify terminal */
++			/* XXX Fixme! This collides with ISO 6429! */
++			vte_da(tty);
+ 			return;
+-		case 'c':
+-			reset_terminal(currcons,1);
++		case '[':	/* CSI - Contro sequence introducer */
++			vc_state = EScsi;
+ 			return;
+-		case '>':  /* Numeric keypad */
+-			clr_kbd(kbdapplic);
++		case ']':	/* OSC - Operating system command */
++			/* XXX Fixme! Wrong sequence and sequence format! */
++			vc_state = ESosc;
+ 			return;
+-		case '=':  /* Appl. keypad */
+-			set_kbd(kbdapplic);
++
++			/* ===== Single control functions ===== */
++
++		case 'c':	/* RIS - Reset to initial state */
++			vte_ris(currcons,1);
+ 			return;
+ 		}
+ 		return;
+-	case ESnonstd:
+-		if (c=='P') {   /* palette escape sequence */
+-			for (npar=0; npar<NPAR; npar++)
+-				par[npar] = 0 ;
+-			npar = 0 ;
++	case ESosc:
++		vc_state = ESinit;
++		switch (c) {
++		case 'P':	/* palette escape sequence */
++			/*
++			 * XXX Fixme! We should use the documented DEC
++			 * device control strings (DCS) instead.  OSC has
++			 * an entirely different meaning!
++			 */
++			for (npar = 0; npar < NPAR; npar++)
++				par[npar] = 0;
++			npar = 0;
+ 			vc_state = ESpalette;
+ 			return;
+-		} else if (c=='R') {   /* reset palette */
++		case 'R':	/* reset palette */
++			/*
++			 * XXX Fixme! See comment above.
++			 */
+ 			reset_palette(currcons);
+-			vc_state = ESnormal;
+-		} else
+-			vc_state = ESnormal;
++			vc_state = ESinit;
++			return;
++		}
+ 		return;
+ 	case ESpalette:
+ 		if ( (c>='0'&&c<='9') || (c>='A'&&c<='F') || (c>='a'&&c<='f') ) {
+@@ -1539,12 +1831,12 @@
+ 				palette[i] = 16*par[j++];
+ 				palette[i] += par[j];
+ 				set_palette(currcons);
+-				vc_state = ESnormal;
++				vc_state = ESinit;
+ 			}
+ 		} else
+-			vc_state = ESnormal;
++			vc_state = ESinit;
+ 		return;
+-	case ESsquare:
++	case EScsi:
+ 		for(npar = 0 ; npar < NPAR ; npar++)
+ 			par[npar] = 0;
+ 		npar = 0;
+@@ -1566,15 +1858,20 @@
+ 			return;
+ 		} else vc_state=ESgotpars;
+ 	case ESgotpars:
+-		vc_state = ESnormal;
++		vc_state = ESinit;
+ 		switch(c) {
+-		case 'h':
++		case 'h':	/* SM - Set mode / DECSM - Set mode */
+ 			set_mode(currcons,1);
+ 			return;
+-		case 'l':
++		case 'l':	/* RM - Reset mode / DECRM - Reset mode */
+ 			set_mode(currcons,0);
+ 			return;
+ 		case 'c':
++			/*
++			 * XXX Fixme!  Need to use final byte reserved for
++			 * private sequences instead of flag designating
++			 * private parameters!
++			 */
+ 			if (ques) {
+ 				if (par[0])
+ 					cursor_type = par[0] | (par[1]<<8) | (par[2]<<16);
+@@ -1584,6 +1881,11 @@
+ 			}
+ 			break;
+ 		case 'm':
++			/*
++			 * XXX Fixme!  Need to use final byte reserved for
++			 * private sequences instead of flag designating
++			 * private parameters!
++			 */
+ 			if (ques) {
+ 				clear_selection();
+ 				if (par[0])
+@@ -1594,12 +1896,36 @@
+ 			}
+ 			break;
+ 		case 'n':
+-			if (!ques) {
+-				if (par[0] == 5)
+-					status_report(tty);
+-				else if (par[0] == 6)
+-					cursor_report(currcons,tty);
+-			}
++#if VTE_VERSION >= 210
++			if (ques) {
++				switch (par[0]) {
++				case 6:	/* DECXCPR - Extended CPR */
++					vte_cpr(currcons, tty, 1);
++					break;
++				case 15:	/* DEC printer status */
++					vte_fake_dec_dsr(tty, "13");
++					break;
++				case 25:	/* DEC UDK status */
++					vte_fake_dec_dsr(tty, "21");
++					break;
++				case 26:	/* DEC keyboard status */
++					vte_fake_dec_dsr(tty, "27;1;0;1");
++					break;
++				case 75:	/* DEC data integrity */
++					vte_fake_dec_dsr(tty, "70");
++					break;
++				}
++			} else
++#endif /* VTE_VERSION >= 210 */
++				switch (par[0]) {
++				case 5:	/* DSR - Device status report */
++					vte_dsr(tty);
++					break;
++				case 6:	/* CPR - Cursor position report */
++					vte_cpr(currcons, tty, 0);
++					break;
++				}
++			ques = 0;
+ 			return;
+ 		}
+ 		if (ques) {
+@@ -1607,83 +1933,128 @@
+ 			return;
+ 		}
+ 		switch(c) {
+-		case 'G': case '`':
+-			if (par[0]) par[0]--;
+-			gotoxy(currcons,par[0],y);
++		case '@':	/* ICH - Insert character */
++			vte_ich(currcons,par[0]);
+ 			return;
+-		case 'A':
++		case 'A':	/* CUU - Cursor up */
++#if VTE_VERSION >= 210
++		case 'k':	/* VPB - Line position backward */
++#endif /* VTE_VERSION >= 210 */
+ 			if (!par[0]) par[0]++;
+ 			gotoxy(currcons,x,y-par[0]);
+ 			return;
+-		case 'B': case 'e':
++		case 'B':	/* CUD - Cursor down */
++		case 'e':	/* VPR - Line position forward */
+ 			if (!par[0]) par[0]++;
+ 			gotoxy(currcons,x,y+par[0]);
+ 			return;
+-		case 'C': case 'a':
++		case 'C':	/* CUF - Cursor right */
++		case 'a':	/* HPR - Character position forward */
+ 			if (!par[0]) par[0]++;
+ 			gotoxy(currcons,x+par[0],y);
+ 			return;
+-		case 'D':
++		case 'D':	/* CUB - Cursor left */
++#if VTE_VERSION >= 210
++		case 'j':	/* HPB - Character position backward */
++#endif /* VTE_VERSION >= 210 */
+ 			if (!par[0]) par[0]++;
+ 			gotoxy(currcons,x-par[0],y);
+ 			return;
+-		case 'E':
++		case 'E':	/* CNL - Cursor next line */
+ 			if (!par[0]) par[0]++;
+ 			gotoxy(currcons,0,y+par[0]);
+ 			return;
+-		case 'F':
++		case 'F':	/* CPL - Cursor preceeding line */
+ 			if (!par[0]) par[0]++;
+ 			gotoxy(currcons,0,y-par[0]);
+ 			return;
+-		case 'd':
++		case 'G':	/* CHA - Cursor character absolute */
++		case '`':	/* HPA - Character position absolute */
+ 			if (par[0]) par[0]--;
+-			gotoxay(currcons,x,par[0]);
++			gotoxy(currcons,par[0],y);
+ 			return;
+-		case 'H': case 'f':
++		case 'H':	/* CUP - Cursor position */
++		case 'f':	/* HVP - Horizontal and vertical position */
+ 			if (par[0]) par[0]--;
+ 			if (par[1]) par[1]--;
+ 			gotoxay(currcons,par[1],par[0]);
+ 			return;
+-		case 'J':
+-			csi_J(currcons,par[0]);
++#if VTE_VERSION >= 210
++		case 'I':	/* CHT - Cursor forward tabulation */
++			if (!par[0]) par[0]++;
++			vte_cht(currcons,par[0]);
+ 			return;
+-		case 'K':
+-			csi_K(currcons,par[0]);
++#endif /* VTE_VERSION >= 210 */
++		case 'J':	/* ED - Erase in page */
++			vte_ed(currcons,par[0]);
+ 			return;
+-		case 'L':
+-			csi_L(currcons,par[0]);
++		case 'K':	/* EL - Erase in line */
++			vte_el(currcons,par[0]);
+ 			return;
+-		case 'M':
+-			csi_M(currcons,par[0]);
++		case 'L':	/* IL - Insert line */
++			vte_il(currcons,par[0]);
+ 			return;
+-		case 'P':
+-			csi_P(currcons,par[0]);
++		case 'M':	/* DL - Delete line */
++			vte_dl(currcons,par[0]);
+ 			return;
+-		case 'c':
++		case 'P':	/* DCH - Delete character */
++			vte_dch(currcons,par[0]);
++			return;
++#if VTE_VERSION >= 210
++		case 'W':	/* CTC - Cursor tabulation control */
++			switch (par[0]) {
++			case 0:	/* Set character tab stop at current position */
++				tab_stop[x >> 5] |= (1 << (x & 31));
++				return;
++			case 2:	/* Clear character tab stop at curr. position */
++				vte_tbc(currcons, 0);
++				return;
++			case 5:	/* All character tab stops are cleared. */
++				vte_tbc(currcons, 5);
++				return;
++			}
++			return;
++#endif /* VTE_VERSION >= 210 */
++		case 'X':	/* ECH - Erase character */
++			vte_ech(currcons, par[0]);
++			return;
++#if VTE_VERSION >= 210
++		case 'Y':	/* CVT - Cursor line tabulation */
+ 			if (!par[0])
+-				respond_ID(tty);
++				par[0]++;
++			vte_cvt(currcons, par[0]);
+ 			return;
+-		case 'g':
++		case 'Z':	/* CBT - Cursor backward tabulation */
++			vte_cbt(currcons, par[0]);
++			return;
++#endif /* VTE_VERSION >= 210 */
++		case ']':	/* setterm functions */
++			/* XXX Fixme! This collides with ISO 6429! */
++			setterm_command(currcons);
++			return;
++		case 'c':	/* DA - Device attribute */
+ 			if (!par[0])
+-				tab_stop[x >> 5] &= ~(1 << (x & 31));
+-			else if (par[0] == 3) {
+-				tab_stop[0] =
+-					tab_stop[1] =
+-					tab_stop[2] =
+-					tab_stop[3] =
+-					tab_stop[4] = 0;
+-			}
++				vte_da(tty);
+ 			return;
+-		case 'm':
+-			csi_m(currcons);
++		case 'd':	/* VPA - Line position absolute */
++			if (par[0]) par[0]--;
++			gotoxay(currcons,x,par[0]);
++			return;
++		case 'g':	/* TBC - Tabulation clear */
++			vte_tbc(currcons, par[0]);
+ 			return;
+-		case 'q': /* DECLL - but only 3 leds */
+-			/* map 0,1,2,3 to 0,1,2,4 */
++		case 'm':	/* SGR - Select graphic rendition */
++			vte_sgr(currcons);
++			return;
++
++			/* ===== Private control sequences ===== */
++
++		case 'q': /* DECLL - Load LEDs */
+ 			if (par[0] < 4)
+ 				setledstate(kbd_table + currcons,
+ 					    (par[0] < 3) ? par[0] : 4);
+ 			return;
+-		case 'r':
++		case 'r':	/* DECSTBM - Set top and bottom margin */
+ 			if (!par[0])
+ 				par[0]++;
+ 			if (!par[1])
+@@ -1696,25 +2067,23 @@
+ 				gotoxay(currcons,0,0);
+ 			}
+ 			return;
+-		case 's':
+-			save_cur(currcons);
+-			return;
+-		case 'u':
+-			restore_cur(currcons);
++#if VTE_VERSION < 199
++		case 's':	/* DECSC - Save cursor */
++			vte_decsc(currcons);
+ 			return;
+-		case 'X':
+-			csi_X(currcons, par[0]);
++		case 'u':	/* DECRC - Restore cursor */
++			vte_decrc(currcons);
+ 			return;
+-		case '@':
+-			csi_at(currcons,par[0]);
+-			return;
+-		case ']': /* setterm functions */
+-			setterm_command(currcons);
++#endif /* VTE_VERSION < 199 */
++#if VTE_VERSION >= 210
++		case 'x':	/* DECREQTPARM - Request terminal parameters */
++			vte_decreptparm(currcons, tty);
+ 			return;
++#endif /* VTE_VERSION >= 210 */
+ 		}
+ 		return;
+-	case ESpercent:
+-		vc_state = ESnormal;
++	case ESdocs:
++		vc_state = ESinit;
+ 		switch (c) {
+ 		case '@':  /* defined in ISO 2022 */
+ 			utf = 0;
+@@ -1726,21 +2095,21 @@
+ 		}
+ 		return;
+ 	case ESfunckey:
+-		vc_state = ESnormal;
++		vc_state = ESinit;
+ 		return;
+-	case EShash:
+-		vc_state = ESnormal;
++	case ESscf:
++		vc_state = ESinit;
+ 		if (c == '8') {
+ 			/* DEC screen alignment test. kludge :-) */
+ 			video_erase_char =
+ 				(video_erase_char & 0xff00) | 'E';
+-			csi_J(currcons, 2);
++			vte_ed(currcons, 2);
+ 			video_erase_char =
+ 				(video_erase_char & 0xff00) | ' ';
+ 			do_update_region(currcons, origin, screenbuf_size/2);
+ 		}
+ 		return;
+-	case ESsetG0:
++	case ESgzd4:
+ 		if (c == '0')
+ 			G0_charset = GRAF_MAP;
+ 		else if (c == 'B')
+@@ -1751,9 +2120,9 @@
+ 			G0_charset = USER_MAP;
+ 		if (charset == 0)
+ 			translate = set_translate(G0_charset,currcons);
+-		vc_state = ESnormal;
++		vc_state = ESinit;
+ 		return;
+-	case ESsetG1:
++	case ESg1d4:
+ 		if (c == '0')
+ 			G1_charset = GRAF_MAP;
+ 		else if (c == 'B')
+@@ -1764,10 +2133,10 @@
+ 			G1_charset = USER_MAP;
+ 		if (charset == 1)
+ 			translate = set_translate(G1_charset,currcons);
+-		vc_state = ESnormal;
++		vc_state = ESinit;
+ 		return;
+ 	default:
+-		vc_state = ESnormal;
++		vc_state = ESinit;
+ 	}
+ }
+ 
+@@ -1861,47 +2230,47 @@
+ 		  tc = translate[toggle_meta ? (c|0x80) : c];
+ 		}
+ 
+-                /* If the original code was a control character we
+-                 * only allow a glyph to be displayed if the code is
+-                 * not normally used (such as for cursor movement) or
+-                 * if the disp_ctrl mode has been explicitly enabled.
+-                 * Certain characters (as given by the CTRL_ALWAYS
+-                 * bitmap) are always displayed as control characters,
+-                 * as the console would be pretty useless without
+-                 * them; to display an arbitrary font position use the
+-                 * direct-to-font zone in UTF-8 mode.
+-                 */
+-                ok = tc && (c >= 32 ||
+-                            (!utf && !(((disp_ctrl ? CTRL_ALWAYS
+-                                         : CTRL_ACTION) >> c) & 1)))
+-                        && (c != 127 || disp_ctrl)
++		/* If the original code was a control character we
++		 * only allow a glyph to be displayed if the code is
++		 * not normally used (such as for cursor movement) or
++		 * if the disp_ctrl mode has been explicitly enabled.
++		 * Certain characters (as given by the CTRL_ALWAYS
++		 * bitmap) are always displayed as control characters,
++		 * as the console would be pretty useless without
++		 * them; to display an arbitrary font position use the
++		 * direct-to-font zone in UTF-8 mode.
++		 */
++		ok = tc && (c >= 32 ||
++			    (!utf && !(((disp_ctrl ? CTRL_ALWAYS
++			                 : CTRL_ACTION) >> c) & 1)))
++			&& (c != 127 || disp_ctrl)
+ 			&& (c != 128+27);
+ 
+-		if (vc_state == ESnormal && ok) {
++		if (vc_state == ESinit && ok) {
+ 			/* Now try to find out how to display it */
+ 			tc = conv_uni_to_pc(vc_cons[currcons].d, tc);
+ 			if ( tc == -4 ) {
+-                                /* If we got -4 (not found) then see if we have
+-                                   defined a replacement character (U+FFFD) */
+-                                tc = conv_uni_to_pc(vc_cons[currcons].d, 0xfffd);
++			        /* If we got -4 (not found) then see if we have
++			           defined a replacement character (U+FFFD) */
++			        tc = conv_uni_to_pc(vc_cons[currcons].d, 0xfffd);
+ 
+ 				/* One reason for the -4 can be that we just
+ 				   did a clear_unimap();
+ 				   try at least to show something. */
+ 				if (tc == -4)
+ 				     tc = c;
+-                        } else if ( tc == -3 ) {
+-                                /* Bad hash table -- hope for the best */
+-                                tc = c;
+-                        }
++			} else if ( tc == -3 ) {
++			        /* Bad hash table -- hope for the best */
++			        tc = c;
++			}
+ 			if (tc & ~charmask)
+-                                continue; /* Conversion failed */
++			        continue; /* Conversion failed */
+ 
+ 			if (need_wrap || decim)
+ 				FLUSH
+ 			if (need_wrap) {
+-				cr(currcons);
+-				lf(currcons);
++				vte_cr(currcons);
++				vte_lf(currcons);
+ 			}
+ 			if (decim)
+ 				insert_char(currcons, 1);
+@@ -2026,14 +2395,14 @@
+ 				cnt = 0;
+ 			}
+ 			if (c == 8) {		/* backspace */
+-				bs(currcons);
++				vte_bs(currcons);
+ 				start = (ushort *)pos;
+ 				myx = x;
+ 				continue;
+ 			}
+ 			if (c != 13)
+-				lf(currcons);
+-			cr(currcons);
++				vte_lf(currcons);
++			vte_cr(currcons);
+ 			start = (ushort *)pos;
+ 			myx = x;
+ 			if (c == 10 || c == 13)
+@@ -2274,7 +2643,7 @@
+ 	ulcolor		= 0x0f;   /* bold white */
+ 	halfcolor       = 0x08;   /* grey */
+ 	vt_cons[currcons]->paste_wait = 0;
+-	reset_terminal(currcons, do_clear);
++	vte_ris(currcons, do_clear);
+ }
+ 
+ /*
+@@ -2363,7 +2732,7 @@
+ 	set_origin(currcons);
+ 	save_screen(currcons);
+ 	gotoxy(currcons,x,y);
+-	csi_J(currcons, 0);
++	vte_ed(currcons, 0);
+ 	update_screen(fg_console);
+ 	printk("Console: %s %s %dx%d",
+ 		can_do_color ? "colour" : "mono",--- console-2.3.51.c	2000/03/11 07:01:07	1.1
++++ console-2.3.51.c	2000/03/11 17:17:54	1.5
+@@ -66,6 +66,11 @@
+  *
+  * Resurrected character buffers in videoram plus lots of other trickery
+  * by Martin Mares <mj@atrey.karlin.mff.cuni.cz>, July 1998
++ *
++ * ECMA-35 (ISO 2022), ECMA-48 (ISO 6429) and missing DEC VT-series functions
++ * by Dominik Kubla <kubla@uni-mainz.de>, February 1999
++ * Adapted for 2.3.51 and changes conditionalized according to VTE_VERSION
++ * by Eric S. Raymond <esr@thyrsus.com>, March 2000.
+  */
+ 
+ #include <linux/module.h>
+@@ -143,8 +148,8 @@
+ 		    unsigned int cols, int do_clear);
+ static void blank_screen(void);
+ static void gotoxy(int currcons, int new_x, int new_y);
+-static void save_cur(int currcons);
+-static void reset_terminal(int currcons, int do_clear);
++static void vte_decsc(int currcons);
++static void vte_ris(int currcons, int do_clear);
+ static void con_flush_chars(struct tty_struct *tty);
+ static void set_vesa_blanking(unsigned long arg);
+ static void set_cursor(int currcons);
+@@ -238,7 +243,7 @@
+ 	unsigned short *d, *s;
+ 
+ 	if (t+nr >= b)
+-		nr = b - t - 1;
++		nr = b - t;
+ 	if (b > video_num_lines || t >= b || nr < 1)
+ 		return;
+ 	if (IS_VISIBLE && sw->con_scroll(vc_cons[currcons].d, t, b, SM_UP, nr))
+@@ -256,7 +261,7 @@
+ 	unsigned int step;
+ 
+ 	if (t+nr >= b)
+-		nr = b - t - 1;
++		nr = b - t;
+ 	if (b > video_num_lines || t >= b || nr < 1)
+ 		return;
+ 	if (IS_VISIBLE && sw->con_scroll(vc_cons[currcons].d, t, b, SM_DOWN, nr))
+@@ -369,7 +374,7 @@
+ static void update_attr(int currcons)
+ {
+ 	attr = build_attr(currcons, color, intensity, blink, underline, reverse ^ decscnm);
+-	video_erase_char = (build_attr(currcons, color, 1, 0, 0, decscnm) << 8) | ' ';
++	video_erase_char = (build_attr(currcons, color, intensity, 0, 0, decscnm) << 8) | ' ';
+ }
+ 
+ /* Note: inverting the screen twice should revert to the original state */
+@@ -750,11 +755,11 @@
+ 		screenbuf_size = ss;
+ 		set_origin(currcons);
+ 
+-		/* do part of a reset_terminal() */
++		/* do part of a vte_ris() */
+ 		top = 0;
+ 		bottom = video_num_lines;
+ 		gotoxy(currcons, x, y);
+-		save_cur(currcons);
++		vte_decsc(currcons);
+ 
+ 		if (console_table[currcons]) {
+ 			struct winsize ws, *cws = &console_table[currcons]->winsize;
+@@ -789,7 +794,13 @@
+ 
+ /*
+  *	VT102 emulator
++ *
++ * VTE_VERSION selects the version of the emulation
++ *
++ * 20x is bug-fixes only (for the 2.3.x series).
++ * 21x improves VT100 and ECMA-48 conformance. 
+  */
++#define VTE_VERSION	210
+ 
+ #define set_kbd(x) set_vc_kbd_mode(kbd_table+currcons,x)
+ #define clr_kbd(x) clr_vc_kbd_mode(kbd_table+currcons,x)
+@@ -874,7 +885,10 @@
+ 	scrolldelta(lines);
+ }
+ 
+-static void lf(int currcons)
++/*
++ * LINE FEED (LF)
++ */
++static void vte_lf(int currcons)
+ {
+     	/* don't scroll if above bottom of scrolling region, or
+ 	 * if below scrolling region
+@@ -888,9 +902,12 @@
+ 	need_wrap = 0;
+ }
+ 
+-static void ri(int currcons)
++/*
++ * REVERSE LINE FEED (RI)
++ */
++static void vte_ri(int currcons)
+ {
+-    	/* don't scroll if below top of scrolling region, or
++	/* don't scroll if below top of scrolling region, or
+ 	 * if above scrolling region
+ 	 */
+ 	if (y == top)
+@@ -902,13 +919,19 @@
+ 	need_wrap = 0;
+ }
+ 
+-static inline void cr(int currcons)
++/*
++ * CARRIAGE RETURN (CR)
++ */
++static inline void vte_cr(int currcons)
+ {
+ 	pos -= x<<1;
+ 	need_wrap = x = 0;
+ }
+ 
+-static inline void bs(int currcons)
++/*
++ * BACK SPACE (BS)
++ */
++static inline void vte_bs(int currcons)
+ {
+ 	if (x) {
+ 		pos -= 2;
+@@ -917,12 +940,64 @@
+ 	}
+ }
+ 
+-static inline void del(int currcons)
++#if VTE_VERSION >= 210
++/*
++ * CURSOR LINE TABULATION (CVT)
++ *
++ * NOTE:
++ * In accordance with our interpretation of VT as LF we will treat CVT as
++ * (par[0] * LF).  Not very creative, but at least consequent.
++ */
++static void vte_cvt(int currcons, int vpar)
+ {
+-	/* ignored */
++	int i;
++
++	for (i = 0; i < vpar; i++) {
++		vte_lf(currcons);
++	}
+ }
+ 
+-static void csi_J(int currcons, int vpar)
++/*
++ * CURSOR BACKWARD TABULATION (CBT)
++ */
++static void vte_cbt(int currcons, int vpar)
++{
++	int i;
++
++	for (i = 0; i < vpar; i++) {
++		pos -= (x << 1);
++		while (x > 0) {
++			x--;
++			if (tab_stop[x >> 5] & (1 << (x & 31)))
++				break;
++		}
++	pos += (x << 1);
++	}
++}
++
++/*
++ * CURSOR FORWARD TABULATION (CHT)
++ */
++static void vte_cht(int currcons, int vpar)
++{
++	int i;
++
++	for (i = 0; i < vpar; i++) {
++		pos -= (x << 1);
++		while (x < video_num_columns - 1) {
++			x++;
++			if (tab_stop[x >> 5] & (1 << (x & 31)))
++				break;
++		}
++	pos += (x << 1);
++	}
++}
++#endif /* VTE_VERSION >= 210 */
++
++/*
++ * ERASE IN PAGE (ED)
++ */
++static void vte_ed(int currcons, int vpar)
+ {
+ 	unsigned int count;
+ 	unsigned short * start;
+@@ -966,7 +1041,10 @@
+ 	need_wrap = 0;
+ }
+ 
+-static void csi_K(int currcons, int vpar)
++/*
++ * ERASE IN LINE (EL)
++ */
++static void vte_el(int currcons, int vpar)
+ {
+ 	unsigned int count;
+ 	unsigned short * start;
+@@ -1000,8 +1078,13 @@
+ 	need_wrap = 0;
+ }
+ 
+-static void csi_X(int currcons, int vpar) /* erase the following vpar positions */
+-{					  /* not vt100? */
++/*
++ * Erase character (ECH)
++ *
++ * NOTE:  This function is not available in DEC VT1xx terminals.
++ */
++static void vte_ech(int currcons, int vpar)
++{
+ 	int count;
+ 
+ 	if (!vpar)
+@@ -1023,7 +1106,12 @@
+ 	color = def_color;
+ }
+ 
+-static void csi_m(int currcons)
++/*
++ * SELECT GRAPHIC RENDITION (SGR)
++ *
++ * NOTE: The DEC vt1xx series only implements attribute values 0,1,4,5 and 7.
++ */
++static void vte_sgr(int currcons)
+ {
+ 	int i;
+ 
+@@ -1032,78 +1120,65 @@
+ 			case 0:	/* all attributes off */
+ 				default_attr(currcons);
+ 				break;
+-			case 1:
++			case 1:	/* bold or increased intensity */
+ 				intensity = 2;
+ 				break;
+-			case 2:
++			case 2:	/* faint or decreased intensity */
+ 				intensity = 0;
+ 				break;
+-			case 4:
++			case 4:	/* singly underlined. */
+ 				underline = 1;
+ 				break;
+-			case 5:
++			case 5:	/* slowly blinking (< 2.5 Hz) */
++#if VTE_VERSION >= 210
++			case 6:	/* rapidly blinking (>= 2.5 Hz) */
++#endif /* VTE_VERSION >= 210 */
+ 				blink = 1;
+ 				break;
+-			case 7:
++			case 7:	/* negative image */
+ 				reverse = 1;
+ 				break;
+-			case 10: /* ANSI X3.64-1979 (SCO-ish?)
+-				  * Select primary font, don't display
+-				  * control chars if defined, don't set
+-				  * bit 8 on output.
+-				  */
++			case 10:	/*  primary (default) font */
+ 				translate = set_translate(charset == 0
+ 						? G0_charset
+ 						: G1_charset,currcons);
+ 				disp_ctrl = 0;
+ 				toggle_meta = 0;
+ 				break;
+-			case 11: /* ANSI X3.64-1979 (SCO-ish?)
+-				  * Select first alternate font, lets
+-				  * chars < 32 be displayed as ROM chars.
+-				  */
++			case 11:	/* first alternative font */
+ 				translate = set_translate(IBMPC_MAP,currcons);
+ 				disp_ctrl = 1;
+ 				toggle_meta = 0;
+ 				break;
+-			case 12: /* ANSI X3.64-1979 (SCO-ish?)
+-				  * Select second alternate font, toggle
+-				  * high bit before displaying as ROM char.
+-				  */
++			case 12:	/* second alternative font */
+ 				translate = set_translate(IBMPC_MAP,currcons);
+ 				disp_ctrl = 1;
+ 				toggle_meta = 1;
+ 				break;
+-			case 21:
+-			case 22:
++#if VTE_VERSION < 199
++			case 21:	/* normal intensity */
++#endif /* VTE_VERSION < 199 */
++			case 22:	/* normal intensity */
+ 				intensity = 1;
+ 				break;
+-			case 24:
++			case 24:	/* not underlined (neither singly nor doubly) */
+ 				underline = 0;
+ 				break;
+-			case 25:
++			case 25:	/* steady (not blinking) */
+ 				blink = 0;
+ 				break;
+-			case 27:
++			case 27:	/* positive image */
+ 				reverse = 0;
+ 				break;
+-			case 38: /* ANSI X3.64-1979 (SCO-ish?)
+-				  * Enables underscore, white foreground
+-				  * with white underscore (Linux - use
+-				  * default foreground).
+-				  */
++			case 38:	/* foreground color (ISO 8613-6/ITU T.416) */
+ 				color = (def_color & 0x0f) | background;
+ 				underline = 1;
+ 				break;
+-			case 39: /* ANSI X3.64-1979 (SCO-ish?)
+-				  * Disable underline option.
+-				  * Reset colour to default? It did this
+-				  * before...
+-				  */
++			case 39:	/* default display color */
+ 				color = (def_color & 0x0f) | background;
+ 				underline = 0;
+ 				break;
+-			case 49:
++			case 49:	/* default background color */
+ 				color = (def_color & 0xf0) | foreground;
+ 				break;
+ 			default:
+@@ -1127,24 +1202,82 @@
+ 	con_schedule_flip(tty);
+ }
+ 
+-static void cursor_report(int currcons, struct tty_struct * tty)
++#if VTE_VERSION >= 210
++/*
++ * Fake a DEC DSR for non-implemented features
++ */
++static void vte_fake_dec_dsr(struct tty_struct *tty, char *reply)
++{
++	char buf[40];
++	sprintf(buf, "\033[?%sn", reply);
++	respond_string(buf, tty);
++}
++#endif /* VTE_VERSION >= 210 */
++
++/*
++ * CURSOR POSITION REPORT (CPR)
++ * DEC EXTENDED CURSOR POSITION REPORT (DECXCPR)
++ */
++static void vte_cpr(int currcons, struct tty_struct *tty, int ext)
+ {
+ 	char buf[40];
+ 
+-	sprintf(buf, "\033[%d;%dR", y + (decom ? top+1 : 1), x+1);
++#if VTE_VERSION >= 210
++	if (ext) {
++		/*
++		 * NOTE:
++		 * Since we don't implement any form of page memory, we will
++		 * always return the cursor position in page 1.
++		 */
++		sprintf(buf, "\033[?%d;%d;1R", y + (decom ? top + 1 : 1), x+1);
++	} else
++#endif /* VTE_VERSION >= 210 */
++		sprintf(buf, "\033[%d;%dR", y + (decom ? top + 1 : 1), x+1);
+ 	respond_string(buf, tty);
+ }
+ 
+-static inline void status_report(struct tty_struct * tty)
++/*
++ * DEVICE STATUS REPORT (DSR)
++ */
++static inline void vte_dsr(struct tty_struct * tty)
+ {
+-	respond_string("\033[0n", tty);	/* Terminal ok */
++	respond_string("\033[0n", tty); /* Terminal ok */
+ }
+ 
+-static inline void respond_ID(struct tty_struct * tty)
++/*
++ * ANSWERBACK MESSAGE
++ */
++static inline void vte_answerback(struct tty_struct *tty)
++{
++	respond_string("l i n u x", tty);
++}
++
++/*
++ * DEVICE ATTRIBUTE (DA)
++ */
++static inline void vte_da(struct tty_struct *tty)
+ {
+ 	respond_string(VT102ID, tty);
+ }
+ 
++#if VTE_VERSION >= 210
++/*
++ * DEC REPORT TERMINAL PARAMETERS (DECREPTPARM)
++ *
++ * NOTE:  This function is _only_ available on DEV VT1xx terminals.
++ *
++ * XXX Fixme! Report should reflect actual parameters instead of being hard
++ *      coded.  -dbk
++ */
++static void vte_decreptparm(int currcons, struct tty_struct *tty)
++{
++	char buf[40];
++
++	sprintf(buf, "\033[%d;1;1;120;120;1;0x", par[0] + 2);
++	respond_string(buf, tty);
++}
++#endif /* VTE_VERSION >= 210 */
++
+ void mouse_report(struct tty_struct * tty, int butt, int mrx, int mry)
+ {
+ 	char buf[8];
+@@ -1162,6 +1295,10 @@
+ 	return report_mouse;
+ }
+ 
++/*
++ * Set mode (SM / DECSM)
++ * Reset mode (RM / DECRM)
++ */
+ static void set_mode(int currcons, int on_off)
+ {
+ 	int i;
+@@ -1294,7 +1431,12 @@
+ 	need_wrap = 0;
+ }
+ 
+-static void csi_at(int currcons, unsigned int nr)
++/*
++ * INSERT CHARACTER (ICH)
++ *
++ * NOTE:  This function is not available in DEC VT1xx terminals.
++ */
++static void vte_ich(int currcons, unsigned int nr)
+ {
+ 	if (nr > video_num_columns - x)
+ 		nr = video_num_columns - x;
+@@ -1303,7 +1445,10 @@
+ 	insert_char(currcons, nr);
+ }
+ 
+-static void csi_L(int currcons, unsigned int nr)
++/*
++ * INSERT LINE (IL)
++ */
++static void vte_il(int currcons, unsigned int nr)
+ {
+ 	if (nr > video_num_lines - y)
+ 		nr = video_num_lines - y;
+@@ -1312,7 +1457,10 @@
+ 	insert_line(currcons, nr);
+ }
+ 
+-static void csi_P(int currcons, unsigned int nr)
++/*
++ * DELETE CHARACTER (DCH)
++ */
++static void vte_dch(int currcons, unsigned int nr)
+ {
+ 	if (nr > video_num_columns - x)
+ 		nr = video_num_columns - x;
+@@ -1321,7 +1469,10 @@
+ 	delete_char(currcons, nr);
+ }
+ 
+-static void csi_M(int currcons, unsigned int nr)
++/*
++ * DELETE LINE (DL)
++ */
++static void vte_dl(int currcons, unsigned int nr)
+ {
+ 	if (nr > video_num_lines - y)
+ 		nr = video_num_lines - y;
+@@ -1330,7 +1481,18 @@
+ 	delete_line(currcons, nr);
+ }
+ 
+-static void save_cur(int currcons)
++/*
++ * SAVE CURSOR (DECSC)
++ *
++ * This saves the following states:
++ *  - cursor position
++ *  - graphic rendition
++ *  - character set shift state
++ *  - state of wrap flag
++ *  - state of origin mode
++ *  - state of selective erase (not implemented)
++ */
++static void vte_decsc(int currcons)
+ {
+ 	saved_x		= x;
+ 	saved_y		= y;
+@@ -1344,7 +1506,10 @@
+ 	saved_G1	= G1_charset;
+ }
+ 
+-static void restore_cur(int currcons)
++/*
++ * RESTORE CURSOR (DECRC)
++ */
++static void vte_decrc(int currcons)
+ {
+ 	gotoxy(currcons,saved_x,saved_y);
+ 	intensity	= s_intensity;
+@@ -1360,15 +1525,31 @@
+ 	need_wrap = 0;
+ }
+ 
+-enum { ESnormal, ESesc, ESsquare, ESgetpars, ESgotpars, ESfunckey,
+-	EShash, ESsetG0, ESsetG1, ESpercent, ESignore, ESnonstd,
+-	ESpalette };
++enum { ESinit, ESesc, EScsi, ESgetpars, ESgotpars, ESfunckey,
++	ESacs, ESscf, ESgzd4, ESg1d4, ESdocs, ESignore, ESosc,
++	ESpalette
++};
+ 
+-static void reset_terminal(int currcons, int do_clear)
++/*
++ * RESET TO INITIAL STATE (RIS)
++ *
++ * On DEC terminals this causes the following:
++ *  - all set-up parameters are replaced by power-up defaults
++ *  - all communications lines are disconnected (should we send SIGHUP to
++ *    controlling process?)
++ *  - all user-defined keys are cleared (not implemented)
++ *  - the screen is cleared
++ *  - cursor is place to upper-left corner
++ *  - SGR state is set to normal
++ *  - selective erase attribute write state is set to "non-selective erase"
++ *    (not implemented)
++ *  - all character sets are set to default (not implemented)
++ */
++static void vte_ris(int currcons, int do_clear)
+ {
+ 	top		= 0;
+ 	bottom		= video_num_lines;
+-	vc_state	= ESnormal;
++	vc_state	= ESinit;
+ 	ques		= 0;
+ 	translate	= set_translate(LAT1_MAP,currcons);
+ 	G0_charset	= LAT1_MAP;
+@@ -1414,28 +1595,78 @@
+ 	bell_duration = DEFAULT_BELL_DURATION;
+ 
+ 	gotoxy(currcons,0,0);
+-	save_cur(currcons);
++	vte_decsc(currcons);
+ 	if (do_clear)
+-	    csi_J(currcons,2);
++	    vte_ed(currcons,2);
++}
++
++/*
++ * TABULATION CLEAR (TBC)
++ *
++ * NOTE:
++ * In case of parameters 0 and 2 the number of lines affected depends on the
++ * setting of the Tabulation Stop Mode (TSM).  Since we don't implement TSM,
++ * this is silently ignored.
++ *
++ * Parameters 1 and 4 are similiar to 0 and 3, but affect only line tabulation
++ * stops, which are not implemented.
++ *
++ * Parameter 2 may only be interpreted, when we implement a tabulation stop map
++ * per display line.
++ */
++static void vte_tbc(int currcons, int vpar)
++{
++
++	switch (vpar) {
++	case 0:
++		/*
++		 * The character tabulation stop at the active
++		 * presentation position is cleared.
++		 */
++		tab_stop[x >> 5] &= ~(1 << (x & 31));
++		return;
++#if 0
++	case 2:
++		/*
++		 * All character tabulation stops in the active
++		 * line are cleared.
++		 */
++#endif
++	case 3:
++		/*
++		 * All character tabulation stops are cleared.
++		 */
++	case 5:
++		/*
++		 * All tabulation stops are cleared.
++		 */
++		tab_stop[0] = tab_stop[1] = tab_stop[2] = tab_stop[3] =
++			tab_stop[4] = 0;
++	}
+ }
+ 
+ static void do_con_trol(struct tty_struct *tty, unsigned int currcons, int c)
+ {
+ 	/*
+-	 *  Control characters can be used in the _middle_
+-	 *  of an escape sequence.
++	 * C0 CONTROL CHARACTERS
++	 *
++	 * NOTE: Control characters can be used in the _middle_
++	 *       of an escape sequence.
+ 	 */
+ 	switch (c) {
+-	case 0:
++	case 0x00:	/* NUL - Null */
++		return;
++	case 0x05:	/* ENQ - Inquiry */
++		vte_answerback(tty);
+ 		return;
+-	case 7:
++	case 0x07:	/* BEL - Bell */
+ 		if (bell_duration)
+ 			kd_mksound(bell_pitch, bell_duration);
+ 		return;
+-	case 8:
+-		bs(currcons);
++	case 0x08:	/* BS - Back space */
++		vte_bs(currcons);
+ 		return;
+-	case 9:
++	case 0x09:	/* HT - Character tabulation */
+ 		pos -= (x << 1);
+ 		while (x < video_num_columns - 1) {
+ 			x++;
+@@ -1444,104 +1675,185 @@
+ 		}
+ 		pos += (x << 1);
+ 		return;
+-	case 10: case 11: case 12:
+-		lf(currcons);
++	case 0x0a:	/* LF - Line feed */
++	case 0x0b:	/* VT - Line tabulation */
++		/*
++		 * Since line tabulation is not implemented in the DEC VT
++		 * series (except VT131 ?),  the DEC VT series treats any
++		 * VT as LF.
++		 */
++	case 0x0c:	/* FF - Form feed */
++		/*
++		 * DEC VT series processes FF as LF.
++		 */
++		vte_lf(currcons);
+ 		if (!is_kbd(lnm))
+ 			return;
+-	case 13:
+-		cr(currcons);
++	case 0x0d:	/* CR - Carriage return */
++		vte_cr(currcons);
+ 		return;
+-	case 14:
++	case 0x0e:	/* SO - Shift out / LS1 - Locking shift 1 */
+ 		charset = 1;
+ 		translate = set_translate(G1_charset,currcons);
+ 		disp_ctrl = 1;
+ 		return;
+-	case 15:
++	case 0x0f:	/* SI - Shift in / LS0 - Locking shift 0 */
+ 		charset = 0;
+ 		translate = set_translate(G0_charset,currcons);
+ 		disp_ctrl = 0;
+ 		return;
+-	case 24: case 26:
+-		vc_state = ESnormal;
++	case 0x18:	/* CAN - Cancel */
++	case 0x1a:	/* SUB - Substitute */
++		vc_state = ESinit;
+ 		return;
+-	case 27:
++	case 0x1b:	/* ESC - Escape */
+ 		vc_state = ESesc;
+ 		return;
+-	case 127:
+-		del(currcons);
++	case 0x7f:	/* DEL - Delete */
++		/*
++		 * This character is ignored, unless a 96-set has been mapped,
++		 * but this is not supported at the moment.
++		 */
++		return;
++#if VTE_VERSION >= 210
++	/*
++	 * C1 control functions (8-bit mode).
++	 *
++	 * XXX Fixme! Should only be interpreted if 8-bit controls are enabled.
++	 * XXX Fixme! Should have all C1 controls implemented (acc. to ECMA).
++	 */
++	case 0x84:	/* IND - Line feed (DEC only, dropped by ECMA/ISO) */
++		vte_lf(currcons);
++		return;
++	case 0x85:	/* NEL - Next line */
++		vte_lf(currcons);
++		vte_cr(currcons);
++		return;
++	case 0x88:	/* HTS - Character tabulation set */
++		tab_stop[x >> 5] |= (1 << (x & 31));
++		return;
++	case 0x8d:	/* RI - Reverse line feed */
++		vte_ri(currcons);
+ 		return;
+-	case 128+27:
+-		vc_state = ESsquare;
++	case 0x9b:	/* CSI - Control sequence introducer */
++		vc_state = EScsi;
+ 		return;
++#endif /* VTE_VERSION >= 210 */
+ 	}
++
+ 	switch(vc_state) {
+ 	case ESesc:
+-		vc_state = ESnormal;
++		vc_state = ESinit;
+ 		switch (c) {
+-		case '[':
+-			vc_state = ESsquare;
++
++#if 0
++		case ' ':	/* ACS - Announce code structure */
++			vc_state = ESacs;
+ 			return;
+-		case ']':
+-			vc_state = ESnonstd;
++#endif
++		case '#':	/* SCF - Single control functions */
++			vc_state = ESscf;
+ 			return;
+-		case '%':
+-			vc_state = ESpercent;
++		case '%':	/* DOCS - Designate other coding system */
++			vc_state = ESdocs;
+ 			return;
+-		case 'E':
+-			cr(currcons);
+-			lf(currcons);
++		case '(':	/* GZD4 - G0-designate 94-set */
++			vc_state = ESgzd4;
+ 			return;
+-		case 'M':
+-			ri(currcons);
++		case ')':	/* G1D4 - G1-designate 94-set */
++			vc_state = ESg1d4;
+ 			return;
+-		case 'D':
+-			lf(currcons);
++
++			/* ===== Private control functions ===== */
++
++		case '7':	/* DECSC - Save cursor */
++			vte_decsc(currcons);
+ 			return;
+-		case 'H':
+-			tab_stop[x >> 5] |= (1 << (x & 31));
++		case '8':	/* DECRC - Restore cursor */
++			vte_decrc(currcons);
+ 			return;
+-		case 'Z':
+-			respond_ID(tty);
++		case '=':	/* DECKPAM - Keypad application mode */
++			set_kbd(kbdapplic);
+ 			return;
+-		case '7':
+-			save_cur(currcons);
++		case '>':	/* DECKPNM - Keypad numeric mode */
++			clr_kbd(kbdapplic);
+ 			return;
+-		case '8':
+-			restore_cur(currcons);
++
++			/* ===== C1 control functions ===== */
++
++		case 'D':	/* IND - Line feed (DEC only, dropped by ECMA/ISO) */
++			vte_lf(currcons);
+ 			return;
+-		case '(':
+-			vc_state = ESsetG0;
++		case 'E':	/* NEL - Next line */
++			vte_cr(currcons);
++			vte_lf(currcons);
+ 			return;
+-		case ')':
+-			vc_state = ESsetG1;
++		case 'H':	/* HTS - Character tabulation set */
++			tab_stop[x >> 5] |= (1 << (x & 31));
+ 			return;
+-		case '#':
+-			vc_state = EShash;
++		case 'M':	/* RI - Reverse line feed */
++			vte_ri(currcons);
+ 			return;
+-		case 'c':
+-			reset_terminal(currcons,1);
++		case 'Z':	/* DECID - Identify terminal */
++			/* XXX: This clashes with ISO 6429! */
++			vte_da(tty);
+ 			return;
+-		case '>':  /* Numeric keypad */
+-			clr_kbd(kbdapplic);
++		case '[':	/* CSI - Control sequence introducer */
++			vc_state = EScsi;
+ 			return;
+-		case '=':  /* Appl. keypad */
+-			set_kbd(kbdapplic);
++		case ']':	/* OSC - Operating system command */
++			/* XXX: Fixme! Wrong sequence and format! */
++			vc_state = ESosc;
++			return;
++
++			/* ===== Single control functions ===== */
++
++		case '`':	/* DMI - Disable manual input */
++		case 'b':	/* EMI - Enable manual input */
++			/* XXX: Implement this together with KAM */
++			return;
++		case 'c':	/* RIS - Reset ti initial state */
++			vte_ris(currcons,1);
+ 			return;
+ 		}
+ 		return;
+-	case ESnonstd:
+-		if (c=='P') {   /* palette escape sequence */
+-			for (npar=0; npar<NPAR; npar++)
+-				par[npar] = 0 ;
+-			npar = 0 ;
+-			vc_state = ESpalette;
+-			return;
+-		} else if (c=='R') {   /* reset palette */
+-			reset_palette(currcons);
+-			vc_state = ESnormal;
+-		} else
+-			vc_state = ESnormal;
++#if 0
++	case ESacs:
++		vc_state = ESinit;
++		switch (c) {
++		case 'F':       /* Select 7-bit C1 control transmission */
++		case 'G':       /* Select 8-Bit C1 control transmission */
++		case 'L':       /* ANSI conformance level 1 */
++		case 'M':       /* ANSI conformance level 2 */
++		case 'N':       /* ANSI conformance level 3 */
++			/* Not yet implemented. */
++			return;
++		}
+ 		return;
++#endif
++	case ESosc:
++                vc_state = ESinit;
++                switch (c) {
++                case 'P':       /* palette escape sequence */
++                        /*
++                         * XXX Fixme! We should use the documented DEC
++                         * device control strings (DCS) instead.  OSC has
++                         * an entirely different meaning!
++                         */
++                        for (npar = 0; npar < NPAR; npar++)
++                                par[npar] = 0;
++                        npar = 0;
++                        vc_state = ESpalette;
++                        return;
++                case 'R':       /* reset palette */
++                        /*
++                         * XXX Fixme! See comment above.
++                         */
++                        reset_palette(currcons);
++                        vc_state = ESinit;
++                        return;
++                }
++                return;
+ 	case ESpalette:
+ 		if ( (c>='0'&&c<='9') || (c>='A'&&c<='F') || (c>='a'&&c<='f') ) {
+ 			par[npar++] = (c>'9' ? (c&0xDF)-'A'+10 : c-'0') ;
+@@ -1554,12 +1866,12 @@
+ 				palette[i] = 16*par[j++];
+ 				palette[i] += par[j];
+ 				set_palette(currcons);
+-				vc_state = ESnormal;
++				vc_state = ESinit;
+ 			}
+ 		} else
+-			vc_state = ESnormal;
++			vc_state = ESinit;
+ 		return;
+-	case ESsquare:
++	case EScsi:
+ 		for(npar = 0 ; npar < NPAR ; npar++)
+ 			par[npar] = 0;
+ 		npar = 0;
+@@ -1581,20 +1893,26 @@
+ 			return;
+ 		} else vc_state=ESgotpars;
+ 	case ESgotpars:
+-		vc_state = ESnormal;
++		vc_state = ESinit;
+ 		switch(c) {
+-		case 'h':
++		case 'h':	/* SM / DECSM - set mode */
+ 			set_mode(currcons,1);
+ 			return;
+-		case 'l':
++		case 'l':	/* RM / DECRM - reset mode */
+ 			set_mode(currcons,0);
+ 			return;
+ 		case 'c':
++			/*
++			 * XXX Fixme!  Need to use final byte reserved for
++			 * private sequences instead of flag designating
++			 * private parameters!
++			 */
+ 			if (ques) {
+ 				if (par[0])
+ 					cursor_type = par[0] | (par[1]<<8) | (par[2]<<16);
+ 				else
+ 					cursor_type = CUR_DEFAULT;
++				ques = 0;
+ 				return;
+ 			}
+ 			break;
+@@ -1605,16 +1923,41 @@
+ 					complement_mask = par[0]<<8 | par[1];
+ 				else
+ 					complement_mask = s_complement_mask;
++				ques = 0;
+ 				return;
+ 			}
+ 			break;
+ 		case 'n':
+-			if (!ques) {
+-				if (par[0] == 5)
+-					status_report(tty);
+-				else if (par[0] == 6)
+-					cursor_report(currcons,tty);
+-			}
++#if VTE_VERSION >= 210
++			if (ques) {
++                                switch (par[0]) {
++                                case 6: /* DECXCPR - Extended CPR */
++                                        vte_cpr(currcons, tty, 1);
++                                        break;
++                                case 15:        /* DEC printer status */
++                                        vte_fake_dec_dsr(tty, "13");
++                                        break;
++                                case 25:        /* DEC UDK status */
++                                        vte_fake_dec_dsr(tty, "21");
++                                        break;
++                                case 26:        /* DEC keyboard status */
++                                        vte_fake_dec_dsr(tty, "27;1;0;1");
++                                        break;
++                                case 75:        /* DEC data integrity */
++                                        vte_fake_dec_dsr(tty, "70");
++                                        break;
++                                }
++			} else
++#endif /* VTE_VERSION >= 210 */
++				switch (par[0]) {
++				case 5:	/* DSR - Device status report */
++					vte_dsr(tty);
++					break;
++				case 6:	/* CPR - Cursor position report */
++					vte_cpr(currcons,tty,0);
++					break;
++				}
++			ques = 0;
+ 			return;
+ 		}
+ 		if (ques) {
+@@ -1622,83 +1965,151 @@
+ 			return;
+ 		}
+ 		switch(c) {
+-		case 'G': case '`':
+-			if (par[0]) par[0]--;
+-			gotoxy(currcons,par[0],y);
++
++			/* ===== Control functions w/ intermediate byte ===== */
++
++#if 0
++		case ' ':	/* Intermediate byte: SP (ISO 6429) */
++			vc_state = EScsi_space;
++			return;
++#endif
++
++			/* ===== Control functions w/o intermediate byte ===== */
++
++		case '@':	/* ICH - Insert character */
++			vte_ich(currcons,par[0]);
+ 			return;
+-		case 'A':
++		case 'A':	/* CUU - Cursor up */
++#if VTE_VERSION >= 210
++		case 'k':	/* VPB - Line position backward */
++#endif /* VTE_VERSION >= 210 */
+ 			if (!par[0]) par[0]++;
+ 			gotoxy(currcons,x,y-par[0]);
+ 			return;
+-		case 'B': case 'e':
++		case 'B':	/* CUD - Cursor down */
++		case 'e':	/* VPR - Line position forward */
+ 			if (!par[0]) par[0]++;
+ 			gotoxy(currcons,x,y+par[0]);
+ 			return;
+-		case 'C': case 'a':
++		case 'C':	/* CUF - Cursor right */
++		case 'a':	/* HPR - Character position forward */
+ 			if (!par[0]) par[0]++;
+ 			gotoxy(currcons,x+par[0],y);
+ 			return;
+-		case 'D':
++		case 'D':	/* CUB - Cursor left */
++#if VTE_VERSION >= 210
++		case 'j':	/* HPB - Character position backward */
++#endif /* VTE_VERSION >= 210 */
+ 			if (!par[0]) par[0]++;
+ 			gotoxy(currcons,x-par[0],y);
+ 			return;
+-		case 'E':
++		case 'E':	/* CNL - Cursor next line */
+ 			if (!par[0]) par[0]++;
+ 			gotoxy(currcons,0,y+par[0]);
+ 			return;
+-		case 'F':
++		case 'F':	/* CPL - Cursor preceeding line */
+ 			if (!par[0]) par[0]++;
+ 			gotoxy(currcons,0,y-par[0]);
+ 			return;
+-		case 'd':
++		case 'G':	/* CHA - Cursor character absolute */
++		case '`':	/* HPA - Character position absolute */
+ 			if (par[0]) par[0]--;
+-			gotoxay(currcons,x,par[0]);
++			gotoxy(currcons,par[0],y);
+ 			return;
+-		case 'H': case 'f':
++		case 'H':	/* CUP - Cursor position */
++		case 'f':	/* HVP - Horizontal and vertical position */
+ 			if (par[0]) par[0]--;
+ 			if (par[1]) par[1]--;
+ 			gotoxay(currcons,par[1],par[0]);
+ 			return;
+-		case 'J':
+-			csi_J(currcons,par[0]);
++#if VTE_VERSION >= 210
++                case 'I':       /* CHT - Cursor forward tabulation */
++                        if (!par[0])
++                                par[0]++;
++                        vte_cht(currcons, par[0]);
++                        return;
++#endif /* VTE_VERSION >= 210 */
++		case 'J':	/* ED - Erase in page */
++			vte_ed(currcons,par[0]);
++			return;
++		case 'K':	/* EL - Erase in line */
++			vte_el(currcons,par[0]);
++			return;
++		case 'L':	/* IL - Insert line */
++			vte_il(currcons,par[0]);
++			return;
++		case 'M':	/* DL - Delete line */
++			vte_dl(currcons,par[0]);
++			return;
++		case 'P':	/* DCH - Delete character */
++			vte_dch(currcons,par[0]);
++			return;
++#if VTE_VERSION >= 210
++		case 'W':	/* CTC - Cursor tabulation control */
++			switch (par[0]) {
++			case 0:	/* Set character tab stop at current position */
++				tab_stop[x >> 5] |= (1 << (x & 31));
++				return;
++			case 2:	/* Clear character tab stop at curr. position */
++				vte_tbc(currcons, 0);
++				return;
++			case 5:	/* All character tab stops are cleared. */
++				vte_tbc(currcons, 5);
++				return;
++			}
+ 			return;
+-		case 'K':
+-			csi_K(currcons,par[0]);
++#endif /* VTE_VERSION >= 210 */
++		case 'X':	/* ECH - Erase character */
++			vte_ech(currcons, par[0]);
+ 			return;
+-		case 'L':
+-			csi_L(currcons,par[0]);
++#if VTE_VERSION >= 210
++		case 'Y':	/* CVT - Cursor line tabulation */
++			if (!par[0])
++				par[0]++;
++			vte_cvt(currcons, par[0]);
+ 			return;
+-		case 'M':
+-			csi_M(currcons,par[0]);
++		case 'Z':	/* CBT - Cursor backward tabulation */
++			vte_cbt(currcons, par[0]);
+ 			return;
+-		case 'P':
+-			csi_P(currcons,par[0]);
++#endif /* VTE_VERSION >= 210 */
++		case ']':	/* setterm functions */
++			/* XXX Fixme! This collides with ISO 6429 */
++			setterm_command(currcons);
+ 			return;
+-		case 'c':
++		case 'c':	/* DA - Device attribute */
+ 			if (!par[0])
+-				respond_ID(tty);
++				vte_da(tty);
+ 			return;
+-		case 'g':
+-			if (!par[0])
+-				tab_stop[x >> 5] &= ~(1 << (x & 31));
+-			else if (par[0] == 3) {
+-				tab_stop[0] =
+-					tab_stop[1] =
+-					tab_stop[2] =
+-					tab_stop[3] =
+-					tab_stop[4] = 0;
+-			}
++		case 'd':	/* VPA - Line position absolute */
++			if (par[0]) par[0]--;
++			gotoxay(currcons,x,par[0]);
+ 			return;
+-		case 'm':
+-			csi_m(currcons);
++		case 'g':	/* TBC - Tabulation clear */
++			vte_tbc(currcons, par[0]);
+ 			return;
++		case 'm':	/* SGR - Select graphics rendition */
++			vte_sgr(currcons);
++			return;
++
++			/* ===== Private control sequences ===== */
++
+ 		case 'q': /* DECLL - but only 3 leds */
+-			/* map 0,1,2,3 to 0,1,2,4 */
++#if 0
++			switch (par[0]) {
++			case 0: /* all LEDs off */
++			case 1: /* LED 1 on */
++			case 2: /* LED 2 on */
++			case 3: /* LED 3 on */
++			case 4: /* LED 4 on */
++			}
++#else
++			/* map 0,1,2,3 to 0,1,2,4 */	/* huh? */
+ 			if (par[0] < 4)
+ 				setledstate(kbd_table + currcons,
+ 					    (par[0] < 3) ? par[0] : 4);
++#endif
+ 			return;
+-		case 'r':
++		case 'r':	/* DECSTBM - Set top and bottom margin */
+ 			if (!par[0])
+ 				par[0]++;
+ 			if (!par[1])
+@@ -1711,25 +2122,23 @@
+ 				gotoxay(currcons,0,0);
+ 			}
+ 			return;
+-		case 's':
+-			save_cur(currcons);
++#if VTE_VERSION < 199
++		case 's':	/* DECSC - Save cursor */
++			vte_decsc(currcons);
+ 			return;
+-		case 'u':
+-			restore_cur(currcons);
++		case 'u':	/* DECRC - Restore cursor */
++			vte_decrc(currcons);
+ 			return;
+-		case 'X':
+-			csi_X(currcons, par[0]);
+-			return;
+-		case '@':
+-			csi_at(currcons,par[0]);
+-			return;
+-		case ']': /* setterm functions */
+-			setterm_command(currcons);
++#endif /* VTE_VERSION < 199 */
++#if VTE_VERSION >= 210
++		case 'x':	/* DECREQTPARM - Request terminal parameters */
++			vte_decreptparm(currcons, tty);
+ 			return;
++#endif /* VTE_VERSION >= 210 */
+ 		}
+ 		return;
+-	case ESpercent:
+-		vc_state = ESnormal;
++	case ESdocs:
++		vc_state = ESinit;
+ 		switch (c) {
+ 		case '@':  /* defined in ISO 2022 */
+ 			utf = 0;
+@@ -1741,48 +2150,86 @@
+ 		}
+ 		return;
+ 	case ESfunckey:
+-		vc_state = ESnormal;
++		vc_state = ESinit;
+ 		return;
+-	case EShash:
+-		vc_state = ESnormal;
++	case ESscf:
++		vc_state = ESinit;
+ 		if (c == '8') {
+ 			/* DEC screen alignment test. kludge :-) */
+ 			video_erase_char =
+ 				(video_erase_char & 0xff00) | 'E';
+-			csi_J(currcons, 2);
++			vte_ed(currcons, 2);
+ 			video_erase_char =
+ 				(video_erase_char & 0xff00) | ' ';
+ 			do_update_region(currcons, origin, screenbuf_size/2);
+ 		}
+ 		return;
+-	case ESsetG0:
+-		if (c == '0')
++	case ESgzd4:
++		switch (c) {
++		case '0':	/* DEC Special graphics */
+ 			G0_charset = GRAF_MAP;
+-		else if (c == 'B')
++			break;
++#if 0
++                case '>':       /* DEC Technical */
++                        G0_charset = DEC_TECH_MAP;
++                        break;
++                case 'A':       /* ISO Latin-1 supplemental */
++                        G0_charset = ISO_LAT1_MAP;
++                        break;
++#endif
++		case 'B':	/* ASCII */
+ 			G0_charset = LAT1_MAP;
+-		else if (c == 'U')
++			break;
++		case 'U':
+ 			G0_charset = IBMPC_MAP;
+-		else if (c == 'K')
++			break;
++		case 'K':
++			/*
++			 * XXX FIXME!
++			 * This is German NRCS on DEC VT!  User-preferred
++			 * supplemental map is '<'!
++			 */
+ 			G0_charset = USER_MAP;
++			break;
++		}
+ 		if (charset == 0)
+ 			translate = set_translate(G0_charset,currcons);
+-		vc_state = ESnormal;
++		vc_state = ESinit;
+ 		return;
+-	case ESsetG1:
+-		if (c == '0')
++	case ESg1d4:
++		switch (c) {
++		case '0':	/* DEC Special graphics */
+ 			G1_charset = GRAF_MAP;
+-		else if (c == 'B')
++			break;
++#if 0
++		case '>':	/* DEC Technical */
++			G1_charset = DEC_TECH_MAP;
++			break;
++		case 'A':	/* ISO Latin-1 supplemental */
++			G1_charset = ISO_LAT1_MAP;
++			break;
++#endif
++		case 'B':	/* ASCII */
+ 			G1_charset = LAT1_MAP;
+-		else if (c == 'U')
++			break;
++		case 'U':
+ 			G1_charset = IBMPC_MAP;
+-		else if (c == 'K')
++			break;
++		case 'K':
++			/*
++			 * XXX FIXME!
++			 * This is German NRCS on DEC VT!  User-preferred
++			 * supplemental map is '<'!
++			 */
+ 			G1_charset = USER_MAP;
++			break;
++		}
+ 		if (charset == 1)
+ 			translate = set_translate(G1_charset,currcons);
+-		vc_state = ESnormal;
++		vc_state = ESinit;
+ 		return;
+ 	default:
+-		vc_state = ESnormal;
++		vc_state = ESinit;
+ 	}
+ }
+ 
+@@ -1923,7 +2370,7 @@
+                         && (c != 127 || disp_ctrl)
+ 			&& (c != 128+27);
+ 
+-		if (vc_state == ESnormal && ok) {
++		if (vc_state == ESinit && ok) {
+ 			/* Now try to find out how to display it */
+ 			tc = conv_uni_to_pc(vc_cons[currcons].d, tc);
+ 			if ( tc == -4 ) {
+@@ -1946,8 +2393,8 @@
+ 			if (need_wrap || decim)
+ 				FLUSH
+ 			if (need_wrap) {
+-				cr(currcons);
+-				lf(currcons);
++				vte_cr(currcons);
++				vte_lf(currcons);
+ 			}
+ 			if (decim)
+ 				insert_char(currcons, 1);
+@@ -2098,14 +2545,14 @@
+ 				cnt = 0;
+ 			}
+ 			if (c == 8) {		/* backspace */
+-				bs(currcons);
++				vte_bs(currcons);
+ 				start = (ushort *)pos;
+ 				myx = x;
+ 				continue;
+ 			}
+ 			if (c != 13)
+-				lf(currcons);
+-			cr(currcons);
++				vte_lf(currcons);
++			vte_cr(currcons);
+ 			start = (ushort *)pos;
+ 			myx = x;
+ 			if (c == 10 || c == 13)
+@@ -2354,7 +2801,7 @@
+ 	ulcolor		= 0x0f;   /* bold white */
+ 	halfcolor       = 0x08;   /* grey */
+ 	init_waitqueue_head(&vt_cons[currcons]->paste_wait);
+-	reset_terminal(currcons, do_clear);
++	vte_ris(currcons, do_clear);
+ }
+ 
+ /*
+@@ -2449,7 +2896,7 @@
+ 	set_origin(currcons);
+ 	save_screen(currcons);
+ 	gotoxy(currcons,x,y);
+-	csi_J(currcons, 0);
++	vte_ed(currcons, 0);
+ 	update_screen(fg_console);
+ 	printk("Console: %s %s %dx%d",
+ 		can_do_color ? "colour" : "mono",--- console.4	2000/03/10 04:47:37	1.1
++++ console.4	2000/03/10 04:53:12	1.2
+@@ -7,8 +7,9 @@
+ .\"
+ .\" Modified, Sun Feb 26 14:58:45 1995, faith@cs.unc.edu
+ .\" Modified, Oct 28 1997, dirson@debian.org
++.\" Updated for console driver version 2 by ESR.
+ .\"
+-.TH CONSOLE 4 "28 Oct 1997" "Console tools" "Linux User's Manual"
++.TH CONSOLE 4 "9 Mar 2000" "Console tools" "Linux User's Manual"
+ 
+ .SH NAME
+ console \- console terminal and virtual consoles
+@@ -23,12 +24,6 @@
+ The device files /dev/* are usually created using the script MAKEDEV,
+ or using mknod(1), usually with mode 0622 and owner root.tty.
+ 
+-Before kernel version 1.1.54 the number of virtual consoles was
+-compiled into the kernel (in tty.h: #define NR_CONSOLES 8)
+-and could be changed by editing and recompiling.
+-Since version 1.1.54 virtual consoles are created on the fly,
+-as soon as they are needed.
+-
+ Common ways to start a process on a console are: (a) tell init(8)
+ (in inittab(5)) to start a getty(8) on the console; (b) ask open(1)
+ to start a process on the console; (c) start X - it will find the
+@@ -48,12 +43,9 @@
+ will free the memory taken by the screen buffers for consoles
+ that no longer have any associated process.
+ 
+-.SH PROPERTIES
+-Consoles carry a lot of state. I hope to document that some other time.
+-The most important fact is that the consoles simulate vt100 terminals.
+-In particular, a console is reset to the initial state by printing the two
+-characters ESC c.
+-All escape sequences can be found in
++The console has a built-in terminal emulation resembling that of a DEC
++VT100; actually it implements a large subset of ANSI X3.64/ECMA-48.
++The escape sequences can be found in
+ .BR console_codes (4).
+ 
+ .SH FILES--- console_codes.4	2000/03/08 10:21:36	1.1
++++ console_codes.4	2000/03/14 16:53:03	1.6
+@@ -15,8 +15,13 @@
+ .\" by Eric S. Raymond <esr@thyrsus.com>.
+ .\"
+ .\" Tiny correction, aeb, 961107.
++.\" 
++.\" Updated for Linux Console Project version 2, 8 Mar 2000 by ESR.
++.\" The following undocumented codes were removed in version 2.0.0:
++.\"	\E[s	DECRC		removed
++.\"	\E[u	DECSC		removed
+ .\"
+-.TH CONSOLE_CODES 4 "October 31, 1996" "Linux" "Linux Programmer's Manual"
++.TH CONSOLE_CODES 4 "March 8, 2000" "Linux" "Linux Programmer's Manual"
+ .SH NAME
+ console_codes \- Linux console escape and control sequences
+ .SH DESCRIPTION
+@@ -173,6 +178,7 @@
+ F	CPL	Move cursor up the indicated # of rows, to column 1.
+ G	CHA	Move cursor to indicated column in current row.
+ H	CUP	Move cursor to the indicated row, column (origin at 1,1).
++I	CHT	Cursor forward tabulation by # stops (version >= 2.1.0).
+ J	ED	Erase display (default: from cursor to end of display).
+ 		ESC [ 1 J: erase from start to cursor.
+ 		ESC [ 2 J: erase whole display.
+@@ -182,15 +188,24 @@
+ L	IL	Insert the indicated # of blank lines.
+ M	DL	Delete the indicated # of lines.
+ P	DCH	Delete the indicated # of characters on the current line.
++W	CTC	#=0, set tab; #=2, clear tab; #=5 clear all tabs  
++		(version >= 2.1.0).
+ X	ECH	Erase the indicated # of characters on the current line.
++Y	CVT	Cursor Vertical Tab, equivalent to # line feeds 
++		(version >= 2.1.0).
++Z	CBT	Cursor Back Tab, back # stops
++		(version >= 2.1.0).
+ a	HPR	Move cursor right the indicated # of columns.
+ c	DA	Answer ESC [ ? 6 c: `I am a VT102'.
+ d	VPA	Move cursor to the indicated row, current column.
+-e	VPR	Move cursor down the indicated # of rows.
++e	VPR	Move cursor down the indicated # of rows
++		(version >= 2.1.0).
+ f	HVP	Move cursor to the indicated row, column.
+ g	TBC	Without parameter: clear tab stop at the current position.
+ 		ESC [ 3 g: delete all tab stops.
+ h	SM	Set Mode (see below).
++k	VPB	Move cursor up the indicated # of rows
++		(version >= 2.1.0).
+ l	RM	Reset Mode (see below).
+ m	SGR	Set attributes (see below).
+ n	DSR	Status report (see below).
+@@ -219,6 +234,7 @@
+ 	(the colors used to simulate dim or underline are set
+ 	using ESC ] ...)
+ 5	set blink
++6	set blink (version >= 2.1.0 and up)
+ 7	set reverse video
+ 10	reset selected mapping, display control flag,
+ 	and toggle meta flag.
+@@ -228,7 +244,8 @@
+ 	set toggle meta flag. (The toggle meta flag
+ 	causes the high bit of a byte to be toggled
+ 	before the mapping table translation is done.)
+-21	set normal intensity (this is not compatible with ECMA-48)
++21	set normal intensity (version 1.x.x only; 
++	this is not compatible with ECMA-48)
+ 22	set normal intensity
+ 24	underline off
+ 25	blink off
+@@ -273,48 +290,104 @@
+ Cursor position report (CPR): Answer is ESC [ \fIy\fP ; \fIx\fP R,
+ where \fIx,y\fP is the cursor location.
+ 
++.SS 8-bit operation
++
++Like a VT220, the console recognizes character 0x9b (128 + 27, alt-ESC)
++as a character sequence introducer (CSI) equivalent to ESC [.  At version
++2.1.0 and above the console also recognizes the following 8-bit control codes:
++.TS
++l l l.
++0x84	IND	Linefeed.
++0x85	NEL	Newline.
++0x88	HTS	Set tab stop at current column.
++0x8d	RI	Reverse linefeed.
++.TE
++
+ .SS DEC Private Mode (DECSET/DECRST) sequences.
+ 
+ These are not described in ECMA-48.  We list the Set Mode sequences;
+ the Reset Mode sequences are obtained by replacing the final `h'
+ by `l'.
+ .TP
+-ESC [ ? 1 h
++CSI ? 1 h
+ DECCKM (default off): When set, the cursor keys send an ESC O prefix,
+ rather than ESC [.
+ .TP
+-ESC [ ? 3 h
++CSI ? 3 h
+ DECCOLM (default off = 80 columns): 80/132 col mode switch.  The
+ driver sources note that this alone does not suffice; some user-mode
+ utility such as
+ .IR resizecons (8)
+ has to change the hardware registers on the console video card.
+ .TP
+-ESC [ ? 5 h
++CSI ? 5 h
+ DECSCNM (default off): Set reverse-video mode.
+ .TP
+-ESC [ ? 6 h
++CSI ? 6 h
+ DECOM (default off): When set, cursor addressing is relative to
+ the upper left corner of the scrolling region.
+ .TP
+-ESC [ ? 7 h
++CSI ? 7 h
+ DECAWM (default on): Set autowrap on.  In this mode, a graphic
+ character emitted after column 80 (or column 132 of DECCOLM is on)
+ forces a wrap to the beginning of the following line first.
+ .TP
+-ESC [ ? 8 h
++CSI ? 8 h
+ DECARM (default on): Set keyboard autorepreat on.
+ .TP
+-ESC [ ? 9 h
++CSI ? 9 h
+ X10 Mouse Reporting (default off): Set reporting mode to 1 (or reset to
+ 0) \- see below.
+ .TP
+-ESC [ ? 25 h
++CSI ? 25 h
+ DECCM (default on): Make cursor visible.
+ .TP
+-ESC [ ? 1000 h
++CSI ? 1000 h
+ X11 Mouse Reporting (default off): Set reporting mode to 2 (or reset
+ to 0) \- see below.
++.TP
++\E#8
++DEC Screen alignment test.
++
++.SS DEC Private Device Status sequences.
++
++.TP
++CSI ? 6n
++DEC extended Cursor position report (DECXCPR) 
++Answer is ESC [ \fIy\fP ; \fIx\fP ; \fIz\fR R,
++where \fIx,y\fP is the cursor location and \fIz\fR the number of the
++memory page on display (currently always 1).  Supported only in
++console version 2.1.0 and higher.
++.TP
++CSI ? 15n	
++DEC Printer Status query.  Currently always returns ESC [ ? 13 n,
++indicating no printer is present.
++.\" See <
+http://vt100.net
+>
++Supported only in console version 2.1.0 and higher.
++.TP
++CSI ? 25n
++DEC UDK status. Currently always returns ESC [ ? 21 n,
++indicating that user-definable keys are locked.
++.\" See <
+http://vt100.net
+>
++Supported only in console version 2.1.0 and higher.
++.TP
++CSI ? 26n	
++Keyboard status.  Currently always returns ESC [ ? 27 ; 1 ; 0 ; 1 n,
++describing a North American LK401 keyboard.
++.\" This response is documented in the VT420 Progamming Summary, p147.
++Supported only in console version 2.1.0 and higher.
++.TP
++CSI ? 75n
++Data integrity check.  Currently always returns ESC [ ? 70 n.
++Supported only in console version 2.1.0 and higher.
++.TP
++CSI x
++(DECREQTPARM) DEC Request Parameters
++Returns ESC [ ; 1 ; 1 ; 120 ; 120 ; 1 ; 0 x,
++describing a solicited report from a terminal in 8-bit no-parity mode
++running at 19200bps (the highest speed a VT100 can report).
++.\" See <
+http://www.cs.utk.edu/~shuford/terminal/virek100.txt>
++Supported only in console version 2.1.0 and higher.
+ 
+ .SS Linux Console Private CSI Sequences
+ 
+@@ -407,7 +480,7 @@
+ 
+ Many different terminal types are described, like the Linux console,
+ as being `VT100-compatible'.  Here we discuss differences vbetween the
+-Linux console an the two most important others, the DEC VT102 and
++Linux console and the two most important others, the DEC VT102 and
+ .IR xterm (1).
+ 
+ .SS Control-character handling
+@@ -508,8 +581,8 @@
+ The 
+ .I xterm
+ program will recognize all of the DEC Private Mode sequences listed
+-above, but none of the Linux private-mode sequences.  For discussion
+-of 
++above, but none of the DEC Device Status or Linux private-mode
++sequences. For discussion of 
+ .IR xterm 's
+ own private-mode sequences, refer to the
+ .I Xterm Control Sequences

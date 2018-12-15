@@ -1,0 +1,117 @@
+Date: Tue, 11 Nov 2008 16:59:31 -0500
+From: Jeff Layton <>
+Subject: Re: Slow file transfer speeds with CFQ IO scheduler in some cases
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2008/11/11/373
+
+On Tue, 11 Nov 2008 16:41:04 -0500
+Jeff Layton <jlayton@redhat.com> wrote:
+> On Tue, 11 Nov 2008 14:36:07 -0500
+> Jeff Moyer <jmoyer@redhat.com> wrote:
+> 
+> > Jens Axboe <jens.axboe@oracle.com> writes:
+> > 
+> > > OK, that looks better. Can I talk you into just trying this little
+> > > patch, just to see what kind of performance that yields? Remove the cfq
+> > > patch first. I would have patched nfsd only, but this is just a quick'n
+> > > dirty.
+> > 
+> > I went ahead and gave it a shot.  The updated CFQ patch with no I/O
+> > context sharing does about 40MB/s reading a 1GB file.  Backing that
+> > patch out, and then adding the patch to share io_context's between
+> > kthreads yields 45MB/s.
+> > 
+> 
+> Here's a quick and dirty patch to make all of the nfsd's have the same
+> io_context. Comments appreciated -- I'm not that familiar with the IO
+> scheduling code. If this looks good, I'll clean it up, add some
+> comments and formally send it to Bruce.
+> 
+No sooner than I send it out than I find a bug. We need to eventually
+put the io_context reference we get. This should be more correct:
+----------------[snip]-------------------
+From d0ee67045a12c677883f77791c6f260588c7b41f Mon Sep 17 00:00:00 2001
+From: Jeff Layton <jlayton@redhat.com>
+Date: Tue, 11 Nov 2008 16:54:16 -0500
+Subject: [PATCH] knfsd: make all nfsd threads share an io_context
+This apparently makes the I/O scheduler treat the threads as a group
+which helps throughput when sequential I/O is multiplexed over several
+nfsd's.
+Signed-off-by: Jeff Layton <jlayton@redhat.com>
+---
+ fs/nfsd/nfssvc.c |   30 ++++++++++++++++++++++++++++++
+ 1 files changed, 30 insertions(+), 0 deletions(-)
+diff --git a/fs/nfsd/nfssvc.c b/fs/nfsd/nfssvc.c
+index 07e4f5d..5cd99f9 100644
+--- a/fs/nfsd/nfssvc.c
++++ b/fs/nfsd/nfssvc.c
+@@ -22,6 +22,7 @@
+ #include <linux/freezer.h>
+ #include <linux/fs_struct.h>
+ #include <linux/kthread.h>
++#include <linux/iocontext.h>
+ 
+ #include <linux/sunrpc/types.h>
+ #include <linux/sunrpc/stats.h>
+@@ -42,6 +43,7 @@ static int			nfsd(void *vrqstp);
+ struct timeval			nfssvc_boot;
+ static atomic_t			nfsd_busy;
+ static unsigned long		nfsd_last_call;
++static struct io_context	*nfsd_io_context;
+ static DEFINE_SPINLOCK(nfsd_call_lock);
+ 
+ /*
+@@ -173,6 +175,10 @@ static void nfsd_last_thread(struct svc_serv *serv)
+ 	nfsd_serv = NULL;
+ 	nfsd_racache_shutdown();
+ 	nfs4_state_shutdown();
++	if (nfsd_io_context) {
++		put_io_context(nfsd_io_context);
++		nfsd_io_context = NULL;
++	}
+ 
+ 	printk(KERN_WARNING "nfsd: last server has exited, flushing export "
+ 			    "cache\n");
+@@ -398,6 +404,28 @@ update_thread_usage(int busy_threads)
+ }
+ 
+ /*
++ * should be called while holding nfsd_mutex
++ */
++static void
++nfsd_set_io_context(void)
++{
++	int cpu, node;
++
++	if (!nfsd_io_context) {
++		cpu = get_cpu();
++		node = cpu_to_node(cpu);
++		put_cpu();
++
++		/*
++		 * get_io_context can return NULL if the alloc_context fails.
++		 * That's not technically fatal here, so we don't bother to
++		 * check for it.
++		 */
++		nfsd_io_context = get_io_context(GFP_KERNEL, node);
++	} else
++		copy_io_context(&current->io_context, &nfsd_io_context);
++}
++/*
+  * This is the NFS server kernel thread
+  */
+ static int
+@@ -410,6 +438,8 @@ nfsd(void *vrqstp)
+ 	/* Lock module and set up kernel thread */
+ 	mutex_lock(&nfsd_mutex);
+ 
++	nfsd_set_io_context();
++
+ 	/* At this point, the thread shares current->fs
+ 	 * with the init process. We need to create files with a
+ 	 * umask of 0 instead of init's umask. */
+-- 
+1.5.5.1

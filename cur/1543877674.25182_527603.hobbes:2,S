@@ -1,0 +1,113 @@
+Date: Wed, 4 Apr 2007 22:55:01 -0700
+From: "Paul Menage" <>
+Subject: Re: [PATCH] Fix race between attach_task and cpuset_exit
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2007/4/5/23
+
+On 3/26/07, Srivatsa Vaddagiri <vatsa@in.ibm.com> wrote:
+> On Sun, Mar 25, 2007 at 12:50:25PM -0700, Paul Jackson wrote:
+> > Is there perhaps another race here?
+>
+> Yes, we have!
+>
+> Modified patch below. Compile/boot tested on a x86_64 box.
+>
+>
+> Currently cpuset_exit() changes the exiting task's ->cpuset pointer w/o
+> taking task_lock(). This can lead to ugly races between attach_task and
+> cpuset_exit. Details of the races are described at
+> 
+http://lkml.org/lkml/2007/3/24/132.
+>
+> Patch below closes those races. It is against 2.6.21-rc4 and has
+> undergone a simple compile/boot test on a x86_64 box.
+>
+> Signed-off-by : Srivatsa Vaddagiri <vatsa@in.ibm.com>
+>
+>
+> ---
+>
+>
+> diff -puN kernel/cpuset.c~cpuset_race_fix kernel/cpuset.c
+> --- linux-2.6.21-rc4/kernel/cpuset.c~cpuset_race_fix    2007-03-25 21:08:27.000000000 +0530
+> +++ linux-2.6.21-rc4-vatsa/kernel/cpuset.c      2007-03-26 16:48:24.000000000 +0530
+> @@ -1182,6 +1182,7 @@ static int attach_task(struct cpuset *cs
+>         pid_t pid;
+>         struct task_struct *tsk;
+>         struct cpuset *oldcs;
+> +       struct cpuset *oldcs_to_be_released = NULL;
+>         cpumask_t cpus;
+>         nodemask_t from, to;
+>         struct mm_struct *mm;
+> @@ -1237,6 +1238,8 @@ static int attach_task(struct cpuset *cs
+>         }
+>         atomic_inc(&cs->count);
+>         rcu_assign_pointer(tsk->cpuset, cs);
+> +       if (atomic_dec_and_test(&oldcs->count))
+> +               oldcs_to_be_released = oldcs;
+>         task_unlock(tsk);
+>
+>         guarantee_online_cpus(cs, &cpus);
+> @@ -1257,8 +1260,8 @@ static int attach_task(struct cpuset *cs
+>
+>         put_task_struct(tsk);
+>         synchronize_rcu();
+> -       if (atomic_dec_and_test(&oldcs->count))
+> -               check_for_release(oldcs, ppathbuf);
+> +       if (oldcs_to_be_released)
+> +               check_for_release(oldcs_to_be_released, ppathbuf);
+>         return 0;
+>  }
+Is this part of the patch necessary? If we're adding a task_lock() in
+cpuset_exit(), then the problem that Vatsa described (both
+cpuset_attach_task() and cpuset_exit() decrementing the same cpuset
+count, and cpuset_attach_task() incrementing the count on a cpuset
+that the task doesn't eventually end up in) go away, since only one
+thread will retrieve the old value of the task's cpuset in order to
+decrement its count.
+>
+> @@ -2200,10 +2203,6 @@ void cpuset_fork(struct task_struct *chi
+>   * it is holding that mutex while calling check_for_release(),
+>   * which calls kmalloc(), so can't be called holding callback_mutex().
+>   *
+> - * We don't need to task_lock() this reference to tsk->cpuset,
+> - * because tsk is already marked PF_EXITING, so attach_task() won't
+> - * mess with it, or task is a failed fork, never visible to attach_task.
+> - *
+>   * the_top_cpuset_hack:
+>   *
+>   *    Set the exiting tasks cpuset to the root cpuset (top_cpuset).
+> @@ -2241,20 +2240,23 @@ void cpuset_fork(struct task_struct *chi
+>  void cpuset_exit(struct task_struct *tsk)
+>  {
+>         struct cpuset *cs;
+> +       struct cpuset *oldcs_to_be_released = NULL;
+>
+> +       task_lock(tsk);
+>         cs = tsk->cpuset;
+>         tsk->cpuset = &top_cpuset;      /* the_top_cpuset_hack - see above */
+> +       if (atomic_dec_and_test(&cs->count))
+> +               oldcs_to_be_released = cs;
+> +       task_unlock(tsk);
+>
+I think this is still racy - at this point we're holding a reference
+on a cpuset that could have a zero count, and we don't hold
+manage_mutex or callback_mutex. So a concurrent rmdir could zap the
+directory and free the cpuset.
+Shouldn't we just put a task_lock()/task_unlock() around these lines
+and leave everything else as-is?
+	task_lock(tsk);
+	cs = tsk->cpuset;
+	tsk->cpuset = &top_cpuset;	/* the_top_cpuset_hack - see above */
+	task_unlock(tsk)
+Paul
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+More majordomo info at  
+http://vger.kernel.org/majordomo-info.html
+Please read the FAQ at  
+http://www.tux.org/lkml/

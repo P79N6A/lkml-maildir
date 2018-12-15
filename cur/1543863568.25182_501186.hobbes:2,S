@@ -1,0 +1,66 @@
+Date: Tue, 23 Jan 2007 10:45:50 +0100
+From: Ingo Molnar <>
+Subject: [patch] notifiers: fix blocking_notifier_call_chain() scalability
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2007/1/23/340
+
+Subject: [patch] notifiers: fix blocking_notifier_call_chain() scalability
+From: Ingo Molnar <mingo@elte.hu>
+while lock-profiling the -rt kernel i noticed weird contention during 
+mmap-intense workloads, and the tracer showed the following gem, in one 
+of our MM hotpaths:
+ threaded-2771  1....   65us : sys_munmap (sysenter_do_call)
+ threaded-2771  1....   66us : profile_munmap (sys_munmap)
+ threaded-2771  1....   66us : blocking_notifier_call_chain (profile_munmap)
+ threaded-2771  1....   66us : rt_down_read (blocking_notifier_call_chain)
+ouch! a global rw-semaphore taken in one of the most 
+performance-sensitive codepaths of the kernel. And i dont even have 
+oprofile enabled! All distro kernels have CONFIG_PROFILING enabled, so 
+this scalability problem affects the majority of Linux users.
+The fix is to enhance blocking_notifier_call_chain() to only take the 
+lock if there appears to be work on the call-chain.
+With this patch applied i get nicely saturated system, and much higher 
+munmap performance, on SMP systems.
+And as a bonus this also fixes a similar scalability bottleneck in the 
+thread-exit codepath: profile_task_exit() ...
+Signed-off-by: Ingo Molnar <mingo@elte.hu>
+---
+ kernel/sys.c |   15 +++++++++++----
+ 1 file changed, 11 insertions(+), 4 deletions(-)
+Index: linux/kernel/sys.c
+===================================================================
+--- linux.orig/kernel/sys.c
++++ linux/kernel/sys.c
+@@ -325,11 +325,18 @@ EXPORT_SYMBOL_GPL(blocking_notifier_chai
+ int blocking_notifier_call_chain(struct blocking_notifier_head *nh,
+ 		unsigned long val, void *v)
+ {
+-	int ret;
++	int ret = NOTIFY_DONE;
+ 
+-	down_read(&nh->rwsem);
+-	ret = notifier_call_chain(&nh->head, val, v);
+-	up_read(&nh->rwsem);
++	/*
++	 * We check the head outside the lock, but if this access is
++	 * racy then it does not matter what the result of the test
++	 * is, we re-check the list after having taken the lock anyway:
++	 */
++	if (rcu_dereference(nh->head)) {
++		down_read(&nh->rwsem);
++		ret = notifier_call_chain(&nh->head, val, v);
++		up_read(&nh->rwsem);
++	}
+ 	return ret;
+ }
+ 
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+More majordomo info at  
+http://vger.kernel.org/majordomo-info.html
+Please read the FAQ at  
+http://www.tux.org/lkml/

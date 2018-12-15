@@ -1,0 +1,180 @@
+Date: Sat, 20 Dec 2003 22:26:47 -0800
+From: Ulrich Drepper <>
+Subject: O_CANLINK and flink
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2003/12/21/1
+
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA1
+This is a refresh of a patch I've sent quite some time ago (in April).
+That old patch introduced a flink() syscall without proper security
+measures.  I've now integrated a proposal for how to fix it.
+int flink (int fd, const char *newname)
+The file associated with fd is linked with the newname.  But this will
+only succeed if the file descriptor fd was created with the O_CANLINK
+flag set.  It is not possible to set O_CANLINK afterwards,
+fcntl(F_SETFL) cannot set the bit, this is important.
+The changes to implement this are pretty trivial.  The patch consists of
+more than a few lines only because the link code is reusing as much as
+possible in the link() and flink() code and the O_* flags definitions
+were reformatted.
+The purpose of this change is two fold.
+For now it is possible to use this functionality in a couple of ways:
+~ we can create quasi-anonymous files.  Like
+    fd = open ("RANDOM", O_EXCL|O_CREAT|O_CANLINK|O_RDWR, 0600);
+    unlink ("RANDOM");
+    ... do some work ...
+    if (work is auccessful)
+      flink (fd, "REALNAME");
+    close (fd)
+~ file descriptors which are passed to a process (by inheritance from
+the parent, through Unix sockets, ...) can be linked to the filesystem.
+Longer-term I think the kernel should support real anonymous files which
+can optionally be created with the O_CANLINK flag.  This would "only"
+save the unlink() call in the example above but not having the file at
+all in the filesystem namespace eliminates one more possible attack vector.
+This patch covers so far only x86.
+- --
+➧ Ulrich Drepper ➧ Red Hat, Inc. ➧ 444 Castro St ➧ Mountain View, CA ❖
+-----BEGIN PGP SIGNATURE-----
+Version: GnuPG v1.2.3 (GNU/Linux)
+iD8DBQE/5T0n2ijCOnn/RHQRAmEOAJ9ZiAfMl0EcudUUREFki0Axpp/MLwCfc9qS
+HMTHoEkve1Tjc70jQTvdElw=
+=InNQ
+-----END PGP SIGNATURE-----
+--- linux-2.6/arch/i386/kernel/entry.S-canlink	2003-11-21 20:31:01.000000000 -0800
++++ linux-2.6/arch/i386/kernel/entry.S	2003-12-20 21:33:27.000000000 -0800
+@@ -882,5 +882,6 @@
+ 	.long sys_utimes
+  	.long sys_fadvise64_64
+ 	.long sys_ni_syscall	/* sys_vserver */
++	.long sys_flink
+ 
+ syscall_table_size=(.-sys_call_table)
+--- linux-2.6/fs/namei.c-canlink	2003-10-02 13:57:30.000000000 -0700
++++ linux-2.6/fs/namei.c	2003-12-20 21:32:50.000000000 -0800
+@@ -17,6 +17,7 @@
+ #include <linux/init.h>
+ #include <linux/module.h>
+ #include <linux/slab.h>
++#include <linux/file.h>
+ #include <linux/fs.h>
+ #include <linux/namei.h>
+ #include <linux/quotaops.h>
+@@ -1847,10 +1848,11 @@
+  * with linux 2.0, and to avoid hard-linking to directories
+  * and other special files.  --ADM
+  */
+-asmlinkage long sys_link(const char __user * oldname, const char __user * newname)
++static long link_common(struct vfsmount *old_mnt, struct dentry *old_dentry,
++			const char __user * newname)
+ {
+ 	struct dentry *new_dentry;
+-	struct nameidata nd, old_nd;
++	struct nameidata nd;
+ 	int error;
+ 	char * to;
+ 
+@@ -1858,32 +1860,56 @@
+ 	if (IS_ERR(to))
+ 		return PTR_ERR(to);
+ 
+-	error = __user_walk(oldname, 0, &old_nd);
+-	if (error)
+-		goto exit;
+ 	error = path_lookup(to, LOOKUP_PARENT, &nd);
+ 	if (error)
+-		goto out;
++		goto exit;
+ 	error = -EXDEV;
+-	if (old_nd.mnt != nd.mnt)
++	if (old_mnt != nd.mnt)
+ 		goto out_release;
+ 	new_dentry = lookup_create(&nd, 0);
+ 	error = PTR_ERR(new_dentry);
+ 	if (!IS_ERR(new_dentry)) {
+-		error = vfs_link(old_nd.dentry, nd.dentry->d_inode, new_dentry);
++		error = vfs_link(old_dentry, nd.dentry->d_inode, new_dentry);
+ 		dput(new_dentry);
+ 	}
+ 	up(&nd.dentry->d_inode->i_sem);
+ out_release:
+ 	path_release(&nd);
+-out:
+-	path_release(&old_nd);
+ exit:
+ 	putname(to);
+ 
+ 	return error;
+ }
+ 
++asmlinkage long sys_link(const char *oldname, const char *newname)
++{
++	struct nameidata old_nd;
++	int error;
++
++	error = __user_walk(oldname, 0, &old_nd);
++	if (!error) {
++		error = link_common(old_nd.mnt, old_nd.dentry, newname);
++		path_release(&old_nd);
++	}
++	return error;
++}
++
++asmlinkage long sys_flink(unsigned int fd, const char *newname)
++{
++	struct file *file;
++	int error = -EBADF;
++
++	file = fget(fd);
++	if (file) {
++		error = -EPERM;
++		if (file->f_flags & O_CANLINK)
++			error = link_common(file->f_vfsmnt, file->f_dentry,
++					    newname);
++		fput(file);
++	}
++	return error;
++}
++
+ /*
+  * The worst of all namespace operations - renaming directory. "Perverted"
+  * doesn't even start to describe it. Somebody in UCB had a heck of a trip...
+--- linux-2.6/include/asm-i386/fcntl.h-canlink	2002-09-26 12:16:53.000000000 -0700
++++ linux-2.6/include/asm-i386/fcntl.h	2003-12-20 21:26:39.000000000 -0800
+@@ -14,12 +14,13 @@
+ #define O_APPEND	  02000
+ #define O_NONBLOCK	  04000
+ #define O_NDELAY	O_NONBLOCK
+-#define O_SYNC		 010000
+-#define FASYNC		 020000	/* fcntl, for BSD compatibility */
+-#define O_DIRECT	 040000	/* direct disk access hint */
+-#define O_LARGEFILE	0100000
+-#define O_DIRECTORY	0200000	/* must be a directory */
+-#define O_NOFOLLOW	0400000 /* don't follow links */
++#define O_SYNC		  010000
++#define FASYNC		  020000	/* fcntl, for BSD compatibility */
++#define O_DIRECT	  040000	/* direct disk access hint */
++#define O_LARGEFILE	 0100000
++#define O_DIRECTORY	 0200000	/* must be a directory */
++#define O_NOFOLLOW	 0400000	/* don't follow links */
++#define O_CANLINK	01000000	/* flink can be used */
+ 
+ #define F_DUPFD		0	/* dup */
+ #define F_GETFD		1	/* get close_on_exec */
+--- linux-2.6/include/asm-i386/unistd.h-canlink	2003-10-02 13:57:30.000000000 -0700
++++ linux-2.6/include/asm-i386/unistd.h	2003-12-20 22:25:21.000000000 -0800
+@@ -279,8 +279,9 @@
+ #define __NR_utimes		271
+ #define __NR_fadvise64_64	272
+ #define __NR_vserver		273
++#define __NR_flink		274
+ 
+-#define NR_syscalls 274
++#define NR_syscalls 275
+ 
+ /* user-visible error numbers are in the range -1 - -124: see <asm-i386/errno.h> */
+ 

@@ -1,0 +1,274 @@
+Date: Wed, 10 Feb 1999 09:34:28 +0100 (CET)
+From: Jakub Jelinek <>
+Subject: [PATCH] Recursive semaphores problems
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/2/10/12
+
+Hi Linus!
+Would you consider looking at the recursive semaphores issue once more
+before 2.2.2? IMHO it is needed a lot, as recursive semaphores change
+semantics for locked semaphores a lot, and in fact provide no clean way to
+use them at the moment.
+First an example of how the semantics changed:
+struct timer_list timer;
+void timeout(unsigned long data)
+{
+	struct semaphore *sem = (struct semaphore *)data;
+	up(sem);
+}
+void foo(void)
+{
+	struct semaphore sem = MUTEX_LOCKED;
+	timer.function = timeout;
+	timer.data = &sem;
+	timer.expires = jiffies + 5*HZ;
+	add_timer(&timer);			// In 2.2.1, owner will be 0, so the down will work as expected
+	down(&sem);
+	timer.expires = jiffies + 5*HZ;
+	add_timer(&timer);			// In 2.2.1, owner will be current, so the following down will return immediately
+	down(&sem);
+}
+Under 2.2.0-pre6, this routine will take about 10HZ, while under 2.2.1 it
+will take about 5HZ. The issue is that MUTEX_LOCKED relies on being
+non-recursive, and in 2.2.1 works only by accident (as owner is in the first
+case 0, which will not match any task, but on subsequent downs it won't work
+as expected). I think asking users to add sem.owner = 0 after each call to
+down is
+1) ugly
+2) accesses architecture specific data, what if some implementation
+   gives another name to owner field, or uses a different approach for
+   semaphore internals?
+3) it will require to audit all drivers for that
+Yesterday I had to fix to places in my drivers with this issue, and there
+are many more places which are still broken.
+So, would you like to reconsider Andrea's patch, or the following approach?
+This one does not add new down/up calls, new structures, just adds a field
+(without changing the size of the sem structure) which tells whether the
+semaphore is recursive or not. MUTEX is recursive semaphore, MUTEX_LOCKED is
+not (in fact, it makes no sense to have MUTEX_LOCKED recursive, the other
+way, ie. norecursive unlocked MUTEX might make sense, so we could add
+MUTEX_NORECURSE). The advantage of this patch is that you generally should
+not need to change anything in the drivers, the old semantics should be back
+for free, while still keeping recursive semaphores for other usages).
+And it should have no performance impact in the common case, just when
+a task already sleeps on a semaphore, it will take one more memory fetch to
+check it in waking_non_zero. I've done alpha,i386 and sparc* only, but other
+platform changes should be straightforward.
+--- include/asm-alpha/semaphore.h	Tue Feb  2 11:47:09 1999
++++ include/asm-alpha/semaphore.h	Wed Feb 10 08:55:30 1999
+@@ -28,14 +28,15 @@
+ 	atomic_t count;
+ 	atomic_t waking;
+ 	struct task_struct *owner;
+-	long owner_depth;
++	int owner_depth;
++	int recursive;
+ 	struct wait_queue * wait;
+ };
+ 
+ #define MUTEX ((struct semaphore) \
+- { ATOMIC_INIT(1), ATOMIC_INIT(0), NULL, 0, NULL })
++ { ATOMIC_INIT(1), ATOMIC_INIT(0), NULL, 0, 1, NULL })
+ #define MUTEX_LOCKED ((struct semaphore) \
+- { ATOMIC_INIT(0), ATOMIC_INIT(0), NULL, 1, NULL })
++ { ATOMIC_INIT(0), ATOMIC_INIT(0), NULL, 1, 0, NULL })
+ 
+ #define semaphore_owner(sem)	((sem)->owner)
+ #define sema_init(sem, val)	atomic_set(&((sem)->count), val)
+@@ -110,7 +111,7 @@
+ 	: "=r"(ret), "=r"(tmp), "=m"(__atomic_fool_gcc(&sem->waking))
+ 	: "0"(0));
+ 
+-	ret |= ((owner_depth != 0) & (sem->owner == tsk));
++	ret |= ((owner_depth != 0) & (sem->owner == tsk) & sem->recursive);
+ 	if (ret) {
+ 		sem->owner = tsk;
+ 		wmb();
+@@ -150,7 +151,7 @@
+ 		"	stq	$8,%1\n"
+ 		"	lda	$28,1\n"
+ 		"	wmb\n"
+-		"	stq	$28,%2\n"
++		"	stl	$28,%2\n"
+ 		"4:	mb\n"
+ 		".section .text2,\"ax\"\n"
+ 		"2:	br	1b\n"
+@@ -185,7 +186,7 @@
+ 		"	stq	$8,%2\n"
+ 		"	lda	$28,1\n"
+ 		"	wmb\n"
+-		"	stq	$28,%3\n"
++		"	stl	$28,%3\n"
+ 		"	mov	$31,$24\n"
+ 		"4:	mb\n"
+ 		".section .text2,\"ax\"\n"
+--- include/asm-i386/semaphore.h	Tue Feb  2 11:47:55 1999
++++ include/asm-i386/semaphore.h	Wed Feb 10 08:59:50 1999
+@@ -49,7 +49,8 @@
+  */
+ struct semaphore {
+ 	atomic_t count;
+-	unsigned long owner, owner_depth;
++	unsigned long owner;
++	short owner_depth, recursive;
+ 	int waking;
+ 	struct wait_queue * wait;
+ };
+@@ -64,8 +65,8 @@
+ #define semaphore_owner(sem) \
+ 	((struct task_struct *)((2*PAGE_MASK) & (sem)->owner))
+ 
+-#define MUTEX ((struct semaphore) { ATOMIC_INIT(1), 0, 0, 0, NULL })
+-#define MUTEX_LOCKED ((struct semaphore) { ATOMIC_INIT(0), 0, 1, 0, NULL })
++#define MUTEX ((struct semaphore) { ATOMIC_INIT(1), 0, 0, 0, 1, NULL })
++#define MUTEX_LOCKED ((struct semaphore) { ATOMIC_INIT(0), 0, 1, 0, 0, NULL })
+ 
+ asmlinkage void __down_failed(void /* special register calling convention */);
+ asmlinkage int  __down_failed_interruptible(void  /* params in registers */);
+@@ -138,7 +139,7 @@
+ 	int ret = 0;
+ 
+ 	spin_lock_irqsave(&semaphore_wake_lock, flags);
+-	if (sem->waking > 0 || (owner_depth && semaphore_owner(sem) == tsk)) {
++	if (sem->waking > 0 || (owner_depth && semaphore_owner(sem) == tsk && sem->recursive)) {
+ 		sem->owner = (unsigned long) tsk;
+ 		sem->owner_depth++;	/* Don't use the possibly stale value */
+ 		sem->waking--;
+@@ -163,7 +164,7 @@
+ 		"decl 0(%0)\n\t"
+ 		"js 2f\n\t"
+ 		"movl %%esp,4(%0)\n"
+-		"movl $1,8(%0)\n\t"
++		"movw $1,8(%0)\n\t"
+ 		"1:\n"
+ 		".section .text.lock,\"ax\"\n"
+ 		"2:\tpushl $1b\n\t"
+@@ -186,7 +187,7 @@
+ 		"decl 0(%1)\n\t"
+ 		"js 2f\n\t"
+ 		"movl %%esp,4(%1)\n\t"
+-		"movl $1,8(%1)\n\t"
++		"movw $1,8(%1)\n\t"
+ 		"xorl %0,%0\n"
+ 		"1:\n"
+ 		".section .text.lock,\"ax\"\n"
+@@ -210,7 +211,7 @@
+ {
+ 	__asm__ __volatile__(
+ 		"# atomic up operation\n\t"
+-		"decl 8(%0)\n\t"
++		"decw 8(%0)\n\t"
+ #ifdef __SMP__
+ 		"lock ; "
+ #endif
+--- include/asm-sparc/semaphore.h	Tue Feb  2 11:48:24 1999
++++ include/asm-sparc/semaphore.h	Wed Feb 10 09:01:42 1999
+@@ -11,12 +11,12 @@
+ 	atomic_t count;
+ 	atomic_t waking;
+ 	struct task_struct * owner;
+-	int depth;
++	short depth, recursive;
+ 	struct wait_queue * wait;
+ };
+ 
+-#define MUTEX ((struct semaphore) { ATOMIC_INIT(1), ATOMIC_INIT(0), NULL, 0, NULL })
+-#define MUTEX_LOCKED ((struct semaphore) { ATOMIC_INIT(0), ATOMIC_INIT(0), NULL, 1, NULL })
++#define MUTEX ((struct semaphore) { ATOMIC_INIT(1), ATOMIC_INIT(0), NULL, 0, 1, NULL })
++#define MUTEX_LOCKED ((struct semaphore) { ATOMIC_INIT(0), ATOMIC_INIT(0), NULL, 1, 0, NULL })
+ 
+ extern void __down(struct semaphore * sem);
+ extern int __down_interruptible(struct semaphore * sem);
+@@ -75,7 +75,7 @@
+ 	: "r" (&sem->waking), "i" (PSR_PIL)
+ 	: "g1", "memory", "cc");
+ #endif
+-	if (ret || (depth != 0 && semaphore_owner(sem) == tsk)) {
++	if (ret || (depth != 0 && semaphore_owner(sem) == tsk && sem->recursive)) {
+ 		sem->owner = tsk;
+ 		barrier();
+ 		sem->depth++;
+@@ -100,7 +100,7 @@
+ 	bl	2f
+ 	 mov	1, %%g7
+ 	st	%%g6, [%%g1 + 8]
+-	st	%%g7, [%%g1 + 12]
++	sth	%%g7, [%%g1 + 12]
+ 1:
+ 	.subsection 2
+ 2:	save	%%sp, -64, %%sp
+@@ -133,7 +133,7 @@
+ 	bl	2f
+ 	 mov	1, %%g7
+ 	st	%%g6, [%%g1 + 8]
+-	st	%%g7, [%%g1 + 12]
++	sth	%%g7, [%%g1 + 12]
+ 	clr	%%g2
+ 1:
+ 	.subsection 2
+--- include/asm-sparc64/semaphore.h	Tue Feb  9 14:14:37 1999
++++ include/asm-sparc64/semaphore.h	Wed Feb 10 09:03:17 1999
+@@ -11,12 +11,12 @@
+ 	atomic_t count;
+ 	atomic_t waking;
+ 	int owner;
+-	int depth;
++	short depth, recursive;
+ 	struct wait_queue * wait;
+ };
+ 
+-#define MUTEX ((struct semaphore) { ATOMIC_INIT(1), ATOMIC_INIT(0), 0, 0, NULL })
+-#define MUTEX_LOCKED ((struct semaphore) { ATOMIC_INIT(0), ATOMIC_INIT(0), 0, 1, NULL })
++#define MUTEX ((struct semaphore) { ATOMIC_INIT(1), ATOMIC_INIT(0), 0, 0, 1, NULL })
++#define MUTEX_LOCKED ((struct semaphore) { ATOMIC_INIT(0), ATOMIC_INIT(0), 0, 1, 0, NULL })
+ 
+ extern void __down(struct semaphore * sem);
+ extern int  __down_interruptible(struct semaphore * sem);
+@@ -46,7 +46,7 @@
+ 2:"	: "=r" (ret)
+ 	: "r" (&((sem)->waking))
+ 	: "g5", "g7", "cc", "memory");
+-	if (ret || (depth != 0 && sem->owner == (int)(((long)tsk)>>13L))) {
++	if (ret || (depth != 0 && sem->owner == (int)(((long)tsk)>>13L && sem->recursive))) {
+ 		sem->owner = (int)(((long)tsk)>>13L);
+ 		membar("#StoreLoad | #StoreStore");
+ 		sem->depth++;
+@@ -69,7 +69,7 @@
+ 		mov	1, %%g5
+ 		stw	%%g7, [%0 + 8]
+ 		membar	#StoreStore
+-		stw	%%g5, [%0 + 12]
++		sth	%%g5, [%0 + 12]
+ 	2:
+ 		.subsection 2
+ 	3:	mov	%0, %%g5
+@@ -104,7 +104,7 @@
+ 		mov	1, %%g5
+ 		stw	%%g7, [%2 + 8]
+ 		membar	#StoreStore
+-		stw	%%g5, [%2 + 12]
++		sth	%%g5, [%2 + 12]
+ 	2:
+ 		.subsection 2
+ 	3:	mov	%2, %%g5
+Cheers,
+    Jakub
+___________________________________________________________________
+Jakub Jelinek | jj@sunsite.mff.cuni.cz | 
+http://sunsite.mff.cuni.cz
+Administrator of SunSITE Czech Republic, MFF, Charles University
+___________________________________________________________________
+UltraLinux  |  
+http://ultra.linux.cz/
+  |  
+http://ultra.penguin.cz/
+Linux version 2.2.1 on a sparc64 machine (3958.37 BogoMips)
+___________________________________________________________________
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

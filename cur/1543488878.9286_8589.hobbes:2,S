@@ -1,0 +1,156 @@
+Date: Sun, 7 Mar 1999 15:16:25 +0100 (CET)
+From: Matthias Moeller <>
+Subject: TCP window updates [Was: PROBLEM: Sending mail-attachment]
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/3/7/35
+
+Some people already reported problems with tcp stalls (Netscape, 
+XEmacs/Gnus etc.). I did some debugging and hopefully found out, 
+when and why this happens.
+Here again is a typical trace:
+> 13:53:20.339402 lh.3333 > lh.1284: P 25161:26641(1480) ack 1 win 31072 (DF)
+> 13:53:20.339402 lh.3333 > lh.1284: P 25161:26641(1480) ack 1 win 31072 (DF)
+> 13:53:20.339450 lh.1284 > lh.3333: . ack 26641 win 4432 (DF)
+> 13:53:20.339450 lh.1284 > lh.3333: . ack 26641 win 4432 (DF)
+> 13:53:20.339864 lh.3333 > lh.1284: P 26641:28121(1480) ack 1 win 31072 (DF)
+> 13:53:20.339864 lh.3333 > lh.1284: P 26641:28121(1480) ack 1 win 31072 (DF)
+> 13:53:20.339903 lh.1284 > lh.3333: . ack 28121 win 2952 (DF)
+> 13:53:20.339903 lh.1284 > lh.3333: . ack 28121 win 2952 (DF)
+> 13:53:20.340299 lh.3333 > lh.1284: P 28121:29601(1480) ack 1 win 31072 (DF)
+> 13:53:20.340299 lh.3333 > lh.1284: P 28121:29601(1480) ack 1 win 31072 (DF)
+> 13:53:20.340337 lh.1284 > lh.3333: . ack 29601 win 1472 (DF)
+> 13:53:20.340337 lh.1284 > lh.3333: . ack 29601 win 1472 (DF)
+*** stall ***
+As Stanislav Meduna already postet, one part of the problem is in
+tcp.c cleanup_rbuf():
+ if((copied >= rcv_window_now) &&
+    ((rcv_window_now + tp->mss_cache) <= tp->window_clamp))
+         tcp_read_wakeup(sk);
+The first check should prevent unnecessary ACKs. Unfortunatly
+it also prevents advertising an increased window sometimes.
+When the reader always reads small chunks of data, say 15 bytes,
+the check will always fail since "copied" is always 15 while
+rcv_window_now mostly is larger.
+But why does the sender not simply send 1472 bytes after receiving
+13:53:20.340337 lh.1284 > lh.3333: . ack 29601 win 1472 (DF) ?
+The reader would then advertise win 0 and everything would be fine
+(the sender would use TIME_PROBE0 to frequently probe the win size
+ of the reader).
+The reason is that the SendQ is empty. This is the timing issue here
+which made the problem appear like a race. 
+Since SendQ is empty now, the kernel will wake up the sender proc.
+The sender now continues calling write(). This invokes tcp_v4_sendmsg()
+in tcp_ipv4.c. Now there are 2 possibilities that data actually gets
+transmitted.
+ 1. In tcp_v4_sendmsg() -> tcp_do_sendmsg() -> 
+       tcp_send_skb((sk, skb, queue_it);
+    For small write sizes ( < mss and < max_window/2 ) "queue_it"
+    is always true. This prevents any transmitting and only queues
+    the data.
+ 2. In tcp_v4_sendmsg() -> 
+	if(tp->send_head && tcp_snd_test(sk, tp->send_head))
+              tcp_write_xmit(sk);
+    The same. tcp_snd_test will always fail for small write() sizes.
+** Summary **
+A tcp stall occures when:
+1. Reader sends an ACK advertising a win < mss / 2.
+2. Senders SendQ is empty in this moment.
+3. Senders subsequent write() calls use write sizes < mss.
+The attached program can demonstrate that. It creates a sender
+and a reader. The sender sends about 50kb to the reader while
+the reader sleeps().
+netstat says correctly:
+Proto Recv-Q Send-Q Local Address           Foreign Address         State      
+tcp        0      0 localhost:3334          localhost:1033          ESTABLISHED 
+tcp    57500      0 localhost:1033          localhost:3334          ESTABLISHED
+Now the reader wakes up and reads the data and the sender sleeps()
+10 seconds. Then the sender writes again 3871 bytes, which is the
+critical size on my machine (mtu 3924).
+Proto Recv-Q Send-Q Local Address           Foreign Address         State      
+tcp        0   3872 localhost:3334          localhost:1033          FIN_WAIT1   
+tcp        0      0 localhost:1033          localhost:3334          ESTABLISHED 
+There is the stall. No further write() will cause any data transmission
+as long as the write size is <= 3871.
+I can not say whether sender or reader side is wrong. I would say both
+but I still have to read the RFCs :).
+Any comments?
+-- Matthias
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <sys/time.h>
+#include <sys/types.h>
+#include <unistd.h>
+#include <netinet/in.h>
+#include <sys/un.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/wait.h>
+#include <signal.h>
+#include <netdb.h>
+#define WSIZE1 57500
+#define WSIZE2 3871
+#define RSIZE 15
+#define PORT 3334
+char buffer[WSIZE1 + WSIZE2];
+void server(void)
+{
+    struct sockaddr_in addr, accept_addr;
+    int addrlen = 0, mainSock, sock;
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(PORT);
+    addr.sin_addr.s_addr = INADDR_ANY;
+    if((mainSock = socket(addr.sin_family, SOCK_STREAM, 0))  < 0)
+    { perror("socket()"); exit(1); }
+    if( bind(mainSock, &addr, sizeof(addr)) < 0)
+    { perror("bind()");   exit(1); }
+    
+    if( listen(mainSock, 1) < 0) 
+    { perror("listen()"); exit(1); }
+    
+    sock = accept(mainSock, (struct sockaddr *)&accept_addr, &addrlen);
+    if(sock < 0) { perror("accept()"); abort(); }
+    
+    write(sock, buffer, WSIZE1);
+    sleep(10);
+    write(sock, buffer, WSIZE2);
+    sleep(3);
+    close(sock);
+    close(mainSock);
+    abort();
+}
+static void client(void)
+{
+    struct sockaddr_in addr;
+    struct hostent *hostent;
+    char buf[RSIZE];
+    int len, sock;
+    if(!(hostent = gethostbyname("localhost")))
+    { printf("Could not resolve host!\n"); exit(1); }
+    addr.sin_port = htons(PORT);
+    addr.sin_family = hostent->h_addrtype;
+    memcpy(&addr.sin_addr, hostent->h_addr, hostent->h_length);
+    if((sock = socket(addr.sin_family, SOCK_STREAM, 0)) < 0)
+    { perror("socket()"); exit(1); }
+    while(connect(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0)
+    { perror("connect()"); exit(1); }
+    sleep(5);
+    len = 0;
+    while(len < WSIZE1 + WSIZE2)
+	len += read(sock, buf, RSIZE);
+    close(sock);
+}
+int main(int argc, char **argv)
+{
+    int i;
+    i = fork();
+    if(!i)
+	server();
+    sleep(2);
+    client();
+    wait(&i);
+    return 0;
+}

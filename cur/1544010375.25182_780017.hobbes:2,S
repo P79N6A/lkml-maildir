@@ -1,0 +1,105 @@
+Date: Fri, 12 Dec 2008 22:18:39 +0300
+From: Vladislav Bolkhovitin <>
+Subject: Dynamic switching of io_context
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2008/12/12/261
+
+Hello Jens,
+In SCST (
+http://scst.sf.net
+) in some cases IO can be submitted 
+asynchronously. This is possible for pass-through (i.e. using 
+scsi_execute_async()) and BLOCKIO (i.e. using direct bio interface, see 
+blockio_exec_rw() in 
+http://scst.svn.sourceforge.net/viewvc/scst/trunk/scst/src/dev_handlers/scst_vdisk.c?revision=614&view=markup
+) 
+backend. For them there's no need to have a per device pool of threads, 
+one or more global thread(s) can perfectly do all the work. But it is 
+very desirable for performance that all the IO is submitted in a 
+dedicated IO context for each initiator (i.e. client), which originated 
+it. I.e. commands from initiator 1 submitted in IO context IOC1, from 
+initiator 2 - IOC2, etc. Most likely, the same approach would be very 
+useful for NFS server as well.
+To achieve that it is necessary to have a possibility to switch IO 
+context of the threads on the fly. I tried to implement that (see the 
+attached patch), but hit BUG_ON(!cic->dead_key) in cic_free_func(), when 
+session for initiator with the corresponding IO context was being 
+destroyed by scst_free_tgt_dev(). At that point it was guaranteed that 
+there was no outstanding IO with this IO context.
+So, I had to go to a more defensive approach to have for each pool of 
+threads, including threads for async. IO, a dedicated IO context, which 
+is currently implemented.
+Could you advice please what was going wrong? What should I do to 
+achieve what's desired?
+Thanks,
+Vlad
+Index: scst/include/scst.h
+===================================================================
+--- scst/include/scst.h	(revision 583)
++++ scst/include/scst.h	(working copy)
+@@ -1516,6 +1516,8 @@ struct scst_tgt_dev {
+ 	spinlock_t thr_data_lock;
+ 	struct list_head thr_data_list;
+ 
++	struct io_context *tgt_dev_ioc;
++
+ 	spinlock_t tgt_dev_lock;	/* per-session device lock */
+ 
+ 	/* List of UA's for this device, protected by tgt_dev_lock */
+Index: scst/src/scst_lib.c
+===================================================================
+--- scst/src/scst_lib.c	(revision 583)
++++ scst/src/scst_lib.c	(working copy)
+@@ -542,6 +542,12 @@ static struct scst_tgt_dev *scst_alloc_a
+ 	for (i = 0; i < (int)ARRAY_SIZE(tgt_dev->sn_slots); i++)
+ 		atomic_set(&tgt_dev->sn_slots[i], 0);
+ 
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 25)
++#if defined(CONFIG_BLOCK) && defined(SCST_ALLOC_IO_CONTEXT_EXPORTED)
++	tgt_dev->tgt_dev_ioc = alloc_io_context(GFP_KERNEL, -1);
++#endif
++#endif
++
+ 	if (dev->handler->parse_atomic &&
+ 	    (sess->tgt->tgtt->preprocessing_done == NULL)) {
+ 		if (sess->tgt->tgtt->rdy_to_xfer_atomic)
+@@ -685,6 +691,8 @@ static void scst_free_tgt_dev(struct scs
+ 			scst_del_cmd_threads(vtt->threads_num);
+ 	}
+ 
++	put_io_context(tgt_dev->tgt_dev_ioc);
++
+ 	kmem_cache_free(scst_tgtd_cachep, tgt_dev);
+ 
+ 	TRACE_EXIT();
+Index: scst/src/dev_handlers/scst_vdisk.c
+===================================================================
+--- scst/src/dev_handlers/scst_vdisk.c	(revision 583)
++++ scst/src/dev_handlers/scst_vdisk.c	(working copy)
+@@ -751,6 +753,14 @@ static int vdisk_do_job(struct scst_cmd 
+ 			scst_thr_data_get(&thr->hdr);
+ 		} else
+ 			thr = container_of(d, struct scst_vdisk_thr, hdr);
++
++		EXTRACHECKS_WARN_ON(tsk->io_context);
++		/*
++		 * No need to call ioc_task_link(), because io_context will be
++		 * cleared in the end of this function.
++		 */
++		tsk->io_context = tgt_dev->tgt_dev_ioc;
++		TRACE_DBG_SPECIAL("io_context %p", tsk->io_context);
+ 	} else {
+ 		thr = &nullio_thr_data;
+ 		scst_thr_data_get(&thr->hdr);
+@@ -1004,6 +1014,8 @@ out_done:
+ 	cmd->scst_cmd_done(cmd, SCST_CMD_STATE_DEFAULT, SCST_CONTEXT_SAME);
+ 
+ out_thr:
++	tsk->io_context = NULL;
++
+ 	if (likely(thr != NULL))
+ 		scst_thr_data_put(&thr->hdr);
+ 

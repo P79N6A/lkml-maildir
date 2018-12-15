@@ -1,0 +1,140 @@
+Date: Fri, 09 Aug 2002 17:57:27 -0700
+From: Andrew Morton <>
+Subject: [patch 9/12] sync get_user_pages with 2.4
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2002/8/9/195
+
+Forward port of get_user_pages() change from 2.4.
+- If the vma is marked as VM_IO area then fail the map.
+  This prevents kernel deadlocks which occur when applications which
+  have frame buffers mapped try to dump core.  Also prevents a kernel
+  oops when a debugger is attached to a process which has an IO mmap.
+- Check that the mapped page is inside mem_map[] (pfn_valid).
+- inline follow_page() and remove the preempt_disable()s.  It has
+  only a single callsite and is called under spinloclk.
+ memory.c |   45 +++++++++++++++++++++++++--------------------
+ 1 files changed, 25 insertions, 20 deletions
+--- 2.5.30/mm/memory.c~get_user_pages-sync	Fri Aug  9 17:36:46 2002
++++ 2.5.30-akpm/mm/memory.c	Fri Aug  9 17:36:46 2002
+@@ -432,9 +432,11 @@ void zap_page_range(struct vm_area_struc
+ }
+ 
+ /*
+- * Do a quick page-table lookup for a single page. 
++ * Do a quick page-table lookup for a single page.
++ * mm->page_table_lock must be held.
+  */
+-static struct page * follow_page(struct mm_struct *mm, unsigned long address, int write) 
++static inline struct page *
++follow_page(struct mm_struct *mm, unsigned long address, int write) 
+ {
+ 	pgd_t *pgd;
+ 	pmd_t *pmd;
+@@ -449,19 +451,14 @@ static struct page * follow_page(struct 
+ 	if (pmd_none(*pmd) || pmd_bad(*pmd))
+ 		goto out;
+ 
+-	preempt_disable();
+ 	ptep = pte_offset_map(pmd, address);
+-	if (!ptep) {
+-		preempt_enable();
++	if (!ptep)
+ 		goto out;
+-	}
+ 
+ 	pte = *ptep;
+ 	pte_unmap(ptep);
+-	preempt_enable();
+ 	if (pte_present(pte)) {
+-		if (!write ||
+-		    (pte_write(pte) && pte_dirty(pte))) {
++		if (!write || (pte_write(pte) && pte_dirty(pte))) {
+ 			pfn = pte_pfn(pte);
+ 			if (pfn_valid(pfn))
+ 				return pfn_to_page(pfn);
+@@ -478,13 +475,17 @@ out:
+  * with IO-aperture pages in kiobufs.
+  */
+ 
+-static inline struct page * get_page_map(struct page *page)
++static inline struct page *get_page_map(struct page *page)
+ {
++	if (!pfn_valid(page_to_pfn(page)))
++		return 0;
+ 	return page;
+ }
+ 
+-int get_user_pages(struct task_struct *tsk, struct mm_struct *mm, unsigned long start,
+-		int len, int write, int force, struct page **pages, struct vm_area_struct **vmas)
++
++int get_user_pages(struct task_struct *tsk, struct mm_struct *mm,
++		unsigned long start, int len, int write, int force,
++		struct page **pages, struct vm_area_struct **vmas)
+ {
+ 	int i;
+ 	unsigned int flags;
+@@ -496,14 +497,14 @@ int get_user_pages(struct task_struct *t
+ 	flags = write ? (VM_WRITE | VM_MAYWRITE) : (VM_READ | VM_MAYREAD);
+ 	flags &= force ? (VM_MAYREAD | VM_MAYWRITE) : (VM_READ | VM_WRITE);
+ 	i = 0;
+-	
+ 
+ 	do {
+ 		struct vm_area_struct *	vma;
+ 
+ 		vma = find_extend_vma(mm, start);
+ 
+-		if ( !vma || !(flags & vma->vm_flags) )
++		if (!vma || (pages && (vma->vm_flags & VM_IO))
++				|| !(flags & vma->vm_flags))
+ 			return i ? : -EFAULT;
+ 
+ 		spin_lock(&mm->page_table_lock);
+@@ -511,7 +512,7 @@ int get_user_pages(struct task_struct *t
+ 			struct page *map;
+ 			while (!(map = follow_page(mm, start, write))) {
+ 				spin_unlock(&mm->page_table_lock);
+-				switch (handle_mm_fault(mm, vma, start, write)) {
++				switch (handle_mm_fault(mm,vma,start,write)) {
+ 				case VM_FAULT_MINOR:
+ 					tsk->min_flt++;
+ 					break;
+@@ -529,11 +530,14 @@ int get_user_pages(struct task_struct *t
+ 			}
+ 			if (pages) {
+ 				pages[i] = get_page_map(map);
+-				/* FIXME: call the correct function,
+-				 * depending on the type of the found page
+-				 */
+-				if (pages[i])
+-					page_cache_get(pages[i]);
++				if (!pages[i]) {
++					spin_unlock(&mm->page_table_lock);
++					while (i--)
++						page_cache_release(pages[i]);
++					i = -EFAULT;
++					goto out;
++				}
++				page_cache_get(pages[i]);
+ 			}
+ 			if (vmas)
+ 				vmas[i] = vma;
+@@ -543,6 +547,7 @@ int get_user_pages(struct task_struct *t
+ 		} while(len && start < vma->vm_end);
+ 		spin_unlock(&mm->page_table_lock);
+ 	} while(len);
++out:
+ 	return i;
+ }
+ 
+.
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+More majordomo info at  
+http://vger.kernel.org/majordomo-info.html
+Please read the FAQ at  
+http://www.tux.org/lkml/

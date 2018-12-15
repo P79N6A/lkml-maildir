@@ -1,0 +1,2158 @@
+Date: Tue, 21 Mar 2000 00:50:15 +1100 (EST)
+From: Alan Modra <>
+Subject: Re: [PATCH] for SMP problems in n_tty.c, serial.c
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/3/20/99
+
+Hi Ted, Andrew,
+   Here's the version with SMP spinlock serial.c
+Things to check in serial.c:
+a) Whether I've caught all deadlocks.  save_flags, cli sequence is OK to
+   do muliple times; spin_lock_irqsave isn't.
+b) Whether it's safe to unlock earlier in startup and register_serial to
+   avoid (a)
+c) Whether I've FUBAR'd scr_info use.
+d) Whether there is sufficient protection for global vars.
+Tested on UP with DEBUG_SPINLOCK, but I don't have a SMP machine handy to
+properly test this patch.
+Regards, Alan Modra
+-- 
+Linuxcare. Support for the Revolution.
+For the benefit of the list: what this patch does is fix a number of
+bugs which will be hit (probably only very occasionally) by users who have
+SMP machines.  In addition, I've removed the global cli()'s in serial.c,
+which are relatively slow on SMP machines, and replaced them with
+spinlocks.  That's the part of this patch that especially needs testing
+and scrutiny.  Find a bug, and tell me how silly I am.
+ChangeLog
+	* include/linux/circ_buf.h: New file.
+	* include/linux/tty.h: Include linux/circ_buf.h
+	(struct tty_struct): Delete read_buf, read_head, read_tail,
+	read_cnt.  Add read, head_lock, tail_lock.
+	Change type of canon_head to int.
+	* include/linux.serialP.h: Include linux/circ_buf.h
+	(struct async_struct): Delete xmit_buf, xmit_head, xmit_tail,
+	xmit_cnt.  Add xmit, xmit_lock.
+	* drivers/char/n_tty.c: Throughout file, remove references to
+	read_cnt, and replace with CIRC_CNT, CIRC_SPACE, CIRC_CNT_TO_END,
+	or CIRC_SPACE_TO_END as appropriate.  Change read_buf, read_head,
+	read_tail to read.buf, read.head, read.tail to suit new circ_buf
+	struct.  Use two spinlocks, one for read.head, one for read.tail
+	so both readers and writers can access the buffer simultaneously.
+	Don't use MIN as it references its args twice.
+	(n_tty_chars_in_buffer): Simplify.  Remove unnecessary spinlock.
+	(n_tty_receive_room): Full buffer is now N_TTY_BUF_SIZE - 1.  Don't
+	return one less than actual available.
+	(n_tty_receive_buf): Localise variables to blocks.
+	(copy_from_read_buf): Remove unnecessary spinlock when finding
+	count in buffer.  Protect against multiple SMP readers.
+	(read_chan): Protect against multiple SMP readers while
+	searching for eol.
+	* drivers/char/tty_ioctl.c: Throughout file, remove references to
+	read_cnt, and replace with CIRC_CNT, CIRC_SPACE, CIRC_CNT_TO_END,
+	or CIRC_SPACE_TO_END as appropriate.  Change read_buf, read_head,
+	read_tail to read.buf, read.head, read.tail to suit new circ_buf
+	struct.
+	* drivers/char/tty_io.c (tty_fasync): Set minimun_to_wake to new
+	full buffer size, N_TTY_BUF_SIZE - 1.
+	* drivers/char/pty.c (MIN): Delete.
+	(pty_write): Replace usage of MIN, as it evaluates its arguments
+	twice, and may call ldisc.receive_room twice.  Localise variables
+	to blocks.
+	*drivers/char/selection.c (MIN): Delete.
+	(paste_selection): Replace usage of MIN.
+	*drivers/char/serial.c: Throughout file, remove references to
+	xmit_cnt, and replace with CIRC_CNT, CIRC_SPACE, CIRC_CNT_TO_END,
+	or CIRC_SPACE_TO_END as appropriate.  Change xmit_buf, xmit_head,
+	xmit_tail to xmit.buf, xmit.head, xmit.tail to suit new circ_buf
+	struct.  Replace save_flags, cli, .., restore_flags with spinlock
+	equivalent.  Don't use MIN as it references its args twice.
+	(rs_interrupt): Hold xmit_lock spinlock for duration.
+	(rs_interrupt_single): Same here,
+	(rs_interrupt_multi): And here.
+	(rs_timer): Use local save_flags, cli here instead of global.
+	(shutdown): Clear info->xmit.buf before we free page.
+	(rs_put_char): Don't xmit.head++, as it leaves xmit.head with an
+	illegal value for a short time.
+	(rs_write_room): Don't return one less than actual available.
+	(line_info): Only use info->MCR when info != &scr_info.  Use
+	static scr_info.
+	(detect_uart_irq): Use static scr_info.
+	(autoconfig): Here too.
+	(rs_init): Init scr_info.
+	(cleanup_module): Clear tmp_buf before freeing page.
+diff -urP -x*~ -xTAGS linux-2.2.15-pre14/drivers/char/n_tty.c linux-2.2.15-smp/drivers/char/n_tty.c
+--- linux-2.2.15-pre14/drivers/char/n_tty.c	Wed Mar 15 14:29:36 2000
++++ linux-2.2.15-smp/drivers/char/n_tty.c	Mon Mar 20 10:23:32 2000
+@@ -1,6 +1,6 @@
+ /*
+  * n_tty.c --- implements the N_TTY line discipline.
+- * 
++ *
+  * This code used to be in tty_io.c, but things are getting hairy
+  * enough that it made sense to split things off.  (The N_TTY
+  * processing has changed so much that it's hardly recognizable,
+@@ -8,19 +8,22 @@
+  *
+  * Note that the open routine for N_TTY is guaranteed never to return
+  * an error.  This is because Linux will fall back to setting a line
+- * to N_TTY if it can not switch to any other line discipline.  
++ * to N_TTY if it can not switch to any other line discipline.
+  *
+  * Written by Theodore Ts'o, Copyright 1994.
+- * 
++ *
+  * This file also contains code originally written by Linus Torvalds,
+  * Copyright 1991, 1992, 1993, and by Julian Cowley, Copyright 1994.
+- * 
++ *
+  * This file may be redistributed under the terms of the GNU Public
+  * License.
+  *
+- * 2000/01/20   Fixed SMP locking on put_tty_queue using bits of 
++ * 2000/01/20   Fixed SMP locking on put_tty_queue using bits of
+  *		the patch by Andrew J. Kroll <ag784@freenet.buffalo.edu>
+  *		who actually finally proved there really was a race.
++ *
++ * 3/00: Rid circular buffer of redundant read_cnt.  Fix a few more races.
++ *	 Alan Modra <alan@linuxcare.com>
+  */
+ 
+ #include <linux/types.h>
+@@ -47,9 +50,6 @@
+ #define CONSOLE_DEV MKDEV(TTY_MAJOR,0)
+ #define SYSCONS_DEV  MKDEV(TTYAUX_MAJOR,1)
+ 
+-#ifndef MIN
+-#define MIN(a,b)	((a) < (b) ? (a) : (b))
+-#endif
+ 
+ /* number of characters left in xmit buffer before select has we have room */
+ #define WAKEUP_CHARS 256
+@@ -68,17 +68,16 @@
+ 	/*
+ 	 *	The problem of stomping on the buffers ends here.
+ 	 *	Why didn't anyone see this one comming? --AJK
+-	*/
+-	spin_lock_irqsave(&tty->read_lock, flags);
+-	if (tty->read_cnt < N_TTY_BUF_SIZE) {
+-		tty->read_buf[tty->read_head] = c;
+-		tty->read_head = (tty->read_head + 1) & (N_TTY_BUF_SIZE-1);
+-		tty->read_cnt++;
++	 */
++	spin_lock_irqsave(&tty->head_lock, flags);
++	if (CIRC_SPACE(tty->read.head, tty->read.tail, N_TTY_BUF_SIZE) != 0) {
++		tty->read.buf[tty->read.head] = c;
++		tty->read.head = (tty->read.head + 1) & (N_TTY_BUF_SIZE-1);
+ 	}
+-	spin_unlock_irqrestore(&tty->read_lock, flags);
++	spin_unlock_irqrestore(&tty->head_lock, flags);
+ }
+ 
+-/* 
++/*
+  * Check whether to call the driver.unthrottle function.
+  * We test the TTY_THROTTLED bit first so that it always
+  * indicates the current state.
+@@ -86,13 +85,13 @@
+ static void check_unthrottle(struct tty_struct * tty)
+ {
+ 	if (tty->count &&
+-	    test_and_clear_bit(TTY_THROTTLED, &tty->flags) && 
++	    test_and_clear_bit(TTY_THROTTLED, &tty->flags) &&
+ 	    tty->driver.unthrottle)
+ 		tty->driver.unthrottle(tty);
+ }
+ 
+ /*
+- * Reset the read buffer counters, clear the flags, 
++ * Reset the read buffer counters, clear the flags,
+  * and make sure the driver is unthrottled. Called
+  * from n_tty_open() and n_tty_flush_buffer().
+  */
+@@ -100,9 +99,11 @@
+ {
+ 	unsigned long flags;
+ 
+-	spin_lock_irqsave(&tty->read_lock, flags);
+-	tty->read_head = tty->read_tail = tty->read_cnt = 0;
+-	spin_unlock_irqrestore(&tty->read_lock, flags);
++	spin_lock_irqsave(&tty->head_lock, flags);
++	spin_lock(&tty->tail_lock);
++	tty->read.head = tty->read.tail = 0;
++	spin_unlock(&tty->tail_lock);
++	spin_unlock_irqrestore(&tty->head_lock, flags);
+ 	tty->canon_head = tty->canon_data = tty->erasing = 0;
+ 	memset(&tty->read_flags, 0, sizeof tty->read_flags);
+ 	check_unthrottle(tty);
+@@ -115,7 +116,7 @@
+ {
+ 	/* clear everything and unthrottle the driver */
+ 	reset_buffer_flags(tty);
+-	
++
+ 	if (!tty->link)
+ 		return;
+ 
+@@ -130,18 +131,13 @@
+  */
+ ssize_t n_tty_chars_in_buffer(struct tty_struct *tty)
+ {
+-	unsigned long flags;
+ 	ssize_t n = 0;
+ 
+-	spin_lock_irqsave(&tty->read_lock, flags);
+ 	if (!tty->icanon) {
+-		n = tty->read_cnt;
++		n = CIRC_CNT(tty->read.head, tty->read.tail, N_TTY_BUF_SIZE);
+ 	} else if (tty->canon_data) {
+-		n = (tty->canon_head > tty->read_tail) ?
+-			tty->canon_head - tty->read_tail :
+-			tty->canon_head + (N_TTY_BUF_SIZE - tty->read_tail);
++		n = CIRC_CNT(tty->canon_head, tty->read.tail, N_TTY_BUF_SIZE);
+ 	}
+-	spin_unlock_irqrestore(&tty->read_lock, flags);
+ 	return n;
+ }
+ 
+@@ -213,7 +209,7 @@
+  * things.
+  */
+ static ssize_t opost_block(struct tty_struct * tty,
+-		       const unsigned char * inbuf, unsigned int nr)
++			   const unsigned char * inbuf, unsigned int nr)
+ {
+ 	char	buf[80];
+ 	int	space;
+@@ -226,11 +222,11 @@
+ 	if (nr > space)
+ 		nr = space;
+ 	if (nr > sizeof(buf))
+-	    nr = sizeof(buf);
++		nr = sizeof(buf);
+ 	nr -= copy_from_user(buf, inbuf, nr);
+ 	if (!nr)
+ 		return 0;
+-	
++
+ 	for (i = 0, cp = buf; i < nr; i++, cp++) {
+ 		switch (*cp) {
+ 		case '\n':
+@@ -268,7 +264,7 @@
+ break_out:
+ 	if (tty->driver.flush_chars)
+ 		tty->driver.flush_chars(tty);
+-	i = tty->driver.write(tty, 0, buf, i);	
++	i = tty->driver.write(tty, 0, buf, i);
+ 	return i;
+ }
+ 
+@@ -306,7 +302,7 @@
+ 	int head, seen_alnums;
+ 	unsigned long flags;
+ 
+-	if (tty->read_head == tty->canon_head) {
++	if (tty->read.head == tty->canon_head) {
+ 		/* opost('\a', tty); */		/* what do you think? */
+ 		return;
+ 	}
+@@ -316,19 +312,15 @@
+ 		kill_type = WERASE;
+ 	else {
+ 		if (!L_ECHO(tty)) {
+-			spin_lock_irqsave(&tty->read_lock, flags);
+-			tty->read_cnt -= ((tty->read_head - tty->canon_head) &
+-					  (N_TTY_BUF_SIZE - 1));
+-			tty->read_head = tty->canon_head;
+-			spin_unlock_irqrestore(&tty->read_lock, flags);
++			spin_lock_irqsave(&tty->head_lock, flags);
++			tty->read.head = tty->canon_head;
++			spin_unlock_irqrestore(&tty->head_lock, flags);
+ 			return;
+ 		}
+ 		if (!L_ECHOK(tty) || !L_ECHOKE(tty) || !L_ECHOE(tty)) {
+-			spin_lock_irqsave(&tty->read_lock, flags);
+-			tty->read_cnt -= ((tty->read_head - tty->canon_head) &
+-					  (N_TTY_BUF_SIZE - 1));
+-			tty->read_head = tty->canon_head;
+-			spin_unlock_irqrestore(&tty->read_lock, flags);
++			spin_lock_irqsave(&tty->head_lock, flags);
++			tty->read.head = tty->canon_head;
++			spin_unlock_irqrestore(&tty->head_lock, flags);
+ 			finish_erasing(tty);
+ 			echo_char(KILL_CHAR(tty), tty);
+ 			/* Add a newline if ECHOK is on and ECHOKE is off. */
+@@ -340,9 +332,9 @@
+ 	}
+ 
+ 	seen_alnums = 0;
+-	while (tty->read_head != tty->canon_head) {
+-		head = (tty->read_head - 1) & (N_TTY_BUF_SIZE-1);
+-		c = tty->read_buf[head];
++	while (tty->read.head != tty->canon_head) {
++		head = (tty->read.head - 1) & (N_TTY_BUF_SIZE-1);
++		c = tty->read.buf[head];
+ 		if (kill_type == WERASE) {
+ 			/* Equivalent to BSD's ALTWERASE. */
+ 			if (isalnum(c) || c == '_')
+@@ -350,10 +342,9 @@
+ 			else if (seen_alnums)
+ 				break;
+ 		}
+-		spin_lock_irqsave(&tty->read_lock, flags);
+-		tty->read_head = head;
+-		tty->read_cnt--;
+-		spin_unlock_irqrestore(&tty->read_lock, flags);
++		spin_lock_irqsave(&tty->head_lock, flags);
++		tty->read.head = head;
++		spin_unlock_irqrestore(&tty->head_lock, flags);
+ 		if (L_ECHO(tty)) {
+ 			if (L_ECHOPRT(tty)) {
+ 				if (!tty->erasing) {
+@@ -366,11 +357,11 @@
+ 				echo_char(ERASE_CHAR(tty), tty);
+ 			} else if (c == '\t') {
+ 				unsigned int col = tty->canon_column;
+-				unsigned long tail = tty->canon_head;
++				int tail = tty->canon_head;
+ 
+ 				/* Find the column of the last char. */
+-				while (tail != tty->read_head) {
+-					c = tty->read_buf[tail];
++				while (tail != tty->read.head) {
++					c = tty->read.buf[tail];
+ 					if (c == '\t')
+ 						col = (col | 7) + 1;
+ 					else if (iscntrl(c)) {
+@@ -383,7 +374,7 @@
+ 
+ 				/* should never happen */
+ 				if (tty->column > 0x80000000)
+-					tty->column = 0; 
++					tty->column = 0;
+ 
+ 				/* Now backup to that column. */
+ 				while (tty->column > col) {
+@@ -412,7 +403,7 @@
+ 		if (kill_type == ERASE)
+ 			break;
+ 	}
+-	if (tty->read_head == tty->canon_head)
++	if (tty->read.head == tty->canon_head)
+ 		finish_erasing(tty);
+ }
+ 
+@@ -479,13 +470,13 @@
+ 		put_tty_queue(c, tty);
+ 		return;
+ 	}
+-	
++
+ 	if (tty->stopped && !tty->flow_stopped &&
+ 	    I_IXON(tty) && I_IXANY(tty)) {
+ 		start_tty(tty);
+ 		return;
+ 	}
+-	
++
+ 	if (I_ISTRIP(tty))
+ 		c &= 0x7f;
+ 	if (I_IUCLC(tty) && L_IEXTEN(tty))
+@@ -511,12 +502,14 @@
+ 		finish_erasing(tty);
+ 		tty->lnext = 0;
+ 		if (L_ECHO(tty)) {
+-			if (tty->read_cnt >= N_TTY_BUF_SIZE-1) {
++			if (CIRC_SPACE(tty->read.head,
++				       tty->read.tail,
++				       N_TTY_BUF_SIZE) < 2) {
+ 				put_char('\a', tty); /* beep if no space */
+ 				return;
+ 			}
+ 			/* Record the column of first canon char. */
+-			if (tty->canon_head == tty->read_head)
++			if (tty->canon_head == tty->read.head)
+ 				tty->canon_column = tty->column;
+ 			echo_char(c, tty);
+ 		}
+@@ -525,7 +518,7 @@
+ 		put_tty_queue(c, tty);
+ 		return;
+ 	}
+-		
++
+ 	if (c == '\r') {
+ 		if (I_IGNCR(tty))
+ 			return;
+@@ -577,20 +570,22 @@
+ 		}
+ 		if (c == REPRINT_CHAR(tty) && L_ECHO(tty) &&
+ 		    L_IEXTEN(tty)) {
+-			unsigned long tail = tty->canon_head;
++			int tail = tty->canon_head;
+ 
+ 			finish_erasing(tty);
+ 			echo_char(c, tty);
+ 			opost('\n', tty);
+-			while (tail != tty->read_head) {
+-				echo_char(tty->read_buf[tail], tty);
++			while (tail != tty->read.head) {
++				echo_char(tty->read.buf[tail], tty);
+ 				tail = (tail+1) & (N_TTY_BUF_SIZE-1);
+ 			}
+ 			return;
+ 		}
+ 		if (c == '\n') {
+ 			if (L_ECHO(tty) || L_ECHONL(tty)) {
+-				if (tty->read_cnt >= N_TTY_BUF_SIZE-1) {
++				if (CIRC_SPACE(tty->read.head,
++					       tty->read.tail,
++					       N_TTY_BUF_SIZE) < 2) {
+ 					put_char('\a', tty);
+ 					return;
+ 				}
+@@ -599,8 +594,8 @@
+ 			goto handle_newline;
+ 		}
+ 		if (c == EOF_CHAR(tty)) {
+-		        if (tty->canon_head != tty->read_head)
+-			        set_bit(TTY_PUSH, &tty->flags);
++		        if (tty->canon_head != tty->read.head)
++				set_bit(TTY_PUSH, &tty->flags);
+ 			c = __DISABLED_CHAR;
+ 			goto handle_newline;
+ 		}
+@@ -610,12 +605,14 @@
+ 			 * XXX are EOL_CHAR and EOL2_CHAR echoed?!?
+ 			 */
+ 			if (L_ECHO(tty)) {
+-				if (tty->read_cnt >= N_TTY_BUF_SIZE-1) {
++				if (CIRC_SPACE(tty->read.head,
++					       tty->read.tail,
++					       N_TTY_BUF_SIZE) < 2) {
+ 					put_char('\a', tty);
+ 					return;
+ 				}
+ 				/* Record the column of first canon char. */
+-				if (tty->canon_head == tty->read_head)
++				if (tty->canon_head == tty->read.head)
+ 					tty->canon_column = tty->column;
+ 				echo_char(c, tty);
+ 			}
+@@ -627,9 +624,9 @@
+ 				put_tty_queue(c, tty);
+ 
+ 		handle_newline:
+-			set_bit(tty->read_head, &tty->read_flags);
++			set_bit(tty->read.head, &tty->read_flags);
+ 			put_tty_queue(c, tty);
+-			tty->canon_head = tty->read_head;
++			tty->canon_head = tty->read.head;
+ 			tty->canon_data++;
+ 			if (tty->fasync)
+ 				kill_fasync(tty->fasync, SIGIO);
+@@ -638,10 +635,12 @@
+ 			return;
+ 		}
+ 	}
+-	
++
+ 	finish_erasing(tty);
+ 	if (L_ECHO(tty)) {
+-		if (tty->read_cnt >= N_TTY_BUF_SIZE-1) {
++		if (CIRC_SPACE(tty->read.head,
++			       tty->read.tail,
++			       N_TTY_BUF_SIZE) < 2) {
+ 			put_char('\a', tty); /* beep if no space */
+ 			return;
+ 		}
+@@ -649,7 +648,7 @@
+ 			opost('\n', tty);
+ 		else {
+ 			/* Record the column of first canon char. */
+-			if (tty->canon_head == tty->read_head)
++			if (tty->canon_head == tty->read.head)
+ 				tty->canon_column = tty->column;
+ 			echo_char(c, tty);
+ 		}
+@@ -659,12 +658,10 @@
+ 		put_tty_queue(c, tty);
+ 
+ 	put_tty_queue(c, tty);
+-}	
++}
+ 
+ static int n_tty_receive_room(struct tty_struct *tty)
+ {
+-	int	left = N_TTY_BUF_SIZE - tty->read_cnt - 1;
+-
+ 	/*
+ 	 * If we are doing input canonicalization, and there are no
+ 	 * pending newlines, let characters through without limit, so
+@@ -672,43 +669,48 @@
+ 	 * characters will be beeped.
+ 	 */
+ 	if (tty->icanon && !tty->canon_data)
+-		return N_TTY_BUF_SIZE;
++		return N_TTY_BUF_SIZE - 1;
+ 
+-	if (left > 0)
+-		return left;
+-	return 0;
++	return CIRC_SPACE(tty->read.head, tty->read.tail, N_TTY_BUF_SIZE);
+ }
+ 
+ static void n_tty_receive_buf(struct tty_struct *tty, const unsigned char *cp,
+ 			      char *fp, int count)
+ {
+-	const unsigned char *p;
+-	char *f, flags = TTY_NORMAL;
+-	int	i;
+-	char	buf[64];
+-	unsigned long cpuflags;
+-
+-	if (!tty->read_buf)
++	if (!tty->read.buf)
+ 		return;
+ 
+ 	if (tty->real_raw) {
+-		spin_lock_irqsave(&tty->read_lock, cpuflags);
+-		i = MIN(count, MIN(N_TTY_BUF_SIZE - tty->read_cnt,
+-				   N_TTY_BUF_SIZE - tty->read_head));
+-		memcpy(tty->read_buf + tty->read_head, cp, i);
+-		tty->read_head = (tty->read_head + i) & (N_TTY_BUF_SIZE-1);
+-		tty->read_cnt += i;
++		int i;
++		unsigned long cpuflags;
++
++		spin_lock_irqsave(&tty->head_lock, cpuflags);
++		i = CIRC_SPACE_TO_END(tty->read.head,
++				      tty->read.tail,
++				      N_TTY_BUF_SIZE);
++		if (count < i)
++			i = count;
++		memcpy(tty->read.buf + tty->read.head, cp, i);
++		tty->read.head = (tty->read.head + i) & (N_TTY_BUF_SIZE-1);
+ 		cp += i;
+ 		count -= i;
+ 
+-		i = MIN(count, MIN(N_TTY_BUF_SIZE - tty->read_cnt,
+-			       N_TTY_BUF_SIZE - tty->read_head));
+-		memcpy(tty->read_buf + tty->read_head, cp, i);
+-		tty->read_head = (tty->read_head + i) & (N_TTY_BUF_SIZE-1);
+-		tty->read_cnt += i;
+-		spin_unlock_irqrestore(&tty->read_lock, cpuflags);
++		if (count) {
++			/* know tty->read.head == 0 */
++			i = CIRC_SPACE(0, tty->read.tail, N_TTY_BUF_SIZE);
++			if (count < i)
++				i = count;
++			memcpy(tty->read.buf, cp, i);
++			tty->read.head = i;
++		}
++		spin_unlock_irqrestore(&tty->head_lock, cpuflags);
+ 	} else {
+-		for (i=count, p = cp, f = fp; i; i--, p++) {
++		int i;
++		const unsigned char *p;
++		char *f, flags = TTY_NORMAL;
++		char buf[64];
++
++		for (i = count, p = cp, f = fp; i; i--, p++) {
+ 			if (f)
+ 				flags = *f++;
+ 			switch (flags) {
+@@ -735,7 +737,10 @@
+ 			tty->driver.flush_chars(tty);
+ 	}
+ 
+-	if (!tty->icanon && (tty->read_cnt >= tty->minimum_to_wake)) {
++	if (!tty->icanon
++	    && CIRC_CNT(tty->read.head,
++			tty->read.tail,
++			N_TTY_BUF_SIZE) >= tty->minimum_to_wake) {
+ 		if (tty->fasync)
+ 			kill_fasync(tty->fasync, SIGIO);
+ 		if (tty->read_wait)
+@@ -765,7 +770,7 @@
+ {
+ 	if (!tty)
+ 		return;
+-	
++
+ 	tty->icanon = (L_ICANON(tty) != 0);
+ 	if (test_bit(TTY_HW_COOK_IN, &tty->flags)) {
+ 		tty->raw = 1;
+@@ -829,9 +834,10 @@
+ static void n_tty_close(struct tty_struct *tty)
+ {
+ 	n_tty_flush_buffer(tty);
+-	if (tty->read_buf) {
+-		free_page((unsigned long) tty->read_buf);
+-		tty->read_buf = 0;
++	if (tty->read.buf) {
++		unsigned long page = (unsigned long) tty->read.buf;
++		tty->read.buf = 0;
++		free_page(page);
+ 	}
+ }
+ 
+@@ -840,13 +846,13 @@
+ 	if (!tty)
+ 		return -EINVAL;
+ 
+-	if (!tty->read_buf) {
+-		tty->read_buf = (unsigned char *)
++	if (!tty->read.buf) {
++		tty->read.buf = (unsigned char *)
+ 			get_free_page(in_interrupt() ? GFP_ATOMIC : GFP_KERNEL);
+-		if (!tty->read_buf)
++		if (!tty->read.buf)
+ 			return -ENOMEM;
+ 	}
+-	memset(tty->read_buf, 0, N_TTY_BUF_SIZE);
++	memset(tty->read.buf, 0, N_TTY_BUF_SIZE);
+ 	reset_buffer_flags(tty);
+ 	tty->column = 0;
+ 	n_tty_set_termios(tty, 0);
+@@ -860,7 +866,9 @@
+ 	if (tty->icanon) {
+ 		if (tty->canon_data)
+ 			return 1;
+-	} else if (tty->read_cnt >= (amt ? amt : 1))
++	} else if (CIRC_CNT(tty->read.head,
++			    tty->read.tail,
++			    N_TTY_BUF_SIZE) >= (amt ? amt : 1))
+ 		return 1;
+ 
+ 	return 0;
+@@ -875,29 +883,42 @@
+  * the buffer to head pointer.
+  */
+ static inline int copy_from_read_buf(struct tty_struct *tty,
+-				      unsigned char **b,
+-				      size_t *nr)
++				     unsigned char **b,
++				     size_t *nr)
+ 
+ {
+ 	int retval;
+-	ssize_t n;
++	int n;
+ 	unsigned long flags;
++	int tail;
+ 
+-	retval = 0;
+-	spin_lock_irqsave(&tty->read_lock, flags);
+-	n = MIN(*nr, MIN(tty->read_cnt, N_TTY_BUF_SIZE - tty->read_tail));
+-	spin_unlock_irqrestore(&tty->read_lock, flags);
+-	if (n) {
+-		mb();
+-		retval = copy_to_user(*b, &tty->read_buf[tty->read_tail], n);
+-		n -= retval;
+-		spin_lock_irqsave(&tty->read_lock, flags);
+-		tty->read_tail = (tty->read_tail + n) & (N_TTY_BUF_SIZE-1);
+-		tty->read_cnt -= n;
+-		spin_unlock_irqrestore(&tty->read_lock, flags);
+-		*b += n;
+-		*nr -= n;
++	/* This block is repeated in the case someone else removed
++	   chars from the buffer while we were in copy_to_user.  (SMP)
++	   We can't hold tail_lock during copy_to_user, because
++	   copy_to_user may fault, and end up enabling interrupts.
++	   Note that CIRC_CNT_TO_END is carefully written so that we
++	   don't need the lock when calculating count in buffer.
++	*/
++	while (1) {
++		tail = tty->read.tail;
++		n = CIRC_CNT_TO_END(tty->read.head, tail, N_TTY_BUF_SIZE);
++		if (*nr < n)
++			n = *nr;
++		if (n == 0)
++			return 0;
++
++		retval = copy_to_user(*b, &tty->read.buf[tail], n);
++		spin_lock_irqsave(&tty->tail_lock, flags);
++		if (tty->read.tail == tail)
++			break;
++		spin_unlock_irqrestore(&tty->tail_lock, flags);
+ 	}
++
++	n -= retval;
++	tty->read.tail = (tty->read.tail + n) & (N_TTY_BUF_SIZE-1);
++	spin_unlock_irqrestore(&tty->tail_lock, flags);
++	*b += n;
++	*nr -= n;
+ 	return retval;
+ }
+ 
+@@ -915,8 +936,8 @@
+ 
+ do_it_again:
+ 
+-	if (!tty->read_buf) {
+-		printk("n_tty_read_chan: called with read_buf == NULL?!?\n");
++	if (!tty->read.buf) {
++		printk("n_tty_read_chan: called with read.buf == NULL?!?\n");
+ 		return -EIO;
+ 	}
+ 
+@@ -987,11 +1008,11 @@
+ 		   so that any interrupt will set the state back to
+ 		   TASK_RUNNING. */
+ 		current->state = TASK_INTERRUPTIBLE;
+-		
++
+ 		if (((minimum - (b - buf)) < tty->minimum_to_wake) &&
+ 		    ((minimum - (b - buf)) >= 1))
+ 			tty->minimum_to_wake = (minimum - (b - buf));
+-		
++
+ 		if (!input_available_p(tty, 0)) {
+ 			if (test_bit(TTY_OTHER_CLOSED, &tty->flags)) {
+ 				retval = -EIO;
+@@ -1024,18 +1045,22 @@
+ 
+ 		if (tty->icanon) {
+ 			/* N.B. avoid overrun if nr == 0 */
+-			while (nr && tty->read_cnt) {
++			while (nr != 0) {
+  				int eol;
+ 
+-				eol = test_and_clear_bit(tty->read_tail,
++				spin_lock_irqsave(&tty->tail_lock, flags);
++				if (tty->read.head == tty->read.tail) {
++					spin_unlock_irqrestore(&tty->tail_lock,
++							       flags);
++					break;
++				}
++				eol = test_and_clear_bit(tty->read.tail,
+ 						&tty->read_flags);
+-				c = tty->read_buf[tty->read_tail];
+-				spin_lock_irqsave(&tty->read_lock, flags);
+-				tty->read_tail = ((tty->read_tail+1) &
++				c = tty->read.buf[tty->read.tail];
++				tty->read.tail = ((tty->read.tail+1) &
+ 						  (N_TTY_BUF_SIZE-1));
+-				tty->read_cnt--;
+-				spin_unlock_irqrestore(&tty->read_lock, flags);
+ 
++				spin_unlock_irqrestore(&tty->tail_lock, flags);
+ 				if (!eol || (c != __DISABLED_CHAR)) {
+ 					put_user(c, b++);
+ 					nr--;
+@@ -1087,9 +1112,9 @@
+ 	if (size) {
+ 		retval = size;
+ 		if (nr)
+-	       		clear_bit(TTY_PUSH, &tty->flags);
++			clear_bit(TTY_PUSH, &tty->flags);
+ 	} else if (test_and_clear_bit(TTY_PUSH, &tty->flags))
+-		 goto do_it_again;
++		goto do_it_again;
+ 
+ 	return retval;
+ }
+@@ -1103,7 +1128,7 @@
+ 	ssize_t retval = 0;
+ 
+ 	/* Job control check -- must be done at start (POSIX.1 7.1.1.4). */
+-	if (L_TOSTOP(tty) && 
++	if (L_TOSTOP(tty) &&
+ 	    file->f_dentry->d_inode->i_rdev != CONSOLE_DEV &&
+ 	    file->f_dentry->d_inode->i_rdev != SYSCONS_DEV) {
+ 		retval = tty_check_change(tty);
+diff -urP -x*~ -xTAGS linux-2.2.15-pre14/drivers/char/pty.c linux-2.2.15-smp/drivers/char/pty.c
+--- linux-2.2.15-pre14/drivers/char/pty.c	Wed Mar 15 14:29:36 2000
++++ linux-2.2.15-smp/drivers/char/pty.c	Thu Mar 16 11:58:40 2000
+@@ -61,8 +61,6 @@
+ static struct pty_struct ptm_state[UNIX98_NR_MAJORS][NR_PTYS];
+ #endif
+ 
+-#define MIN(a,b)	((a) < (b) ? (a) : (b))
+-
+ static void pty_close(struct tty_struct * tty, struct file * filp)
+ {
+ 	if (!tty)
+@@ -136,21 +134,25 @@
+ 		       const unsigned char *buf, int count)
+ {
+ 	struct tty_struct *to = tty->link;
+-	int	c=0, n;
+-	char	*temp_buffer;
++	int c = 0;
+ 
+ 	if (!to || tty->stopped)
+ 		return 0;
+ 
+ 	if (from_user) {
++		char *temp_buffer;
+ 		down(&tty->flip.pty_sem);
+ 		temp_buffer = &tty->flip.char_buf[0];
+ 		while (count > 0) {
++			int n, n2;
+ 			/* check space so we don't copy needlessly */ 
+-			n = MIN(count, to->ldisc.receive_room(to));
++			n = to->ldisc.receive_room(to);
++			if (count < n)
++				n = count;
+ 			if (!n) break;
+ 
+-			n  = MIN(n, PTY_BUF_SIZE);
++			if (PTY_BUF_SIZE < n)
++				n = PTY_BUF_SIZE;
+ 			n -= copy_from_user(temp_buffer, buf, n);
+ 			if (!n) {
+ 				if (!c)
+@@ -159,7 +161,9 @@
+ 			}
+ 
+ 			/* check again in case the buffer filled up */
+-			n = MIN(n, to->ldisc.receive_room(to));
++			n2 = to->ldisc.receive_room(to);
++			if (n2 < n)
++				n = n2;
+ 			if (!n) break;
+ 			buf   += n; 
+ 			c     += n;
+diff -urP -x*~ -xTAGS linux-2.2.15-pre14/drivers/char/selection.c linux-2.2.15-smp/drivers/char/selection.c
+--- linux-2.2.15-pre14/drivers/char/selection.c	Mon Sep 28 20:59:42 1998
++++ linux-2.2.15-smp/drivers/char/selection.c	Thu Mar 16 12:03:45 2000
+@@ -25,10 +25,6 @@
+ #include <linux/console_struct.h>
+ #include <linux/selection.h>
+ 
+-#ifndef MIN
+-#define MIN(a,b)	((a) < (b) ? (a) : (b))
+-#endif
+-
+ /* Don't take this from <ctype.h>: 011-015 on the screen aren't spaces */
+ #define isspace(c)	((c) == ' ')
+ 
+@@ -295,7 +291,7 @@
+ int paste_selection(struct tty_struct *tty)
+ {
+ 	struct vt_struct *vt = (struct vt_struct *) tty->driver_data;
+-	int	pasted = 0, count;
++	int	pasted = 0, count, n;
+ 	struct wait_queue wait = { current, NULL };
+ 
+ 	poke_blanked_console();
+@@ -307,7 +303,9 @@
+ 			continue;
+ 		}
+ 		count = sel_buffer_lth - pasted;
+-		count = MIN(count, tty->ldisc.receive_room(tty));
++		n = tty->ldisc.receive_room(tty);
++		if (n < count)
++			count = n;
+ 		tty->ldisc.receive_buf(tty, sel_buffer + pasted, 0, count);
+ 		pasted += count;
+ 	}
+diff -urP -x*~ -xTAGS linux-2.2.15-pre14/drivers/char/serial.c linux-2.2.15-smp/drivers/char/serial.c
+--- linux-2.2.15-pre14/drivers/char/serial.c	Wed Mar 15 13:09:23 2000
++++ linux-2.2.15-smp/drivers/char/serial.c	Tue Mar 21 00:13:45 2000
+@@ -32,6 +32,11 @@
+  *  4/98: Added changes to support the ARM architecture proposed by
+  * 	  Russell King
+  *
++ *  3/00: Rid circular buffer of redundant xmit_cnt and use SMP
++ *	  friendly spin_lock_irqsave rather than global cli.  Fix a
++ *	  few races on freeing buffers too.
++ *	  Alan Modra <alan@linuxcare.com>
++ *
+  * This module exports the following rs232 io functions:
+  *
+  *	int rs_init(void);
+@@ -155,7 +160,7 @@
+ #endif
+ 	
+ static char *serial_name = "Serial driver";
+-static char *serial_version = "4.27";
++static char *serial_version = "4.28";
+ 
+ static DECLARE_TASK_QUEUE(tq_serial);
+ 
+@@ -171,6 +176,17 @@
+  */
+ 
+ static struct async_struct *IRQ_ports[NR_IRQS];
++/* scr_info is for serial_{in,out}, and locking */
++static struct async_struct scr_info;
++#ifdef SEPARATE_SERIAL_LOCKING
++/* This is the way to go eventually, with a separate lock for each
++   serial port.  */
++#define SERIAL_LOCK &info->xmit_lock
++#else
++/* I'm chicken.  Just use one lock.  */
++#define SERIAL_LOCK &scr_info.xmit_lock
++#endif
++
+ #ifdef CONFIG_SERIAL_MULTIPORT
+ static struct rs_multiport_struct rs_multiport[NR_IRQS];
+ #endif
+@@ -180,7 +196,7 @@
+ #endif
+ 
+ static unsigned detect_uart_irq (struct serial_state * state);
+-static void autoconfig(struct serial_state * info);
++static void autoconfig(struct serial_state * state);
+ static void change_speed(struct async_struct *info, struct termios *old);
+ static void rs_wait_until_sent(struct tty_struct *tty, int timeout);
+ 
+@@ -212,9 +228,6 @@
+ static struct termios *serial_termios[NR_PORTS];
+ static struct termios *serial_termios_locked[NR_PORTS];
+ 
+-#ifndef MIN
+-#define MIN(a,b)	((a) < (b) ? (a) : (b))
+-#endif
+ 
+ /*
+  * tmp_buf is used as a temporary buffer by serial_write.  We need to
+@@ -318,12 +331,12 @@
+ 	if (serial_paranoia_check(info, tty->device, "rs_stop"))
+ 		return;
+ 	
+-	save_flags(flags); cli();
++	spin_lock_irqsave(SERIAL_LOCK, flags);
+ 	if (info->IER & UART_IER_THRI) {
+ 		info->IER &= ~UART_IER_THRI;
+ 		serial_out(info, UART_IER, info->IER);
+ 	}
+-	restore_flags(flags);
++	spin_unlock_irqrestore(SERIAL_LOCK, flags);
+ }
+ 
+ static void rs_start(struct tty_struct *tty)
+@@ -334,12 +347,14 @@
+ 	if (serial_paranoia_check(info, tty->device, "rs_start"))
+ 		return;
+ 	
+-	save_flags(flags); cli();
+-	if (info->xmit_cnt && info->xmit_buf && !(info->IER & UART_IER_THRI)) {
++	spin_lock_irqsave(SERIAL_LOCK, flags);
++	if (info->xmit.head != info->xmit.tail
++	    && info->xmit.buf
++	    && !(info->IER & UART_IER_THRI)) {
+ 		info->IER |= UART_IER_THRI;
+ 		serial_out(info, UART_IER, info->IER);
+ 	}
+-	restore_flags(flags);
++	spin_unlock_irqrestore(SERIAL_LOCK, flags);
+ }
+ 
+ /*
+@@ -459,7 +474,7 @@
+ static _INLINE_ void transmit_chars(struct async_struct *info, int *intr_done)
+ {
+ 	int count;
+-	
++
+ 	if (info->x_char) {
+ 		serial_outp(info, UART_TX, info->x_char);
+ 		info->state->icount.tx++;
+@@ -468,8 +483,9 @@
+ 			*intr_done = 0;
+ 		return;
+ 	}
+-	if ((info->xmit_cnt <= 0) || info->tty->stopped ||
+-	    info->tty->hw_stopped) {
++	if (info->xmit.head == info->xmit.tail
++	    || info->tty->stopped
++	    || info->tty->hw_stopped) {
+ 		info->IER &= ~UART_IER_THRI;
+ 		serial_out(info, UART_IER, info->IER);
+ 		return;
+@@ -477,14 +493,16 @@
+ 	
+ 	count = info->xmit_fifo_size;
+ 	do {
+-		serial_out(info, UART_TX, info->xmit_buf[info->xmit_tail++]);
+-		info->xmit_tail = info->xmit_tail & (SERIAL_XMIT_SIZE-1);
++		serial_out(info, UART_TX, info->xmit.buf[info->xmit.tail]);
++		info->xmit.tail = (info->xmit.tail + 1) & (SERIAL_XMIT_SIZE-1);
+ 		info->state->icount.tx++;
+-		if (--info->xmit_cnt <= 0)
++		if (info->xmit.head == info->xmit.tail)
+ 			break;
+ 	} while (--count > 0);
+ 	
+-	if (info->xmit_cnt < WAKEUP_CHARS)
++	if (CIRC_CNT(info->xmit.head,
++		     info->xmit.tail,
++		     SERIAL_XMIT_SIZE) < WAKEUP_CHARS)
+ 		rs_sched_event(info, RS_EVENT_WRITE_WAKEUP);
+ 
+ #ifdef SERIAL_DEBUG_INTR
+@@ -493,7 +511,7 @@
+ 	if (intr_done)
+ 		*intr_done = 0;
+ 
+-	if (info->xmit_cnt <= 0) {
++	if (info->xmit.head == info->xmit.tail) {
+ 		info->IER &= ~UART_IER_THRI;
+ 		serial_out(info, UART_IER, info->IER);
+ 	}
+@@ -585,11 +603,13 @@
+ #ifdef SERIAL_DEBUG_INTR
+ 	printk("rs_interrupt(%d)...", irq);
+ #endif
+-	
++
+ 	info = IRQ_ports[irq];
+ 	if (!info)
+ 		return;
+-	
++
++	spin_lock(SERIAL_LOCK);
++
+ #ifdef CONFIG_SERIAL_MULTIPORT	
+ 	multi = &rs_multiport[irq];
+ 	if (multi->port_monitor)
+@@ -636,6 +656,7 @@
+ 		       info->state->irq, first_multi,
+ 		       inb(multi->port_monitor));
+ #endif
++	spin_unlock(SERIAL_LOCK);
+ #ifdef SERIAL_DEBUG_INTR
+ 	printk("end.\n");
+ #endif
+@@ -659,11 +680,13 @@
+ #ifdef SERIAL_DEBUG_INTR
+ 	printk("rs_interrupt_single(%d)...", irq);
+ #endif
+-	
++
+ 	info = IRQ_ports[irq];
+ 	if (!info || !info->tty)
+ 		return;
+ 
++	spin_lock(SERIAL_LOCK);
++
+ #ifdef CONFIG_SERIAL_MULTIPORT	
+ 	multi = &rs_multiport[irq];
+ 	if (multi->port_monitor)
+@@ -694,6 +717,7 @@
+ 		       info->state->irq, first_multi,
+ 		       inb(multi->port_monitor));
+ #endif
++	spin_unlock(SERIAL_LOCK);
+ #ifdef SERIAL_DEBUG_INTR
+ 	printk("end.\n");
+ #endif
+@@ -714,15 +738,18 @@
+ #ifdef SERIAL_DEBUG_INTR
+ 	printk("rs_interrupt_multi(%d)...", irq);
+ #endif
+-	
++
+ 	info = IRQ_ports[irq];
+ 	if (!info)
+ 		return;
++
++	spin_lock(SERIAL_LOCK);
++
+ 	multi = &rs_multiport[irq];
+ 	if (!multi->port1) {
+ 		/* Should never happen */
+ 		printk("rs_interrupt_multi: NULL port1!\n");
+-		return;
++		goto out;
+ 	}
+ 	if (multi->port_monitor)
+ 		first_multi = inb(multi->port_monitor);
+@@ -776,6 +803,8 @@
+ 			continue;
+ 		break;
+ 	} 
++ out:
++	spin_unlock(SERIAL_LOCK);
+ #ifdef SERIAL_DEBUG_INTR
+ 	printk("end.\n");
+ #endif
+@@ -838,16 +867,18 @@
+ 			info = IRQ_ports[i];
+ 			if (!info)
+ 				continue;
+-			save_flags(flags); cli();
++			__save_flags(flags); __cli();
+ #ifdef CONFIG_SERIAL_SHARE_IRQ
+ 			if (info->next_port) {
++				spin_lock(SERIAL_LOCK);
+ 				do {
+ 					serial_out(info, UART_IER, 0);
+ 					info->IER |= UART_IER_THRI;
+ 					serial_out(info, UART_IER, info->IER);
+ 					info = info->next_port;
+ 				} while (info);
+-#ifdef CONFIG_SERIAL_MULTIPORT					
++				spin_unlock(SERIAL_LOCK);
++#ifdef CONFIG_SERIAL_MULTIPORT
+ 				if (rs_multiport[i].port1)
+ 					rs_interrupt_multi(i, NULL, NULL);
+ 				else
+@@ -856,7 +887,7 @@
+ 			} else
+ #endif /* CONFIG_SERIAL_SHARE_IRQ */
+ 				rs_interrupt_single(i, NULL, NULL);
+-			restore_flags(flags);
++			__restore_flags(flags);
+ 		}
+ 	}
+ 	last_strobe = jiffies;
+@@ -864,13 +895,13 @@
+ 	timer_active |= 1 << RS_TIMER;
+ 
+ 	if (IRQ_ports[0]) {
+-		save_flags(flags); cli();
++		__save_flags(flags); __cli();
+ #ifdef CONFIG_SERIAL_SHARE_IRQ
+ 		rs_interrupt(0, NULL, NULL);
+ #else
+ 		rs_interrupt_single(0, NULL, NULL);
+ #endif
+-		restore_flags(flags);
++		__restore_flags(flags);
+ 
+ 		timer_table[RS_TIMER].expires = jiffies + IRQ_timeout[0] - 2;
+ 	}
+@@ -925,7 +956,7 @@
+ 	if (!page)
+ 		return -ENOMEM;
+ 
+-	save_flags(flags); cli();
++	spin_lock_irqsave(SERIAL_LOCK, flags);
+ 
+ 	if (info->flags & ASYNC_INITIALIZED) {
+ 		free_page(page);
+@@ -938,10 +969,10 @@
+ 		free_page(page);
+ 		goto errout;
+ 	}
+-	if (info->xmit_buf)
++	if (info->xmit.buf)
+ 		free_page(page);
+ 	else
+-		info->xmit_buf = (unsigned char *) page;
++		info->xmit.buf = (unsigned char *) page;
+ 
+ #ifdef SERIAL_DEBUG_OPEN
+ 	printk("starting up ttys%d (irq %d)...", info->line, state->irq);
+@@ -1086,7 +1117,7 @@
+ 
+ 	if (info->tty)
+ 		clear_bit(TTY_IO_ERROR, &info->tty->flags);
+-	info->xmit_cnt = info->xmit_head = info->xmit_tail = 0;
++	info->xmit.head = info->xmit.tail = 0;
+ 
+ 	/*
+ 	 * Set up serial timers...
+@@ -1107,6 +1138,7 @@
+ 		if ((info->flags & ASYNC_SPD_MASK) == ASYNC_SPD_WARP)
+ 			info->tty->alt_speed = 460800;
+ 	}
++	spin_unlock_irqrestore(SERIAL_LOCK, flags);
+ 	
+ 	/*
+ 	 * and set the speed of the serial port
+@@ -1114,11 +1146,10 @@
+ 	change_speed(info, 0);
+ 
+ 	info->flags |= ASYNC_INITIALIZED;
+-	restore_flags(flags);
+ 	return 0;
+ 	
+ errout:
+-	restore_flags(flags);
++	spin_unlock_irqrestore(SERIAL_LOCK, flags);
+ 	return retval;
+ }
+ 
+@@ -1142,7 +1173,7 @@
+ 	       state->irq);
+ #endif
+ 	
+-	save_flags(flags); cli(); /* Disable interrupts */
++	spin_lock_irqsave(SERIAL_LOCK, flags);
+ 
+ 	/*
+ 	 * clear delta_msr_wait queue to avoid mem leaks: we may free the irq
+@@ -1178,9 +1209,10 @@
+ 			free_irq(state->irq, NULL);
+ 	}
+ 
+-	if (info->xmit_buf) {
+-		free_page((unsigned long) info->xmit_buf);
+-		info->xmit_buf = 0;
++	if (info->xmit.buf) {
++		unsigned long pg = (unsigned long) info->xmit.buf;
++		info->xmit.buf = 0;
++		free_page(pg);
+ 	}
+ 
+ 	info->IER = 0;
+@@ -1227,7 +1259,7 @@
+ 		serial_outp(info, UART_IER, UART_IERX_SLEEP);
+ 	}
+ 	info->flags &= ~ASYNC_INITIALIZED;
+-	restore_flags(flags);
++	spin_unlock_irqrestore(SERIAL_LOCK, flags);
+ }
+ 
+ /*
+@@ -1371,7 +1403,7 @@
+ 	 */
+ 	if ((cflag & CREAD) == 0)
+ 		info->ignore_status_mask |= UART_LSR_DR;
+-	save_flags(flags); cli();
++	spin_lock_irqsave(SERIAL_LOCK, flags);
+ 	if (uart_config[info->state->type].flags & UART_STARTECH) {
+ 		serial_outp(info, UART_LCR, 0xBF);
+ 		serial_outp(info, UART_EFR,
+@@ -1390,7 +1422,7 @@
+ 		}
+ 		serial_outp(info, UART_FCR, fcr); 	/* set fcr */
+ 	}
+-	restore_flags(flags);
++	spin_unlock_irqrestore(SERIAL_LOCK, flags);
+ }
+ 
+ static void rs_put_char(struct tty_struct *tty, unsigned char ch)
+@@ -1401,19 +1433,19 @@
+ 	if (serial_paranoia_check(info, tty->device, "rs_put_char"))
+ 		return;
+ 
+-	if (!tty || !info->xmit_buf)
++	if (!tty || !info->xmit.buf)
+ 		return;
+ 
+-	save_flags(flags); cli();
+-	if (info->xmit_cnt >= SERIAL_XMIT_SIZE - 1) {
+-		restore_flags(flags);
+-		return;
+-	}
+-
+-	info->xmit_buf[info->xmit_head++] = ch;
+-	info->xmit_head &= SERIAL_XMIT_SIZE-1;
+-	info->xmit_cnt++;
+-	restore_flags(flags);
++	spin_lock_irqsave(SERIAL_LOCK, flags);
++	if (CIRC_SPACE(info->xmit.head,
++		       info->xmit.tail,
++		       SERIAL_XMIT_SIZE) == 0)
++		goto out;
++
++	info->xmit.buf[info->xmit.head] = ch;
++	info->xmit.head = (info->xmit.head + 1) & (SERIAL_XMIT_SIZE-1);
++ out:
++	spin_unlock_irqrestore(SERIAL_LOCK, flags);
+ }
+ 
+ static void rs_flush_chars(struct tty_struct *tty)
+@@ -1424,14 +1456,16 @@
+ 	if (serial_paranoia_check(info, tty->device, "rs_flush_chars"))
+ 		return;
+ 
+-	if (info->xmit_cnt <= 0 || tty->stopped || tty->hw_stopped ||
+-	    !info->xmit_buf)
++	if (info->xmit.head == info->xmit.tail
++	    || tty->stopped
++	    || tty->hw_stopped
++	    || !info->xmit.buf)
+ 		return;
+ 
+-	save_flags(flags); cli();
++	spin_lock_irqsave(SERIAL_LOCK, flags);
+ 	info->IER |= UART_IER_THRI;
+ 	serial_out(info, UART_IER, info->IER);
+-	restore_flags(flags);
++	spin_unlock_irqrestore(SERIAL_LOCK, flags);
+ }
+ 
+ static int rs_write(struct tty_struct * tty, int from_user,
+@@ -1444,16 +1478,18 @@
+ 	if (serial_paranoia_check(info, tty->device, "rs_write"))
+ 		return 0;
+ 
+-	if (!tty || !info->xmit_buf || !tmp_buf)
++	if (!tty || !info->xmit.buf || !tmp_buf)
+ 		return 0;
+ 
+-	save_flags(flags);
+ 	if (from_user) {
+ 		down(&tmp_buf_sem);
+ 		while (1) {
+-			c = MIN(count,
+-				MIN(SERIAL_XMIT_SIZE - info->xmit_cnt - 1,
+-				    SERIAL_XMIT_SIZE - info->xmit_head));
++			int c1;
++			c = CIRC_SPACE_TO_END(info->xmit.head,
++					      info->xmit.tail,
++					      SERIAL_XMIT_SIZE);
++			if (count < c)
++				c = count;
+ 			if (c <= 0)
+ 				break;
+ 
+@@ -1463,41 +1499,45 @@
+ 					ret = -EFAULT;
+ 				break;
+ 			}
+-			cli();
+-			c = MIN(c, MIN(SERIAL_XMIT_SIZE - info->xmit_cnt - 1,
+-				       SERIAL_XMIT_SIZE - info->xmit_head));
+-			memcpy(info->xmit_buf + info->xmit_head, tmp_buf, c);
+-			info->xmit_head = ((info->xmit_head + c) &
++			spin_lock_irqsave(SERIAL_LOCK, flags);
++			c1 = CIRC_SPACE_TO_END(info->xmit.head,
++					       info->xmit.tail,
++					       SERIAL_XMIT_SIZE);
++			if (c1 < c)
++				c = c1;
++			memcpy(info->xmit.buf + info->xmit.head, tmp_buf, c);
++			info->xmit.head = ((info->xmit.head + c) &
+ 					   (SERIAL_XMIT_SIZE-1));
+-			info->xmit_cnt += c;
+-			restore_flags(flags);
++			spin_unlock_irqrestore(SERIAL_LOCK, flags);
+ 			buf += c;
+ 			count -= c;
+ 			ret += c;
+ 		}
+ 		up(&tmp_buf_sem);
+ 	} else {
++		spin_lock_irqsave(SERIAL_LOCK, flags);
+ 		while (1) {
+-			cli();		
+-			c = MIN(count,
+-				MIN(SERIAL_XMIT_SIZE - info->xmit_cnt - 1,
+-				    SERIAL_XMIT_SIZE - info->xmit_head));
++			c = CIRC_SPACE_TO_END(info->xmit.head,
++					      info->xmit.tail,
++					      SERIAL_XMIT_SIZE);
++			if (count < c)
++				c = count;
+ 			if (c <= 0) {
+-				restore_flags(flags);
+ 				break;
+ 			}
+-			memcpy(info->xmit_buf + info->xmit_head, buf, c);
+-			info->xmit_head = ((info->xmit_head + c) &
++			memcpy(info->xmit.buf + info->xmit.head, buf, c);
++			info->xmit.head = ((info->xmit.head + c) &
+ 					   (SERIAL_XMIT_SIZE-1));
+-			info->xmit_cnt += c;
+-			restore_flags(flags);
+ 			buf += c;
+ 			count -= c;
+ 			ret += c;
+ 		}
++		spin_unlock_irqrestore(SERIAL_LOCK, flags);
+ 	}
+-	if (info->xmit_cnt && !tty->stopped && !tty->hw_stopped &&
+-	    !(info->IER & UART_IER_THRI)) {
++	if (info->xmit.head != info->xmit.tail
++	    && !tty->stopped
++	    && !tty->hw_stopped
++	    && !(info->IER & UART_IER_THRI)) {
+ 		info->IER |= UART_IER_THRI;
+ 		serial_out(info, UART_IER, info->IER);
+ 	}
+@@ -1507,14 +1547,10 @@
+ static int rs_write_room(struct tty_struct *tty)
+ {
+ 	struct async_struct *info = (struct async_struct *)tty->driver_data;
+-	int	ret;
+ 				
+ 	if (serial_paranoia_check(info, tty->device, "rs_write_room"))
+ 		return 0;
+-	ret = SERIAL_XMIT_SIZE - info->xmit_cnt - 1;
+-	if (ret < 0)
+-		ret = 0;
+-	return ret;
++	return CIRC_SPACE(info->xmit.head, info->xmit.tail, SERIAL_XMIT_SIZE);
+ }
+ 
+ static int rs_chars_in_buffer(struct tty_struct *tty)
+@@ -1523,7 +1559,7 @@
+ 				
+ 	if (serial_paranoia_check(info, tty->device, "rs_chars_in_buffer"))
+ 		return 0;
+-	return info->xmit_cnt;
++	return CIRC_CNT(info->xmit.head, info->xmit.tail, SERIAL_XMIT_SIZE);
+ }
+ 
+ static void rs_flush_buffer(struct tty_struct *tty)
+@@ -1533,9 +1569,9 @@
+ 	
+ 	if (serial_paranoia_check(info, tty->device, "rs_flush_buffer"))
+ 		return;
+-	save_flags(flags); cli();
+-	info->xmit_cnt = info->xmit_head = info->xmit_tail = 0;
+-	restore_flags(flags);
++	spin_lock_irqsave(SERIAL_LOCK, flags);
++	info->xmit.head = info->xmit.tail = 0;
++	spin_unlock_irqrestore(SERIAL_LOCK, flags);
+ 	wake_up_interruptible(&tty->write_wait);
+ 	if ((tty->flags & (1 << TTY_DO_WRITE_WAKEUP)) &&
+ 	    tty->ldisc.write_wakeup)
+@@ -1589,9 +1625,9 @@
+ 	if (tty->termios->c_cflag & CRTSCTS)
+ 		info->MCR &= ~UART_MCR_RTS;
+ 
+-	save_flags(flags); cli();
++	spin_lock_irqsave(SERIAL_LOCK, flags);
+ 	serial_out(info, UART_MCR, info->MCR);
+-	restore_flags(flags);
++	spin_unlock_irqrestore(SERIAL_LOCK, flags);
+ }
+ 
+ static void rs_unthrottle(struct tty_struct * tty)
+@@ -1616,9 +1652,9 @@
+ 	}
+ 	if (tty->termios->c_cflag & CRTSCTS)
+ 		info->MCR |= UART_MCR_RTS;
+-	save_flags(flags); cli();
++	spin_lock_irqsave(SERIAL_LOCK, flags);
+ 	serial_out(info, UART_MCR, info->MCR);
+-	restore_flags(flags);
++	spin_unlock_irqrestore(SERIAL_LOCK, flags);
+ }
+ 
+ /*
+@@ -1784,9 +1820,9 @@
+ 	unsigned int result;
+ 	unsigned long flags;
+ 
+-	save_flags(flags); cli();
++	spin_lock_irqsave(SERIAL_LOCK, flags);
+ 	status = serial_in(info, UART_LSR);
+-	restore_flags(flags);
++	spin_unlock_irqrestore(SERIAL_LOCK, flags);
+ 	result = ((status & UART_LSR_TEMT) ? TIOCSER_TEMT : 0);
+ 	return put_user(result,value);
+ }
+@@ -1799,9 +1835,9 @@
+ 	unsigned long flags;
+ 
+ 	control = info->MCR;
+-	save_flags(flags); cli();
++	spin_lock_irqsave(SERIAL_LOCK, flags);
+ 	status = serial_in(info, UART_MSR);
+-	restore_flags(flags);
++	spin_unlock_irqrestore(SERIAL_LOCK, flags);
+ 	result =  ((control & UART_MCR_RTS) ? TIOCM_RTS : 0)
+ 		| ((control & UART_MCR_DTR) ? TIOCM_DTR : 0)
+ #ifdef TIOCM_OUT1
+@@ -1867,16 +1903,14 @@
+ 	default:
+ 		return -EINVAL;
+ 	}
+-	save_flags(flags); cli();
++	spin_lock_irqsave(SERIAL_LOCK, flags);
+ 	serial_out(info, UART_MCR, info->MCR);
+-	restore_flags(flags);
++	spin_unlock_irqrestore(SERIAL_LOCK, flags);
+ 	return 0;
+ }
+ 
+ static int do_autoconfig(struct async_struct * info)
+ {
+-	int			retval;
+-	
+ 	if (!capable(CAP_SYS_ADMIN))
+ 		return -EPERM;
+ 	
+@@ -1891,10 +1925,7 @@
+ 	    (info->state->type != PORT_UNKNOWN))
+ 		info->state->irq = detect_uart_irq(info->state);
+ 
+-	retval = startup(info);
+-	if (retval)
+-		return retval;
+-	return 0;
++	return startup(info);
+ }
+ 
+ /*
+@@ -1910,14 +1941,14 @@
+ 
+ 	if (!info->port)
+ 		return;
+-	save_flags(flags); cli();
++	spin_lock_irqsave(SERIAL_LOCK, flags);
+ 	if (break_state == -1)
+ 		serial_out(info, UART_LCR,
+ 			   serial_inp(info, UART_LCR) | UART_LCR_SBC);
+ 	else
+ 		serial_out(info, UART_LCR,
+ 			   serial_inp(info, UART_LCR) & ~UART_LCR_SBC);
+-	restore_flags(flags);
++	spin_unlock_irqrestore(SERIAL_LOCK, flags);
+ }
+ 
+ #ifdef CONFIG_SERIAL_MULTIPORT
+@@ -2094,18 +2125,18 @@
+ 		 * Caller should use TIOCGICOUNT to see which one it was
+ 		 */
+ 		case TIOCMIWAIT:
+-			save_flags(flags); cli();
++			spin_lock_irqsave(SERIAL_LOCK, flags);
+ 			/* note the counters on entry */
+ 			cprev = info->state->icount;
+-			restore_flags(flags);
++			spin_unlock_irqrestore(SERIAL_LOCK, flags);
+ 			while (1) {
+ 				interruptible_sleep_on(&info->delta_msr_wait);
+ 				/* see if a signal did it */
+ 				if (signal_pending(current))
+ 					return -ERESTARTSYS;
+-				save_flags(flags); cli();
++				spin_lock_irqsave(SERIAL_LOCK, flags);
+ 				cnow = info->state->icount; /* atomic copy */
+-				restore_flags(flags);
++				spin_unlock_irqrestore(SERIAL_LOCK, flags);
+ 				if (cnow.rng == cprev.rng && cnow.dsr == cprev.dsr && 
+ 				    cnow.dcd == cprev.dcd && cnow.cts == cprev.cts)
+ 					return -EIO; /* no change => error */
+@@ -2126,9 +2157,9 @@
+ 		 *     RI where only 0->1 is counted.
+ 		 */
+ 		case TIOCGICOUNT:
+-			save_flags(flags); cli();
++			spin_lock_irqsave(SERIAL_LOCK, flags);
+ 			cnow = info->state->icount;
+-			restore_flags(flags);
++			spin_unlock_irqrestore(SERIAL_LOCK, flags);
+ 			p_cuser = (struct serial_icounter_struct *) arg;
+ 			error = put_user(cnow.cts, &p_cuser->cts);
+ 			if (error) return error;
+@@ -2183,9 +2214,9 @@
+ 	if ((old_termios->c_cflag & CBAUD) &&
+ 	    !(cflag & CBAUD)) {
+ 		info->MCR &= ~(UART_MCR_DTR|UART_MCR_RTS);
+-		save_flags(flags); cli();
++		spin_lock_irqsave(SERIAL_LOCK, flags);
+ 		serial_out(info, UART_MCR, info->MCR);
+-		restore_flags(flags);
++		spin_unlock_irqrestore(SERIAL_LOCK, flags);
+ 	}
+ 	
+ 	/* Handle transition away from B0 status */
+@@ -2196,9 +2227,9 @@
+ 		    !test_bit(TTY_THROTTLED, &tty->flags)) {
+ 			info->MCR |= UART_MCR_RTS;
+ 		}
+-		save_flags(flags); cli();
++		spin_lock_irqsave(SERIAL_LOCK, flags);
+ 		serial_out(info, UART_MCR, info->MCR);
+-		restore_flags(flags);
++		spin_unlock_irqrestore(SERIAL_LOCK, flags);
+ 	}
+ 	
+ 	/* Handle turning off CRTSCTS */
+@@ -2242,13 +2273,12 @@
+ 
+ 	state = info->state;
+ 	
+-	save_flags(flags); cli();
++	spin_lock_irqsave(SERIAL_LOCK, flags);
+ 	
+ 	if (tty_hung_up_p(filp)) {
+ 		DBG_CNT("before DEC-hung");
+ 		MOD_DEC_USE_COUNT;
+-		restore_flags(flags);
+-		return;
++		goto errout;
+ 	}
+ 	
+ #ifdef SERIAL_DEBUG_OPEN
+@@ -2274,8 +2304,7 @@
+ 	if (state->count) {
+ 		DBG_CNT("before DEC-2");
+ 		MOD_DEC_USE_COUNT;
+-		restore_flags(flags);
+-		return;
++		goto errout;
+ 	}
+ 	info->flags |= ASYNC_CLOSING;
+ 	/*
+@@ -2310,6 +2339,8 @@
+ 		 */
+ 		rs_wait_until_sent(tty, info->timeout);
+ 	}
++	spin_unlock_irqrestore(SERIAL_LOCK, flags);
++
+ 	shutdown(info);
+ 	if (tty->driver.flush_buffer)
+ 		tty->driver.flush_buffer(tty);
+@@ -2329,7 +2360,10 @@
+ 			 ASYNC_CLOSING);
+ 	wake_up_interruptible(&info->close_wait);
+ 	MOD_DEC_USE_COUNT;
+-	restore_flags(flags);
++	return;
++
++ errout:
++	spin_unlock_irqrestore(SERIAL_LOCK, flags);
+ }
+ 
+ /*
+@@ -2363,8 +2397,8 @@
+ 	char_time = char_time / 5;
+ 	if (char_time == 0)
+ 		char_time = 1;
+-	if (timeout)
+-	  char_time = MIN(char_time, timeout);
++	if (timeout && timeout < char_time)
++		char_time = timeout;
+ 	/*
+ 	 * If the transmitter hasn't cleared in twice the approximate
+ 	 * amount of time to send the entire FIFO, it probably won't
+@@ -2502,21 +2536,21 @@
+ 	printk("block_til_ready before block: ttys%d, count = %d\n",
+ 	       state->line, state->count);
+ #endif
+-	save_flags(flags); cli();
++	spin_lock_irqsave(SERIAL_LOCK, flags);
+ 	if (!tty_hung_up_p(filp)) {
+ 		extra_count = 1;
+ 		state->count--;
+ 	}
+-	restore_flags(flags);
++	spin_unlock_irqrestore(SERIAL_LOCK, flags);
+ 	info->blocked_open++;
+ 	while (1) {
+-		save_flags(flags); cli();
++		spin_lock_irqsave(SERIAL_LOCK, flags);
+ 		if (!(info->flags & ASYNC_CALLOUT_ACTIVE) &&
+ 		    (tty->termios->c_cflag & CBAUD))
+ 			serial_out(info, UART_MCR,
+ 				   serial_inp(info, UART_MCR) |
+ 				   (UART_MCR_DTR | UART_MCR_RTS));
+-		restore_flags(flags);
++		spin_unlock_irqrestore(SERIAL_LOCK, flags);
+ 		current->state = TASK_INTERRUPTIBLE;
+ 		if (tty_hung_up_p(filp) ||
+ 		    !(info->flags & ASYNC_INITIALIZED)) {
+@@ -2585,6 +2619,7 @@
+ 	info->tqueue.routine = do_softint;
+ 	info->tqueue.data = info;
+ 	info->state = sstate;
++	spin_lock_init(&info->xmit_lock);
+ 	if (sstate->info) {
+ 		kfree_s(info, sizeof(struct async_struct));
+ 		*ret_info = sstate->info;
+@@ -2707,7 +2742,7 @@
+ 
+ static inline int line_info(char *buf, struct serial_state *state)
+ {
+-	struct async_struct *info = state->info, scr_info;
++	struct async_struct *info = state->info;
+ 	char	stat_buf[30], control, status;
+ 	int	ret;
+ 	unsigned long flags;
+@@ -2724,20 +2759,21 @@
+ 	/*
+ 	 * Figure out the current RS-232 lines
+ 	 */
+-	if (!info) {
+-		info = &scr_info;	/* This is just for serial_{in,out} */
++	if (!info)
++		info = &scr_info;
++
++	spin_lock_irqsave(SERIAL_LOCK, flags);
+ 
+-		info->magic = SERIAL_MAGIC;
++	if (info == &scr_info) {
+ 		info->port = state->port;
+ 		info->flags = state->flags;
+-		info->quot = 0;
+-		info->tty = 0;
+ 	}
+-	save_flags(flags); cli();
++
+ 	status = serial_in(info, UART_MSR);
+-	control = info ? info->MCR : serial_in(info, UART_MCR);
+-	restore_flags(flags); 
+-	
++	control = info != &scr_info ? info->MCR : serial_in(info, UART_MCR);
++
++	spin_unlock_irqrestore(SERIAL_LOCK, flags);
++
+ 	stat_buf[0] = 0;
+ 	stat_buf[1] = 0;
+ 	if (control & UART_MCR_RTS)
+@@ -2861,12 +2897,26 @@
+ 	int irq;
+ 	unsigned long irqs;
+ 	unsigned char save_mcr, save_ier;
+-	struct async_struct scr_info; /* serial_{in,out} because HUB6 */
+-
++	struct async_struct *info = state->info;
+ #ifdef CONFIG_SERIAL_MANY_PORTS
+ 	unsigned char save_ICP=0; /* no warning */
+ 	unsigned short ICP=0;
++#endif
++
++	if (!info)
++		info = &scr_info;
+ 
++	spin_lock(SERIAL_LOCK);
++
++	if (info == &scr_info) {
++		info->port = state->port;
++		info->flags = state->flags;
++#ifdef CONFIG_HUB6
++		info->hub6 = state->hub6;
++#endif
++	}
++
++#ifdef CONFIG_SERIAL_MANY_PORTS
+ 	if (state->flags & ASYNC_FOURPORT)  {
+ 		ICP = (state->port & 0xFE0) | 0x01F;
+ 		save_ICP = inb_p(ICP);
+@@ -2874,44 +2924,38 @@
+ 		(void) inb_p(ICP);
+ 	}
+ #endif
+-	scr_info.magic = SERIAL_MAGIC;
+-	scr_info.port = state->port;
+-	scr_info.flags = state->flags;
+-#ifdef CONFIG_HUB6
+-	scr_info.hub6 = state->hub6;
+-#endif
+-
+ 	/* forget possible initially masked and pending IRQ */
+ 	probe_irq_off(probe_irq_on());
+-	save_mcr = serial_inp(&scr_info, UART_MCR);
+-	save_ier = serial_inp(&scr_info, UART_IER);
+-	serial_outp(&scr_info, UART_MCR, UART_MCR_OUT1 | UART_MCR_OUT2);
++	save_mcr = serial_inp(info, UART_MCR);
++	save_ier = serial_inp(info, UART_IER);
++	serial_outp(info, UART_MCR, UART_MCR_OUT1 | UART_MCR_OUT2);
+ 	
+ 	irqs = probe_irq_on();
+-	serial_outp(&scr_info, UART_MCR, 0);
++	serial_outp(info, UART_MCR, 0);
+ 	udelay (10);
+ 	if (state->flags & ASYNC_FOURPORT)  {
+-		serial_outp(&scr_info, UART_MCR,
++		serial_outp(info, UART_MCR,
+ 			    UART_MCR_DTR | UART_MCR_RTS);
+ 	} else {
+-		serial_outp(&scr_info, UART_MCR,
++		serial_outp(info, UART_MCR,
+ 			    UART_MCR_DTR | UART_MCR_RTS | UART_MCR_OUT2);
+ 	}
+-	serial_outp(&scr_info, UART_IER, 0x0f);	/* enable all intrs */
+-	(void)serial_inp(&scr_info, UART_LSR);
+-	(void)serial_inp(&scr_info, UART_RX);
+-	(void)serial_inp(&scr_info, UART_IIR);
+-	(void)serial_inp(&scr_info, UART_MSR);
+-	serial_outp(&scr_info, UART_TX, 0xFF);
++	serial_outp(info, UART_IER, 0x0f);	/* enable all intrs */
++	(void)serial_inp(info, UART_LSR);
++	(void)serial_inp(info, UART_RX);
++	(void)serial_inp(info, UART_IIR);
++	(void)serial_inp(info, UART_MSR);
++	serial_outp(info, UART_TX, 0xFF);
+ 	udelay (20);
+ 	irq = probe_irq_off(irqs);
+ 
+-	serial_outp(&scr_info, UART_MCR, save_mcr);
+-	serial_outp(&scr_info, UART_IER, save_ier);
++	serial_outp(info, UART_MCR, save_mcr);
++	serial_outp(info, UART_IER, save_ier);
+ #ifdef CONFIG_SERIAL_MANY_PORTS
+ 	if (state->flags & ASYNC_FOURPORT)
+ 		outb_p(save_ICP, ICP);
+ #endif
++	spin_unlock(SERIAL_LOCK);
+ 	return (irq > 0)? irq : 0;
+ }
+ 
+@@ -2922,28 +2966,30 @@
+  * whether or not this UART is a 16550A, since this will determine
+  * whether or not we can use its FIFO features.
+  */
+-static void autoconfig(struct serial_state * state)
++static void autoconfig(struct serial_state *state)
+ {
+ 	unsigned char status1, status2, scratch, scratch2;
+-	struct async_struct *info, scr_info;
++	struct async_struct *info = state->info;
+ 	unsigned long flags;
+ 
+ 	state->type = PORT_UNKNOWN;
+ 	
+ 	if (!state->port)
+ 		return;
+-		
+-	info = &scr_info;	/* This is just for serial_{in,out} */
+ 
+-	info->magic = SERIAL_MAGIC;
+-	info->port = state->port;
+-	info->flags = state->flags;
++	if (!info)
++		info = &scr_info;
++
++	spin_lock_irqsave(SERIAL_LOCK, flags);
++
++	if (info == &scr_info) {
++		info->port = state->port;
++		info->flags = state->flags;
+ #ifdef CONFIG_HUB6
+-	info->hub6 = state->hub6;
++		info->hub6 = state->hub6;
+ #endif
++	}
+ 
+-	save_flags(flags); cli();
+-	
+ 	/*
+ 	 * Do a simple existence test first; if we fail this, there's
+ 	 * no point trying anything else.
+@@ -2958,10 +3004,8 @@
+ 	outb(0xff, 0x080);
+ 	scratch2 = serial_inp(info, UART_IER);
+ 	serial_outp(info, UART_IER, scratch);
+-	if (scratch2) {
+-		restore_flags(flags);
+-		return;		/* We failed; there's nothing here */
+-	}
++	if (scratch2)
++		goto out;	/* We failed; there's nothing here */
+ 
+ 	/* 
+ 	 * Check to see if a UART is really there.  Certain broken
+@@ -2978,10 +3022,8 @@
+ 		serial_outp(info, UART_MCR, UART_MCR_LOOP | 0x0A);
+ 		status1 = serial_inp(info, UART_MSR) & 0xF0;
+ 		serial_outp(info, UART_MCR, scratch);
+-		if (status1 != 0x90) {
+-			restore_flags(flags);
+-			return;
+-		}
++		if (status1 != 0x90)
++			goto out;
+ 	} 
+ 	
+ 	scratch2 = serial_in(info, UART_LCR);
+@@ -3043,10 +3085,8 @@
+ 	}
+ 	state->xmit_fifo_size =	uart_config[state->type].dfl_xmit_fifo_size;
+ 
+-	if (state->type == PORT_UNKNOWN) {
+-		restore_flags(flags);
+-		return;
+-	}
++	if (state->type == PORT_UNKNOWN)
++		goto out;
+ 
+ 	request_region(info->port,8,"serial(auto)");
+ 
+@@ -3066,8 +3106,8 @@
+ 				     UART_FCR_CLEAR_XMIT));
+ 	(void)serial_in(info, UART_RX);
+ 	serial_outp(info, UART_IER, 0);
+-	
+-	restore_flags(flags);
++ out:
++	spin_unlock_irqrestore(SERIAL_LOCK, flags);
+ }
+ 
+ int register_serial(struct serial_struct *req);
+@@ -3105,6 +3145,9 @@
+ 		       sizeof(struct rs_multiport_struct));
+ #endif
+ 	}
++	memset(&scr_info, 0, sizeof scr_info);
++	scr_info.magic = SERIAL_MAGIC;
++	spin_lock_init(&scr_info.xmit_lock);
+ #ifdef CONFIG_SERIAL_CONSOLE
+ 	/*
+ 	 *	The interrupt of the serial console port
+@@ -3224,9 +3267,9 @@
+ 	int i;
+ 	unsigned long flags;
+ 	struct serial_state *state;
++	struct async_struct *info = &scr_info;
+ 
+-	save_flags(flags);
+-	cli();
++	spin_lock_irqsave(SERIAL_LOCK, flags);
+ 	for (i = 0; i < NR_PORTS; i++) {
+ 		if (rs_table[i].port == req->port)
+ 			break;
+@@ -3238,12 +3281,12 @@
+ 				break;
+ 	}
+ 	if (i == NR_PORTS) {
+-		restore_flags(flags);
++		spin_unlock_irqrestore(SERIAL_LOCK, flags);
+ 		return -1;
+ 	}
+ 	state = &rs_table[i];
+ 	if (rs_table[i].count) {
+-		restore_flags(flags);
++		spin_unlock_irqrestore(SERIAL_LOCK, flags);
+ 		printk("Couldn't configure serial #%d (port=%d,irq=%d): "
+ 		       "device already open\n", i, req->port, req->irq);
+ 		return -1;
+@@ -3252,13 +3295,13 @@
+ 	state->port = req->port;
+ 	state->flags = req->flags;
+ 
++	spin_unlock_irqrestore(SERIAL_LOCK, flags);
++
+ 	autoconfig(state);
+ 	if (state->type == PORT_UNKNOWN) {
+-		restore_flags(flags);
+ 		printk("register_serial(): autoconfig failed\n");
+ 		return -1;
+ 	}
+-	restore_flags(flags);
+ 
+ 	if ((state->flags & ASYNC_AUTO_IRQ) && (state->port != 0))
+ 		state->irq = detect_uart_irq(state);
+@@ -3273,14 +3316,14 @@
+ {
+ 	unsigned long flags;
+ 	struct serial_state *state = &rs_table[line];
++	struct async_struct *info = &scr_info;
+ 
+-	save_flags(flags);
+-	cli();
++	spin_lock_irqsave(SERIAL_LOCK, flags);
+ 	if (state->info && state->info->tty)
+ 		tty_hangup(state->info->tty);
+ 	state->type = PORT_UNKNOWN;
++	spin_unlock_irqrestore(SERIAL_LOCK, flags);
+ 	printk(KERN_INFO "tty%02d unloaded\n", state->line);
+-	restore_flags(flags);
+ }
+ 
+ #ifdef MODULE
+@@ -3294,11 +3337,10 @@
+ 	unsigned long flags;
+ 	int e1, e2;
+ 	int i;
+-	struct async_struct *info;
++	struct async_struct *info = &scr_info;
+ 
+ 	/* printk("Unloading %s: version %s\n", serial_name, serial_version); */
+-	save_flags(flags);
+-	cli();
++	spin_lock_irqsave(SERIAL_LOCK, flags);
+ 	timer_active &= ~(1 << RS_TIMER);
+ 	timer_table[RS_TIMER].fn = NULL;
+ 	timer_table[RS_TIMER].expires = 0;
+@@ -3309,20 +3351,23 @@
+ 	if ((e2 = tty_unregister_driver(&callout_driver)))
+ 		printk("SERIAL: failed to unregister callout driver (%d)\n", 
+ 		       e2);
+-	restore_flags(flags);
+ 
+ 	for (i = 0; i < NR_PORTS; i++) {
++		struct async_struct *inf;
+ 		if (rs_table[i].type != PORT_UNKNOWN)
+ 			release_region(rs_table[i].port, 8);
+-		info = rs_table[i].info;
+-		if (info) {
++		inf = rs_table[i].info;
++		if (inf) {
+ 			rs_table[i].info = NULL;
+-			kfree_s(info, sizeof(struct async_struct));
++			kfree_s(inf, sizeof(struct async_struct));
+ 		}
+ 	}
++	spin_unlock_irqrestore(SERIAL_LOCK, flags);
++
+ 	if (tmp_buf) {
+-		free_page((unsigned long) tmp_buf);
++		unsigned long pg = (unsigned long) tmp_buf;
+ 		tmp_buf = NULL;
++		free_page(pg);
+ 	}
+ }
+ #endif /* MODULE */
+diff -urP -x*~ -xTAGS linux-2.2.15-pre14/drivers/char/tty_io.c linux-2.2.15-smp/drivers/char/tty_io.c
+--- linux-2.2.15-pre14/drivers/char/tty_io.c	Wed Mar 15 14:29:38 2000
++++ linux-2.2.15-smp/drivers/char/tty_io.c	Sun Mar 19 23:28:18 2000
+@@ -1457,7 +1457,7 @@
+ 		}
+ 	} else {
+ 		if (!tty->fasync && !waitqueue_active(&tty->read_wait))
+-			tty->minimum_to_wake = N_TTY_BUF_SIZE;
++			tty->minimum_to_wake = N_TTY_BUF_SIZE - 1;
+ 	}
+ 	return 0;
+ }
+@@ -1943,7 +1943,8 @@
+ 	tty->tq_hangup.data = tty;
+ 	sema_init(&tty->atomic_read, 1);
+ 	sema_init(&tty->atomic_write, 1);
+-	spin_lock_init(&tty->read_lock);
++	spin_lock_init(&tty->head_lock);
++	spin_lock_init(&tty->tail_lock);
+ }
+ 
+ /*
+diff -urP -x*~ -xTAGS linux-2.2.15-pre14/drivers/char/tty_ioctl.c linux-2.2.15-smp/drivers/char/tty_ioctl.c
+--- linux-2.2.15-pre14/drivers/char/tty_ioctl.c	Wed Jan 27 21:28:33 1999
++++ linux-2.2.15-smp/drivers/char/tty_ioctl.c	Sat Mar 18 17:55:45 2000
+@@ -107,12 +107,12 @@
+ 	canon_change = (old_termios.c_lflag ^ tty->termios->c_lflag) & ICANON;
+ 	if (canon_change) {
+ 		memset(&tty->read_flags, 0, sizeof tty->read_flags);
+-		tty->canon_head = tty->read_tail;
++		tty->canon_head = tty->read.tail;
+ 		tty->canon_data = 0;
+ 		tty->erasing = 0;
+ 	}
+ 	sti();
+-	if (canon_change && !L_ICANON(tty) && tty->read_cnt)
++	if (canon_change && !L_ICANON(tty) && tty->read.head != tty->read.tail)
+ 		/* Get characters left over from canonical mode. */
+ 		wake_up_interruptible(&tty->read_wait);
+ 
+@@ -184,15 +184,15 @@
+ {
+ 	int nr, head, tail;
+ 
+-	if (!tty->canon_data || !tty->read_buf)
++	if (!tty->canon_data || !tty->read.buf)
+ 		return 0;
+ 	head = tty->canon_head;
+-	tail = tty->read_tail;
+-	nr = (head - tail) & (N_TTY_BUF_SIZE-1);
++	tail = tty->read.tail;
++	nr = CIRC_CNT(head, tail, N_TTY_BUF_SIZE);
+ 	/* Skip EOF-chars.. */
+ 	while (head != tail) {
+ 		if (test_bit(tail, &tty->read_flags) &&
+-		    tty->read_buf[tail] == __DISABLED_CHAR)
++		    tty->read.buf[tail] == __DISABLED_CHAR)
+ 			nr--;
+ 		tail = (tail+1) & (N_TTY_BUF_SIZE-1);
+ 	}
+@@ -470,7 +470,9 @@
+ 					tty->driver.chars_in_buffer(tty) : 0,
+ 					(int *) arg);
+ 		case TIOCINQ:
+-			retval = tty->read_cnt;
++			retval = CIRC_CNT(tty->read.head,
++					  tty->read.tail,
++					  N_TTY_BUF_SIZE);
+ 			if (L_ICANON(tty))
+ 				retval = inq_canon(tty);
+ 			return put_user(retval, (unsigned int *) arg);
+diff -urP -x*~ -xTAGS linux-2.2.15-pre14/include/linux/circ_buf.h linux-2.2.15-smp/include/linux/circ_buf.h
+--- linux-2.2.15-pre14/include/linux/circ_buf.h	Thu Jan  1 09:30:00 1970
++++ linux-2.2.15-smp/include/linux/circ_buf.h	Sat Mar 18 17:43:34 2000
+@@ -0,0 +1,32 @@
++#ifndef _LINUX_CIRC_BUF_H
++#define _LINUX_CIRC_BUF_H 1
++
++struct circ_buf {
++	char *buf;
++	int head;
++	int tail;
++};
++
++/* Return count in buffer.  */
++#define CIRC_CNT(head,tail,size) (((head) - (tail)) & ((size)-1))
++
++/* Return space available, 0..size-1.  We always leave one free char
++   as a completely full buffer has head == tail, which is the same as
++   empty.  */
++#define CIRC_SPACE(head,tail,size) CIRC_CNT((tail),((head)+1),(size))
++
++/* Return count up to the end of the buffer.  Carefully avoid
++   accessing head and tail more than once, so they can change
++   underneath us without returning inconsistent results.  */
++#define CIRC_CNT_TO_END(head,tail,size) \
++	({int end = (size) - (tail); \
++	  int n = ((head) + end) & ((size)-1); \
++	  n < end ? n : end;})
++
++/* Return space available up to the end of the buffer.  */
++#define CIRC_SPACE_TO_END(head,tail,size) \
++	({int end = (size) - 1 - (head); \
++	  int n = (end + (tail)) & ((size)-1); \
++	  n <= end ? n : end+1;})
++
++#endif /* _LINUX_CIRC_BUF_H  */
+diff -urP -x*~ -xTAGS linux-2.2.15-pre14/include/linux/serialP.h linux-2.2.15-smp/include/linux/serialP.h
+--- linux-2.2.15-pre14/include/linux/serialP.h	Thu Nov 27 20:42:59 1997
++++ linux-2.2.15-smp/include/linux/serialP.h	Mon Mar 20 16:27:12 2000
+@@ -21,6 +21,7 @@
+ 
+ #include <linux/termios.h>
+ #include <linux/tqueue.h>
++#include <linux/circ_buf.h>
+ 
+ /*
+  * Counters of the input lines (CTS, DSR, RI, CD) interrupts
+@@ -75,10 +76,8 @@
+ 	int			blocked_open; /* # of blocked opens */
+ 	long			session; /* Session of opening process */
+ 	long			pgrp; /* pgrp of opening process */
+-	unsigned char 		*xmit_buf;
+-	int			xmit_head;
+-	int			xmit_tail;
+-	int			xmit_cnt;
++	struct circ_buf		xmit;
++	spinlock_t		xmit_lock;
+ 	struct tq_struct	tqueue;
+ 	struct wait_queue	*open_wait;
+ 	struct wait_queue	*close_wait;
+diff -urP -x*~ -xTAGS linux-2.2.15-pre14/include/linux/tty.h linux-2.2.15-smp/include/linux/tty.h
+--- linux-2.2.15-pre14/include/linux/tty.h	Wed Mar 15 17:04:41 2000
++++ linux-2.2.15-smp/include/linux/tty.h	Mon Mar 20 16:27:12 2000
+@@ -24,6 +24,7 @@
+ #include <linux/tty_driver.h>
+ #include <linux/tty_ldisc.h>
+ #include <linux/serialP.h>
++#include <linux/circ_buf.h>
+ 
+ #include <asm/system.h>
+ 
+@@ -281,8 +282,9 @@
+ 	void *disc_data;
+ 	void *driver_data;
+ 
++/* N_TTY_BUF_SIZE must be a power of two.  */
+ #define N_TTY_BUF_SIZE 4096
+-	
++
+ 	/*
+ 	 * The following is data for the N_TTY line discipline.  For
+ 	 * historical reasons, this is included in the tty structure.
+@@ -294,17 +296,15 @@
+ 	unsigned overrun_time;
+ 	int num_overrun;
+ 	unsigned long process_char_map[256/(8*sizeof(unsigned long))];
+-	char *read_buf;
+-	int read_head;
+-	int read_tail;
+-	int read_cnt;
++	struct circ_buf read;
++	spinlock_t head_lock;
++	spinlock_t tail_lock;
+ 	unsigned long read_flags[N_TTY_BUF_SIZE/(8*sizeof(unsigned long))];
+ 	int canon_data;
+-	unsigned long canon_head;
++	int canon_head;
+ 	unsigned int canon_column;
+ 	struct semaphore atomic_read;
+ 	struct semaphore atomic_write;
+-	spinlock_t read_lock;
+ };
+ 
+ /* tty magic number */

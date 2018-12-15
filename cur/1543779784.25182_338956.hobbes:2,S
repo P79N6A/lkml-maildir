@@ -1,0 +1,149 @@
+Date: Wed, 3 Aug 2005 17:51:47 -0700
+From: Nishanth Aravamudan <>
+Subject: [PATCH] push rounding up of relative request to schedule_timeout()
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2005/8/3/258
+
+On 03.08.2005 [16:20:57 +0200], Roman Zippel wrote:
+> Hi,
+> 
+> On Mon, 1 Aug 2005, Nishanth Aravamudan wrote:
+> 
+> > +unsigned int __sched schedule_timeout_msecs(unsigned int timeout_msecs)
+> > +{
+> > +	unsigned long expire_jifs;
+> > +
+> > +	if (timeout_msecs == MAX_SCHEDULE_TIMEOUT_MSECS) {
+> > +		expire_jifs = MAX_SCHEDULE_TIMEOUT;
+> > +	} else {
+> > +		/*
+> > +		 * msecs_to_jiffies() is a unit conversion, which truncates
+> > +		 * (rounds down), so we need to add 1.
+> > +		 */
+> > +		expire_jifs = msecs_to_jiffies(timeout_msecs) + 1;
+> > +	}
+> > +
+> > +	expire_jifs = schedule_timeout(expire_jifs);
+> > +
+> > +	/*
+> > +	 * don't need to add 1 here, even though there is truncation,
+> > +	 * because we will add 1 if/when the value is sent back in
+> > +	 */
+> > +	return jiffies_to_msecs(expire_jifs);
+> > +}
+> 
+> As I already mentioned for msleep_interruptible this is a really terrible 
+> interface.
+> The "jiffies_to_msecs(msecs_to_jiffies(timeout_msecs) + 1)" case (when the 
+> process is immediately woken up again) makes the caller suspectible to 
+> timeout manipulations and requires constant reauditing, that no caller 
+> gets it wrong, so it's better to avoid this error source completely.
+After some thought today, I realized the +1 case is not specific to
+milliseconds. It's just that it's only being done *correctly* in the
+milliseconds case...I think ;)
+So, consider the following:
+We are requesting a 10 jiffy sleep via
+	set_current_state(TASK_INTERRUPTIBLE);
+	schedule_timeout(10);
+Keep in mind that jiffies is only incremented when the timer interrupt
+occurs (the whole point being, again, we do not have any inter-tick
+jiffy-value).
+In schedule_timeout() we will add the 10 to jiffies' current value. But
+what happens if we were calling schedule_timeout() immediately before
+the next timer interrupt occurs? Then we will only sleep slightly more
+than 9 jiffies, instead of the 10 requested. The basic issue is that we
+are always taking the floor of the current position in jiffies in
+schedule_timeout() by adding the relative offset to jiffies. To
+guarantee the timeout requested passes, we must add the relative offset
+to (jiffies+1) [See the attached patch, which I think fixes the
+"problem" in 2.6.13-rc5]. Most callers are already rounding up or adding
+one to their request, so it may not be a problem. And, often, these are
+sleeping paths, so most callers don't care about precision. So, while
+you are correct that there is a chance for "infinite" sleep in
+msleep_interruptible() and schedule_timeout_{intr,unintr}_msecs(), there
+technically *should* be such a possibility in the jiffies case too, but
+the code wasn't correct up until now.
+All in all, seems buggy, but my analysis may also be wrong -- and this
+case may be damn well near impossible to actually create.
+> Constant conversion between different time units is a really bad idea. If 
+> the user needs the remaining time, he is really better off to do it 
+> himself by checking jiffies and only does an initial conversion from 
+> relative to absolute (kernel) time.
+> This wrapper function really should be an inline function and should look 
+> more like this:
+> 
+> static inline int schedule_timeout_msecs(unsigned int timeout_msecs)
+> {
+> 	return schedule_timeout(msecs_to_jiffies(timeout_msecs) + 1) != 0;
+> }
+I don't think I want the schedule_timeout*() functions' return values'
+meanings to be different depending on whether you use milliseconds or
+jiffies. Your version makes the millisecond-case boolean in return,
+which is differnent than schedule_timeout()'s remaining-jiffies return
+value.
+I have also been thinking about the need to use
+while(time_after(timeout_jiffies, timeout)) vs.  while(timeout_msecs),
+but I will respond to a different e-mail about that.
+Thanks,
+Nish
+---
+ timer.c |   11 ++++++-----
+ 1 files changed, 6 insertions(+), 5 deletions(-)
+Description: Ensure that schedule_timeout() requests can not possibly
+expire early in the timeout case, by adding the requested relative jiffy
+value to the next value of jiffies. Currently, by adding to the current
+value of jiffies, we might actually expire a jiffy too early (in a
+corner case).
+Signed-off-by: Nishanth Aravamudan <nacc@us.ibm.com>
+--- 2.6.13-rc5/kernel/timer.c	2005-08-01 12:31:53.000000000 -0700
++++ 2.6.13-rc5-dev/kernel/timer.c	2005-08-03 17:30:10.000000000 -0700
+@@ -1134,7 +1134,7 @@ fastcall signed long __sched schedule_ti
+ 		}
+ 	}
+ 
+-	expire = timeout + jiffies;
++	expire = timeout + jiffies + 1;
+ 
+ 	init_timer(&timer);
+ 	timer.expires = expire;
+@@ -1190,9 +1190,10 @@ unsigned int __sched schedule_timeout_ms
+ 	} else {
+ 		/*
+ 		 * msecs_to_jiffies() is a unit conversion, which truncates
+-		 * (rounds down), so we need to add 1.
++		 * (rounds down), so we need to add 1, but this is taken
++		 * care of by schedule_timeout() now.
+ 		 */
+-		expire_jifs = msecs_to_jiffies(timeout_msecs) + 1;
++		expire_jifs = msecs_to_jiffies(timeout_msecs);
+ 	}
+ 
+ 	expire_jifs = schedule_timeout(expire_jifs);
+@@ -1675,7 +1676,7 @@ unregister_time_interpolator(struct time
+  */
+ void msleep(unsigned int msecs)
+ {
+-	unsigned long timeout = msecs_to_jiffies(msecs) + 1;
++	unsigned long timeout = msecs_to_jiffies(msecs);
+ 
+ 	while (timeout) {
+ 		set_current_state(TASK_UNINTERRUPTIBLE);
+@@ -1691,7 +1692,7 @@ EXPORT_SYMBOL(msleep);
+  */
+ unsigned long msleep_interruptible(unsigned int msecs)
+ {
+-	unsigned long timeout = msecs_to_jiffies(msecs) + 1;
++	unsigned long timeout = msecs_to_jiffies(msecs);
+ 
+ 	while (timeout && !signal_pending(current)) {
+ 		set_current_state(TASK_INTERRUPTIBLE);
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+More majordomo info at  
+http://vger.kernel.org/majordomo-info.html
+Please read the FAQ at  
+http://www.tux.org/lkml/

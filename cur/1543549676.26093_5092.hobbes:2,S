@@ -1,0 +1,165 @@
+Date: Mon, 25 Sep 2000 13:57:07 +0100
+From: James Cownie <>
+Subject: Re: [PATCH] 2.4.0 i386 watchpoint problems [NEW PATCH]
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/9/25/20
+
+Here is a patch to arch/i386/traps.c and arch/i386/signal.c which does
+what you are suggesting, I believe.
+I have tested this and it works fine for me. (Though I do also need
+the patch which stores dr6 back into current->thread.debugreg[6]. That
+is not included here since I submitted it separately and assume it is
+uncontentious). All user generated watchpoints are noted, as are ones
+triggered from the kernel by system calls overwriting the watched
+data.
+A couple more points :-
+1) I restore the debug control register at the point where a signal is
+   about to be delivered, rather than at the top of the loop as you
+   suggested. I think that's safe (and potentially less work if we go
+   around the loop more than once).
+2) Rather than zapping the eip in the watchpoint trap to -1 if the
+   trap occurs in the kernel, I make it the user eip from the thread.
+   That makes a debugger point at the right place, i.e. the system
+   call inside which the watchpoint triggered.
+-- Jim 
+James Cownie	<jcownie@etnus.com>
+Etnus, LLC.     +44 117 9071438
+http://www.etnus.com
+jcownie@pc2: diff -u signal.c-test7 signal.c
+--- signal.c-test7	Mon Sep 25 11:52:35 2000
++++ signal.c	Mon Sep 25 11:52:38 2000
+@@ -600,6 +600,7 @@
+ 
+ 	for (;;) {
+ 		unsigned long signr;
++		unsigned long thread_dr7;
+ 
+ 		spin_lock_irq(&current->sigmask_lock);
+ 		signr = dequeue_signal(&current->blocked, &info);
+@@ -689,6 +690,16 @@
+ 				/* NOTREACHED */
+ 			}
+ 		}
++
++		/* Reenable any watchpoints before delivering the
++		 * signal to user space. The processor register will
++		 * have been cleared if the watchpoint triggered
++		 * inside the kernel.
++		 */
++		thread_dr7 = current->thread.debugreg[7];
++		__asm__("movl %0,%%db7"
++			: /* no output */
++			: "r" (thread_dr7));
+ 
+ 		/* Whee!  Actually deliver the signal.  */
+ 		handle_signal(signr, ka, &info, oldset, regs);
+jcownie@pc2: diff -c traps.c-2.4.0-test7 traps.c
+*** traps.c-2.4.0-test7	Sat Aug  5 00:15:38 2000
+--- traps.c	Mon Sep 25 13:42:43 2000
+***************
+*** 491,507 ****
+  }
+  /*
+!  * Careful - we must not do a lock-kernel until we have checked that the
+!  * debug fault happened in user mode. Getting debug exceptions while
+!  * in the kernel has to be handled without locking, to avoid deadlocks..
+   *
+   * Being careful here means that we don't have to be as careful in a
+   * lot of more complicated places (task switching can be a bit lazy
+   * about restoring all the debug state, and ptrace doesn't have to
+   * find every occurrence of the TF bit that could be saved away even
+!  * by user code - and we don't have to be careful about what values
+!  * can be written to the debug registers because there are no really
+!  * bad cases).
+   */
+  asmlinkage void do_debug(struct pt_regs * regs, long error_code)
+  {
+--- 491,516 ----
+  }
+  /*
+!  * Our handling of the processor debug registers is non-trivial.
+!  * We do not clear them on entry and exit from the kernel. Therefore
+!  * it is possible to get a watchpoint trap here from inside the kernel.
+!  * However, the code in ./ptrace.c has ensured that the user can
+!  * only set watchpoints on userspace addresses. Therefore the in-kernel
+!  * watchpoint trap can only occur in code which is reading/writing
+!  * from user space. Such code must not hold kernel locks (since it
+!  * can equally take a page fault), therefore it is safe to call
+!  * force_sig_info even though that claims and releases locks.
+!  * 
+!  * Code in ./signal.c ensures that the debug control register
+!  * is restored before we deliver any signal, and therefore that
+!  * user code runs with the correct debug control register even though
+!  * we clear it here.
+   *
+   * Being careful here means that we don't have to be as careful in a
+   * lot of more complicated places (task switching can be a bit lazy
+   * about restoring all the debug state, and ptrace doesn't have to
+   * find every occurrence of the TF bit that could be saved away even
+!  * by user code)
+   */
+  asmlinkage void do_debug(struct pt_regs * regs, long error_code)
+  {
+***************
+*** 535,562 ****
+  			goto clear_TF;
+  	}
+- 	/* If this is a kernel mode trap, we need to reset db7 to allow us to continue sanely */
+- 	if ((regs->xcs & 3) == 0)
+- 		goto clear_dr7;
+  	/* Ok, finally something we can handle */
+  	tsk->thread.trap_no = 1;
+  	tsk->thread.error_code = error_code;
+  	info.si_signo = SIGTRAP;
+  	info.si_errno = 0;
+  	info.si_code = TRAP_BRKPT;
+! 	info.si_addr = (void *)regs->eip;
+  	force_sig_info(SIGTRAP, &info, tsk);
+- 	return;
+- debug_vm86:
+- 	handle_vm86_trap((struct kernel_vm86_regs *) regs, error_code, 1);
+- 	return;
+  clear_dr7:
+  	__asm__("movl %0,%%db7"
+  		: /* no output */
+  		: "r" (0));
+  	return;
+  clear_TF:
+--- 544,574 ----
+  			goto clear_TF;
+  	}
+  	/* Ok, finally something we can handle */
+  	tsk->thread.trap_no = 1;
+  	tsk->thread.error_code = error_code;
+  	info.si_signo = SIGTRAP;
+  	info.si_errno = 0;
+  	info.si_code = TRAP_BRKPT;
+! 	
+! 	/* If this is a kernel mode trap, save the user PC on entry to 
+! 	 * the kernel, that's what the debugger can make sense of.
+! 	 */
+! 	info.si_addr = ((regs->xcs & 3) == 0) ? (void *)tsk->thread.eip : 
+! 	                                        (void *)regs->eip;
+  	force_sig_info(SIGTRAP, &info, tsk);
++ 	/* Disable additional traps. They'll be re-enabled when
++ 	 * the signal is delivered.
++ 	 */
+  clear_dr7:
+  	__asm__("movl %0,%%db7"
+  		: /* no output */
+  		: "r" (0));
++ 	return;
++ 
++ debug_vm86:
++ 	handle_vm86_trap((struct kernel_vm86_regs *) regs, error_code, 1);
+  	return;
+  clear_TF:
+jcownie@pc2: 
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+Please read the FAQ at 
+http://www.tux.org/lkml/

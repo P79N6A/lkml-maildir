@@ -1,0 +1,340 @@
+Date: Sat, 19 Feb 2000 15:29:32 +1100
+From: Paul Mackerras <>
+Subject: [PATCH] 2.2 PPP driver SMP-safe
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/2/19/10
+
+The following patch should make the PPP driver in 2.2 SMP-safe.
+It works fine on a UP system, I haven't had a chance to test it on an SMP
+system, so it may not even work on SMP (I expect it will, but you never
+know :-).  I would appreciate hearing from anyone who tries it out on an
+SMP system.
+Basically I have replaced the tty_pushing and woke_up fields in the ppp
+struct with a `state' field; bits in the state field are updated
+atomically with the test_and_set_bit, test_and_clear_bit etc. functions.
+It doesn't require any pppd update.
+Paul.
+diff -urN official/drivers/net/ppp.c linux/drivers/net/ppp.c
+--- official/drivers/net/ppp.c	Mon Oct 25 11:19:22 1999
++++ linux/drivers/net/ppp.c	Fri Feb 18 21:36:40 2000
+@@ -175,6 +175,12 @@
+ EXPORT_SYMBOL(ppp_register_compressor);
+ EXPORT_SYMBOL(ppp_unregister_compressor);
+ 
++/* Bits in ppp->state */
++#define PUSHING		0	/* currently executing in ppp_tty_push */
++#define WAKEUP		1	/* someone else wants to also */
++#define XMITFULL	2	/* someone owns ppp->tpkt */
++#define FLUSHING	3	/* discard output */
++
+ /*************************************************************
+  * LINE DISCIPLINE SUPPORT
+  *    The following code implements the PPP line discipline
+@@ -323,7 +329,7 @@
+ {
+ 	ppp->escape = 0;
+ 	ppp->toss   = 0xE0;
+-	ppp->tty_pushing = 0;
++	ppp->state = 0;
+ 
+ 	memset (ppp->xmit_async_map, 0, sizeof (ppp->xmit_async_map));
+ 	ppp->xmit_async_map[0] = 0xffffffff;
+@@ -838,7 +844,7 @@
+ 	
+ 	CHECK_PPP(0);
+ 
+-	if (ppp->tpkt != NULL)
++	if (test_and_set_bit(XMITFULL, &ppp->state))
+ 		return -1;
+ 	ppp->tpkt = skb;
+ 
+@@ -886,67 +892,59 @@
+ static int
+ ppp_tty_sync_push(struct ppp *ppp)
+ {
+-	int sent;
+-	struct tty_struct *tty = ppp2tty(ppp);
+-	unsigned long flags;
++	int sent, done = 0;
++	struct tty_struct *tty;
+ 		
+ 	CHECK_PPP(0);
+ 
+-	if (ppp->tpkt == NULL)
+-		return 0;
+-		
+-	/* prevent reentrancy with tty_pushing flag */		
+-	save_flags(flags);
+-	cli();
+-	if (ppp->tty_pushing) {
+-		/* record wakeup attempt so we don't lose */
+-		/* a wakeup call while doing push processing */
+-		ppp->woke_up=1;
+-		restore_flags(flags);
++	wmb();
++	set_bit(WAKEUP, &ppp->state);
++	wmb();
++	if (test_and_set_bit(PUSHING, &ppp->state))
+ 		return 0;
+-	}
+-	ppp->tty_pushing = 1;
+-	restore_flags(flags);
+-	
+-	if (tty == NULL || tty->disc_data != (void *) ppp)
+-		goto flush;
+-		
+-	for(;;){
+-		ppp->woke_up=0;
+-		
++
++ again:
++	wmb();
++	clear_bit(WAKEUP, &ppp->state);
++	mb();
++
++	if (ppp->tpkt != 0) {
+ 		/* Note: Sync driver accepts complete frame or nothing */
+-		tty->flags |= (1 << TTY_DO_WRITE_WAKEUP);
+-		sent = tty->driver.write(tty, 0, ppp->tpkt->data, ppp->tpkt->len);
+-		if (sent < 0) {
++		tty = ppp2tty(ppp);
++		sent = -1;
++		if (test_bit(FLUSHING, &ppp->state))
++			sent = ppp->tpkt->len;
++		else if (tty != NULL && tty->disc_data == (void *) ppp) {
++			tty->flags |= (1 << TTY_DO_WRITE_WAKEUP);
++			sent = tty->driver.write(tty, 0, ppp->tpkt->data, ppp->tpkt->len);
++		}
++		if (sent < 0)
+ 			/* write error (possible loss of CD) */
+ 			/* record error and discard current packet */
+ 			ppp->stats.ppp_oerrors++;
+-			break;
+-		}
+-		ppp->stats.ppp_obytes += sent;
+-		if (sent < ppp->tpkt->len) {
+-			/* driver unable to accept frame just yet */
+-			save_flags(flags);
+-			cli();
+-			if (ppp->woke_up) {
+-				/* wake up called while processing */
+-				/* try to send the frame again */
+-				restore_flags(flags);
+-				continue;
+-			}
+-			/* wait for wakeup callback to try send again */
+-			ppp->tty_pushing = 0;
+-			restore_flags(flags);
+-			return 0;
++		else
++			ppp->stats.ppp_obytes += sent;
++		if (sent < 0 || sent >= ppp->tpkt->len) {
++			/* driver accepted the frame or we got an error */
++			kfree_skb(ppp->tpkt);
++			ppp->tpkt = 0;
++			wmb();
++			clear_bit(XMITFULL, &ppp->state);
++			done = 1;
+ 		}
+-		break;
+ 	}
+-flush:	
+-	/* done with current packet (sent or discarded) */
+-	kfree_skb(ppp->tpkt);
+-	ppp->tpkt = 0;
+-	ppp->tty_pushing = 0;
+-	return 1;
++	if (ppp->tpkt == 0)
++		clear_bit(FLUSHING, &ppp->state);
++	wmb();
++	clear_bit(PUSHING, &ppp->state);
++	wmb();
++	if (test_and_clear_bit(WAKEUP, &ppp->state)) {
++		wmb();
++		if (!test_and_set_bit(PUSHING, &ppp->state))
++			goto again;
++	}
++
++	return done;
+ }
+ 
+ /*
+@@ -964,10 +962,13 @@
+ 
+ 	ppp_tty_push(ppp);
+ 
+-	if (ppp->tpkt != NULL)
++	wmb();
++	if (test_and_set_bit(XMITFULL, &ppp->state))
+ 		return -1;
+-	ppp->tpkt = skb;
++	wmb();
+ 	ppp->tpkt_pos = 0;
++	wmb();
++	ppp->tpkt = skb;
+ 
+ 	return ppp_tty_push(ppp);
+ }
+@@ -980,58 +981,70 @@
+ ppp_tty_push(struct ppp *ppp)
+ {
+ 	int avail, sent, done = 0;
+-	struct tty_struct *tty = ppp2tty(ppp);
++	struct tty_struct *tty;
+ 	
+ 	if (ppp->flags & SC_SYNC) 
+ 		return ppp_tty_sync_push(ppp);
+ 
+ 	CHECK_PPP(0);
+-	if (ppp->tty_pushing) {
+-		ppp->woke_up = 1;
++
++	wmb();
++	set_bit(WAKEUP, &ppp->state);
++	wmb();
++	if (test_and_set_bit(PUSHING, &ppp->state))
+ 		return 0;
+-	}
+-	if (tty == NULL || tty->disc_data != (void *) ppp)
+-		goto flush;
+-	while (ppp->optr < ppp->olim || ppp->tpkt != 0) {
+-		ppp->tty_pushing = 1;
+-		mb();
+-		ppp->woke_up = 0;
+-		avail = ppp->olim - ppp->optr;
+-		if (avail > 0) {
++
++ again:
++	wmb();
++	clear_bit(WAKEUP, &ppp->state);
++	mb();
++
++	avail = ppp->olim - ppp->optr;
++	if (avail > 0) {
++		tty = ppp2tty(ppp);
++		sent = -1;
++		if (test_bit(FLUSHING, &ppp->state)) {
++			sent = avail;
++		} else if (tty != NULL && tty->disc_data == (void *) ppp) {
+ 			tty->flags |= (1 << TTY_DO_WRITE_WAKEUP);
+ 			sent = tty->driver.write(tty, 0, ppp->optr, avail);
+-			if (sent < 0)
+-				goto flush;	/* error, e.g. loss of CD */
+-			ppp->stats.ppp_obytes += sent;
+-			ppp->optr += sent;
+-			if (sent < avail) {
++		}
++		if (sent < 0) {
++			/* error, e.g. loss of CD */
++			ppp->stats.ppp_oerrors++;
++			ppp->optr = ppp->olim;
++			if (ppp->tpkt != 0) {
++				kfree_skb(ppp->tpkt);
++				ppp->tpkt = 0;
+ 				wmb();
+-				ppp->tty_pushing = 0;
+-				mb();
+-				if (ppp->woke_up)
+-					continue;
+-				return done;
++				clear_bit(XMITFULL, &ppp->state);
++				done = 1;
+ 			}
++		} else {
++			ppp->stats.ppp_obytes += sent;
++			ppp->optr += sent;
+ 		}
+-		if (ppp->tpkt != 0)
+-			done = ppp_async_encode(ppp);
+-		wmb();
+-		ppp->tty_pushing = 0;
+ 	}
+-	return done;
+ 
+-flush:
+-	ppp->tty_pushing = 1;
+-	mb();
+-	ppp->stats.ppp_oerrors++;
+-	if (ppp->tpkt != 0) {
+-		kfree_skb(ppp->tpkt);
+-		ppp->tpkt = 0;
+-		done = 1;
++	if (ppp->optr == ppp->olim) {
++		if (ppp->tpkt != 0) {
++			done |= ppp_async_encode(ppp);
++			goto again;
++		} else {
++			/* buffers are empty */
++			clear_bit(FLUSHING, &ppp->state);
++		}
+ 	}
+-	ppp->optr = ppp->olim;
++
++	wmb();
++	clear_bit(PUSHING, &ppp->state);
+ 	wmb();
+-	ppp->tty_pushing = 0;
++	if (test_and_clear_bit(WAKEUP, &ppp->state)) {
++		wmb();
++		if (!test_and_set_bit(PUSHING, &ppp->state))
++			goto again;
++	}
++
+ 	return done;
+ }
+ 
+@@ -1132,6 +1145,9 @@
+ 
+ 		kfree_skb(ppp->tpkt);
+ 		ppp->tpkt = 0;
++		wmb();
++		clear_bit(XMITFULL, &ppp->state);
++		mb();
+ 		return 1;
+ 	}
+ 
+@@ -1154,20 +1170,9 @@
+ 	struct sk_buff *skb;
+ 	int done = 0;
+ 
++	set_bit(FLUSHING, &ppp->state);
+ 	while ((skb = skb_dequeue(&ppp->xmt_q)) != NULL)
+ 		kfree_skb(skb);
+-	ppp->tty_pushing = 1;
+-	mb();
+-	ppp->optr = ppp->olim;
+-	if (ppp->tpkt != NULL) {
+-		kfree_skb(ppp->tpkt);
+-		ppp->tpkt = 0;
+-		done = 1;
+-	}
+-	wmb();
+-	ppp->tty_pushing = 0;
+-	if (done)
+-		ppp_output_wakeup(ppp);
+ }
+ 
+ /*
+diff -urN official/include/linux/if_pppvar.h linux/include/linux/if_pppvar.h
+--- official/include/linux/if_pppvar.h	Sat May  1 03:36:34 1999
++++ linux/include/linux/if_pppvar.h	Fri Feb 18 20:41:13 2000
+@@ -86,10 +86,9 @@
+ 	/* Information specific to using ppp on async serial lines. */
+ 	struct tty_struct *tty;		/* ptr to TTY structure	*/
+ 	struct tty_struct *backup_tty;	/* TTY to use if tty gets closed */
++	unsigned long	state;		/* state flags, use atomic ops  */
+ 	__u8		escape;		/* 0x20 if prev char was PPP_ESC */
+ 	__u8		toss;		/* toss this frame		*/
+-	volatile __u8	tty_pushing;	/* internal state flag		*/
+-	volatile __u8	woke_up;	/* internal state flag		*/
+ 	__u32		xmit_async_map[8]; /* 1 bit means that given control 
+ 					   character is quoted on output*/
+ 	__u32		recv_async_map; /* 1 bit means that given control 
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

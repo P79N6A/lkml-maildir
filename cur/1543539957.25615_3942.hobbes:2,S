@@ -1,0 +1,459 @@
+Date: Wed, 26 Jul 2000 19:47:23 +0100 (BST)
+From: Tigran Aivazian <>
+Subject: [patch-2.4.0-test5-pre5] badfs and forced umount
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/7/26/92
+
+Hi Manfred,
+I have amended the patch wrt to useful comments you made about the rules
+of accessing p->fs,files,mm and restructured the code to make it clearer.
+I do still remember the issues wrt races but am still thinking about them
+- nevertheless it is worth releasing this version so everyone can
+look/test/fix it.
+A few notes:
+a) some debug code is enabled, e.g. badfs (renamed from nullfs after I
+learnt from FreeBSD that nullfs is something completely different) forces
+itself to be MNT_VISIBLE (via kern_mnt->mnt_flags) and
+get_filesystem_info() prints the value of mnt_count for each mnt entry -
+this is harmless except lsof(8) complain (well, it did anyway until today
+when MNT_VISIBLE was added). This is temporary until I am 100% confident
+we are not leaking mnt_count under any circumstances.
+b) the mnt_count leak into badfs (but not real fs!) is
+intentional. I.e. it is harmless to badfs (it can't be umounted) but
+serves as a useful indicator of forced umount activity that occurred.
+c) it works here, so don't be afraid to try it - it (maybe) won't fry your
+data ;)
+Regards,
+Tigran
+diff -urN -X dontdiff linux/fs/Makefile badfs/fs/Makefile
+--- linux/fs/Makefile	Tue Jul 11 19:26:50 2000
++++ badfs/fs/Makefile	Wed Jul 26 17:52:18 2000
+@@ -19,9 +19,9 @@
+ ALL_SUB_DIRS = coda minix ext2 fat msdos vfat proc isofs nfs umsdos ntfs \
+ 		hpfs sysv smbfs ncpfs ufs efs affs romfs autofs hfs lockd \
+ 		nfsd nls devpts devfs adfs partitions qnx4 udf bfs cramfs \
+-		openpromfs autofs4 ramfs jffs
++		openpromfs autofs4 ramfs jffs badfs
+ 
+-SUB_DIRS :=
++SUB_DIRS := badfs
+ 
+ ifeq ($(CONFIG_QUOTA),y)
+ O_OBJS += dquot.o
+diff -urN -X dontdiff linux/fs/bad_inode.c badfs/fs/bad_inode.c
+--- linux/fs/bad_inode.c	Thu Apr 27 09:01:30 2000
++++ badfs/fs/bad_inode.c	Wed Jul 26 17:39:44 2000
+@@ -29,7 +29,7 @@
+ 
+ #define EIO_ERROR ((void *) (return_EIO))
+ 
+-static struct file_operations bad_file_ops =
++struct file_operations bad_file_ops =
+ {
+ 	llseek:		EIO_ERROR,
+ 	read:		EIO_ERROR,
+diff -urN -X dontdiff linux/fs/badfs/Makefile badfs/fs/badfs/Makefile
+--- linux/fs/badfs/Makefile	Thu Jan  1 01:00:00 1970
++++ badfs/fs/badfs/Makefile	Wed Jul 26 17:40:27 2000
+@@ -0,0 +1,9 @@
++#
++# Makefile for badfs filesystem.
++#
++
++O_TARGET := badfs.o
++O_OBJS   := inode.o
++M_OBJS   := $(O_TARGET)
++
++include $(TOPDIR)/Rules.make
+diff -urN -X dontdiff linux/fs/badfs/inode.c badfs/fs/badfs/inode.c
+--- linux/fs/badfs/inode.c	Thu Jan  1 01:00:00 1970
++++ badfs/fs/badfs/inode.c	Wed Jul 26 19:35:38 2000
+@@ -0,0 +1,333 @@
++/*
++ *  badfs - the Bad Filesystem
++ *
++ *  Author - Tigran Aivazian <tigran@veritas.com>
++ *
++ *  Thanks to:
++ *  	Manfred Spraul <manfred@colorfullife.com>, for useful comments.
++ *
++ *  This file is released under the GPL.
++ *
++ *  The badfs filesystem is used by forced umount ('umount -f' command)
++ *  to move inodes that keep the filesystem being umounted busy to it.
++ *
++ *  The entry point into this module is via quiesce_filesystem() called
++ *  from fs/super.c:do_umount() if MNT_FORCE is passed.
++ */
++
++#include <linux/module.h>
++#include <linux/fs.h>
++#include <linux/mm.h>
++#include <linux/init.h>
++#include <linux/smp_lock.h>
++
++#define BADFS_MAGIC	0xABCD0001
++
++static struct super_block *badfs_read_super(struct super_block *,void *,int);
++
++static DECLARE_FSTYPE(badfs_fs_type, "badfs", 
++			badfs_read_super, FS_NOMOUNT|FS_SINGLE);
++
++static struct vfsmount *badfs_mnt = NULL;
++static struct super_block *badfs_sb = NULL; /* badfs_mnt->mnt_sb */
++
++static int __init init_badfs_fs(void)
++{
++	int err = register_filesystem(&badfs_fs_type);
++
++	if (!err) {
++		badfs_mnt = kern_mount(&badfs_fs_type);
++		if (IS_ERR(badfs_mnt)) {
++			err = PTR_ERR(badfs_mnt);
++			unregister_filesystem(&badfs_fs_type);
++		} else {
++			badfs_sb = badfs_mnt->mnt_sb;
++			badfs_mnt->mnt_flags |= MNT_VISIBLE;
++			err = 0;
++		}
++	}
++	return err;
++}
++
++module_init(init_badfs_fs);
++
++static struct inode *badfs_get_inode(struct super_block *sb, int mode)
++{
++	struct inode *inode = get_empty_inode();
++
++	if (inode) {
++		make_bad_inode(inode);
++		inode->i_sb = sb;
++		inode->i_dev = sb->s_dev;
++		inode->i_mode = mode;
++		inode->i_nlink = 1;
++		inode->i_size = 0;
++		inode->i_blocks = 0;
++	}
++	return inode;
++}
++
++static int badfs_statfs(struct super_block *sb, struct statfs *buf)
++{
++	buf->f_type = BADFS_MAGIC;
++	buf->f_bsize = BLOCK_SIZE;
++	buf->f_namelen = 0;
++	return 0;
++}
++
++static struct super_operations badfs_ops = {
++	statfs:		badfs_statfs,
++};
++
++/* VFS ->read_super() method */
++static struct super_block *badfs_read_super(struct super_block * sb, 
++		void * data, int silent)
++{
++	struct inode * root = badfs_get_inode(sb, S_IFDIR|S_IRUSR|S_IWUSR);
++
++	if (!root)
++		return NULL;
++	sb->s_blocksize = 1024;
++	sb->s_blocksize_bits = 10;
++	sb->s_magic = BADFS_MAGIC;
++	sb->s_op = &badfs_ops;
++	sb->s_root = d_alloc(NULL, &(const struct qstr){ "bad:", 5, 0});
++	if (!sb->s_root) {
++		iput(root);
++		return NULL;
++	}
++	sb->s_root->d_sb = sb;
++	sb->s_root->d_parent = sb->s_root;
++	d_instantiate(sb->s_root, root);
++	return sb;
++}
++
++/* moves the inode into badfs and bads it, called on every open file. 
++ * The 'root' argument is passed so that we don't down root->i_sem twice 
++ */
++static void disable_fd(struct files_struct *files, int fd, 
++		struct dentry *root)
++{
++	struct file *file;
++	struct inode *inode;
++	mode_t saved_mode;
++	struct file_operations *fop;
++
++	file = files->fd[fd];
++	inode = file->f_dentry->d_inode;
++	fop = file->f_op;
++
++	/* serialize with operations on this inode */
++	down(&inode->i_sem);
++
++	locks_remove_posix(file, files);
++	locks_remove_flock(file);
++
++	/* flush and release fs-specific resources */
++	if (fop->flush)
++		fop->flush(file);
++	if (fop->release)
++		fop->release(inode, file);
++
++	/* get rid of pages in the cache */
++	vmtruncate(inode, 0);
++
++	/* rehash this inode into badfs */
++	remove_inode_hash(inode);
++	inode->i_sb = badfs_sb;
++	insert_inode_hash(inode);
++
++	/* make subsequent io on this inode return EIO */
++	saved_mode = inode->i_mode;
++	make_bad_inode(inode);
++	inode->i_mode = saved_mode;
++	inode->i_dev = badfs_sb->s_dev;
++	xchg(&inode->i_fop, &bad_file_ops);
++	xchg(&file->f_op, &bad_file_ops);
++
++	/* switch file->f_vfsmnt to badfs mntpoint */
++	mntput(file->f_vfsmnt);
++	file->f_vfsmnt = mntget(badfs_mnt);
++
++	/* ok, now we can decrement root's d_count */
++	dput(root);
++
++	up(&inode->i_sem);
++}
++
++static void disable_pwd(struct fs_struct *fs)
++{
++	struct inode *inode;
++	struct dentry *dentry;
++
++	inode = badfs_get_inode(badfs_sb, S_IFDIR|0755);
++	if (!inode) {
++		printk(KERN_ERR "disable_pwd(): can't allocate inode\n");
++		return;
++	}
++	dentry = d_alloc(badfs_sb->s_root, 
++			&(const struct qstr){"dead_pwd", 8, 0});
++	if (!dentry) {
++		iput(inode);
++		printk(KERN_ERR "disable_pwd(): can't allocate dentry\n");
++		return;
++	}
++	d_instantiate(dentry, inode);
++	dget(dentry);
++	set_fs_pwd(fs, badfs_mnt, dentry);
++}
++
++static void disable_root(struct fs_struct *fs)
++{
++	struct inode *inode;
++	struct dentry *dentry;
++
++	inode = badfs_get_inode(badfs_sb, S_IFDIR|0755);
++	if (!inode) {
++		printk(KERN_ERR "disable_root(): can't allocate inode\n");
++		return;
++	}
++	dentry = d_alloc(badfs_sb->s_root, 
++			&(const struct qstr){"dead_root", 9, 0});
++	if (!dentry) {
++		iput(inode);
++		printk(KERN_ERR "disable_root(): can't allocate dentry\n");
++		return;
++	}
++	d_instantiate(dentry, inode);
++	dget(dentry);
++	set_fs_root(fs, badfs_mnt, dentry);
++}
++
++/* called from do_umount() if MNT_FORCE is specified */
++void quiesce_filesystem(struct vfsmount *mnt)
++{
++	struct task_struct *p;
++	struct dentry *root;
++	struct file *file;
++	struct inode *inode;
++	struct super_block *sb;
++
++	sb = mnt->mnt_sb;
++	root = sb->s_root;
++
++	/* we do three passes through the task list:
++	 *   1. p->fs that can keep us busy, i.e. root and pwd
++	 *   2. p->files, i.e. open files (we badfs them)
++	 *   3. p->mm, i.e. mmaped files (we simply do_munmap them)
++	 * There is no guarantee that by the time we restart the loop
++	 * the amount of work to do in the loop has not increased.
++	 */
++repeat1:
++	read_lock(&tasklist_lock);
++	for_each_task(p) {
++		struct fs_struct *fs;
++
++		/* get a reference to p->fs */
++		task_lock(p);
++		fs = p->fs;
++		if (!fs) {
++			task_unlock(p);
++			continue;
++		} else
++			atomic_inc(&fs->count);
++		task_unlock(p);
++
++		if (fs->pwdmnt == mnt) {
++			read_unlock(&tasklist_lock);
++			disable_pwd(fs); /* may block */
++			put_fs_struct(fs);
++			goto repeat1;
++		}
++		if (fs->rootmnt == mnt) {
++			read_unlock(&tasklist_lock);
++			disable_root(fs); /* may block */
++			put_fs_struct(fs);
++			goto repeat1;
++		}
++	}
++	read_unlock(&tasklist_lock);
++
++repeat2:
++	read_lock(&tasklist_lock);
++	for_each_task(p) {
++		int fd, j = 0;
++		struct files_struct *files;
++
++		/* get a reference to p->files */
++		task_lock(p);
++		files = p->files;
++		if (!files) {
++			task_unlock(p);
++			continue;
++		} else
++			atomic_inc(&files->count);
++		task_unlock(p);
++
++		/* check if this process has open files here */
++		while (1) {
++			unsigned long set;
++
++			fd = j * __NFDBITS;
++			if (fd >= files->max_fdset || fd >= files->max_fds)
++				break;
++			set = files->open_fds->fds_bits[j++];
++			while (set) {
++				if (set & 1) {
++					file = files->fd[fd];
++					inode = file->f_dentry->d_inode;
++					if (inode && (file->f_vfsmnt == mnt)
++						&& !is_bad_inode(inode)) {
++						read_unlock(&tasklist_lock);
++						disable_fd(files, fd, root);
++						put_files_struct(files);
++						goto repeat2;
++					}
++				}
++				fd++;
++				set >>= 1;
++			}
++		}
++	}
++	read_unlock(&tasklist_lock);
++
++repeat3:
++	read_lock(&tasklist_lock);
++	for_each_task(p) {
++		struct mm_struct *mm;
++		struct vm_area_struct *vma;
++
++		/* get a reference to p->mm */
++		task_lock(p);
++		mm = p->mm;
++		if (!mm) {
++			task_unlock(p);
++			continue;
++		} else
++			atomic_inc(&mm->mm_users);
++		task_unlock(p);
++
++		/* check for mmap'd files and unmap them */
++		vmlist_modify_lock(mm);
++		for (vma = mm->mmap; vma; vma=vma->vm_next) {
++			file = vma->vm_file;
++			if (!file)
++				continue;
++			inode = file->f_dentry->d_inode;
++			if (!inode || !inode->i_sb)
++				continue;
++			if (file->f_vfsmnt == mnt) {
++				vmlist_modify_unlock(mm);
++				read_unlock(&tasklist_lock);
++				down(&mm->mmap_sem);
++				do_munmap(mm, vma->vm_start, 
++					vma->vm_end - vma->vm_start);
++				up(&mm->mmap_sem);
++				mmput(mm);
++				goto repeat3;
++			}
++		}
++		vmlist_modify_unlock(mm);
++	}
++	read_unlock(&tasklist_lock);
++}
+diff -urN -X dontdiff linux/fs/super.c badfs/fs/super.c
+--- linux/fs/super.c	Wed Jul 26 16:07:54 2000
++++ badfs/fs/super.c	Wed Jul 26 19:34:49 2000
+@@ -478,10 +478,11 @@
+ 		path = d_path(tmp->mnt_root, tmp, buffer, PAGE_SIZE);
+ 		if (!path)
+ 			continue;
+-		len += sprintf( buf + len, "%s %s %s %s",
++		len += sprintf( buf + len, "%s %s %s %s mnt_count=%d",
+ 			tmp->mnt_devname ? tmp->mnt_devname : "none", path,
+ 			tmp->mnt_sb->s_type->name,
+-			tmp->mnt_sb->s_flags & MS_RDONLY ? "ro" : "rw" );
++			tmp->mnt_sb->s_flags & MS_RDONLY ? "ro" : "rw",
++			atomic_read(&tmp->mnt_count));
+ 		for (fs_infop = fs_info; fs_infop->flag; fs_infop++) {
+ 		  if (tmp->mnt_sb->s_flags & fs_infop->flag) {
+ 		    strcpy(buf + len, fs_infop->str);
+@@ -993,6 +994,9 @@
+ 			retval = do_remount_sb(sb, MS_RDONLY, 0);
+ 		return retval;
+ 	}
++
++	if (flags&MNT_FORCE)
++		quiesce_filesystem(mnt);
+ 
+ 	spin_lock(&dcache_lock);
+ 	if (atomic_read(&mnt->mnt_count) > 2) {
+diff -urN -X dontdiff linux/include/linux/fs.h badfs/include/linux/fs.h
+--- linux/include/linux/fs.h	Wed Jul 26 16:07:55 2000
++++ badfs/include/linux/fs.h	Wed Jul 26 19:34:29 2000
+@@ -910,6 +910,7 @@
+ /* Invalid inode operations -- fs/bad_inode.c */
+ extern void make_bad_inode(struct inode *);
+ extern int is_bad_inode(struct inode *);
++extern struct file_operations bad_file_ops;
+ 
+ extern struct file_operations read_fifo_fops;
+ extern struct file_operations write_fifo_fops;
+@@ -1171,6 +1172,8 @@
+ extern kdev_t ROOT_DEV;
+ extern char root_device_name[];
+ 
++/* fs/badfs/inode.c - used by forced umount */
++extern void quiesce_filesystem(struct vfsmount *);
+ 
+ extern void show_buffers(void);
+ extern void mount_root(void);
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

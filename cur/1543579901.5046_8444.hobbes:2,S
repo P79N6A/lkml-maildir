@@ -1,0 +1,379 @@
+Date: Thu, 25 Jan 2001 12:50:26 +0000 (GMT)
+From: Mark Hemment <>
+Subject: [Patch] Pushing the global kernel lock (aka BKL)
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2001/1/25/40
+
+Hi,
+  Several places in the kernel run holding the global kernel lock when it
+isn't needed.  This usually occurs when where is a function which can be
+called via many different paths; some holding the lock, others not.
+  Now, if a function can block (and hence drop the kernel lock) the caller
+cannot rely on the kernel lock for its own integerity.  Such a functon
+_may_ be a candidate for dropping the lock (if it is held) on entry, and
+retaken on exit.  This improves SMP scalability.
+  A good example of this is generic_make_request().  This function can be
+arrived at by several different paths, some of which will be holding the
+lock, and some not.  It (or, rather the functions it can call) may block
+and a caller has no control over this.  generic_make_request() does not
+need the kernel lock itself, and any functions it calls which do require
+the lock should be taking it (as they cannot guarantee it is already
+held).  This makes it a good candidate for dropping the lock early (rather
+than only dropping when blocking).
+  Dropping the kernel lock, even for a short period, helps
+scalability.  Note, if the lock is held when an interrupt arrives, the
+interrupt handler runs holding the lock and so do any bottom-half handlers
+run on the back of the interrupt.  So, less time it is held, the smaller
+the chance of being interrupted while holding it, the better the
+scalability.
+  As the current nfsd code isn't threaded, it runs holding the kernel
+lock.  Any reduction in holding the lock helps nfs server scalability.
+  The current macros used to drop and retake the kernel lock in
+schedule() cannot be used in many cases as they do not nest.
+  The attached patch (against 2.4.1-pre10) defines two new macros for x86
+(save_and_drop_kernel_lock(x) and restore_kernel_lock(x)) and a new
+declaration macro (DECLARE_KERNEL_LOCK_COUNTER(x)).  These allow "pushing"
+and "poping" of the kernel lock.
+  The patch also contains some examples of usage (although the one in
+nfsd/vfs.c could be done with an unlock_kernel()/lock_kernel() pair).
+  If the idea is acceptable, I'll tidy up the patch and add the necessary
+macros for other archs.
+  My questions are;
+	a) Does this make sense?
+	b) Is it acceptable in the kernel?
+	c) Any better suggestions for the macro names?
+  I'd be interested in any results from those applying this patch
+and running benchmarks on SMP boxes - mainly filesystem benchmarks.
+  I admit this is not the cleanest of ideas.
+Mark
+diff -urN -X dontdiff vxfs-2.4.1-pre10/drivers/block/ll_rw_blk.c markhe-2.4.1-pre10/drivers/block/ll_rw_blk.c
+--- vxfs-2.4.1-pre10/drivers/block/ll_rw_blk.c	Wed Jan 24 10:56:23 2001
++++ markhe-2.4.1-pre10/drivers/block/ll_rw_blk.c	Thu Jan 25 09:47:09 2001
+@@ -907,10 +907,24 @@
+ {
+ 	int major = MAJOR(bh->b_rdev);
+ 	request_queue_t *q;
++	DECLARE_KERNEL_LOCK_COUNTER(lock_depth)
+ 
+ 	if (!bh->b_end_io)
+ 		BUG();
+ 
++	/*
++	 * The caller cannot make any assumptions as to whether this
++	 * function (or, rather, the funcs called from here) will block
++	 * or not.
++	 * Also, we can be called with or without the global kernel lock.
++	 * As the kernel lock isn't need here, and should be taken by
++	 * any functions called from here which need it, it is safe to
++	 * drop the lock.  This helps scalability (and _really_ helps
++	 * scalability when there is a threaded volume manager sitting
++	 * below).
++	 */
++	save_and_drop_kernel_lock(lock_depth);
++
+ 	if (blk_size[major]) {
+ 		unsigned long maxsector = (blk_size[major][MINOR(bh->b_rdev)] << 1) + 1;
+ 		unsigned long sector = bh->b_rsector;
+@@ -931,6 +945,7 @@
+ 				       blk_size[major][MINOR(bh->b_rdev)]);
+ 			}
+ 			bh->b_end_io(bh, 0);
++			restore_kernel_lock(lock_depth);
+ 			return;
+ 		}
+ 	}
+@@ -953,6 +968,8 @@
+ 			break;
+ 		}
+ 	} while (q->make_request_fn(q, rw, bh));
++
++	restore_kernel_lock(lock_depth);
+ }
+ 
+ 
+diff -urN -X dontdiff vxfs-2.4.1-pre10/fs/nfsd/vfs.c markhe-2.4.1-pre10/fs/nfsd/vfs.c
+--- vxfs-2.4.1-pre10/fs/nfsd/vfs.c	Fri Dec 29 22:07:23 2000
++++ markhe-2.4.1-pre10/fs/nfsd/vfs.c	Thu Jan 25 10:01:51 2001
+@@ -30,6 +30,7 @@
+ #include <linux/net.h>
+ #include <linux/unistd.h>
+ #include <linux/malloc.h>
++#include <linux/smp_lock.h>
+ #include <linux/in.h>
+ #define __NO_VERSION__
+ #include <linux/module.h>
+@@ -596,6 +597,7 @@
+ 	mm_segment_t	oldfs;
+ 	int		err;
+ 	struct file	file;
++	DECLARE_KERNEL_LOCK_COUNTER(lock_depth)
+ 
+ 	err = nfsd_open(rqstp, fhp, S_IFREG, MAY_READ, &file);
+ 	if (err)
+@@ -618,12 +620,25 @@
+ 		file.f_ralen = ra->p_ralen;
+ 		file.f_rawin = ra->p_rawin;
+ 	}
++
++	/*
++	 * The nfs daemons run holding the global kernel lock, but read()
++	 * doesn't require the lock to be held.
++	 * Could simply do an unlock_kernel() here, as we always arrive
++	 * here with a single hold on the kernel lock.  However, be
++	 * future proof and make sure we really get rid of our hold
++	 * on the lock with a push-and-drop type operation.
++	 */
++	save_and_drop_kernel_lock(lock_depth);
++
+ 	file.f_pos = offset;
+ 
+ 	oldfs = get_fs(); set_fs(KERNEL_DS);
+ 	err = file.f_op->read(&file, buf, *count, &file.f_pos);
+ 	set_fs(oldfs);
+ 
++	restore_kernel_lock(lock_depth);
++
+ 	/* Write back readahead params */
+ 	if (ra != NULL) {
+ 		dprintk("nfsd: raparms %ld %ld %ld %ld %ld\n",
+@@ -665,6 +680,7 @@
+ 	mm_segment_t		oldfs;
+ 	int			err = 0;
+ 	int			stable = *stablep;
++	DECLARE_KERNEL_LOCK_COUNTER(lock_depth)
+ 
+ 	err = nfsd_open(rqstp, fhp, S_IFREG, MAY_WRITE, &file);
+ 	if (err)
+@@ -680,6 +696,18 @@
+ 		goto out_close;
+ #endif
+ 
++	/*
++	 * Do not need to hold the global kernel lock over a write() -
++	 * see nfsd_read() for a short discussion.
++	 *
++	 * It is safe to drop the lock here as;
++	 *	o "file" is private to the current process (ie. does not
++	 *	  change under us).
++	 *	o the file-handle "fhp" does not change under us.
++	 *	o the export is read lock.
++	 */
++	save_and_drop_kernel_lock(lock_depth);
++
+ 	dentry = file.f_dentry;
+ 	inode = dentry->d_inode;
+ 	exp   = fhp->fh_export;
+@@ -708,9 +736,12 @@
+ 	/* Write the data. */
+ 	oldfs = get_fs(); set_fs(KERNEL_DS);
+ 	err = file.f_op->write(&file, buf, cnt, &file.f_pos);
++	set_fs(oldfs);
++
++	restore_kernel_lock(lock_depth);
++
+ 	if (err >= 0)
+ 		nfsdstats.io_write += cnt;
+-	set_fs(oldfs);
+ 
+ 	/* clear setuid/setgid flag after write */
+ 	if (err >= 0 && (inode->i_mode & (S_ISUID | S_ISGID))) {
+diff -urN -X dontdiff vxfs-2.4.1-pre10/include/asm-i386/smplock.h markhe-2.4.1-pre10/include/asm-i386/smplock.h
+--- vxfs-2.4.1-pre10/include/asm-i386/smplock.h	Wed Jan 24 11:28:14 2001
++++ markhe-2.4.1-pre10/include/asm-i386/smplock.h	Thu Jan 25 10:38:13 2001
+@@ -73,3 +73,31 @@
+ 		 "=m" (current->lock_depth));
+ #endif
+ }
++
++#define DECLARE_KERNEL_LOCK_COUNTER(count)	int	count = -1;
++
++#define save_and_drop_kernel_lock(count)        \
++		do {						\
++			struct task_struct *task;		\
++								\
++			task = current;				\
++			(count) = task->lock_depth;		\
++			if ((count) >= 0) {			\
++				spin_unlock(&kernel_flag);	\
++				task->lock_depth = -1;		\
++			}					\
++		} while (0)
++
++#define restore_kernel_lock(count) 	\
++		do {						\
++			if ((count) >= 0) {			\
++				struct task_struct *task;	\
++								\
++				task = current;			\
++				if (task->lock_depth >= 0)	\
++					BUG();			\
++				task->lock_depth = (count);	\
++				count = -1;			\
++				spin_lock(&kernel_flag);	\
++			}					\
++		} while (0)
+diff -urN -X dontdiff vxfs-2.4.1-pre10/include/linux/smp_lock.h markhe-2.4.1-pre10/include/linux/smp_lock.h
+--- vxfs-2.4.1-pre10/include/linux/smp_lock.h	Wed Jan 24 11:28:14 2001
++++ markhe-2.4.1-pre10/include/linux/smp_lock.h	Wed Jan 24 19:03:23 2001
+@@ -11,6 +11,10 @@
+ #define reacquire_kernel_lock(task)		do { } while(0)
+ #define kernel_locked() 1
+ 
++#define	DECLARE_KERNEL_LOCK_COUNTER(count)		
++#define	save_and_drop_kernel_lock(count)	do { } while (0)
++#define	restore_kernel_lock(count)		do { } while (0)
++
+ #else
+ 
+ #include <asm/smplock.h>
+diff -urN -X dontdiff vxfs-2.4.1-pre10/mm/page_alloc.c markhe-2.4.1-pre10/mm/page_alloc.c
+--- vxfs-2.4.1-pre10/mm/page_alloc.c	Wed Jan 24 10:56:24 2001
++++ markhe-2.4.1-pre10/mm/page_alloc.c	Thu Jan 25 10:07:22 2001
+@@ -17,6 +17,7 @@
+ #include <linux/pagemap.h>
+ #include <linux/bootmem.h>
+ #include <linux/slab.h>
++#include <linux/smp_lock.h>
+ 
+ int nr_swap_pages;
+ int nr_active_pages;
+@@ -408,6 +409,21 @@
+ 	 * 	--> try to free pages ourselves with page_launder
+ 	 */
+ 	if (!(current->flags & PF_MEMALLOC)) {
++		DECLARE_KERNEL_LOCK_COUNTER(lock_depth)
++
++		if (gfp_mask & __GFP_WAIT) {
++			/*
++			 * gfp_mask has __GFP_WAIT, so caller is prepared
++			 * for a blocking operation and therefore cannot
++			 * be relying on the global kernel lock across
++			 * this allocation.
++			 * We'll probably be doing quite a bit of work
++			 * below, so drop the kernel lock now and help
++			 * scalability.
++			 */
++			save_and_drop_kernel_lock(lock_depth);
++		}
++
+ 		/*
+ 		 * Are we dealing with a higher order allocation?
+ 		 *
+@@ -417,6 +433,7 @@
+ 		 */
+ 		if (order > 0 && (gfp_mask & __GFP_WAIT)) {
+ 			zone = zonelist->zones;
++
+ 			/* First, clean some dirty pages. */
+ 			current->flags |= PF_MEMALLOC;
+ 			page_launder(gfp_mask, 1);
+@@ -436,10 +453,13 @@
+ 					__free_page(page);
+ 					/* Try if the allocation succeeds. */
+ 					page = rmqueue(z, order);
+-					if (page)
++					if (page) {
++						restore_kernel_lock(lock_depth);
+ 						return page;
++					}
+ 				}
+ 			}
++
+ 		}
+ 		/*
+ 		 * When we arrive here, we are really tight on memory.
+@@ -455,6 +475,7 @@
+ 			memory_pressure++;
+ 			try_to_free_pages(gfp_mask);
+ 			wakeup_bdflush(0);
++			restore_kernel_lock(lock_depth);
+ 			if (!order)
+ 				goto try_again;
+ 		}
+diff -urN -X dontdiff vxfs-2.4.1-pre10/net/sunrpc/svcsock.c markhe-2.4.1-pre10/net/sunrpc/svcsock.c
+--- vxfs-2.4.1-pre10/net/sunrpc/svcsock.c	Mon Oct 30 22:41:41 2000
++++ markhe-2.4.1-pre10/net/sunrpc/svcsock.c	Thu Jan 25 10:27:47 2001
+@@ -31,6 +31,7 @@
+ #include <linux/malloc.h>
+ #include <linux/netdevice.h>
+ #include <linux/skbuff.h>
++#include <linux/smp_lock.h>
+ #include <net/sock.h>
+ #include <net/checksum.h>
+ #include <net/ip.h>
+@@ -366,12 +367,21 @@
+ 	struct sk_buff	*skb;
+ 	u32		*data;
+ 	int		err, len;
++	DECLARE_KERNEL_LOCK_COUNTER(lock_depth)
++
++	/*
++	 * Can safely call skb_recv_datagram() without the kernel lock.
++	 * Also, svc_sock_received() and skb_free_datagram are SMP safe.
++	 */
++	save_and_drop_kernel_lock(lock_depth);
+ 
+ 	svsk->sk_data = 0;
+ 	while ((skb = skb_recv_datagram(svsk->sk_sk, 0, 1, &err)) == NULL) {
+ 		svc_sock_received(svsk, 0);
+-		if (err == -EAGAIN)
++		if (err == -EAGAIN) {
++			restore_kernel_lock(lock_depth);
+ 			return err;
++		}
+ 		/* possibly an icmp error */
+ 		dprintk("svc: recvfrom returned error %d\n", -err);
+ 	}
+@@ -382,10 +392,21 @@
+ 		if ((unsigned short)csum_fold(csum)) {
+ 			skb_free_datagram(svsk->sk_sk, skb);
+ 			svc_sock_received(svsk, 0);
++			restore_kernel_lock(lock_depth);
+ 			return 0;
+ 		}
+ 	}
+ 
++	/*
++ 	 * Could have the lock dropped for longer, but restore
++	 * it here for now.
++	 */
++	restore_kernel_lock(lock_depth);
++
++	/*
++	 * Hmm, wouldn't a peek be better?  Avoid some unnecessary wakeups.
++	 * XXX
++	 */
+ 	/* There may be more data */
+ 	svsk->sk_data = 1;
+ 
+@@ -417,8 +438,17 @@
+ static int
+ svc_udp_sendto(struct svc_rqst *rqstp)
+ {
+-	struct svc_buf	*bufp = &rqstp->rq_resbuf;
++	struct svc_buf	*bufp;
+ 	int		error;
++	DECLARE_KERNEL_LOCK_COUNTER(lock_depth)
++
++	/*
++	 * Don't need protection of the kernel lock here;
++	 * svc_sendto() (which calls sock_sendmsg()) is SMP safe.
++	 */
++	save_and_drop_kernel_lock(lock_depth);
++
++	bufp = &rqstp->rq_resbuf;
+ 
+ 	/* Set up the first element of the reply iovec.
+ 	 * Any other iovecs that may be in use have been taken
+@@ -435,6 +465,8 @@
+ 	else if (error == -EAGAIN)
+ 		/* Ignore and wait for re-xmit */
+ 		error = 0;
++
++	restore_kernel_lock(lock_depth);
+ 
+ 	return error;
+ }

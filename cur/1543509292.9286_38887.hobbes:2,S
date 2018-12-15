@@ -1,0 +1,1140 @@
+Date: Tue, 14 Sep 1999 15:47:53 +0200 (MET DST)
+From: Christian Ehrhardt <>
+Subject: [PRE-FIX] mandatory file locking
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/9/14/72
+
+Hi,
+I reported some problems with mandatory file locking some time ago.
+Here's a patch against 2.2.10 that fixes these problems on my box.
+Please tell me what you think about it.
+Have a look at 
+http://www.mathematik.uni-ulm.de/~ehrhardt/lk
+for some source code that demonstrates two of the problems.
+This is the first time I try to hack the kernel so someone should
+proofread the patch and point out the things I overlooked.
+There's still some work to be done:
+1.) open should either clear O_APPEND for all files that can't do
+    lseek(fd,0,2) or set a special flag in struct file.
+2.) I didn't know how to handle pwrite on a file opened with O_APPEND.
+3.) Most of the comments I added should be removed. I left them in there
+    to make the purpose of this patch a bit clearer.
+4.) I can't test the changes in arch/sparc64.
+BTW: Solaris mishandles mandatory locks with O_APPEND files, too.
+    --Christian
+diff -ur linux-2.2.10/arch/sparc64/kernel/sys_sparc32.c linux-2.2.10-p/arch/sparc64/kernel/sys_sparc32.c
+--- linux-2.2.10/arch/sparc64/kernel/sys_sparc32.c	Wed Jun  2 18:55:38 1999
++++ linux-2.2.10-p/arch/sparc64/kernel/sys_sparc32.c	Sat Sep 11 12:19:14 1999
+@@ -757,6 +757,9 @@
+ 	struct iovec iovstack[UIO_FASTIOV];
+ 	struct iovec *iov=iovstack, *ivp;
+ 	struct inode *inode;
++	struct file_lock * lock;
++	loff_t pos;
++	size_t size;
+ 	long retval, i;
+ 	IO_fn_t fn;
+ 
+@@ -793,32 +796,44 @@
+ 	}
+ 
+ 	inode = file->f_dentry->d_inode;
++retry:
++	pos = file->f_pos;
++	size = inode->i_size;
++	if (file->f_flags & O_APPEND) {
++                loff_t tmp;
++                tmp = llseek (file, inode, 0, 2);
++                if (ret >= 0)
++                        pos = tmp;
++	}
+ 	/* VERIFY_WRITE actually means a read, as we write to user space */
+-	retval = locks_verify_area((type == VERIFY_WRITE
++	lock = locks_verify_area((type == VERIFY_WRITE
+ 				    ? FLOCK_VERIFY_READ : FLOCK_VERIFY_WRITE),
+-				   inode, file, file->f_pos, tot_len);
+-	if (retval) {
++				   inode, file, file->f_pos, tot_len, 1);
++	if (IS_ERR(lock)) {
+ 		if (iov != iovstack)
+ 			kfree(iov);
+-		return retval;
++		return PTR_ERR(lock);
+ 	}
++        if ((file->f_pos != pos) ||
++            ((file->f_flags & O_APPEND) && (inode->i_size != size))) {
++                locks_unlock_access (inode, lock);
++                goto retry;
++        }
+ 
+ 	/* Then do the actual IO.  Note that sockets need to be handled
+ 	 * specially as they have atomicity guarantees and can handle
+ 	 * iovec's natively
+ 	 */
++	if (type == VERIFY_READ)
++		down (&inode->i_sem);
+ 	if (inode->i_sock) {
+-		int err;
+-		err = sock_readv_writev(type, inode, file, iov, count, tot_len);
+-		if (iov != iovstack)
+-			kfree(iov);
+-		return err;
++		retval = sock_readv_writev(type, inode, file, iov, count, tot_len);
++		goto out_unlock;
+ 	}
+ 
+ 	if (!file->f_op) {
+-		if (iov != iovstack)
+-			kfree(iov);
+-		return -EINVAL;
++		retval = -EINVAL;
++		goto out_unlock;
+ 	}
+ 	/* VERIFY_WRITE actually means a read, as we write to user space */
+ 	fn = file->f_op->read;
+@@ -844,8 +859,12 @@
+ 		if (nr != len)
+ 			break;
+ 	}
++out_unlock:
++	if (type == VERIFY_READ)
++		up (&inode->i_sem);
+ 	if (iov != iovstack)
+ 		kfree(iov);
++	locks_unlock_access (inode, lock);
+ 	return retval;
+ }
+ 
+@@ -884,10 +903,8 @@
+ 	if(!(file->f_mode & 2))
+ 		goto out;
+ 
+-	down(&file->f_dentry->d_inode->i_sem);
+ 	ret = do_readv_writev32(VERIFY_READ, file,
+ 				vector, count);
+-	up(&file->f_dentry->d_inode->i_sem);
+ out:
+ 	fput(file);
+ bad_file:
+diff -ur linux-2.2.10/fs/inode.c linux-2.2.10-p/fs/inode.c
+--- linux-2.2.10/fs/inode.c	Tue May  4 19:57:12 1999
++++ linux-2.2.10-p/fs/inode.c	Sat Sep 11 16:57:18 1999
+@@ -523,6 +523,7 @@
+ 	inode->i_writecount = 0;
+ 	inode->i_size = 0;
+ 	inode->i_generation = 0;
++	inode->i_nolockcount = 0;
+ 	memset(&inode->i_dquot, 0, sizeof(inode->i_dquot));
+ 	sema_init(&inode->i_sem, 1);
+ }
+diff -ur linux-2.2.10/fs/locks.c linux-2.2.10-p/fs/locks.c
+--- linux-2.2.10/fs/locks.c	Tue May 11 17:52:14 1999
++++ linux-2.2.10-p/fs/locks.c	Mon Sep 13 18:44:55 1999
+@@ -103,6 +103,27 @@
+  *
+  *  Fixed /proc/locks interface so that we can't overrun the buffer we are handed.
+  *  Andy Walker (andy@lysaker.kvaerner.no), May 12, 1997.
++ *
++ *  There are several ways to circumvent mandatory locks if
++ *  the process sleeps while or after calling locks_verify_area:
++ *  1.) While sleeping in locks_verify area the file position may be
++ *      modified by a process sharing our file pointer (sys_read and
++ *      sys_write).
++ *  2.) O_APPEND is handled after the area is verified. (sys_write)
++ *  3.) While sleeping in down(inode->i_sem) another process may add
++ *      a mandatory lock.
++ *  In 1. and 2. we end up writing to an area different from the area
++ *  we verified, in 3. we will write to a mandatory locked area.
++ *
++ *  locks_mandatory_area now adds special locks to inode->i_flock.
++ *  These access locks have FL_POSIX and FL_ACCESS set and are held
++ *  while the kernel accesses a region in a mandatory locked file..
++ *  These locks also prevent other processes from modifying the file->f_pos.
++ *  Access locks still allow new mandatory locks to be created but
++ *  the first access to the locked region will be blocked.
++ *  Two access locks even conflict if they have the same owner.
++ * 
++ *  Christian Ehrhardt (ehrhardt@mathematik.uni-ulm.de), Sep 5, 1999
+  */
+ 
+ #include <linux/malloc.h>
+@@ -158,7 +179,7 @@
+ 
+ 	if (fl->fl_nextblock != NULL || fl->fl_prevblock != NULL)
+ 		panic("Attempting to free lock with active block list");
+-		
++
+ 	kfree(fl);
+ 	return;
+ }
+@@ -402,14 +423,17 @@
+ 	 * and shared.
+ 	 */
+ 	if (IS_MANDLOCK(inode) &&
+-	    (inode->i_mode & (S_ISGID | S_IXGRP)) == S_ISGID &&
+-	    inode->i_mmap) {
+-		struct vm_area_struct *vma = inode->i_mmap;
++	    (inode->i_mode & (S_ISGID | S_IXGRP)) == S_ISGID) {
+ 		error = -EAGAIN;
+-		do {
+-			if (vma->vm_flags & VM_MAYSHARE)
+-				goto out_putf;
+-		} while ((vma = vma->vm_next_share) != NULL);
++		if (inode->i_nolockcount)
++			goto out_putf;
++		if (inode->i_mmap) {
++			struct vm_area_struct *vma = inode->i_mmap;
++			do {
++				if (vma->vm_flags & VM_MAYSHARE)
++					goto out_putf;
++			} while ((vma = vma->vm_next_share) != NULL);
++		}
+ 	}
+ 
+ 	error = -EINVAL;
+@@ -537,26 +561,57 @@
+ 	for (cfl = filp->f_dentry->d_inode->i_flock; cfl; cfl = cfl->fl_next) {
+ 		if (!(cfl->fl_flags & FL_POSIX))
+ 			continue;
+-		if (posix_locks_conflict(cfl, fl))
++		if (posix_locks_conflict(fl, cfl))
+ 			break;
+ 	}
+ 
+ 	return (cfl);
+ }
+ 
++
+ int locks_verify_locked(struct inode *inode)
+ {
+ 	/* Candidates for mandatory locking have the setgid bit set
+ 	 * but no group execute bit -  an otherwise meaningless combination.
+ 	 */
++	inode->i_nolockcount++;
+ 	if (IS_MANDLOCK(inode) &&
+ 	    (inode->i_mode & (S_ISGID | S_IXGRP)) == S_ISGID)
+ 		return (locks_mandatory_locked(inode));
+ 	return (0);
+ }
+ 
+-int locks_verify_area(int read_write, struct inode *inode, struct file *filp,
+-		      loff_t offset, size_t count)
++/* Release an access lock. We identify the lock by its pointer,
++ * this is possible because only access locks are handled by
++ * this and access locks aren't combined.
++ */
++
++void locks_unlock_access (struct inode * inode, struct file_lock * lock)
++{
++	struct file_lock ** before;
++
++	if (lock == NULL)
++		return;
++	before = &inode->i_flock;
++	while (*before != NULL) {
++		if (*before == lock) {
++			/* Sanity checks */
++			if ((*before)->fl_flags != (FL_POSIX | FL_ACCESS))
++				break;
++			locks_delete_lock (before, 0);
++			return;
++		}
++		before = &((*before)->fl_next);
++	}
++	/* Should not be reached */
++	printk (KERN_ERR "locks_unlock_access: Bad pointer (%08lx) or flags\n",
++							(long)lock);
++}
++
++
++struct file_lock * locks_verify_area(int read_write, struct inode *inode,
++	struct file *filp, loff_t offset, size_t count, unsigned int wait)
+ {
+ 	/* Candidates for mandatory locking have the setgid bit set
+ 	 * but no group execute bit -  an otherwise meaningless combination.
+@@ -564,8 +619,8 @@
+ 	if (IS_MANDLOCK(inode) &&
+ 	    (inode->i_mode & (S_ISGID | S_IXGRP)) == S_ISGID)
+ 		return (locks_mandatory_area(read_write, inode, filp, offset,
+-					     count));
+-	return (0);
++					     count, wait));
++	return (NULL);
+ }
+ 
+ int locks_mandatory_locked(struct inode *inode)
+@@ -578,29 +633,47 @@
+ 	for (fl = inode->i_flock; fl != NULL; fl = fl->fl_next) {
+ 		if (!(fl->fl_flags & FL_POSIX))
+ 			continue;
+-		if (fl->fl_owner != owner)
++		if (fl->fl_owner != owner) {
++			inode->i_nolockcount--;
+ 			return (-EAGAIN);
++		}
+ 	}
+ 	return (0);
+ }
+ 
+-int locks_mandatory_area(int read_write, struct inode *inode,
++
++struct file_lock * locks_mandatory_area(int read_write, struct inode *inode,
+ 			 struct file *filp, loff_t offset,
+-			 size_t count)
++			 size_t count, unsigned int wait)
+ {
+-	struct file_lock *fl;
+-	struct file_lock tfl;
+-
+-	memset(&tfl, 0, sizeof(tfl));
+-
+-	tfl.fl_file = filp;
+-	tfl.fl_flags = FL_POSIX | FL_ACCESS;
+-	tfl.fl_owner = current->files;
+-	tfl.fl_pid = current->pid;
+-	tfl.fl_type = (read_write == FLOCK_VERIFY_WRITE) ? F_WRLCK : F_RDLCK;
+-	tfl.fl_start = offset;
+-	tfl.fl_end = offset + count - 1;
+-
++	struct file_lock *fl, **before;
++	struct file_lock * access;
++	int ret;
++	int seek;
++
++	access = locks_empty_lock ();
++	if (!access)
++		return ERR_PTR(-ENOMEM);
++	/* FLOCK_VERIFY_SEEK is used by seek. Only access locks freeze
++	 * the file pointer. Thus FLOCK_VERIFY_SEEK only cares about
++	 * access locks.
++	 */
++	seek = (read_write == FLOCK_VERIFY_SEEK);
++	memset(access, 0, sizeof(struct file_lock));
++	access->fl_file = filp;
++	access->fl_flags = FL_POSIX | FL_ACCESS;
++	access->fl_owner = current->files;
++	access->fl_pid = current->pid;
++	access->fl_type = (read_write == FLOCK_VERIFY_READ) ? F_RDLCK : F_WRLCK;
++	access->fl_start = offset;
++	access->fl_end = offset + count - 1;
++	access->fl_notify = NULL;
++	/* Should we call f_op->lock somewhere now that we are adding a
++	 * lock ? It would be a real mess and currently its not needed
++	 * because only NFS uses f_op->lock and it doesn't allow mandatory
++	 * locks anyway.
++	 */
++	ret = 0;
+ repeat:
+ 	/* Search the lock list for this inode for locks that conflict with
+ 	 * the proposed read/write.
+@@ -608,32 +681,54 @@
+ 	for (fl = inode->i_flock; fl != NULL; fl = fl->fl_next) {
+ 		if (!(fl->fl_flags & FL_POSIX))
+ 			continue;
++		if (seek && (!(fl->fl_flags & FL_ACCESS) ||
++			      (fl->fl_file != access->fl_file)))
++			continue;
+ 		/* Block for writes against a "read" lock,
+ 		 * and both reads and writes against a "write" lock.
+ 		 */
+-		if (posix_locks_conflict(fl, &tfl)) {
+-			if (filp && (filp->f_flags & O_NONBLOCK))
+-				return (-EAGAIN);
+-			if (signal_pending(current))
+-				return (-ERESTARTSYS);
+-			if (posix_locks_deadlock(&tfl, fl))
+-				return (-EDEADLK);
+-
+-			locks_insert_block(fl, &tfl);
+-			interruptible_sleep_on(&tfl.fl_wait);
+-			locks_delete_block(fl, &tfl);
++		if (posix_locks_conflict(access, fl)) {
++			if (!wait || (filp && (filp->f_flags & O_NONBLOCK))) {
++				ret = -EAGAIN;
++				goto out_nolock;
++			}
++			if (signal_pending(current)) {
++				ret = -ERESTARTSYS;
++				goto out_nolock;
++			}
++			if (posix_locks_deadlock(access, fl)) {
++				ret = -EDEADLK;
++				goto out_nolock;
++			}
+ 
+-			if (signal_pending(current))
+-				return (-ERESTARTSYS);
++			locks_insert_block(fl, access);
++			interruptible_sleep_on(&access->fl_wait);
++			locks_delete_block(fl, access);
++
++			if (signal_pending(current)) {
++				ret = -ERESTARTSYS;
++				goto out_nolock;
++			}
+ 			/* If we've been sleeping someone might have
+ 			 * changed the permissions behind our back.
+ 			 */
+-			if ((inode->i_mode & (S_ISGID | S_IXGRP)) != S_ISGID)
+-				break;
++			if ((inode->i_mode & (S_ISGID | S_IXGRP)) != S_ISGID) {
++				goto out_nolock;
++			}
+ 			goto repeat;
+ 		}
+ 	}
+-	return (0);
++	/* Insert the lock after the flock locks. */
++	for (before = &inode->i_flock;
++	     (*before) && ((*before)->fl_flags & FL_FLOCK);
++	     before = &(*before)->fl_next)
++		; /* Nothing */
++	locks_insert_lock (before, access);
++	return access;
++out_nolock:
++	if (access)
++		locks_free_lock (access);
++	return (ERR_PTR(ret));
+ }
+ 
+ /* Verify a "struct flock" and copy it to a "struct file_lock" as a POSIX
+@@ -719,19 +814,24 @@
+ 	return (1);
+ }
+ 
+-/* Determine if lock sys_fl blocks lock caller_fl. POSIX specific
+- * checking before calling the locks_conflict().
++/* Determine if the existing lock old_fl conflicts with the new lock
++ * new_fl. POSIX specific checking before calling the locks_conflict().
++ * Warning: With access locks this function is no longer symmetric!
++ *          The first parameter is always the new, the second is
++ *          the existing lock.
+  */
+-static int posix_locks_conflict(struct file_lock *caller_fl, struct file_lock *sys_fl)
++static int posix_locks_conflict(struct file_lock * new_fl, struct file_lock *old_fl)
+ {
+ 	/* POSIX locks owned by the same process do not conflict with
+ 	 * each other.
+ 	 */
+-	if (!(sys_fl->fl_flags & FL_POSIX) ||
+-	    locks_same_owner(caller_fl, sys_fl))
++	if (!(old_fl->fl_flags & FL_POSIX) ||
++             (old_fl->fl_flags & FL_ACCESS & ~new_fl->fl_flags) ||
++	    (locks_same_owner(new_fl, old_fl) &&
++	     !(old_fl->fl_flags & new_fl->fl_flags & FL_ACCESS)))
+ 		return (0);
+ 
+-	return (locks_conflict(caller_fl, sys_fl));
++	return (locks_conflict(new_fl, old_fl));
+ }
+ 
+ /* Determine if lock sys_fl blocks lock caller_fl. FLOCK specific
+@@ -785,6 +885,9 @@
+  * Note: the above assumption may not be true when handling lock requests
+  * from a broken NFS client. But broken NFS clients have a lot more to
+  * worry about than proper deadlock detection anyway... --okir
++ *
++ * It isn't true if CLONE_PID and CLONE_FILES are used together, either.
++ * The use of CLONE_PID is not recommended, however. --cae
+  */
+ static int posix_locks_deadlock(struct file_lock *caller_fl,
+ 				struct file_lock *block_fl)
+@@ -923,6 +1026,9 @@
+ 	struct inode * inode = filp->f_dentry->d_inode;
+ 	int error, added = 0;
+ 
++	/* Sanity check. */
++	if (caller->fl_flags & FL_ACCESS)
++		return -EINVAL;
+ 	/*
+ 	 * We may need two file_lock structures for this operation,
+ 	 * so we get them in advance to avoid races.
+@@ -965,9 +1071,10 @@
+ 	
+ 	before = &inode->i_flock;
+ 
+-	/* First skip locks owned by other processes.
++	/* First skip locks owned by other processes and access locks.
+ 	 */
+ 	while ((fl = *before) && (!(fl->fl_flags & FL_POSIX) ||
++				   (fl->fl_flags & FL_ACCESS) ||
+ 				  !locks_same_owner(caller, fl))) {
+ 		before = &fl->fl_next;
+ 	}
+diff -ur linux-2.2.10/fs/namei.c linux-2.2.10-p/fs/namei.c
+--- linux-2.2.10/fs/namei.c	Sun May  9 05:46:08 1999
++++ linux-2.2.10-p/fs/namei.c	Sat Sep 11 15:45:15 1999
+@@ -766,12 +766,8 @@
+ 		/*
+ 		 * Refuse to truncate files with mandatory locks held on them.
+ 		 */
+-		error = locks_verify_locked(inode);
+-		if (!error) {
+-			DQUOT_INIT(inode);
+-			
+-			error = do_truncate(dentry, 0);
+-		}
++		DQUOT_INIT(inode);
++		error = do_truncate(dentry, 0);
+ 		put_write_access(inode);
+ 		if (error)
+ 			goto exit;
+diff -ur linux-2.2.10/fs/open.c linux-2.2.10-p/fs/open.c
+--- linux-2.2.10/fs/open.c	Fri Apr 16 23:21:39 1999
++++ linux-2.2.10-p/fs/open.c	Sat Sep 11 15:44:10 1999
+@@ -68,11 +68,31 @@
+ 	struct inode *inode = dentry->d_inode;
+ 	int error;
+ 	struct iattr newattrs;
++	struct file_lock * lock;
++	loff_t start,len;
+ 
+ 	/* Not pretty: "inode->i_size" shouldn't really be "off_t". But it is. */
+ 	if ((off_t) length < 0)
+ 		return -EINVAL;
+ 
++	/* The +1 is needed to handle a race with mandatory locks and
++	 * O_APPEND: Task 1 seeks to the end of file, gets an access
++	 * lock and sleeps in down. Task two "truncates" the file to
++	 * something arbitrary, i.e. changes inode->i_size, the fs
++	 * code honours this and booom.
++         */
++	start = length;
++	len   = 1+abs(inode->i_size - length);
++	if (length > inode->i_size) {
++		start = inode->i_size;
++		len--;
++	}
++	lock = locks_verify_area(FLOCK_VERIFY_WRITE, inode, NULL,
++				start, len, 1);
++	if (IS_ERR(lock)) {
++		error = PTR_ERR(lock);
++		goto unlock;
++	}
+ 	down(&inode->i_sem);
+ 	newattrs.ia_size = length;
+ 	newattrs.ia_valid = ATTR_SIZE | ATTR_CTIME;
+@@ -84,6 +104,8 @@
+ 			inode->i_op->truncate(inode);
+ 	}
+ 	up(&inode->i_sem);
++unlock:
++	locks_unlock_access (inode, lock);
+ 	return error;
+ }
+ 
+@@ -120,14 +142,8 @@
+ 	error = get_write_access(inode);
+ 	if (error)
+ 		goto dput_and_out;
+-
+-	error = locks_verify_area(FLOCK_VERIFY_WRITE, inode, NULL,
+-				  length < inode->i_size ? length : inode->i_size,
+-				  abs(inode->i_size - length));
+-	if (!error) {
+-		DQUOT_INIT(inode);
+-		error = do_truncate(dentry, length);
+-	}
++	DQUOT_INIT(inode);
++	error = do_truncate(dentry, length);
+ 	put_write_access(inode);
+ dput_and_out:
+ 	dput(dentry);
+@@ -141,6 +157,7 @@
+ 	struct inode * inode;
+ 	struct dentry *dentry;
+ 	struct file * file;
++	struct file_lock * lock;
+ 	int error;
+ 
+ 	lock_kernel();
+@@ -159,11 +176,7 @@
+ 	error = -EPERM;
+ 	if (IS_IMMUTABLE(inode) || IS_APPEND(inode))
+ 		goto out_putf;
+-	error = locks_verify_area(FLOCK_VERIFY_WRITE, inode, file,
+-				  length<inode->i_size ? length : inode->i_size,
+-				  abs(inode->i_size - length));
+-	if (!error)
+-		error = do_truncate(dentry, length);
++	error = do_truncate(dentry, length);
+ out_putf:
+ 	fput(file);
+ out:
+diff -ur linux-2.2.10/fs/read_write.c linux-2.2.10-p/fs/read_write.c
+--- linux-2.2.10/fs/read_write.c	Sun Dec 27 19:52:09 1998
++++ linux-2.2.10-p/fs/read_write.c	Sat Sep 11 12:24:17 1999
+@@ -36,14 +36,28 @@
+ 	return retval;
+ }
+ 
+-static inline loff_t llseek(struct file *file, loff_t offset, int origin)
++loff_t llseek(struct file *file, struct inode * inode, loff_t offset, int origin)
+ {
+ 	loff_t (*fn)(struct file *, loff_t, int);
+-
++	struct file_lock * lock;
++	loff_t pos;
++retry:
++	pos = file->f_pos;
++	lock = locks_verify_area (FLOCK_VERIFY_SEEK, inode, file,
++				  file->f_pos, 1, 1);
++	if (IS_ERR(lock)) {
++		return PTR_ERR(lock);
++	}
++	if (pos != file->f_pos) {
++		locks_unlock_access (inode, lock);
++		goto retry;
++	}
+ 	fn = default_llseek;
+ 	if (file->f_op && file->f_op->llseek)
+ 		fn = file->f_op->llseek;
+-	return fn(file, offset, origin);
++	pos = fn(file, offset, origin);
++	locks_unlock_access (inode, lock);
++	return pos;
+ }
+ 
+ asmlinkage off_t sys_lseek(unsigned int fd, off_t offset, unsigned int origin)
+@@ -63,8 +77,9 @@
+ 	    !(inode = dentry->d_inode))
+ 		goto out_putf;
+ 	retval = -EINVAL;
+-	if (origin <= 2)
+-		retval = llseek(file, offset, origin);
++	if (origin > 2)
++		goto out_putf;
++	retval = llseek(file, inode, offset, origin);
+ out_putf:
+ 	fput(file);
+ bad:
+@@ -95,10 +110,8 @@
+ 	retval = -EINVAL;
+ 	if (origin > 2)
+ 		goto out_putf;
+-
+-	offset = llseek(file, ((loff_t) offset_high << 32) | offset_low,
++	offset = llseek(file, inode, ((loff_t) offset_high << 32) | offset_low,
+ 			origin);
+-
+ 	retval = (int)offset;
+ 	if (offset >= 0) {
+ 		retval = -EFAULT;
+@@ -116,7 +129,9 @@
+ asmlinkage ssize_t sys_read(unsigned int fd, char * buf, size_t count)
+ {
+ 	ssize_t ret;
++	struct file_lock * lock;
+ 	struct file * file;
++	loff_t pos;
+ 	ssize_t (*read)(struct file *, char *, size_t, loff_t *);
+ 
+ 	lock_kernel();
+@@ -127,14 +142,27 @@
+ 		goto bad_file;
+ 	if (!(file->f_mode & FMODE_READ))
+ 		goto out;
+-	ret = locks_verify_area(FLOCK_VERIFY_READ, file->f_dentry->d_inode,
+-				file, file->f_pos, count);
+-	if (ret)
+-		goto out;
+ 	ret = -EINVAL;
+ 	if (!file->f_op || !(read = file->f_op->read))
+ 		goto out;
++retry:
++	pos = file->f_pos;
++	lock = locks_verify_area(FLOCK_VERIFY_READ, file->f_dentry->d_inode,
++				file, file->f_pos, count, 1);
++	if (IS_ERR(lock)) {
++		ret = PTR_ERR(lock);
++		goto out;
++	}
++	/* If the file pointer is shared f_pos might change while we
++	 * sleep. Note that we might sleep longer than actually need
++	 * in this case.
++	 */
++	if (file->f_pos != pos) {
++		locks_unlock_access (file->f_dentry->d_inode, lock);
++		goto retry;
++	}
+ 	ret = read(file, buf, count, &file->f_pos);
++	locks_unlock_access (file->f_dentry->d_inode, lock);
+ out:
+ 	fput(file);
+ bad_file:
+@@ -145,8 +173,11 @@
+ asmlinkage ssize_t sys_write(unsigned int fd, const char * buf, size_t count)
+ {
+ 	ssize_t ret;
++	struct file_lock * lock;
+ 	struct file * file;
+ 	struct inode * inode;
++	loff_t pos;
++	ssize_t size;
+ 	ssize_t (*write)(struct file *, const char *, size_t, loff_t *);
+ 
+ 	lock_kernel();
+@@ -157,18 +188,35 @@
+ 		goto bad_file;
+ 	if (!(file->f_mode & FMODE_WRITE))
+ 		goto out;
+-	inode = file->f_dentry->d_inode;
+-	ret = locks_verify_area(FLOCK_VERIFY_WRITE, inode, file,
+-				file->f_pos, count);
+-	if (ret)
+-		goto out;
+ 	ret = -EINVAL;
+ 	if (!file->f_op || !(write = file->f_op->write))
+ 		goto out;
++	inode = file->f_dentry->d_inode;
++retry:
++	pos = file->f_pos;
++	size = inode->i_size;
++	if (file->f_flags & O_APPEND) {
++		loff_t tmp;
++		tmp = llseek (file, inode, 0, 2);
++		if (tmp >= 0)
++			pos = tmp;
++	}
++	lock = locks_verify_area(FLOCK_VERIFY_WRITE, inode, file,
++				 file->f_pos, count, 1);
++	if (IS_ERR(lock)) {
++		ret = PTR_ERR(lock);
++		goto out;
++	}
++	if ((file->f_pos != pos) ||
++	    ((file->f_flags & O_APPEND) && (inode->i_size != size))) {
++		locks_unlock_access (inode, lock);
++		goto retry;
++	}
+ 
+ 	down(&inode->i_sem);
+ 	ret = write(file, buf, count, &file->f_pos);
+ 	up(&inode->i_sem);
++	locks_unlock_access (inode, lock);
+ out:
+ 	fput(file);
+ bad_file:
+@@ -189,6 +237,9 @@
+ 	ssize_t ret, i;
+ 	io_fn_t fn;
+ 	struct inode *inode;
++	struct file_lock * lock;
++	loff_t pos;
++	ssize_t size;
+ 
+ 	/*
+ 	 * First get the "struct iovec" from user memory and
+@@ -215,30 +266,49 @@
+ 		tot_len += iov[i].iov_len;
+ 
+ 	inode = file->f_dentry->d_inode;
++retry:
++	pos = file->f_pos;
++	size = inode->i_size;
++	if ((type == VERIFY_READ) && (file->f_flags & O_APPEND)) {
++		loff_t tmp;
++		tmp = llseek (file, inode, 0, 2);
++		if (ret >= 0)
++			pos = tmp;
++	}
+ 	/* VERIFY_WRITE actually means a read, as we write to user space */
+-	ret = locks_verify_area((type == VERIFY_WRITE
++	lock = locks_verify_area((type == VERIFY_WRITE
+ 				 ? FLOCK_VERIFY_READ : FLOCK_VERIFY_WRITE),
+-				inode, file, file->f_pos, tot_len);
+-	if (ret) goto out;
++				inode, file, file->f_pos, tot_len, 1);
++	if (IS_ERR(lock)) {
++		ret = PTR_ERR(lock);
++		goto out;
++	}
++	if ((file->f_pos != pos) || ((type == VERIFY_READ) &&
++	      (file->f_flags & O_APPEND) && (inode->i_size != size))) {
++		locks_unlock_access (inode, lock);
++		goto retry;
++	}
+ 
+ 	/*
+ 	 * Then do the actual IO.  Note that sockets need to be handled
+ 	 * specially as they have atomicity guarantees and can handle
+ 	 * iovec's natively
+ 	 */
++	if (type == VERIFY_READ)
++		down(&inode->i_sem);
+ 	if (inode->i_sock) {
+ 		ret = sock_readv_writev(type,inode,file,iov,count,tot_len);
+-		goto out;
++		goto out_unlock;
+ 	}
+ 
+ 	ret = -EINVAL;
+ 	if (!file->f_op)
+-		goto out;
++		goto out_unlock;
+ 
+ 	/* VERIFY_WRITE actually means a read, as we write to user space */
+ 	fn = file->f_op->read;
+ 	if (type == VERIFY_READ)
+-		fn = (io_fn_t) file->f_op->write;		
++		fn = (io_fn_t) file->f_op->write;
+ 
+ 	ret = 0;
+ 	vector = iov;
+@@ -262,7 +332,10 @@
+ 		if (nr != len)
+ 			break;
+ 	}
+-
++out_unlock:
++	if (type == VERIFY_READ)
++		up(&inode->i_sem);
++	locks_unlock_access (inode, lock);
+ out:
+ 	if (iov != iovstack)
+ 		kfree(iov);
+@@ -304,9 +377,10 @@
+ 	if (!file)
+ 		goto bad_file;
+ 	if (file->f_op && file->f_op->write && (file->f_mode & FMODE_WRITE)) {
+-		down(&file->f_dentry->d_inode->i_sem);
++		/* The down/up operations are in do_readv_writev
++		 * to prevent deadlocks with locks_verify_area.
++		 */
+ 		ret = do_readv_writev(VERIFY_READ, file, vector, count);
+-		up(&file->f_dentry->d_inode->i_sem);
+ 	}
+ 	fput(file);
+ 
+@@ -325,6 +399,7 @@
+ 	ssize_t ret;
+ 	struct file * file;
+ 	ssize_t (*read)(struct file *, char *, size_t, loff_t *);
++	struct file_lock * lock;
+ 
+ 	lock_kernel();
+ 
+@@ -334,16 +409,19 @@
+ 		goto bad_file;
+ 	if (!(file->f_mode & FMODE_READ))
+ 		goto out;
+-	ret = locks_verify_area(FLOCK_VERIFY_READ, file->f_dentry->d_inode,
+-				file, pos, count);
+-	if (ret)
+-		goto out;
+ 	ret = -EINVAL;
+ 	if (!file->f_op || !(read = file->f_op->read))
+ 		goto out;
+ 	if (pos < 0)
+ 		goto out;
++	lock = locks_verify_area(FLOCK_VERIFY_READ, file->f_dentry->d_inode,
++				file, pos, count, 1);
++	if (IS_ERR(lock)) {
++		ret = PTR_ERR(lock);
++		goto out;
++	}
+ 	ret = read(file, buf, count, &pos);
++	locks_unlock_access (file->f_dentry->d_inode, lock);
+ out:
+ 	fput(file);
+ bad_file:
+@@ -351,12 +429,19 @@
+ 	return ret;
+ }
+ 
++/* XXX What should we do with pwrite and O_APPEND ? I decided to return
++ * EINVAL (better ideas ?) and issue a warning to find out if anyone really
++ * does this. Don't know if this conforms to any standards but just ignoring
++ * pos with O_APPEND sounds like a bad idea. --cae
++ */
+ asmlinkage ssize_t sys_pwrite(unsigned int fd, const char * buf,
+ 			      size_t count, loff_t pos)
+ {
+ 	ssize_t ret;
+ 	struct file * file;
+ 	ssize_t (*write)(struct file *, const char *, size_t, loff_t *);
++	struct file_lock * lock;
++	struct inode * inode;
+ 
+ 	lock_kernel();
+ 
+@@ -366,20 +451,27 @@
+ 		goto bad_file;
+ 	if (!(file->f_mode & FMODE_WRITE))
+ 		goto out;
+-	ret = locks_verify_area(FLOCK_VERIFY_WRITE, file->f_dentry->d_inode,
+-				file, pos, count);
+-	if (ret)
+-		goto out;
+ 	ret = -EINVAL;
+ 	if (!file->f_op || !(write = file->f_op->write))
+ 		goto out;
+ 	if (pos < 0)
+ 		goto out;
++	if (file->f_flags & O_APPEND) {
++		printk (KERN_WARNING "pwrite called with O_APPEND\n");
++		goto out;
++	}
++	inode = file->f_dentry->d_inode;
++	lock = locks_verify_area(FLOCK_VERIFY_WRITE, inode,
++				file, pos, count, 1);
++	if (IS_ERR(lock)) {
++		ret = PTR_ERR(lock);
++		goto out;
++	}
+ 
+-	down(&file->f_dentry->d_inode->i_sem);
+-	ret = write(file, buf, count, &pos);
+-	up(&file->f_dentry->d_inode->i_sem);
+-
++	down(&inode->i_sem);
++        ret = write(file, buf, count, &pos);
++	up(&inode->i_sem);
++	locks_unlock_access (inode, lock);
+ out:
+ 	fput(file);
+ bad_file:
+diff -ur linux-2.2.10/include/linux/fs.h linux-2.2.10-p/include/linux/fs.h
+--- linux-2.2.10/include/linux/fs.h	Fri Jul 30 11:25:54 1999
++++ linux-2.2.10-p/include/linux/fs.h	Mon Sep 13 18:33:03 1999
+@@ -95,6 +95,7 @@
+ #define S_IMMUTABLE	512	/* Immutable file */
+ #define MS_NOATIME	1024	/* Do not update access times. */
+ #define MS_NODIRATIME   2048    /* Do not update directory access times */
++#define S_NOLOCKS	4096	/* Temporarily disallow new locks */
+ 
+ #define MS_ODD_RENAME   32768    /* Temporary stuff; will go away as soon
+ 				  * as nfs_rename() will be cleaned up
+@@ -366,6 +367,7 @@
+ 	unsigned char		i_sock;
+ 
+ 	int			i_writecount;
++	int			i_nolockcount;
+ 	unsigned int		i_attr_flags;
+ 	__u32			i_generation;
+ 	union {
+@@ -655,11 +657,13 @@
+ 
+ #define FLOCK_VERIFY_READ  1
+ #define FLOCK_VERIFY_WRITE 2
++#define FLOCK_VERIFY_SEEK  3
+ 
++extern void locks_unlock_access (struct inode * inode, struct file_lock * lock);
+ extern int locks_mandatory_locked(struct inode *inode);
+-extern int locks_mandatory_area(int read_write, struct inode *inode,
++extern struct file_lock * locks_mandatory_area(int read_write, struct inode *inode,
+ 				struct file *filp, loff_t offset,
+-				size_t count);
++				size_t count, unsigned int wait);
+ 
+ extern inline int locks_verify_locked(struct inode *inode)
+ {
+@@ -672,9 +676,9 @@
+ 	return (0);
+ }
+ 
+-extern inline int locks_verify_area(int read_write, struct inode *inode,
++extern inline struct file_lock * locks_verify_area(int read_write, struct inode *inode,
+ 				    struct file *filp, loff_t offset,
+-				    size_t count)
++				    size_t count, unsigned int wait)
+ {
+ 	/* Candidates for mandatory locking have the setgid bit set
+ 	 * but no group execute bit -  an otherwise meaningless combination.
+@@ -682,8 +686,8 @@
+ 	if (IS_MANDLOCK(inode) &&
+ 	    (inode->i_mode & (S_ISGID | S_IXGRP)) == S_ISGID)
+ 		return (locks_mandatory_area(read_write, inode, filp, offset,
+-					     count));
+-	return (0);
++					     count, wait));
++	return (NULL);
+ }
+ 
+ 
+@@ -694,6 +698,8 @@
+ extern int do_truncate(struct dentry *, unsigned long);
+ extern int get_unused_fd(void);
+ extern void put_unused_fd(unsigned int);
++extern loff_t llseek(struct file *file, struct inode * inode, loff_t offset, int origin);
++ 
+ 
+ extern struct file *filp_open(const char *, int, int);
+ extern int filp_close(struct file *, fl_owner_t id);
+diff -ur linux-2.2.10/mm/filemap.c linux-2.2.10-p/mm/filemap.c
+--- linux-2.2.10/mm/filemap.c	Tue May 11 17:51:13 1999
++++ linux-2.2.10-p/mm/filemap.c	Sat Sep 11 12:17:06 1999
+@@ -20,6 +20,7 @@
+ #include <linux/file.h>
+ #include <linux/swapctl.h>
+ #include <linux/slab.h>
++#include <linux/fs.h>
+ 
+ #include <asm/pgtable.h>
+ #include <asm/uaccess.h>
+@@ -837,7 +838,10 @@
+ {
+ 	ssize_t retval;
+ 	struct file * in_file, * out_file;
+-	struct inode * in_inode, * out_inode;
++	struct inode * in_inode = NULL, * out_inode = NULL;
++	struct file_lock * in_lock = NULL, * out_lock = NULL;
++	loff_t pos;
++	ssize_t size;
+ 
+ 	lock_kernel();
+ 
+@@ -856,9 +860,12 @@
+ 		goto fput_in;
+ 	if (!in_inode->i_op || !in_inode->i_op->readpage)
+ 		goto fput_in;
+-	retval = locks_verify_area(FLOCK_VERIFY_READ, in_inode, in_file, in_file->f_pos, count);
+-	if (retval)
++	in_lock = locks_verify_area(FLOCK_VERIFY_READ, in_inode, in_file, in_file->f_pos, count, 1);
++	if (IS_ERR(in_lock)) {
++		retval = PTR_ERR(in_lock);
++		in_lock = NULL;
+ 		goto fput_in;
++	}
+ 
+ 	/*
+ 	 * Get output file, and verify that it is ok..
+@@ -875,9 +882,27 @@
+ 	out_inode = out_file->f_dentry->d_inode;
+ 	if (!out_inode)
+ 		goto fput_out;
+-	retval = locks_verify_area(FLOCK_VERIFY_WRITE, out_inode, out_file, out_file->f_pos, count);
+-	if (retval)
++retry:
++	pos = out_file->f_pos;
++	size = out_inode->i_size;
++	if (out_file->f_flags & O_APPEND) {
++                loff_t tmp;
++                tmp = llseek (out_file, out_inode, 0, 2);
++                if (tmp >= 0)
++                        pos = tmp;
++	}
++
++	out_lock = locks_verify_area(FLOCK_VERIFY_WRITE, out_inode, out_file, out_file->f_pos, count, 1);
++	if (IS_ERR(out_lock)) {
++		retval = PTR_ERR(out_lock);
++		out_lock = NULL;
+ 		goto fput_out;
++	}
++	if ((out_file->f_pos != pos) ||
++	    ((out_file->f_flags & O_APPEND) && (out_inode->i_size != size))) {
++		locks_unlock_access (out_inode, out_lock);
++		goto retry;
++	}
+ 
+ 	retval = 0;
+ 	if (count) {
+@@ -905,10 +930,11 @@
+ 			put_user(pos, offset);
+ 	}
+ 
+-
+ fput_out:
++	locks_unlock_access (out_inode, out_lock);
+ 	fput(out_file);
+ fput_in:
++	locks_unlock_access (in_inode, in_lock);
+ 	fput(in_file);
+ out:
+ 	unlock_kernel();
+diff -ur linux-2.2.10/mm/mmap.c linux-2.2.10-p/mm/mmap.c
+--- linux-2.2.10/mm/mmap.c	Wed May  5 00:44:38 1999
++++ linux-2.2.10-p/mm/mmap.c	Sat Sep 11 18:55:30 1999
+@@ -174,7 +174,7 @@
+ {
+ 	struct mm_struct * mm = current->mm;
+ 	struct vm_area_struct * vma;
+-	int error;
++	int error, lck = -1;
+ 
+ 	if (file && (!file->f_op || !file->f_op->mmap))
+ 		return -ENODEV;
+@@ -216,13 +216,15 @@
+ 				return -EACCES;
+ 
+ 			/* make sure there are no mandatory locks on the file. */
+-			if (locks_verify_locked(file->f_dentry->d_inode))
++			if ((lck = locks_verify_locked(file->f_dentry->d_inode)))
+ 				return -EAGAIN;
+ 
+ 			/* fall through */
+ 		case MAP_PRIVATE:
+-			if (!(file->f_mode & 1))
+-				return -EACCES;
++			if (!(file->f_mode & 1)) {
++				error =  -EACCES;
++				goto unlock;
++			}
+ 			break;
+ 
+ 		default:
+@@ -235,12 +237,16 @@
+ 	 * that it represents a valid section of the address space.
+ 	 */
+ 	if (flags & MAP_FIXED) {
+-		if (addr & ~PAGE_MASK)
+-			return -EINVAL;
++		if (addr & ~PAGE_MASK) {
++			error = -EINVAL;
++			goto unlock;
++		}
+ 	} else {
+ 		addr = get_unmapped_area(addr, len);
+-		if (!addr)
+-			return -ENOMEM;
++		if (!addr) {
++			error = -ENOMEM;
++			goto unlock;
++		}
+ 	}
+ 
+ 	/* Determine the object being mapped and call the appropriate
+@@ -248,8 +254,10 @@
+ 	 * not unmapped, but the maps are removed from the list.
+ 	 */
+ 	vma = kmem_cache_alloc(vm_area_cachep, SLAB_KERNEL);
+-	if (!vma)
+-		return -ENOMEM;
++	if (!vma) {
++		error = -ENOMEM;
++		goto unlock;
++	}
+ 
+ 	vma->vm_mm = mm;
+ 	vma->vm_start = addr;
+@@ -337,6 +345,8 @@
+ 		mm->locked_vm += len >> PAGE_SHIFT;
+ 		make_pages_present(addr, addr + len);
+ 	}
++	if (lck == 0)
++		file->f_dentry->d_inode->i_nolockcount--;
+ 	return addr;
+ 
+ unmap_and_free_vma:
+@@ -346,6 +356,9 @@
+ 	flush_tlb_range(mm, vma->vm_start, vma->vm_end);
+ free_vma:
+ 	kmem_cache_free(vm_area_cachep, vma);
++unlock:
++	if (lck == 0)
++		file->f_dentry->d_inode->i_nolockcount--;
+ 	return error;
+ }
+-- 
+****************************************************************************
+** Christian Ehrhardt  **  e-Mail: ehrhardt@mathematik.uni-ulm.de  *********
+****************************************************************************
+THAT'S ALL FOLKS!
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

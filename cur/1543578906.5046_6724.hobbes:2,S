@@ -1,0 +1,215 @@
+Date: Mon, 15 Jan 2001 23:02:00 +0100
+From: Roger Larsson <>
+Subject: Re: Latency: allowing resheduling while holding spin_locks
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2001/1/15/88
+
+On Sunday 14 January 2001 01:06, george anzinger wrote:
+> Nigel Gamble wrote:
+> > On Sat, 13 Jan 2001, Roger Larsson wrote:
+> > > A rethinking of the rescheduling strategy...
+> >
+> > Actually, I think you have more-or-less described how successful
+> > preemptible kernels have already been developed, given that your
+> > "sleeping spin locks" are really just sleeping mutexes (or binary
+> > semaphores).
+> >
+> > 1.  Short critical regions are protected by spin_lock_irq().  The maximum
+> > value of "short" is therefore bounded by the maximum time we are happy
+> > to disable (local) interrupts - ideally ~100us.
+> >
+> > 2.  Longer regions are protected by sleeping mutexes.
+> >
+> > 3.  Algorithms are rearchitected until all of the highly contended locks
+> > are of type 1, and only low contention locks are of type 2.
+> >
+> > This approach has the advantage that we don't need to use a no-preempt
+> > count, and test it on exit from every spinlock to see if a preempting
+> > interrupt that has caused a need_resched has occurred, since we won't
+> > see the interrupt until it's safe to do the preemptive resched.
+>
+> I agree that this was true in days of yore.  But these days the irq
+> instructions introduce serialization points and, me thinks, may be much
+> more time consuming than the "++, --, if (false)" that a preemption
+> count implemtation introduces.  Could some one with a knowledge of the
+> hardware comment on this?
+>
+> I am not suggesting that the "++, --, if (false)" is faster than an
+> interrupt, but that it is faster than cli, sti.  Of course we are
+> assuming that there is <stuff> between the cli and the sti as there is
+> between the ++ and the -- if (false).
+>
+The problem with counting scheme is that you can not schedule inside any
+spinlock - you have to split them up. Maybe you will have to do that anyway.
+But if your RT process never needs more memory - it should be quite safe.
+The difference with a sleeping mutex is that it can be made lazier - keep it
+in the runlist, there should be very few...
+See first patch attempt.
+(George, Nigel told me about your idea before I sent the previous mail. So 
+major influence comes from you. But I do not think that it is equivalent)
+/RogerL
+Note: changed email...--- ./linux/kernel/sched.c.orig	Sat Jan 13 19:19:20 2001
++++ ./linux/kernel/sched.c	Sat Jan 13 23:27:13 2001
+@@ -144,7 +144,7 @@
+ 	 * Also, dont trigger a counter recalculation.
+ 	 */
+ 	weight = -1;
+-	if (p->policy & SCHED_YIELD)
++	if (p->policy & (SCHED_YIELD | SCHED_SPINLOCK))
+ 		goto out;
+ 
+ 	/*
+@@ -978,7 +978,7 @@
+ 	read_lock(&tasklist_lock);
+ 	p = find_process_by_pid(pid);
+ 	if (p)
+-		retval = p->policy & ~SCHED_YIELD;
++		retval = p->policy & ~(SCHED_YIELD | SCHED_SPINLOCK);
+ 	read_unlock(&tasklist_lock);
+ 
+ out_nounlock:
+@@ -1267,3 +1267,54 @@
+ 	atomic_inc(&init_mm.mm_count);
+ 	enter_lazy_tlb(&init_mm, current, cpu);
+ }
++
++void wakeup_spinlock_yielder(spinlock_t *lock)
++{
++	int need_resched = 0;
++	struct list_head *tmp;
++	struct task_struct *p;
++	
++	/* I do not like this part...
++	*   not SMP safe, the runqueue might change under us...
++	*   can not use spinlocks...
++	*   runlist might be long...
++	*/
++	local_irqsave(&flags);
++	if (lock->spin) {
++		/* someone is "spinning" on it
++		 * it has to have higher prio than this
++		 * let go of ALL :-( spinning processes
++		 */
++		lock->spin = 0;
++
++		list_for_each(tmp, &runqueue_head) {
++			p = list_entry(tmp, struct task_struct, run_list);
++			if (p->policy & SCHED_SPINLOCK) {
++				p->policy &= ~SCHED_SPINLOCK;
++			}
++		}
++
++		need_resched = 1;
++	}
++	local_irqrestore(&flags);
++
++	/* all higher prio will get a chance to run... */
++	if (need_resched)
++		schedule_running();
++}
++
++void schedule_spinlock(spinlock_t *lock)
++{
++	while (test_and_set(lock->lock)) {
++		/* note: owner can not race here, it has lower prio */
++
++		lock->spinon = 1;
++		p->policy |= SCHED_SPINLOCK;
++		schedule_running();
++		/* will be released in priority order */
++	}
++}
++
++
++
++
+--- ./linux/include/linux/sched.h.orig	Sat Jan 13 19:25:53 2001
++++ ./linux/include/linux/sched.h	Sat Jan 13 19:26:31 2001
+@@ -119,6 +119,7 @@
+  * yield the CPU for one re-schedule..
+  */
+ #define SCHED_YIELD		0x10
++#define SCHED_SPINLOCK          0x20
+ 
+ struct sched_param {
+ 	int sched_priority;
+--- ./linux/include/linux/spinlock.h.orig	Sat Jan 13 19:40:30 2001
++++ ./linux/include/linux/spinlock.h	Sat Jan 13 21:51:14 2001
+@@ -66,16 +66,37 @@
+ 
+ typedef struct {
+ 	volatile unsigned long lock;
++	??? queue;
+ } spinlock_t;
+ #define SPIN_LOCK_UNLOCKED (spinlock_t) { 0 }
+ 
++void wakeup_spinlock_yielder(spinlock_t *lock);
++void schedule_spinlock(spinlock_t *lock);
++
+ #define spin_lock_init(x)	do { (x)->lock = 0; } while (0)
+ #define spin_is_locked(lock)	(test_bit(0,(lock)))
+-#define spin_trylock(lock)	(!test_and_set_bit(0,(lock)))
++#define spin_trylock(lock)	(!test_and_set_bit(0,(lock))) /* fail handled */
++
++#define spin_lock(x)		do { 
++        if (test_and_set(lock->lock)) \
++	       schedule_spinlock(); /* kind of yield, giving low goodness, sticky */ \
++        } while (0)
++
++#define spin_unlock_wait(x)	do { \
++        if (spin_is_locked(x))  { \
++                schedule_spinlock(); \
++                spin_unlock(); \
++        } \
++    } while (0)
+ 
+-#define spin_lock(x)		do { (x)->lock = 1; } while (0)
+-#define spin_unlock_wait(x)	do { } while (0)
+-#define spin_unlock(x)		do { (x)->lock = 0; } while (0)
++#define spin_unlock(x)		do { \
++         (x)->lock = 0; \
++\
++         /* note: someone with higher prio than me, \
++            might steal the lock from even higher prio waiters here */ \
++\
++         if (lock->queue) \
++                 wakeup_spinlock_yielder(lock); } while (0)
+ 
+ #else /* (DEBUG_SPINLOCKS >= 2) */
+ 
+--- ./linux/drivers/sound/emu10k1/irqmgr.c.orig	Mon Jan  8 18:49:35 2001
++++ ./linux/drivers/sound/emu10k1/irqmgr.c	Mon Jan  8 19:02:46 2001
+@@ -42,6 +42,7 @@
+ {
+ 	struct emu10k1_card *card = (struct emu10k1_card *) dev_id;
+ 	u32 irqstatus, tmp;
++	u32 limit_loop;
+ 
+ 	if (!(irqstatus = emu10k1_readfn0(card, IPR)))
+ 		return;
+@@ -60,6 +61,7 @@
+ 	 ** - Eric
+ 	 */
+ 
++	limit_loop = 0; /* wrap first, wait for next zero */
+ 	do {
+ 		DPD(4, "irq status %x\n", irqstatus);
+ 
+@@ -85,8 +87,12 @@
+ 
+ 		emu10k1_writefn0(card, IPR, tmp);
+ 
+-	} while ((irqstatus = emu10k1_readfn0(card, IPR)));
++	} while ((irqstatus = emu10k1_readfn0(card, IPR)) &&
++		 --limit_loop);
++
++	if (limit_loop == 0 && irqstatus != 0)
++	  printk(KERN_ERR "loop limit reached in emu10k, irqstatus %x\n",
++		 irqstatus);
+ 
+ 	return;
+ }
+-

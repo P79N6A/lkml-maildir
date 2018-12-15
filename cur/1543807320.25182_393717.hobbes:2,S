@@ -1,0 +1,102 @@
+Date: Sun, 5 Feb 2006 15:22:26 +0100
+From: Ingo Molnar <>
+Subject: Re: [PATCH -mm] swsusp: freeze user space processes first
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2006/2/5/60
+
+* Pavel Machek <pavel@suse.cz> wrote:
+> > then i'd suggest to change the vfork implementation to make this code 
+> > freezable. Nothing that userspace does should cause freezing to fail.  
+> > If it does, we've designed things incorrectly on the kernel side.
+> 
+> Does that also mean we have bugs with signal delivery? If vfork(); 
+> sleep(100000); causes process to be uninterruptible for few days, it 
+> will not be killable and increase load average...
+"half-done" vforks are indeed in uninterruptible sleep. They are not 
+directly killable, but they are killable indirectly through their 
+parent. But yes, in theory it would be cleaner if the vfork code used 
+wait_for_completion_interruptible(). It has to be done carefully though, 
+for two reasons:
+- implementational: use task_lock()/task_unlock() to protect
+  p->vfork_done in mm_release() and in do_fork().
+- semantical: signals to a vfork-ing parent are defined to be delayed
+  to after the child has released the parent/MM.
+the (untested) patch below handles issue #1, but doesnt handle issue #2: 
+this patch opens up a vfork parent to get interrupted early, with any 
+signal.
+a full approach would probably be to set up a restart handler perhaps, 
+and restart the wait later on? This would also require the &vfork 
+completion structure [which is on the kernel stack right now] to be 
+embedded in task_struct, to make sure the parent can wait on the child 
+without extra state. (one more detail is nesting: a signal handler could 
+do another vfork(), which thus needs to initialize the &vfork safely and 
+in a race-free manner.)
+i'm wondering whether signals handled in the parent during a vfork wait 
+would be the correct semantics though. Ulrich?
+	Ingo
+--- linux/kernel/fork.c.orig
++++ linux/kernel/fork.c
+@@ -423,16 +423,24 @@ EXPORT_SYMBOL_GPL(get_task_mm);
+  */
+ void mm_release(struct task_struct *tsk, struct mm_struct *mm)
+ {
+-	struct completion *vfork_done = tsk->vfork_done;
+-
+ 	/* Get rid of any cached register state */
+ 	deactivate_mm(tsk, mm);
+ 
+-	/* notify parent sleeping on vfork() */
+-	if (vfork_done) {
+-		tsk->vfork_done = NULL;
+-		complete(vfork_done);
++	if (unlikely(tsk->vfork_done)) {
++		task_lock(tsk);
++		/*
++		 * notify parent sleeping on vfork().
++		 *
++		 * (re-check vfork_done under the task lock, to make sure
++		 *  we did not race with a signal sent to the parent)
++		 */
++		if (tsk->vfork_done) {
++			complete(tsk->vfork_done);
++			tsk->vfork_done = NULL;
++		}
++		task_unlock(tsk);
+ 	}
++
+ 	if (tsk->clear_child_tid && atomic_read(&mm->mm_users) > 1) {
+ 		u32 __user * tidptr = tsk->clear_child_tid;
+ 		tsk->clear_child_tid = NULL;
+@@ -1287,7 +1295,21 @@ long do_fork(unsigned long clone_flags,
+ 		}
+ 
+ 		if (clone_flags & CLONE_VFORK) {
+-			wait_for_completion(&vfork);
++			int ret = wait_for_completion_interruptible(&vfork);
++			if (unlikely(ret)) {
++				/*
++				 * make sure we did not race with
++				 * mm_release():
++				 */
++				task_lock(p);
++				if (p->vfork_done)
++					p->vfork_done = NULL;
++				else
++					ret = 0;
++				task_unlock(p);
++				if (ret)
++					return -EINTR;
++			}
+ 			if (unlikely (current->ptrace & PT_TRACE_VFORK_DONE))
+ 				ptrace_notify ((PTRACE_EVENT_VFORK_DONE << 8) | SIGTRAP);
+ 		}
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+More majordomo info at  
+http://vger.kernel.org/majordomo-info.html
+Please read the FAQ at  
+http://www.tux.org/lkml/

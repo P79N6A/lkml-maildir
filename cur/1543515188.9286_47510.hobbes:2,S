@@ -1,0 +1,231 @@
+Date: Sat, 6 Nov 1999 16:45:31 +0200 (EET)
+From: Julian Anastasov <>
+Subject: [PATCH] 2.2.13* ARP patch - LVS related
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/11/6/26
+
+	Hi,
+	This patch is related to the Linux Virtual Server (LVS)
+problems in Direct-Route mode.
+	It seems that other arp patches that rely on IFF_NOARP are
+incorrect. But it is required that the arp code must be more
+friendly to the Direct-Route mode of the LVS - if configured
+properly.
+	This patch uses the concept of the "hidden" interface. You
+can feed it with packets but don't expect the host to send ARP
+replies for it even through other interfaces.
+The good:
+- We allow remote host to configure and to use interface with the same
+IP as our "hidden" interface, in our case the LVS box.
+- We don't check IFF_NOARP, i.e. proxy_arp can work. Instead, we
+use new interface flag: /proc/sys/net/ipv4/conf/*/arp_invisible
+The bad:
+- There is no ioctl handling yet. In fact, may be it is not needed.
+May be IFF_ARP_INVISIBLE can be used but not in 2.2.x ?
+- May be we broke something in the kernel? It requires some
+testing, of course.
+Side effects:
+- We change system structure: ipv4_devconf. Is this fatal for 2.2.x?
+May be it is not exported?
+- for the user: don't try to ping this interface from other hosts.
+It can receive packets from hosts that know it is here - the LVS box.
+You can always add permanent ARP entry in the remote host.
+	To all net folks, I want to ask some questions about the
+ioctl handling.
+	What means this check for ATF_DONTPUB in arp_ioctl():
+	if (!(r.arp_flags & ATF_PUBL) &&
+	    (r.arp_flags & (ATF_NETMASK|ATF_DONTPUB)))
+		return -EINVAL;
+	Why !ATF_PUBL && ATF_DONTPUB is not allowed ?
+	Is it possible ATF_DONTPUB to be used as flag aka
+/proc/sys/net/ipv4/conf/*/arp_invisible ? Or we can use another
+flag name ? In 2.2.x or 2.3.x ?
+	For the configuration.
+	arp_invisible=0 must be default for normal interfaces but
+if the value is 1 we must skip the arp_send in arp_rcv(). Note that
+/proc/sys/net/ipv4/conf/all/arp_invisible is "global enable", i.e.
+it must be 1 to allow any interface to be marked as "hidden" using
+echo 1 > /proc/sys/net/ipv4/conf/<interface_name>/arp_invisible.
+And don't touch /proc/sys/net/ipv4/conf/default/arp_invisible. It
+must be 0 or you host will be entirely invisible to the world.
+	We change the src ip in the ARP request if it is
+caused by outgoing packet originated from the "hidden" interface.
+We don't want to trigger remote ARP requests if we can't reply to
+them. Let the LVS box reply to them.
+	Note that we still can use arp_send() to send requests with
+sip == "hidden" IP, i.e. when IN_DEV_ARP_INVISIBLE is not checked.
+	In attached patch I use the name "arp_invisible". It can
+be changed to arp_hidden, etc. All printk can be removed or
+net_ratelimit()-ed. The patch is against 2.2.13ac2 but can be
+safely used with 2.2.13. It is not required for the LVS box except
+when this box can be used as "Real Server" (internal server, from the
+LVS terms) from another host that can be LVS box too!
+Configuration example:
+# Global enable, you can use it only once
+echo 1 > /proc/sys/net/ipv4/conf/all/arp_invisible
+# Hide this interface and don't reply for it
+echo 1 > /proc/sys/net/ipv4/conf/<the_bad_guy>/arp_invisible
+OK, I expect Your comments and suggestions. May be something is
+broken in the kernel from this patch. Feel free to fix it :)
+Regards,
+Julian Anastasov
+--- linux/include/linux/inetdevice.h.orig	Mon Jan  4 14:31:35 1999
++++ linux/include/linux/inetdevice.h	Sat Nov  6 12:39:39 1999
+@@ -16,6 +16,7 @@
+ 	int	log_martians;
+ 	int	forwarding;
+ 	int	mc_forwarding;
++	int	arp_invisible;
+ 	void	*sysctl;
+ };
+ 
+@@ -40,6 +41,7 @@
+ 
+ #define IN_DEV_LOG_MARTIANS(in_dev)	(ipv4_devconf.log_martians || (in_dev)->cnf.log_martians)
+ #define IN_DEV_PROXY_ARP(in_dev)	(ipv4_devconf.proxy_arp || (in_dev)->cnf.proxy_arp)
++#define IN_DEV_ARP_INVISIBLE(in_dev)	(ipv4_devconf.arp_invisible && (in_dev)->cnf.arp_invisible)
+ #define IN_DEV_SHARED_MEDIA(in_dev)	(ipv4_devconf.shared_media || (in_dev)->cnf.shared_media)
+ #define IN_DEV_TX_REDIRECTS(in_dev)	(ipv4_devconf.send_redirects || (in_dev)->cnf.send_redirects)
+ #define IN_DEV_SEC_REDIRECTS(in_dev)	(ipv4_devconf.secure_redirects || (in_dev)->cnf.secure_redirects)
+--- linux/include/linux/sysctl.h.orig	Fri Oct 29 14:36:12 1999
++++ linux/include/linux/sysctl.h	Fri Nov  5 17:50:49 1999
+@@ -267,7 +267,8 @@
+ 	NET_IPV4_CONF_RP_FILTER=8,
+ 	NET_IPV4_CONF_ACCEPT_SOURCE_ROUTE=9,
+ 	NET_IPV4_CONF_BOOTP_RELAY=10,
+-	NET_IPV4_CONF_LOG_MARTIANS=11
++	NET_IPV4_CONF_LOG_MARTIANS=11,
++	NET_IPV4_CONF_ARP_INVISIBLE=12
+ };
+ 
+ /* /proc/sys/net/ipv6 */
+--- linux/net/ipv4/arp.c.orig	Fri Oct 29 14:33:46 1999
++++ linux/net/ipv4/arp.c	Sat Nov  6 16:50:30 1999
+@@ -65,6 +65,8 @@
+  *					clean up the APFDDI & gen. FDDI bits.
+  *		Alexey Kuznetsov:	new arp state machine;
+  *					now it is in net/core/neighbour.c.
++ *		Julian Anastasov:	arp_invisible flag: hide the
++ *					interface and don't reply for it
+  */
+ 
+ /* RFC1122 Status:
+@@ -308,13 +310,23 @@
+ 	u32 saddr;
+ 	u8  *dst_ha = NULL;
+ 	struct device *dev = neigh->dev;
++	struct device *dev2;
++	struct in_device *in_dev = NULL;
+ 	u32 target = *(u32*)neigh->primary_key;
+ 	int probes = neigh->probes;
+ 
+-	if (skb && inet_addr_type(skb->nh.iph->saddr) == RTN_LOCAL)
++	if (skb && inet_addr_type(skb->nh.iph->saddr) == RTN_LOCAL) {
+ 		saddr = skb->nh.iph->saddr;
+-	else
++		dev2 = ip_dev_find(saddr);
++		if (dev2) in_dev = (struct in_device *) dev2->ip_ptr;
++		if (in_dev && IN_DEV_ARP_INVISIBLE(in_dev)) {
++			printk(KERN_INFO "%s: src ip=%d.%d.%d.%d is hidden, will select another src ip\n", __FUNCTION__, NIPQUAD(saddr));
++			in_dev = NULL;
++		}
++	} 
++	if (!in_dev) {
+ 		saddr = inet_select_addr(dev, target, RT_SCOPE_LINK);
++	}
+ 
+ 	if ((probes -= neigh->parms->ucast_probes) < 0) {
+ 		if (!(neigh->nud_state&NUD_VALID))
+@@ -542,6 +554,8 @@
+ 	u16 dev_type = dev->type;
+ 	int addr_type;
+ 	struct in_device *in_dev = dev->ip_ptr;
++	struct in_device *in_dev2;
++	struct device *tdev;
+ 	struct neighbour *n;
+ 
+ /*
+@@ -654,8 +668,17 @@
+ 	/* Special case: IPv4 duplicate address detection packet (RFC2131) */
+ 	if (sip == 0) {
+ 		if (arp->ar_op == __constant_htons(ARPOP_REQUEST) &&
+-		    inet_addr_type(tip) == RTN_LOCAL)
+-			arp_send(ARPOP_REPLY,ETH_P_ARP,tip,dev,tip,sha,dev->dev_addr,dev->dev_addr);
++		    inet_addr_type(tip) == RTN_LOCAL) {
++			in_dev2 = NULL;
++			tdev = ip_dev_find(tip);
++			if (tdev) in_dev2 = (struct in_device *) tdev->ip_ptr;
++			/*
++			 * In fact, we allow remote host to use this IP
++			 * if our interface is "hidden"
++			 */
++			if (in_dev2 && !IN_DEV_ARP_INVISIBLE(in_dev2))
++				arp_send(ARPOP_REPLY,ETH_P_ARP,tip,dev,tip,sha,dev->dev_addr,dev->dev_addr);
++		}
+ 		goto out;
+ 	}
+ 
+@@ -668,7 +691,14 @@
+ 		if (addr_type == RTN_LOCAL) {
+ 			n = neigh_event_ns(&arp_tbl, sha, &sip, dev);
+ 			if (n) {
+-				arp_send(ARPOP_REPLY,ETH_P_ARP,sip,dev,tip,sha,dev->dev_addr,sha);
++				in_dev2 = NULL;
++				tdev = ip_dev_find(tip);
++				if (tdev) in_dev2 = (struct in_device *) tdev->ip_ptr;
++				if (in_dev2 && IN_DEV_ARP_INVISIBLE(in_dev2)) {
++					printk(KERN_INFO "%s: Skipping answer for hidden IP %d.%d.%d.%d\n", __FUNCTION__, NIPQUAD(tip));
++				}
++				if (in_dev2 && !IN_DEV_ARP_INVISIBLE(in_dev2))
++					arp_send(ARPOP_REPLY,ETH_P_ARP,sip,dev,tip,sha,dev->dev_addr,sha);
+ 				neigh_release(n);
+ 			}
+ 			goto out;
+--- linux/net/ipv4/devinet.c.orig	Fri Oct 29 14:33:03 1999
++++ linux/net/ipv4/devinet.c	Fri Nov  5 17:53:42 1999
+@@ -923,7 +923,7 @@
+ static struct devinet_sysctl_table
+ {
+ 	struct ctl_table_header *sysctl_header;
+-	ctl_table devinet_vars[12];
++	ctl_table devinet_vars[13];
+ 	ctl_table devinet_dev[2];
+ 	ctl_table devinet_conf_dir[2];
+ 	ctl_table devinet_proto_dir[2];
+@@ -956,6 +956,9 @@
+          &proc_dointvec},
+ 	{NET_IPV4_CONF_PROXY_ARP, "proxy_arp",
+          &ipv4_devconf.proxy_arp, sizeof(int), 0644, NULL,
++         &proc_dointvec},
++	{NET_IPV4_CONF_ARP_INVISIBLE, "arp_invisible",
++         &ipv4_devconf.arp_invisible, sizeof(int), 0644, NULL,
+          &proc_dointvec},
+ 	{NET_IPV4_CONF_BOOTP_RELAY, "bootp_relay",
+          &ipv4_devconf.bootp_relay, sizeof(int), 0644, NULL,
+--- linux/Documentation/networking/ip-sysctl.txt.orig	Fri Oct 29 14:31:39 1999
++++ linux/Documentation/networking/ip-sysctl.txt	Sat Nov  6 16:57:27 1999
+@@ -156,6 +156,9 @@
+ proxy_arp - BOOLEAN
+ 	Do proxy arp.
+ 
++arp_invisible - BOOLEAN
++	Hide this interface and don't send ARP replies for it.
++
+ shared_media - BOOLEAN
+ 	undocumented.
+ 
+--- linux/Documentation/proc.txt.orig	Fri Oct 29 14:30:10 1999
++++ linux/Documentation/proc.txt	Sat Nov  6 12:36:23 1999
+@@ -1163,6 +1163,9 @@
+ proxy_arp
+    Do (1) or don't (0) do proxy ARP.
+ 
++arp_invisible
++   Hide this interface and don't send ARP replies for it.
++
+ rp_filter
+    Integer value deciding if source validation should be made. 
+    1 means yes, 0 means no. Disabled by default, but 

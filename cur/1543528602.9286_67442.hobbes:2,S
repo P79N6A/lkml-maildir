@@ -1,0 +1,526 @@
+Date: Sat,  4 Mar 2000 21:59:57 +0300 (MSK)
+From: "Khimenko Victor" <>
+Subject: setproctitle(3) & /proc/*/cmdline
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/3/4/102
+
+Hi, Alexander!
+Looks like you were one who broken setproctitle(3) and so IMO you should be one
+who'll fix it :-) I hope you know what setproctittle(3) is but other readers
+can be not aware so... setproctitle(3) is BSD'ism to change name of process in
+task lisk. Quite a few widely used programs (sendmail, ftpd, inn, etc) depends
+on setproctitle(3). GLibC does not have setproctitle(3) so they used some
+hackish implementation bundled with that programs. Unfortunatelly this
+implementation depended on subtle bug in Linux procfs that was there for ages:
+cmdline will always return FULL first argument of program even if program
+messed with it's arguments and so even this first argument will not fit in
+interval from arg_start to arg_end. IMO we do not need "Windows way" (to put
+bug back just to make programs happy; since expansion of command line was
+done over environment such solutions can not be called even remotely "sane"
+anyway). But we can (and IMNSHO should!) make "proper" implementation of
+setproctitle(3) in glibc instead: too many important programs using it.
+We need some support in kernel though. I cooked up patch (see below). There
+are two new syscalls: setenviron(2) and setarguments(2). One for use in
+setenv(3)/unsetenv(3) and one for setproctitle(3). They should be used this
+way in GLibC :
+int setenv(const char *name, const char *value, int overwrite) {
+        char **envp;
+        ...
+        envp=NULL;
+        setenviron(&envp);
+        if (envp) {
+                evpd=environ;
+                setenviron(&envp);
+        }
+}
+void setproctitle(const char *fmt, ...) {
+        char argc;
+        static char *title;
+        static char **argv;
+        argv=NULL;
+        setarguments(&argc,&argv);
+        if (argv) {
+                argc=1;
+                title=&buffer;
+                argv=&title;
+                setarguments(&argc,&argv);
+        }
+}
+Idea is the same as with signal(2): old value will be returned and if it's
+NULL (=explicit "do not show") then we should not change anything (or perhaps
+we should anyway? No matter: it's userspace policy). If you'll set argv or
+environ to NULL then even after execve(2) arguments will not be shown in
+/proc (and thus in ps, top, etc): it can be usefull sometimes -- for example
+you'll be able to use wget with password-protected sites safely... Comments ?
+P.S. I've done only i386 version. Support for other architectures should be
+trivial though...
+diff -uNr linux/arch/i386/kernel/entry.S linux-2.3.49/arch/i386/kernel/entry.S
+--- linux/arch/i386/kernel/entry.S	Mon Feb 21 21:59:36 2000
++++ linux-2.3.49/arch/i386/kernel/entry.S	Sat Mar  4 19:35:13 2000
+@@ -638,6 +638,8 @@
+ 	.long SYMBOL_NAME(sys_setfsuid)		/* 215 */
+ 	.long SYMBOL_NAME(sys_setfsgid)
+ 	.long SYMBOL_NAME(sys_pivot_root)
++ 	.long SYMBOL_NAME(sys_setenviron)
++ 	.long SYMBOL_NAME(sys_setarguments)
+ 
+ 
+ 	/*
+@@ -646,6 +648,6 @@
+ 	 * entries. Don't panic if you notice that this hasn't
+ 	 * been shrunk every time we add a new system call.
+ 	 */
+-	.rept NR_syscalls-217
++	.rept NR_syscalls-219
+ 		.long SYMBOL_NAME(sys_ni_syscall)
+ 	.endr
+diff -uNr linux/drivers/block/floppy.c linux-2.3.49/drivers/block/floppy.c
+--- linux/drivers/block/floppy.c	Thu Feb 17 02:42:05 2000
++++ linux-2.3.49/drivers/block/floppy.c	Sat Mar  4 19:33:26 2000
+@@ -4375,48 +4375,6 @@
+ 	}
+ }
+ 
+-static void __init mod_setup(char *pattern, int (*setup)(char *))
+-{
+-	unsigned long i;
+-	char c;
+-	int j;
+-	int match;
+-	char buffer[100];
+-	int length = strlen(pattern)+1;
+-
+-	match=0;
+-	j=1;
+-
+-	for (i=current->mm->env_start; i< current->mm->env_end; i ++){
+-		get_user(c, (char *)i);
+-		if (match){
+-			if (j==99)
+-				c='\0';
+-			buffer[j] = c;
+-			if (!c || c == ' ' || c == '\t'){
+-				if (j){
+-					buffer[j] = '\0';
+-					setup(buffer);
+-				}
+-				j=0;
+-			} else
+-				j++;
+-			if (!c)
+-				break;
+-			continue;
+-		}
+-		if ((!j && !c) || (j && c == pattern[j-1]))
+-			j++;
+-		else
+-			j=0;
+-		if (j==length){
+-			match=1;
+-			j=0;
+-		}
+-	}
+-}
+-
+-
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
+@@ -4426,8 +4384,6 @@
+ 		
+ 	if(floppy)
+ 		parse_floppy_cfg_string(floppy);
+-	else
+-		mod_setup("floppy=", floppy_setup);
+ 		
+ 	return floppy_init();
+ }
+diff -uNr linux/fs/binfmt_aout.c linux-2.3.49/fs/binfmt_aout.c
+--- linux/fs/binfmt_aout.c	Tue Nov 23 21:04:00 1999
++++ linux-2.3.49/fs/binfmt_aout.c	Sat Mar  4 19:33:26 2000
+@@ -227,14 +227,19 @@
+ #endif
+ 	sp -= envc+1;
+ 	envp = (char **) sp;
++	if ((current->pid == 1) || current->mm->environ)
++		current->mm->environ = (unsigned long) envp;
+ 	sp -= argc+1;
+ 	argv = (char **) sp;
++	if ((current->pid == 1) || current->mm->argv)
++		current->mm->argv = (unsigned long) argv;
+ #if defined(__i386__) || defined(__mc68000__)
+ 	put_user((unsigned long) envp,--sp);
+ 	put_user((unsigned long) argv,--sp);
+ #endif
++	if ((current->pid == 1) || current->mm->argv)
++		current->mm->argc = argc;
+ 	put_user(argc,--sp);
+-	current->mm->arg_start = (unsigned long) p;
+ 	while (argc-->0) {
+ 		char c;
+ 		put_user(p,argv++);
+@@ -243,7 +248,6 @@
+ 		} while (c);
+ 	}
+ 	put_user(NULL,argv);
+-	current->mm->arg_end = current->mm->env_start = (unsigned long) p;
+ 	while (envc-->0) {
+ 		char c;
+ 		put_user(p,envp++);
+@@ -252,7 +256,6 @@
+ 		} while (c);
+ 	}
+ 	put_user(NULL,envp);
+-	current->mm->env_end = (unsigned long) p;
+ 	return sp;
+ }
+ 
+diff -uNr linux/fs/binfmt_elf.c linux-2.3.49/fs/binfmt_elf.c
+--- linux/fs/binfmt_elf.c	Tue Feb 29 22:13:27 2000
++++ linux-2.3.49/fs/binfmt_elf.c	Sat Mar  4 19:33:26 2000
+@@ -9,6 +9,13 @@
+  * Copyright 1993, 1994: Eric Youngdale (ericy@cais.com).
+  */
+ 
++/*
++ * We need to allocate array with pointers to arguments on stack.
++ * If there are more then NARGS_PASS arguments few passes will be used.
++ */
++
++#define NARGS_PASS 32
++
+ #include <linux/module.h>
+ 
+ #include <linux/fs.h>
+@@ -176,27 +183,29 @@
+ 
+ 	sp -= envc+1;
+ 	envp = (elf_caddr_t *) sp;
++	if ((current->pid == 1) || current->mm->environ)
++		current->mm->environ = (unsigned long) envp;
+ 	sp -= argc+1;
+ 	argv = (elf_caddr_t *) sp;
++	if ((current->pid == 1) || current->mm->argv)
++		current->mm->argv = (unsigned long) argv;
+ 	if (!ibcs) {
+ 		__put_user((elf_addr_t)(unsigned long) envp,--sp);
+ 		__put_user((elf_addr_t)(unsigned long) argv,--sp);
+ 	}
+-
+ 	__put_user((elf_addr_t)argc,--sp);
+-	current->mm->arg_start = (unsigned long) p;
++	if ((current->pid == 1) || current->mm->argv)
++		current->mm->argc = argc;
+ 	while (argc-->0) {
+ 		__put_user((elf_caddr_t)(unsigned long)p,argv++);
+ 		p += strlen_user(p);
+ 	}
+ 	__put_user(NULL, argv);
+-	current->mm->arg_end = current->mm->env_start = (unsigned long) p;
+ 	while (envc-->0) {
+ 		__put_user((elf_caddr_t)(unsigned long)p,envp++);
+ 		p += strlen_user(p);
+ 	}
+ 	__put_user(NULL, envp);
+-	current->mm->env_end = (unsigned long) p;
+ 	return sp;
+ }
+ 
+@@ -721,7 +730,7 @@
+ 			(interpreter_type == INTERPRETER_AOUT ? 0 : 1));
+ 	/* N.B. passed_fileno might not be initialized? */
+ 	if (interpreter_type == INTERPRETER_AOUT)
+-		current->mm->arg_start += strlen(passed_fileno) + 1;
++		current->mm->argv++;
+ 	current->mm->start_brk = current->mm->brk = elf_brk;
+ 	current->mm->end_code = end_code;
+ 	current->mm->start_code = start_code;
+@@ -1175,19 +1184,60 @@
+ 	psinfo.pr_uid = NEW_TO_OLD_UID(current->uid);
+ 	psinfo.pr_gid = NEW_TO_OLD_GID(current->gid);
+ 	{
+-		int i, len;
++		int i, res = 0;
++		unsigned long args[NARGS_PASS];
++		int arg, argc, bufsize = ELF_PRARGSZ, readnum = 0;
++		unsigned long argv = current->mm->argv, nextp;
+ 
+ 		set_fs(fs);
++		
++		for (arg = NARGS_PASS, argc = current->mm->argc ; argc && bufsize; arg++,argc--) {
++			int len;
++
++			if (arg == NARGS_PASS) {
++				int narg = argc>NARGS_PASS?NARGS_PASS:argc;
++				int len = narg*sizeof(unsigned long);
++				int rlen = copy_from_user(args, (const char *)argv, len);
++				
++				if (rlen != len) {
++					/*
++					 * Premature end of arguments list
++					 */
++					argc = rlen/sizeof(unsigned long);
++					if (!argc) break;
++				} else
++					argv+=NARGS_PASS;
++				arg = 0;
++			}
++			if (!readnum || nextp != args[arg]) {
++				/*
++			         * Data is not already read to buffer in right
++				 * place. Read it. Looks like it's not typical
++				 * to have data already read but due to Linux's
++				 * fs/exec.c it's most common case.
++			         */
++				copy_from_user(psinfo.pr_psargs+res,
++					(const char *)args[arg], bufsize);
++				if (!readnum) {
++					nextp = 0;
++					*(psinfo.pr_psargs+res++)='\0';
++					continue;
++				}
++				nextp = args[arg];
++			}
++			len = strnlen(psinfo.pr_psargs+res, readnum);
++
++			if (len < readnum) len++;
++			res += len;
++			nextp += len;
++			readnum -= len;
++			bufsize -= len;
++		}
+ 
+-		len = current->mm->arg_end - current->mm->arg_start;
+-		if (len >= ELF_PRARGSZ)
+-			len = ELF_PRARGSZ-1;
+-		copy_from_user(&psinfo.pr_psargs,
+-			      (const char *)current->mm->arg_start, len);
+-		for(i = 0; i < len; i++)
++		for(i = 0; i < res; i++)
+ 			if (psinfo.pr_psargs[i] == 0)
+ 				psinfo.pr_psargs[i] = ' ';
+-		psinfo.pr_psargs[len] = 0;
++		psinfo.pr_psargs[res] = 0;
+ 
+ 		set_fs(KERNEL_DS);
+ 	}
+diff -uNr linux/fs/proc/base.c linux-2.3.49/fs/proc/base.c
+--- linux/fs/proc/base.c	Sun Feb 27 07:33:07 2000
++++ linux-2.3.49/fs/proc/base.c	Sat Mar  4 19:49:08 2000
+@@ -32,6 +32,13 @@
+ 
+ #define fake_ino(pid,ino) (((pid)<<16)|(ino))
+ 
++/*
++ * We need to allocate array with pointers to arguments on stack.
++ * If there are more then NARGS_PASS arguments few passes will be used.
++ */
++
++#define NARGS_PASS 32
++
+ ssize_t proc_pid_read_maps(struct task_struct*,struct file*,char*,size_t,loff_t*);
+ int proc_pid_stat(struct task_struct*,char*);
+ int proc_pid_status(struct task_struct*,char*);
+@@ -102,12 +109,52 @@
+ static int proc_pid_environ(struct task_struct *task, char * buffer)
+ {
+ 	struct mm_struct *mm = task->mm;
++	unsigned long args[NARGS_PASS];
++	int arg, argc, bufsize = PAGE_SIZE, readnum = 0;
++	unsigned long argv, nextp;
+ 	int res = 0;
+-	if (mm) {
+-		int len = mm->env_end - mm->env_start;
+-		if (len > PAGE_SIZE)
+-			len = PAGE_SIZE;
+-		res = access_process_vm(task, mm->env_start, buffer, len, 0);
++	if (mm && (argv = mm->environ)) {
++		/*
++		 * argc = PAGE_SIZE/2 since each string should be at least
++		 * two characters long !
++		 */
++		for (arg = NARGS_PASS, argc = PAGE_SIZE/2 ; argc && bufsize; arg++,argc--) {
++			int len;
++
++			if (arg == NARGS_PASS) {
++				int narg = argc>NARGS_PASS?NARGS_PASS:argc;
++				int len = narg*sizeof(unsigned long);
++				int rlen = access_process_vm(task, argv, args, len, 0);
++				
++				if (rlen != len) {
++					argc = rlen/sizeof(unsigned long);
++					if (!argc) break;
++				}
++				else
++					argv+=NARGS_PASS;
++				arg = 0;
++			}
++			if (!readnum || nextp != args[arg]) {
++				/*
++			         * Data is not already read to buffer in right
++				 * place. Read it. Looks like it's not typical
++				 * to have data already read but due to Linux's
++				 * fs/exec.c it's most common case.
++			         */
++				readnum = access_process_vm(task, args[arg], buffer+res, bufsize, 0);
++				if (!readnum)
++					break;
++				nextp = args[arg];
++			}
++			len = strnlen(buffer+res, readnum);
++
++			if (len < readnum) len++;
++			res += len;
++			if (len <= 1) break;
++			nextp += len;
++			readnum -= len;
++			bufsize -= len;
++		}
+ 	}
+ 	return res;
+ }
+@@ -117,12 +164,53 @@
+ static int proc_pid_cmdline(struct task_struct *task, char * buffer)
+ {
+ 	struct mm_struct *mm = task->mm;
++	unsigned long args[NARGS_PASS];
++	int arg, argc, bufsize = PAGE_SIZE, readnum = 0;
++	unsigned long argv, nextp;
+ 	int res = 0;
+-	if (mm) {
+-		int len = mm->arg_end - mm->arg_start;
+-		if (len > PAGE_SIZE)
+-			len = PAGE_SIZE;
+-		res = access_process_vm(task, mm->arg_start, buffer, len, 0);
++	if (mm && (argv = mm->argv)) {
++		for (arg = NARGS_PASS, argc = mm->argc ; argc && bufsize; arg++,argc--) {
++			int len;
++
++			if (arg == NARGS_PASS) {
++				int narg = argc>NARGS_PASS?NARGS_PASS:argc;
++				int len = narg*sizeof(unsigned long);
++				int rlen = access_process_vm(task, argv, args, len, 0);
++				
++				if (rlen != len) {
++					/*
++					 * Premature end of arguments list
++					 */
++					argc = rlen/sizeof(unsigned long);
++					if (!argc) break;
++				}
++				else
++					argv+=NARGS_PASS;
++				arg = 0;
++			}
++			if (!readnum || nextp != args[arg]) {
++				/*
++			         * Data is not already read to buffer in right
++				 * place. Read it. Looks like it's not typical
++				 * to have data already read but due to Linux's
++				 * fs/exec.c it's most common case.
++			         */
++				readnum = access_process_vm(task, args[arg], buffer+res, bufsize, 0);
++				if (!readnum) {
++					nextp = 0;
++					*(buffer+res++)='\0';
++					continue;
++				}
++				nextp = args[arg];
++			}
++			len = strnlen(buffer+res, readnum);
++
++			if (len < readnum) len++;
++			res += len;
++			nextp += len;
++			readnum -= len;
++			bufsize -= len;
++		}
+ 	}
+ 	return res;
+ }
+diff -uNr linux/include/asm-i386/unistd.h linux-2.3.49/include/asm-i386/unistd.h
+--- linux/include/asm-i386/unistd.h	Wed Jan 26 23:32:02 2000
++++ linux-2.3.49/include/asm-i386/unistd.h	Sat Mar  4 19:34:39 2000
+@@ -222,6 +222,8 @@
+ #define __NR_setfsuid32		215
+ #define __NR_setfsgid32		216
+ #define __NR_pivot_root		217
++#define __NR_setenviron		218
++#define __NR_setarguments	219
+ 
+ /* user-visible error numbers are in the range -1 - -124: see <asm-i386/errno.h> */
+ 
+diff -uNr linux/include/linux/sched.h linux-2.3.49/include/linux/sched.h
+--- linux/include/linux/sched.h	Fri Mar  3 01:01:33 2000
++++ linux-2.3.49/include/linux/sched.h	Sat Mar  4 19:33:49 2000
+@@ -212,7 +212,9 @@
+ 	unsigned long context;
+ 	unsigned long start_code, end_code, start_data, end_data;
+ 	unsigned long start_brk, brk, start_stack;
+-	unsigned long arg_start, arg_end, env_start, env_end;
++	int argc;
++	unsigned long argv;
++	unsigned long environ;
+ 	unsigned long rss, total_vm, locked_vm;
+ 	unsigned long def_flags;
+ 	unsigned long cpu_vm_mask;
+diff -uNr linux/kernel/fork.c linux-2.3.49/kernel/fork.c
+--- linux/kernel/fork.c	Mon Feb 14 05:20:21 2000
++++ linux-2.3.49/kernel/fork.c	Sat Mar  4 19:33:49 2000
+@@ -234,7 +234,7 @@
+ 	int retval;
+ 
+ 	/* Kill me slowly. UGLY! FIXME! */
+-	memcpy(&mm->start_code, &current->mm->start_code, 15*sizeof(unsigned long));
++	memcpy(&mm->start_code, &current->mm->start_code, 14*sizeof(unsigned long));
+ 
+ 	flush_cache_mm(current->mm);
+ 	pprev = &mm->mmap;
+diff -uNr linux/kernel/sys.c linux-2.3.49/kernel/sys.c
+--- linux/kernel/sys.c	Thu Feb 24 21:14:29 2000
++++ linux-2.3.49/kernel/sys.c	Sat Mar  4 19:33:49 2000
+@@ -1064,3 +1064,36 @@
+ 	return error;
+ }
+ 
++asmlinkage long sys_setenviron(char ***environp)
++{
++	unsigned long environ;
++	
++	if (get_user((char **)environ, environp))
++		return -EFAULT;
++
++	environ = xchg(&current->mm->environ, environ);
++
++	return put_user(environ, environp);
++}
++
++asmlinkage long sys_setarguments(int *argcp, char ***argvp)
++{
++	int argc;
++	int retval;
++	unsigned long argv;
++	
++	if (get_user(argc, argcp))
++		return -EFAULT;
++	if (get_user((char **)argv, argvp))
++		return -EFAULT;
++		
++	write_lock_irq(&tasklist_lock);
++	argc =  xchg(&current->mm->argc, argc);
++	argv =  xchg(&current->mm->argv, argv);
++	write_unlock_irq(&tasklist_lock);
++	
++	if (!(retval = put_user(argc, argcp)))
++		retval = put_user(argv, argvp);
++
++	return retval;
++}
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

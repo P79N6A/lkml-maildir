@@ -1,0 +1,172 @@
+Date: Wed, 17 Oct 2001 11:21:03 -0700 (PDT)
+From: Linus Torvalds <>
+Subject: Re: Making diff(1) of linux kernels faster
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2001/10/17/67
+
+On Wed, 17 Oct 2001, Marcelo Tosatti wrote:
+> >
+> > And I've for a long time thought about adding a "readahead()" system call.
+> > There are just too many uses for it, it has come up in many different
+> > areas..
+>
+> There is a paper on USENIX 2001 which does implement directory readahead
+> and it shows huge improvements for some workload.
+Hmm.. The implementation is trivial, it's really just a simple 3-line
+while-loop, with the rest of the code just doing argument checking etc.
+Attached is the kernel diff ("ra-diff") along with a stupid program
+("preread.c"), cribbed mostly from Pauls first patch to use it to pre-read
+a while tree.
+It took much longer to compile the kernel and reboot, and write the
+test-program than it did to write the patch itself ;)
+It walks the whole kernel tree in 0.2 seconds of CPU-time on my machine
+(of course, if it actually needs to start IO, the 0.2 seconds becomes 0.3
+seconds of CPU time and almost a minute and a half of wall-clock.
+Anyway, it clearly isn't a CPU-hog like doing a real "read" would have
+been).
+And unlike the read, it doesn't have any impact on the active queue.
+		Linus
+diff -u --recursive --new-file pre3/linux/arch/i386/kernel/entry.S linux/arch/i386/kernel/entry.S
+--- pre3/linux/arch/i386/kernel/entry.S	Mon Oct  8 10:39:58 2001
++++ linux/arch/i386/kernel/entry.S	Wed Oct 17 10:02:39 2001
+@@ -621,6 +621,7 @@
+ 	.long SYMBOL_NAME(sys_ni_syscall)	/* reserved for TUX */
+ 	.long SYMBOL_NAME(sys_ni_syscall)	/* Reserved for Security */
+ 	.long SYMBOL_NAME(sys_gettid)
++	.long SYMBOL_NAME(sys_readahead)	/* 225 */
+ 
+ 	.rept NR_syscalls-(.-sys_call_table)/4
+ 		.long SYMBOL_NAME(sys_ni_syscall)
+diff -u --recursive --new-file pre3/linux/include/asm-i386/unistd.h linux/include/asm-i386/unistd.h
+--- pre3/linux/include/asm-i386/unistd.h	Mon Oct  8 10:40:16 2001
++++ linux/include/asm-i386/unistd.h	Wed Oct 17 10:03:03 2001
+@@ -229,6 +229,7 @@
+ #define __NR_fcntl64		221
+ #define __NR_security		223	/* syscall for security modules */
+ #define __NR_gettid		224
++#define __NR_readahead		225
+ 
+ /* user-visible error numbers are in the range -1 - -124: see <asm-i386/errno.h> */
+ 
+diff -u --recursive --new-file pre3/linux/mm/filemap.c linux/mm/filemap.c
+--- pre3/linux/mm/filemap.c	Mon Oct 15 16:17:40 2001
++++ linux/mm/filemap.c	Wed Oct 17 10:21:37 2001
+@@ -1520,6 +1520,53 @@
+ 	return retval;
+ }
+ 
++static ssize_t do_readahead(struct file *file, unsigned long index, unsigned long nr)
++{
++	struct address_space *mapping = file->f_dentry->d_inode->i_mapping;
++	unsigned long max;
++
++	if (!mapping || !mapping->a_ops || !mapping->a_ops->readpage)
++		return -EINVAL;
++
++	/* Limit it to the size of the file.. */
++	max = (mapping->host->i_size + ~PAGE_CACHE_MASK) >> PAGE_CACHE_SHIFT;
++	if (index > max)
++		return 0;
++	max -= index;
++	if (nr > max)
++		nr = max;
++
++	/* And limit it to a sane percentage of the inactive list.. */
++	max = nr_inactive_pages / 2;
++	if (nr > max)
++		nr = max;
++
++	while (nr) {
++		page_cache_read(file, index);
++		index++;
++		nr--;
++	}
++	return 0;
++}
++
++asmlinkage ssize_t sys_readahead(int fd, loff_t offset, size_t count)
++{
++	ssize_t ret;
++	struct file *file;
++
++	ret = -EBADF;
++	file = fget(fd);
++	if (file) {
++		if (file->f_mode & FMODE_READ) {
++			unsigned long start = offset >> PAGE_CACHE_SHIFT;
++			unsigned long len = (count + ((long)offset & ~PAGE_CACHE_MASK)) >> PAGE_CACHE_SHIFT;
++			ret = do_readahead(file, start, len);
++		}
++		fput(file);
++	}
++	return ret;
++}
++
+ /*
+  * Read-ahead and flush behind for MADV_SEQUENTIAL areas.  Since we are
+  * sure this is sequential access, we don't need a flexible read-ahead#include <sys/types.h>
+#include <sys/stat.h>
+#include <dirent.h>
+#include <stdlib.h>
+#include <sys/fcntl.h>
+/* Preload the OS's cache with all files of one branch for recursive diffs */
+#define __NR_readahead 225
+asm(
+"__readahead:\n\t"
+        "pushl %ebx\n\t"
+        "pushl %esi\n\t"
+	"movl 12(%esp),%ebx\n\t"
+	"movl 16(%esp),%ecx\n\t"
+	"movl 20(%esp),%edx\n\t"
+	"movl 24(%esp),%esi\n\t"
+	"movl $225,%eax\n\t"
+	"int $0x80\n\t"
+	"popl %esi\n\t"
+	"popl %ebx\n\t"
+	"ret"
+);
+extern ssize_t __readahead(int fd, loff_t offset, size_t size);
+void
+preread (dir)
+	const char *dir;
+{
+  DIR *d;
+  struct dirent *dent;
+  d = opendir(dir);
+  if (d == NULL) return;
+  while ((dent = readdir(d)) != NULL)
+    {
+      int fd;
+      struct stat st;
+      char *name, *path;
+      name = dent->d_name;
+      if (name[0] == '.' && (name[1] == 0 || (name[1] == '.' && name[2] == 0)))
+            continue;
+      path = malloc(strlen(dir)+strlen(name)+2);
+      strcpy(path, dir);
+      strcat(path, "/");
+      strcat(path, name);
+      fd = open(path, O_RDONLY);
+      if (fd >= 0) {
+      	if (fstat(fd, &st) == 0) {
+	      if (S_ISDIR(st.st_mode))
+	           preread(path);
+	      else if (S_ISREG(st.st_mode))
+	        {
+          	__readahead(fd, 0, ~0UL);
+	        }
+	}
+	close(fd);
+      }
+      free(path);
+  }
+  closedir(d);
+}
+int main(int argc, char **argv)
+{
+	preread(argv[1]);
+	return 0;
+}

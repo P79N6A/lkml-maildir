@@ -1,0 +1,393 @@
+Date: Wed, 30 Jun 1999 14:57:47 +0200 (CEST)
+From: Andrea Arcangeli <>
+Subject: fs corruption with pre-2.3.9-5 + this little patch
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/6/30/75
+
+I think I finally spotted the problem in my tree that was causing fs
+corruption.
+With only this little patch applyed to pre-2.3.9-5 I corrupted completly
+my test-machine only by running a memory hog + bonnie at the same time.
+(now I am reinstalling linux on such machine...).
+The other nice thing is that without this little patch the page-LRU code
+never failed in 20/30 minutes (and I also just prepared a patch with only
+the LRU code for pre-2.3.9-5 :).
+Well I attach here the alone patch that triggers fs corruption running
+bonnie and a memory hog at the same time on pre-2.3.9-5.
+patch against pre-2.3.9-5, NOTE: the interesting part is only buffer.c,
+review the other part as well of course, but the genhd is only to avoid
+lilo to oops in ll_rw_block (no Alloced block), and the ll_rw_block part
+is there _only_ if you use more than one blockdevice in write mode (I
+could as well ignore it here).
+Index: linux//drivers/block/genhd.c
+===================================================================
+RCS file: /var/cvs/linux/drivers/block/genhd.c,v
+retrieving revision 1.1.1.11
+diff -u -r1.1.1.11 genhd.c
+--- linux//drivers/block/genhd.c	1999/06/14 17:12:06	1.1.1.11
++++ linux//drivers/block/genhd.c	1999/06/30 02:00:36
+@@ -225,7 +225,7 @@
+ 	   * This block is from a device that we're about to stomp on.
+ 	   * So make sure nobody thinks this block is usable.
+ 	   */
+-		bh->b_state = 0;
++		mark_buffer_uptodate(bh, 0);
+ 
+ 		if ((*(unsigned short *) (bh->b_data+510)) != cpu_to_le16(MSDOS_LABEL_MAGIC))
+ 			goto done;
+@@ -386,7 +386,7 @@
+ 
+ 	if (!(bh = bread(dev,0,get_ptable_blocksize(dev))))
+ 		return;
+-	bh->b_state = 0;
++	mark_buffer_uptodate(bh, 0);
+ 	l = (struct bsd_disklabel *) (bh->b_data+512);
+ 	if (l->d_magic != BSD_DISKMAGIC) {
+ 		brelse(bh);
+@@ -421,7 +421,7 @@
+ 
+ 	if (!(bh = bread(dev, 14, get_ptable_blocksize(dev))))
+ 		return;
+-	bh->b_state = 0;
++	mark_buffer_uptodate(bh, 0);
+ 	l = (struct unixware_disklabel *) (bh->b_data+512);
+ 	if (le32_to_cpu(l->d_magic) != UNIXWARE_DISKMAGIC ||
+ 	    le32_to_cpu(l->vtoc.v_magic) != UNIXWARE_DISKMAGIC2) {
+@@ -472,7 +472,7 @@
+ 	/* In some cases we modify the geometry    */
+ 	/*  of the drive (below), so ensure that   */
+ 	/*  nobody else tries to re-use this data. */
+-	bh->b_state = 0;
++	mark_buffer_uptodate(bh, 0);
+ #ifdef CONFIG_BLK_DEV_IDE
+ check_table:
+ #endif
+Index: linux//drivers/block/ll_rw_blk.c
+===================================================================
+RCS file: /var/cvs/linux/drivers/block/ll_rw_blk.c,v
+retrieving revision 1.1.1.12
+diff -u -r1.1.1.12 ll_rw_blk.c
+--- linux//drivers/block/ll_rw_blk.c	1999/06/28 15:04:29	1.1.1.12
++++ linux//drivers/block/ll_rw_blk.c	1999/06/30 01:59:58
+@@ -206,7 +206,7 @@
+ /*
+  * wait until a free request in the first N entries is available.
+  */
+-static struct request * __get_request_wait(int n, kdev_t dev)
++static inline struct request * get_request_wait(int n, kdev_t dev)
+ {
+ 	register struct request *req;
+ 	DECLARE_WAITQUEUE(wait, current);
+@@ -214,33 +214,25 @@
+ 
+ 	add_wait_queue(&wait_for_request, &wait);
+ 	for (;;) {
++		run_task_queue(&tq_disk);
+ 		current->state = TASK_UNINTERRUPTIBLE;
+ 		spin_lock_irqsave(&io_request_lock,flags);
+ 		req = get_request(n, dev);
+ 		spin_unlock_irqrestore(&io_request_lock,flags);
+ 		if (req)
+ 			break;
+-		run_task_queue(&tq_disk);
+ 		schedule();
++		spin_lock_irqsave(&io_request_lock,flags);
++		req = get_request(n, dev);
++		spin_unlock_irqrestore(&io_request_lock,flags);
++		if (req)
++			break;
+ 	}
+ 	remove_wait_queue(&wait_for_request, &wait);
+ 	current->state = TASK_RUNNING;
+ 	return req;
+ }
+ 
+-static inline struct request * get_request_wait(int n, kdev_t dev)
+-{
+-	register struct request *req;
+-	unsigned long flags;
+-
+-	spin_lock_irqsave(&io_request_lock,flags);
+-	req = get_request(n, dev);
+-	spin_unlock_irqrestore(&io_request_lock,flags);
+-	if (req)
+-		return req;
+-	return __get_request_wait(n, dev);
+-}
+-
+ /* RO fail safe mechanism */
+ 
+ static long ro_bits[MAX_BLKDEV][8];
+@@ -550,8 +542,8 @@
+ /* if no request available: if rw_ahead, forget it; otherwise try again blocking.. */
+ 	if (!req) {
+ 		if (rw_ahead)
+-			goto end_io;
+-		req = __get_request_wait(max_req, bh->b_rdev);
++			goto failed_ahead;
++		req = get_request_wait(max_req, bh->b_rdev);
+ 	}
+ 
+ /* fill up the request-info, and add it to the queue */
+@@ -568,6 +560,16 @@
+ 	add_request(major+blk_dev,req);
+ 	return;
+ 
++failed_ahead:
++	switch (rw)
++	{
++	case READ:
++		kstat.pgpgin--;
++		break;
++	case WRITE:
++		kstat.pgpgout--;
++		break;
++	}
+ end_io:
+ 	bh->b_end_io(bh, test_bit(BH_Uptodate, &bh->b_state));
+ }
+@@ -578,9 +580,6 @@
+ 
+ void ll_rw_block(int rw, int nr, struct buffer_head * bh[])
+ {
+-	unsigned int major;
+-	int correct_size;
+-	struct blk_dev_struct * dev;
+ 	int i;
+ 
+ 	/* Make sure that the first block contains something reasonable */
+@@ -590,30 +589,36 @@
+ 			return;
+ 	}
+ 
+-	dev = NULL;
+-	if ((major = MAJOR(bh[0]->b_dev)) < MAX_BLKDEV)
+-		dev = blk_dev + major;
+-	if (!dev || !dev->request_fn) {
+-		printk(KERN_ERR
+-	"ll_rw_block: Trying to read nonexistent block-device %s (%ld)\n",
+-		kdevname(bh[0]->b_dev), bh[0]->b_blocknr);
+-		goto sorry;
+-	}
+-
+-	/* Determine correct block size for this device.  */
+-	correct_size = BLOCK_SIZE;
+-	if (blksize_size[major]) {
+-		i = blksize_size[major][MINOR(bh[0]->b_dev)];
+-		if (i)
+-			correct_size = i;
+-	}
++	for (i = 0; i < nr; i++)
++	{
++		unsigned int major;
++		int correct_size;
++		struct blk_dev_struct * dev;
++
++		dev = NULL;
++		if ((major = MAJOR(bh[i]->b_dev)) < MAX_BLKDEV)
++			dev = blk_dev + major;
++		if (!dev || !dev->request_fn) {
++			printk(KERN_ERR
++			       "ll_rw_block: Trying to read nonexistent "
++			       "block-device %s (%ld)\n",
++			       kdevname(bh[i]->b_dev), bh[i]->b_blocknr);
++			goto sorry;
++		}
+ 
+-	/* Verify requested block sizes.  */
+-	for (i = 0; i < nr; i++) {
++		/* Determine correct block size for this device.  */
++		correct_size = BLOCK_SIZE;
++		if (blksize_size[major]) {
++			int tmp_size;
++			tmp_size = blksize_size[major][MINOR(bh[i]->b_dev)];
++			if (tmp_size)
++				correct_size = tmp_size;
++		}
++		/* Verify requested block sizes.  */
+ 		if (bh[i]->b_size != correct_size) {
+ 			printk(KERN_NOTICE "ll_rw_block: device %s: "
+ 			       "only %d-char blocks implemented (%lu)\n",
+-			       kdevname(bh[0]->b_dev),
++			       kdevname(bh[i]->b_dev),
+ 			       correct_size, bh[i]->b_size);
+ 			goto sorry;
+ 		}
+@@ -630,35 +635,31 @@
+ 		        goto sorry;
+ 		}
+ #endif
+-	}
+-
+-	if ((rw == WRITE || rw == WRITEA) && is_read_only(bh[0]->b_dev)) {
+-		printk(KERN_NOTICE "Can't write to read-only device %s\n",
+-		       kdevname(bh[0]->b_dev));
+-		goto sorry;
++		if ((rw == WRITE || rw == WRITEA) &&
++		    is_read_only(bh[i]->b_dev)) {
++			printk(KERN_NOTICE
++			       "Can't write to read-only device %s\n",
++			       kdevname(bh[i]->b_dev));
++			goto sorry;
++		}
+ 	}
+ 
+ 	for (i = 0; i < nr; i++) {
+-		if (bh[i]) {
+-			set_bit(BH_Req, &bh[i]->b_state);
++		set_bit(BH_Req, &bh[i]->b_state);
+ #ifdef CONFIG_BLK_DEV_MD
+-			if (MAJOR(bh[i]->b_dev) == MD_MAJOR) {
+-				md_make_request(MINOR (bh[i]->b_dev), rw, bh[i]);
+-				continue;
+-			}
++		if (MAJOR(bh[i]->b_dev) == MD_MAJOR) {
++			md_make_request(MINOR (bh[i]->b_dev), rw, bh[i]);
++		} else
+ #endif
+ 			make_request(MAJOR(bh[i]->b_rdev), rw, bh[i]);
+-		}
+ 	}
+ 	return;
+ 
+       sorry:
+ 	for (i = 0; i < nr; i++) {
+-		if (bh[i]) {
+-			clear_bit(BH_Dirty, &bh[i]->b_state);
+-			clear_bit(BH_Uptodate, &bh[i]->b_state);
+-			bh[i]->b_end_io(bh[i], 0);
+-		}
++		clear_bit(BH_Dirty, &bh[i]->b_state);
++		clear_bit(BH_Uptodate, &bh[i]->b_state);
++		bh[i]->b_end_io(bh[i], 0);
+ 	}
+ 	return;
+ }
+Index: linux//fs/buffer.c
+===================================================================
+RCS file: /var/cvs/linux/fs/buffer.c,v
+retrieving revision 1.1.1.26
+diff -u -r1.1.1.26 buffer.c
+--- linux//fs/buffer.c	1999/06/28 15:07:22	1.1.1.26
++++ linux//fs/buffer.c	1999/06/30 02:07:29
+@@ -1752,17 +1752,28 @@
+ int try_to_free_buffers(struct page * page)
+ {
+ 	struct buffer_head * tmp, * bh = page->buffers;
++	int locked, nr;
++	struct buffer_head * arr[MAX_BUF_PER_PAGE];
+ 
++ unlocked:
++	locked = nr = 0;
+ 	tmp = bh;
+ 	do {
+-		struct buffer_head * p = tmp;
+-
++		if (buffer_busy(tmp))
++		{
++			if (tmp->b_count || buffer_protected(tmp))
++				return 0;
++			if (buffer_dirty(tmp) || buffer_locked(tmp))
++				locked = 1;
++			if (buffer_dirty(tmp) && !buffer_locked(tmp))
++				arr[nr++] = tmp;
++		}
+ 		tmp = tmp->b_this_page;
+-		if (buffer_busy(p))
+-			goto busy_buffer_page;
+ 	} while (tmp != bh);
+ 
+-	tmp = bh;
++	if (locked)
++		goto failed;
++
+ 	do {
+ 		struct buffer_head * p = tmp;
+ 		tmp = tmp->b_this_page;
+@@ -1784,10 +1795,16 @@
+ 	__free_page(page);
+ 	return 1;
+ 
+-busy_buffer_page:
+-	/* Uhhuh, start writeback so that we don't end up with all dirty pages */
+-	too_many_dirty_buffers = 1;
+-	wakeup_bdflush(0);
++ failed:
++	if (nr)
++	{
++		int i;
++		ll_rw_block(WRITEA, nr, arr);
++		for (i = 0; i < nr; i++)
++			if (buffer_dirty(arr[i]) || buffer_locked(arr[i]))
++				return 0;
++		goto unlocked;
++	}
+ 	return 0;
+ }
+ 
+Now I ask you if you see a bug in the above patch. I would be very happy
+if you could find a bug in it. But if you can't see bugs then I think it
+would be better to merge it in the stock tree in order to give light to
+the bug.
+Note: with the patch - since there isn't aging in the buffer cache - in a
+clean pre-2.3.9-5 then the ll_rw_block can be run over a _fresh_
+dirty-buffer (far more fresh then the the one at the end of the dirty lru
+list). Maybe another way to corrupt the fs is to start syncing young
+buffers in the lru list? I have no idea if that can be the reason of the
+problem though. I also reviewed the get_block ext2 path and I can't see
+anything obvious wrong there.
+I am also using the above patch in 2.2.10 in my andrea-VM patches and it
+always worked like a charm in 2.2.x (no one bug report so far while lots
+of people is using it, me included). I never had fs corruption with my
+andrea-VM patches so far and I am using it all the time now that I can't
+run 2.3.x on my fast-machine where I don't want to risk to reinstall
+everything :). If I would have the test-machine just running (now is in
+the middle of mke2fs :), I would have just added the down(&i_sem) around
+get_block in the write-helper-functions in buffer.c, to see if I can
+trigger fs corruption such way as well.
+As last thing (patch details) ll_rw_block(WRITEA) should be not allowed to
+sleep so there should be no risk to have two shrink_mmap trying to free
+the same buffer at the same time. (but even if WRITEA would sleep my LRU
+code can handle two SMP parallel shrink_mmap at the same time, so it
+wouldn't be a problem here)
+I also checked that there isn't corruption due stack overflow due
+ll_rw_block called too much nested into the stack.
+Also note that everything seems stable (it doesn't look as a mm
+corruption) only ext2 complains and trashes away.
+Exactly the program I am using to leak memory is this:
+main()
+{
+	char *p[50];
+	int i, j;
+	for (j=0; j<50; j++)
+	{
+		p[j] = (char *) malloc(1000000);
+	}
+	for (;;)
+		for (j=0; j<50; j++)
+		{
+			for (i=0; i<1000000; i++)
+				p[j][i] = 0;
+		}
+}
+The test-machine has 32mbyte of RAM and 70mbyte of swap so it swapout
+continously around 20/30mbyte of data.
+Then I run in background a bonnie loop:
+	while :; do bonnie ; done &
+After 10/20 minutes the fs start complaining, remount in read-only mode
+and if I am in luck I can boot without mke2fs after that :).
+Comments are appreciated.
+Andrea
+PS. I would be happy also if you could try the patch on a test-machine and
+confirm that you can trask the fs this way.
+PPS. My next step are to try to reproduce with the inode semaphore held
+and then to check that my new SMP-threaded LRU code is safe and unrelated
+with the fs problems I had since 2.3.7.
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

@@ -1,0 +1,298 @@
+Date: Tue, 15 Jun 1999 15:19:48 -0500 (CDT)
+From: "Robert B. Hamilton" <>
+Subject: [patch] register_rtc_handler
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/6/15/88
+
+This is a request; if there's a better way, then wonderful, but I'd like 
+to see something like this go into the kernel.  It allows stand-alone
+modules to perform tasks using the rtc in a more robust and simple way 
+than is currently available, and enables those modules to be compiled 
+separately  from the kernel, at the cost of maybe 20 or 30 bytes in 
+kernel size.
+  The rationale is that on occasion one may want an insertable module 
+which makes use of periodic interrupts from the rtc - ideally without 
+requiring a kernel recompile, and without interfering with the rtc driver.  
+(I'm thinking of course about tasks for which for one reason or another 
+one doesn't want to be performed in user space.)
+Without this patch, the module itself would have to guard against 
+dropped interrupts, detect whether or not the rtc driver is using the 
+rtc, and try to prevent the rtc driver from taking control of the device 
+when the module is using it. Why not let the existing code in the rtc 
+driver handle that? 
+The following patch allows you to do so.  It adds two functions,
+register_rtc_handler and ungregister_rtc_handler, which are intended
+to be called from "module space" to register/unregister a function 
+to be called from inside the rtc interrupt handler, and exports them.
+It also touches the makefile to enable the export, and creates a
+file rtc.h, to declare the functions.
+The periodic interrupt rate is set by the register_interrupt_handler.
+It returns -EBUSY if the rtc is already in use.
+ I've been using this patch off and on through the last couple dozen or so 
+kernel revisions, and it has been very stable, so I suspect others may find
+it as useful as I have.  I've used it last against 2.2.9, don't know if it 
+will apply against 2.3 series, but offhand I suspect it might. 
+                                   --Robert Hamilton
+===========================================================================
+--- linux/drivers/char/rtc.c	Wed Jan 27 17:29:16 1999
++++ linux/drivers/char/rtc.c	Wed Jan 27 17:32:53 1999
+@@ -57,11 +57,16 @@
+ #include <linux/mc146818rtc.h>
+ #include <linux/init.h>
+ #include <linux/poll.h>
+ 
+ #include <asm/io.h>
+ #include <asm/uaccess.h>
+ #include <asm/system.h>
+ 
++#include <linux/config.h>
++#include <linux/module.h>
++#include <linux/rtc.h>
++
++
+ /*
+  *	We sponge a minor off of the misc major. No need slurping
+  *	up another valuable major dev number for this. If you add
+@@ -104,6 +109,14 @@
+ unsigned long rtc_irq_data = 0;		/* our output to the world	*/
+ 
+ /*
++ * Register a function from a module to execute on the periodic interrupt 
++ */
++EXPORT_SYMBOL(register_rtc_handler);
++EXPORT_SYMBOL(unregister_rtc_handler);
++
++void (*hook_function)(void)=NULL;        /* current hooked function     */
++ 
++/*
+  *	If this driver ever becomes modularised, it will be really nice
+  *	to make the epoch retain its value across module reload...
+  */
+@@ -132,7 +145,9 @@
+ 	rtc_irq_data += 0x100;
+ 	rtc_irq_data &= ~0xff;
+ 	rtc_irq_data |= (CMOS_READ(RTC_INTR_FLAGS) & 0xF0);
+-	wake_up_interruptible(&rtc_wait);	
++	if(hook_function)(*hook_function)();
++		
++			wake_up_interruptible(&rtc_wait);	
+ 
+ 	if (rtc_status & RTC_TIMER_ON)
+ 		mod_timer(&rtc_irq_timer, jiffies + HZ/rtc_freq + 2*HZ/100);
+@@ -183,6 +198,72 @@
+ 	return retval;
+ }
+ 
++/*
++ * Set the periodic interrupt rate
++ *   Broken out from the rtc_ioctl
++ *   because we want to export a function which
++ *   sets the interrupt rate
++ */
++ 
++static int rtc_irqp_set(unsigned long arg)
++{
++		int tmp = 0;
++		unsigned char val;
++		unsigned long flags;
++
++		/* 
++		 * The max we can do is 8192Hz.
++		 */
++		if ((arg < 2) || (arg > 8192))
++			return -EINVAL;
++		/*
++		 * We don't really want Joe User generating more
++		 * than 64Hz of interrupts on a multi-user machine.
++		 */
++		if ((arg > 64) && (!capable(CAP_SYS_RESOURCE)))
++			return -EACCES;
++
++		while (arg > (1<<tmp))
++			tmp++;
++
++		/*
++		 * Check that the input was really a power of 2.
++		 */
++		if (arg != (1<<tmp))
++			return -EINVAL;
++
++		rtc_freq = arg;
++
++		save_flags(flags);
++		cli();
++		val = CMOS_READ(RTC_FREQ_SELECT) & 0xf0;
++		val |= (16 - tmp);
++		CMOS_WRITE(val, RTC_FREQ_SELECT);
++		restore_flags(flags);
++		return 0;
++	}
++/*
++ *   Enable the periodic interrupts
++ */
++ 
++static int rtc_pie_on(void){
++
++		/*
++		 * We don't really want Joe User enabling more
++		 * than 64Hz of interrupts on a multi-user machine.
++		 */
++		if ((rtc_freq > 64) && (!capable(CAP_SYS_RESOURCE)))
++			return -EACCES;
++
++		if (!(rtc_status & RTC_TIMER_ON)) {
++			rtc_status |= RTC_TIMER_ON;
++			rtc_irq_timer.expires = jiffies + HZ/rtc_freq + 2*HZ/100;
++			add_timer(&rtc_irq_timer);
++		}
++		set_rtc_irq_bit(RTC_PIE);
++		return 0;
++	}
++
+ static int rtc_ioctl(struct inode *inode, struct file *file, unsigned int cmd,
+ 		     unsigned long arg)
+ {
+@@ -212,22 +293,8 @@
+ 	}
+ 	case RTC_PIE_ON:	/* Allow periodic ints		*/
+ 	{
+-
+-		/*
+-		 * We don't really want Joe User enabling more
+-		 * than 64Hz of interrupts on a multi-user machine.
+-		 */
+-		if ((rtc_freq > 64) && (!capable(CAP_SYS_RESOURCE)))
+-			return -EACCES;
+-
+-		if (!(rtc_status & RTC_TIMER_ON)) {
+-			rtc_status |= RTC_TIMER_ON;
+-			rtc_irq_timer.expires = jiffies + HZ/rtc_freq + 2*HZ/100;
+-			add_timer(&rtc_irq_timer);
+-		}
+-		set_rtc_irq_bit(RTC_PIE);
+-		return 0;
+-	}
++		return rtc_pie_on();
++	}	
+ 	case RTC_UIE_OFF:	/* Mask ints from RTC updates.	*/
+ 	{
+ 		mask_rtc_irq_bit(RTC_UIE);
+@@ -379,39 +446,7 @@
+ 	}
+ 	case RTC_IRQP_SET:	/* Set periodic IRQ rate.	*/
+ 	{
+-		int tmp = 0;
+-		unsigned char val;
+-
+-		/* 
+-		 * The max we can do is 8192Hz.
+-		 */
+-		if ((arg < 2) || (arg > 8192))
+-			return -EINVAL;
+-		/*
+-		 * We don't really want Joe User generating more
+-		 * than 64Hz of interrupts on a multi-user machine.
+-		 */
+-		if ((arg > 64) && (!capable(CAP_SYS_RESOURCE)))
+-			return -EACCES;
+-
+-		while (arg > (1<<tmp))
+-			tmp++;
+-
+-		/*
+-		 * Check that the input was really a power of 2.
+-		 */
+-		if (arg != (1<<tmp))
+-			return -EINVAL;
+-
+-		rtc_freq = arg;
+-
+-		save_flags(flags);
+-		cli();
+-		val = CMOS_READ(RTC_FREQ_SELECT) & 0xf0;
+-		val |= (16 - tmp);
+-		CMOS_WRITE(val, RTC_FREQ_SELECT);
+-		restore_flags(flags);
+-		return 0;
++		return rtc_irqp_set(arg);
+ 	}
+ #ifdef __alpha__
+ 	case RTC_EPOCH_READ:	/* Read the epoch.	*/
+@@ -817,4 +852,36 @@
+ 	CMOS_READ(RTC_INTR_FLAGS);
+ 	rtc_irq_data = 0;
+ 	restore_flags(flags);
++}
++
++
++int register_rtc_handler( void (*hf)(void),unsigned long frequency)
++{
++	int err;
++	 	
++	if (hook_function)
++	 	return -EBUSY;	
++
++	if(rtc_status & RTC_IS_OPEN)
++		return -EBUSY;
++
++	/* Set periodic IRQ rate.	*/
++
++	if((err=rtc_irqp_set(frequency)))return err; 
++
++	/* Enable periodic interrupts    */
++
++	if((err=rtc_pie_on())) return err;     
++	
++	hook_function=hf;
++
++	rtc_status |= RTC_IS_OPEN;
++
++	return 0;
++}
++
++int unregister_rtc_handler()
++{
++	hook_function=NULL;
++	return rtc_release(NULL,NULL);
+ }
+--- linux/drivers/char/Makefile	Wed Jan 27 17:26:12 1999
++++ linux/drivers/char/Makefile	Wed Jan 27 17:34:35 1999
+@@ -257,7 +257,7 @@
+ endif
+ 
+ ifeq ($(CONFIG_RTC),y)
+-L_OBJS += rtc.o
++LX_OBJS += rtc.o
+ endif
+ 
+ ifeq ($(CONFIG_NVRAM),y)
+--- linux/include/linux/rtc.h	Wed Jan 27 17:37:51 1999
++++ linux/include/linux/rtc.h	Wed Jan 27 17:40:39 1999
+@@ -0,0 +1,19 @@
++#ifndef _RTC_EXPORT
++#define _RTC_EXPORT
++/*
++ * This gives modules the ability to excute a handler at 
++ * periodic intervals using interrupts generated by the rtc
++ * and coexist peacefully with the rtc driver.
++ *
++ *  freq must be a power of 2 up to 8192
++ * 
++ * Robert Hamilton, Jan 25, 1999
++ */
++ 
++#ifdef __KERNEL__
++
++int register_rtc_handler( void (*handler)(void),unsigned long freq);	
++int unregister_rtc_handler(void);
++
++#endif
++#endif
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

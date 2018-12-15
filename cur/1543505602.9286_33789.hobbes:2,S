@@ -1,0 +1,265 @@
+Date: Thu, 12 Aug 1999 17:22:02 +0200 (CEST)
+From: Andrea Arcangeli <>
+Subject: Re: 2.3.12 - klogd 100%CPU
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/8/14/18
+
+On Tue, 10 Aug 1999, Manfred Spraul wrote:
+>I noticed that the synchronization in do_syslog() is completely broken
+>on both SMP & UP.
+Agreed.
+>I've attached the patch I posted a few days ago.
+Your patch is not complete. You can drop the big kernel lock from
+do_syslog and you must grab the console_lock also in other places. Once
+you are serialized you know that log_start will always have a coherent
+value and you don't need to &= it with the buf-mask every time. I like to
+have variables always at coherent values so you'll need to do the &= only
+in one place while incrementing it.
+Also there's no need to change the internals of syslog(case 3:). You only
+care to have a coherent `j' value to not overflow the static kernel ring
+buffer.
+This my patch should include all your good stuff:
+--- 2.3.13/kernel/printk.c	Thu Aug 12 02:53:25 1999
++++ printk.c	Thu Aug 12 16:35:54 1999
+@@ -46,6 +46,7 @@
+ static unsigned long logged_chars = 0;
+ struct console_cmdline console_cmdline[MAX_CMDLINECONSOLES];
+ static int preferred_console = -1;
++spinlock_t console_lock = SPIN_LOCK_UNLOCKED;
+ 
+ /*
+  *	Setup a list of consoles. Called from init/main.c
+@@ -122,7 +123,6 @@
+ 	char c;
+ 	int error = -EPERM;
+ 
+-	lock_kernel();
+ 	error = 0;
+ 	switch (type) {
+ 	case 0:		/* Close log */
+@@ -143,18 +143,19 @@
+ 		if (error)
+ 			goto out;
+ 		i = 0;
++		spin_lock_irq(&console_lock);
+ 		while (log_size && i < len) {
+ 			c = *((char *) log_buf+log_start);
+ 			log_start++;
+ 			log_size--;
+ 			log_start &= LOG_BUF_LEN-1;
+-			sti();
++			spin_unlock_irq(&console_lock);
+ 			__put_user(c,buf);
+ 			buf++;
+ 			i++;
+-			cli();
++			spin_lock_irq(&console_lock);
+ 		}
+-		sti();
++		spin_unlock_irq(&console_lock);
+ 		error = i;
+ 		break;
+ 	case 4:		/* Read/clear last kernel messages */
+@@ -170,43 +171,59 @@
+ 		error = verify_area(VERIFY_WRITE,buf,len);
+ 		if (error)
+ 			goto out;
+-		/*
+-		 * The logged_chars, log_start, and log_size values may
+-		 * change from an interrupt, so we disable interrupts.
+-		 */
+-		__save_flags(flags);
+-		__cli();
+ 		count = len;
+ 		if (count > LOG_BUF_LEN)
+ 			count = LOG_BUF_LEN;
++		/* The logged_chars, log_start, and log_size are serialized
++		   by the console_lock (the console_lock can be acquired also
++		   from irqs by printk). */
++		spin_lock_irq(&console_lock);
+ 		if (count > logged_chars)
+ 			count = logged_chars;
+ 		j = log_start + log_size - count;
+-		__restore_flags(flags);
++		spin_unlock_irq(&console_lock);
++		/* While writing data to the userspace buffer printk may
++		   trash our information but the _only_ thing we care is to
++		   have a coherent `j' value. */
+ 		for (i = 0; i < count; i++) {
+ 			c = *((char *) log_buf+(j++ & (LOG_BUF_LEN-1)));
+ 			__put_user(c, buf++);
+ 		}
+ 		if (do_clear)
++		{
++			/* the increment done in printk may undo our
++			   not atomic assigment if we do it without the
++			   console lock held. */
++			spin_lock_irq(&console_lock);
+ 			logged_chars = 0;
++			spin_unlock_irq(&console_lock);
++		}
+ 		error = i;
+ 		break;
+ 	case 5:		/* Clear ring buffer */
++		spin_lock_irq(&console_lock);
+ 		logged_chars = 0;
++		spin_unlock_irq(&console_lock);
+ 		break;
+ 	case 6:		/* Disable logging to console */
++		spin_lock_irq(&console_lock);
+ 		console_loglevel = minimum_console_loglevel;
++		spin_unlock_irq(&console_lock);
+ 		break;
+ 	case 7:		/* Enable logging to console */
++		spin_lock_irq(&console_lock);
+ 		console_loglevel = default_console_loglevel;
++		spin_unlock_irq(&console_lock);
+ 		break;
+ 	case 8:
+ 		error = -EINVAL;
+ 		if (len < 1 || len > 8)
+ 			goto out;
++		spin_lock_irq(&console_lock);
+ 		if (len < minimum_console_loglevel)
+ 			len = minimum_console_loglevel;
+ 		console_loglevel = len;
++		spin_unlock_irq(&console_lock);
+ 		error = 0;
+ 		break;
+ 	default:
+@@ -214,7 +231,6 @@
+ 		break;
+ 	}
+ out:
+-	unlock_kernel();
+ 	return error;
+ }
+ 
+@@ -226,8 +242,6 @@
+ }
+ 
+ 
+-spinlock_t console_lock;
+-
+ asmlinkage int printk(const char *fmt, ...)
+ {
+ 	va_list args;
+@@ -295,21 +309,26 @@
+ 	struct console *c = console_drivers;
+ 	int len = strlen(s);
+ 
++	spin_lock_irq(&console_lock);
+ 	while(c) {
+ 		if ((c->flags & CON_ENABLED) && c->write)
+ 			c->write(c, s, len);
+ 		c = c->next;
+ 	}
++	spin_unlock_irq(&console_lock);
+ }
+ 
+ void unblank_console(void)
+ {
+ 	struct console *c = console_drivers;
++
++	spin_lock_irq(&console_lock);
+ 	while(c) {
+ 		if ((c->flags & CON_ENABLED) && c->unblank)
+ 			c->unblank();
+ 		c = c->next;
+ 	}
++	spin_unlock_irq(&console_lock);
+ }
+ 
+ /*
+@@ -321,11 +340,12 @@
+ void register_console(struct console * console)
+ {
+ 	int	i,j,len;
+-	int	p = log_start;
++	int	p;
+ 	char	buf[16];
+ 	signed char msg_level = -1;
+ 	char	*q;
+ 
++	spin_lock_irq(&console_lock);
+ 	/*
+ 	 *	See if we want to use this console driver. If we
+ 	 *	didn't select a console we take the first one
+@@ -364,7 +384,7 @@
+ 	}
+ 
+ 	if (!(console->flags & CON_ENABLED))
+-		return;
++		goto out;
+ 
+ 	/*
+ 	 *	Put this console in the list - keep the
+@@ -377,12 +397,12 @@
+ 		console->next = console_drivers->next;
+ 		console_drivers->next = console;
+ 	}
+-	if ((console->flags & CON_PRINTBUFFER) == 0) return;
++	if ((console->flags & CON_PRINTBUFFER) == 0) goto out;
+ 
+ 	/*
+ 	 *	Print out buffered log messages.
+ 	 */
+-	for (i=0,j=0; i < log_size; i++) {
++	for (p=log_start,i=0,j=0; i < log_size; i++) {
+ 		buf[j++] = log_buf[p];
+ 		p++; p &= LOG_BUF_LEN-1;
+ 		if (buf[j-1] != '\n' && i < log_size - 1 && j < sizeof(buf)-1)
+@@ -401,26 +421,32 @@
+ 			msg_level = -1;
+ 		j = 0;
+ 	}
++ out:
++	spin_unlock_irq(&console_lock);
+ }
+ 
+ 
+ int unregister_console(struct console * console)
+ {
+         struct console *a,*b;
++	int ret = 0;
+ 	
++	spin_lock_irq(&console_lock);
+ 	if (console_drivers == console) {
+ 		console_drivers=console->next;
+-		return (0);
++		goto out;
+ 	}
+ 	for (a=console_drivers->next, b=console_drivers ;
+ 	     a; b=a, a=b->next) {
+ 		if (a == console) {
+ 			b->next = a->next;
+-			return 0;
++			goto out;
+ 		}  
+ 	}
+-	
+-	return (1);
++	ret = 1;
++ out:
++	spin_unlock_irq(&console_lock);
++	return ret;
+ }
+ 	
+ /*
+It applyes cleanly to both 2.3.13 and 2.2.11.
+Manfred I would appreciate if you could check that I didn't missed
+something from your original patch.
+NOTE: in the line below I am not grabbing the console_lock while reading
+log_size. That should be fine since from log_size we only want to know if
+printk did any progress or not. And log_size can't overflow but it will be
+high bound to LOG_BUF_LEN inside printk().
+		error = wait_event_interruptible(log_wait, log_size);
+Andrea
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

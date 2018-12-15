@@ -1,0 +1,624 @@
+Date: Tue, 7 Nov 2000 08:25:42 +0800 (CST)
+From: Chih-Chung Chang <>
+Subject: [PATCH] VCD support for isofs
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/11/6/230
+
+Attached patches add VCD support in isofs.
+Against 2.2.16 and 2.4.0-test10.
+diff -ur isofs.orig/file.c isofs/file.c
+--- isofs.orig/file.c	Mon Mar  8 07:25:23 1999
++++ isofs/file.c	Tue Nov  7 08:07:57 2000
+@@ -54,3 +54,24 @@
+ 	NULL,	       		/* truncate */
+ 	NULL			/* permission */
+ };
++
++extern int readpage_form2(struct file *, struct page *);
++struct inode_operations isofs_file_inode_operations_form2 = {
++	&isofs_file_operations,	/* default file operations */
++	NULL,			/* create */
++	NULL,			/* lookup */
++	NULL,			/* link */
++	NULL,			/* unlink */
++	NULL,			/* symlink */
++	NULL,			/* mkdir */
++	NULL,			/* rmdir */
++	NULL,			/* mknod */
++	NULL,			/* rename */
++	NULL,			/* readlink */
++	NULL,			/* follow_link */
++	readpage_form2,		/* readpage */
++	NULL,			/* writepage */
++	isofs_bmap,		/* bmap */
++	NULL,	       		/* truncate */
++	NULL			/* permission */
++};
+diff -ur isofs.orig/inode.c isofs/inode.c
+--- isofs.orig/inode.c	Wed Aug 23 03:24:10 2000
++++ isofs/inode.c	Tue Nov  7 08:08:02 2000
+@@ -1085,6 +1085,231 @@
+ 	goto out;
+ }
+ 
++int cd_ioctl(struct super_block *s, int request, unsigned long arg)
++{
++	extern struct file_operations * get_blkfops(unsigned int);
++	kdev_t dev = s->s_dev;
++	struct file_operations *fops = get_blkfops(MAJOR(dev));
++	int ret = -1;
++	if(fops && fops->ioctl)
++	{
++		struct inode inode_fake;
++		mm_segment_t old_fs=get_fs();
++		set_fs(KERNEL_DS);
++		inode_fake.i_rdev=dev;
++		ret = fops->ioctl(&inode_fake,NULL,request,arg);
++		set_fs(old_fs);
++	}
++	return ret;
++}
++
++static char *last_buf;
++unsigned char* cd_read_raw_sector(struct inode *inode, int sector_nr)
++{
++	static struct semaphore last_buf_sem = MUTEX;
++	static struct inode* last_inode;
++	static int last_sector_nr = -1;
++	unsigned char *buf;
++	struct cdrom_msf *msf;
++	int lba;
++
++	buf = kmalloc(CD_FRAMESIZE_RAW,GFP_KERNEL);
++	if(buf == NULL) return NULL;
++
++	down(&last_buf_sem);
++
++	if(sector_nr == last_sector_nr && inode == last_inode)
++	// how to do the right check/invalidate?
++	{
++		memcpy(buf,last_buf,CD_FRAMESIZE_RAW);
++		goto out;
++	}
++
++	lba = isofs_bmap(inode,0) + 150 + sector_nr;
++	msf = (struct cdrom_msf *)buf;
++	msf->cdmsf_min0 = lba/75/60;
++	msf->cdmsf_sec0 = (lba/75)%60;
++	msf->cdmsf_frame0 = lba%75;
++	if(cd_ioctl(inode->i_sb,CDROMREADRAW,(unsigned long)msf) < 0)
++	{
++		kfree(buf);
++		buf = NULL;
++	}
++	else
++	{
++		last_inode = inode;
++		last_sector_nr = sector_nr;
++		memcpy(last_buf,buf,CD_FRAMESIZE_RAW);
++	}
++out:
++	up(&last_buf_sem);
++	return buf;
++}
++
++#define FORM2_DATA_SIZE 2324
++static int kisofsd_pid;
++static int kisofsd_running = 0;
++static spinlock_t kisofsd_req_lock = SPIN_LOCK_UNLOCKED;
++static LIST_HEAD(kisofsd_req_list);	/* List of requests needing servicing */
++static struct wait_queue *kisofsd_wait;
++
++struct kisofsd_req {
++	struct list_head req_list;
++	struct inode *inode;
++	struct page *page;
++};
++
++static int kisofsd_add_request(struct inode* inode, struct page *page)
++{
++	struct kisofsd_req *req = kmalloc(sizeof(struct kisofsd_req),
++						GFP_KERNEL);
++	if(req == NULL) return -ENOMEM;
++
++	set_bit(PG_locked, &page->flags);
++	clear_bit(PG_uptodate, &page->flags);
++	clear_bit(PG_error, &page->flags);
++
++	INIT_LIST_HEAD(&req->req_list);
++	req->inode = inode;
++	req->page = page;
++
++	spin_lock(&kisofsd_req_lock);
++	list_add(&req->req_list,kisofsd_req_list.prev);
++	wake_up(&kisofsd_wait);
++	spin_unlock(&kisofsd_req_lock);
++
++	return 0;
++}
++
++static void readpage_form2_real(struct inode* inode, struct page* page)
++{
++	char *buf = (char *)page_address(page);
++	int start_sector, start_byte;
++	int stop_sector, stop_byte;
++	int sector;
++	int offset = page->offset;
++	
++	// the code is adapted from cdXA.c of cdfs-0.41
++
++	start_sector = offset / FORM2_DATA_SIZE;
++	start_byte = offset % FORM2_DATA_SIZE;
++	stop_sector = (offset + PAGE_SIZE) / FORM2_DATA_SIZE;
++	stop_byte = (offset + PAGE_SIZE) % FORM2_DATA_SIZE;
++	
++	if(stop_byte == 0)
++	{
++		--stop_sector;
++		stop_byte = FORM2_DATA_SIZE;
++	}
++
++	for(sector = start_sector; sector <= stop_sector; sector++)
++	{
++		int copy_length;
++		unsigned char *data;
++		unsigned char *raw_sector = cd_read_raw_sector(inode,sector);
++		if(raw_sector == NULL) break;
++
++		data = raw_sector + 24;
++		if(sector == start_sector)
++		{
++			data += start_byte;
++			if(sector != stop_sector)
++				copy_length = FORM2_DATA_SIZE - start_byte;
++			else
++				copy_length = stop_byte - start_byte;
++		} 
++		else if (sector == stop_sector)
++			copy_length = stop_byte;
++		else
++			copy_length = FORM2_DATA_SIZE;
++		
++		memcpy(buf,data,copy_length);
++		buf += copy_length;
++		kfree(raw_sector);
++	}
++
++	if(sector > stop_sector)
++		set_bit(PG_uptodate, &page->flags);
++	else
++		set_bit(PG_error, &page->flags);
++	clear_bit(PG_locked, &page->flags);
++	wake_up(&page->wait);
++}
++
++static void kisofsd_process_request(void)
++{
++	spin_lock(&kisofsd_req_lock);
++	while(!list_empty(&kisofsd_req_list))
++	{
++		struct list_head * tmp;
++		struct kisofsd_req * req;
++		
++		tmp = kisofsd_req_list.next;
++		list_del(tmp);
++
++		spin_unlock(&kisofsd_req_lock);
++		req = list_entry(tmp, struct kisofsd_req, req_list);
++		readpage_form2_real(req->inode, req->page);
++		kfree(req);
++		spin_lock(&kisofsd_req_lock);
++	}
++	spin_unlock(&kisofsd_req_lock);
++}
++
++static void daemonize(void)
++{
++	struct fs_struct *fs;
++
++	/*
++	 * If we were started as result of loading a module, close all of the
++	 * user space pages.  We don't need them, and if we didn't close them
++	 * they would be locked into memory.
++	 */
++	exit_mm(current);
++
++	current->session = 1;
++	current->pgrp = 1;
++
++	/* Become as one with the init task */
++
++	exit_fs(current);	/* current->fs->count--; */
++	fs = init_task.fs;
++	current->fs = fs;
++	atomic_inc(&fs->count);
++
++}
++
++static int kisofsd_thread(void *unused)
++{
++	/*
++	 * This thread doesn't need any user-level access,
++	 * so get rid of all our resources
++	 */
++	exit_files(current);  /* daemonize doesn't do exit_files */
++	daemonize();
++
++	/* Setup a nice name */
++	strcpy(current->comm, "kisofsd");
++
++	/* Send me a signal to get me die (for debugging) */
++	do {
++		kisofsd_process_request();
++		wait_event_interruptible(kisofsd_wait,!list_empty(&kisofsd_req_list));
++	} while (!signal_pending(current));
++
++	kisofsd_running = 0;
++	return 0;
++}
++
++int readpage_form2(struct file *file, struct page *page)
++{
++	struct inode *inode = file->f_dentry->d_inode;
++	if(kisofsd_running)
++		return kisofsd_add_request(inode, page);
++	else
++		return -EIO;
++}
++
+ void isofs_read_inode(struct inode * inode)
+ {
+ 	struct super_block *sb = inode->i_sb;
+@@ -1233,7 +1458,22 @@
+ #endif IGNORE_WRONG_MULTI_VOLUME_SPECS
+ 	{
+ 	  if (S_ISREG(inode->i_mode))
++	  {
++	    extern struct inode_operations isofs_file_inode_operations_form2;
++	    unsigned char *buf;
+ 	    inode->i_op = &isofs_file_inode_operations;
++	    buf = cd_read_raw_sector(inode,0);
++	    if(buf)
++	    {
++		    if(buf[15] == 2 && (buf[18]&(1<<5)))
++		    {
++			inode->i_op = &isofs_file_inode_operations_form2;
++			inode->i_size = (inode->i_size/2048)*FORM2_DATA_SIZE+
++					(inode->i_size%2048);
++		    }
++		    kfree(buf);
++	    }
++	  }
+ 	  else if (S_ISDIR(inode->i_mode))
+ 	    inode->i_op = &isofs_dir_inode_operations;
+ 	  else if (S_ISLNK(inode->i_mode))
+@@ -1436,7 +1676,24 @@
+ 
+ __initfunc(int init_iso9660_fs(void))
+ {
+-        return register_filesystem(&iso9660_fs_type);
++	int err;
++        err = register_filesystem(&iso9660_fs_type);
++        if(err < 0) return err;
++
++	last_buf = kmalloc(CD_FRAMESIZE_RAW,GFP_KERNEL);
++	if(last_buf == NULL) return -ENOMEM;
++
++	kisofsd_pid = kernel_thread(kisofsd_thread, NULL, 
++			CLONE_FS | CLONE_FILES | CLONE_SIGHAND);
++	if(kisofsd_pid > 0) 
++	{
++		kisofsd_running = 1;
++		return 0;
++	}
++
++	printk("init_iso9660_fs: kernel_thread failed.\n");
++	unregister_filesystem(&iso9660_fs_type);
++	return -1;
+ }
+ 
+ #ifdef MODULE
+@@ -1449,7 +1706,21 @@
+ 
+ void cleanup_module(void)
+ {
++	int ret;
++	ret = kill_proc(kisofsd_pid, SIGTERM, 1);
++	if(!ret) {
++		/* Wait 10 seconds */
++		int count = 10 * 100;
++		while (kisofsd_running && --count) {
++			current->state = TASK_INTERRUPTIBLE;
++			schedule_timeout(1);
++		}
++
++		if(!count)
++			printk("Giving up on killing kisofsd !");
++	}
+ 	unregister_filesystem(&iso9660_fs_type);
++	kfree(last_buf);
+ }
+ 
+ #endifdiff -ur isofs.orig/inode.c isofs/inode.c
+--- isofs.orig/inode.c	Thu Oct 19 16:48:42 2000
++++ isofs/inode.c	Tue Nov  7 08:06:22 2000
+@@ -985,6 +985,12 @@
+ 	sync_page: block_sync_page,
+ 	bmap: _isofs_bmap
+ };
++int readpage_form2(struct file *file, struct page *page);
++static struct address_space_operations isofs_aops_form2 = {
++	readpage: readpage_form2,
++	sync_page: block_sync_page,
++	bmap: _isofs_bmap
++};
+ 
+ static inline void test_and_set_uid(uid_t *p, uid_t value)
+ {
+@@ -1092,6 +1098,196 @@
+ 	goto out;
+ }
+ 
++int cd_ioctl(struct super_block *s, int request, unsigned long arg)
++{
++	return ioctl_by_bdev(s->s_bdev,request,arg);
++}
++
++static char *last_buf;
++unsigned char* cd_read_raw_sector(struct inode *inode, int sector_nr)
++{
++	static DECLARE_MUTEX(last_buf_sem);
++	static struct inode* last_inode;
++	static int last_sector_nr = -1;
++	unsigned char *buf;
++	struct cdrom_msf *msf;
++	int lba;
++
++	buf = kmalloc(CD_FRAMESIZE_RAW,GFP_KERNEL);
++	if(buf == NULL) return NULL;
++
++	down(&last_buf_sem);
++
++	if(sector_nr == last_sector_nr && inode == last_inode)
++	// how to do the right check/invalidate?
++	{
++		memcpy(buf,last_buf,CD_FRAMESIZE_RAW);
++		goto out;
++	}
++
++	lba = isofs_bmap(inode,0) + 150 + sector_nr;
++	msf = (struct cdrom_msf *)buf;
++	msf->cdmsf_min0 = lba/75/60;
++	msf->cdmsf_sec0 = (lba/75)%60;
++	msf->cdmsf_frame0 = lba%75;
++	if(cd_ioctl(inode->i_sb,CDROMREADRAW,(unsigned long)msf) < 0)
++	{
++		kfree(buf);
++		buf = NULL;
++	}
++	else
++	{
++		last_inode = inode;
++		last_sector_nr = sector_nr;
++		memcpy(last_buf,buf,CD_FRAMESIZE_RAW);
++	}
++out:
++	up(&last_buf_sem);
++	return buf;
++}
++
++#define FORM2_DATA_SIZE 2324
++static int kisofsd_pid;
++static int kisofsd_running = 0;
++static spinlock_t kisofsd_req_lock = SPIN_LOCK_UNLOCKED;
++static LIST_HEAD(kisofsd_req_list);	/* List of requests needing servicing */
++static DECLARE_WAIT_QUEUE_HEAD(kisofsd_wait);
++
++struct kisofsd_req {
++	struct list_head req_list;
++	struct inode *inode;
++	struct page *page;
++};
++
++static int kisofsd_add_request(struct inode* inode, struct page *page)
++{
++	struct kisofsd_req *req = kmalloc(sizeof(struct kisofsd_req),
++						GFP_KERNEL);
++	if(req == NULL) return -ENOMEM;
++
++	if (!PageLocked(page))
++		PAGE_BUG(page);
++	clear_bit(PG_uptodate, &page->flags);
++	clear_bit(PG_error, &page->flags);
++
++	INIT_LIST_HEAD(&req->req_list);
++	req->inode = inode;
++	req->page = page;
++
++	spin_lock(&kisofsd_req_lock);
++	list_add(&req->req_list,kisofsd_req_list.prev);
++	wake_up(&kisofsd_wait);
++	spin_unlock(&kisofsd_req_lock);
++
++	return 0;
++}
++
++static void readpage_form2_real(struct inode* inode, struct page* page)
++{
++	char *buf = (char *)page_address(page);
++	int start_sector, start_byte;
++	int stop_sector, stop_byte;
++	int sector;
++	int offset = page->index << PAGE_CACHE_SHIFT;;
++	
++	// the code is adapted from cdXA.c of cdfs-0.41
++
++	start_sector = offset / FORM2_DATA_SIZE;
++	start_byte = offset % FORM2_DATA_SIZE;
++	stop_sector = (offset + PAGE_SIZE) / FORM2_DATA_SIZE;
++	stop_byte = (offset + PAGE_SIZE) % FORM2_DATA_SIZE;
++	
++	if(stop_byte == 0)
++	{
++		--stop_sector;
++		stop_byte = FORM2_DATA_SIZE;
++	}
++
++	for(sector = start_sector; sector <= stop_sector; sector++)
++	{
++		int copy_length;
++		unsigned char *data;
++		unsigned char *raw_sector = cd_read_raw_sector(inode,sector);
++		if(raw_sector == NULL) break;
++
++		data = raw_sector + 24;
++		if(sector == start_sector)
++		{
++			data += start_byte;
++			if(sector != stop_sector)
++				copy_length = FORM2_DATA_SIZE - start_byte;
++			else
++				copy_length = stop_byte - start_byte;
++		} 
++		else if (sector == stop_sector)
++			copy_length = stop_byte;
++		else
++			copy_length = FORM2_DATA_SIZE;
++		
++		memcpy(buf,data,copy_length);
++		buf += copy_length;
++		kfree(raw_sector);
++	}
++
++	if(sector > stop_sector)
++		set_bit(PG_uptodate, &page->flags);
++	else
++		set_bit(PG_error, &page->flags);
++	clear_bit(PG_locked, &page->flags);
++	wake_up(&page->wait);
++}
++
++static void kisofsd_process_request(void)
++{
++	spin_lock(&kisofsd_req_lock);
++	while(!list_empty(&kisofsd_req_list))
++	{
++		struct list_head * tmp;
++		struct kisofsd_req * req;
++		
++		tmp = kisofsd_req_list.next;
++		list_del(tmp);
++
++		spin_unlock(&kisofsd_req_lock);
++		req = list_entry(tmp, struct kisofsd_req, req_list);
++		readpage_form2_real(req->inode, req->page);
++		kfree(req);
++		spin_lock(&kisofsd_req_lock);
++	}
++	spin_unlock(&kisofsd_req_lock);
++}
++
++static int kisofsd_thread(void *unused)
++{
++	/*
++	 * This thread doesn't need any user-level access,
++	 * so get rid of all our resources
++	 */
++	exit_files(current);  /* daemonize doesn't do exit_files */
++	daemonize();
++
++	/* Setup a nice name */
++	strcpy(current->comm, "kisofsd");
++
++	/* Send me a signal to get me die (for debugging) */
++	do {
++		kisofsd_process_request();
++		wait_event_interruptible(kisofsd_wait,!list_empty(&kisofsd_req_list));
++	} while (!signal_pending(current));
++
++	kisofsd_running = 0;
++	return 0;
++}
++
++int readpage_form2(struct file *file, struct page *page)
++{
++	struct inode *inode = file->f_dentry->d_inode;
++	if(kisofsd_running)
++		return kisofsd_add_request(inode, page);
++	else
++		return -EIO;
++}
++
+ static void isofs_read_inode(struct inode * inode)
+ {
+ 	struct super_block *sb = inode->i_sb;
+@@ -1239,8 +1435,20 @@
+ #endif IGNORE_WRONG_MULTI_VOLUME_SPECS
+ 	{
+ 	  if (S_ISREG(inode->i_mode)) {
++	    unsigned char *buf;
+ 	    inode->i_fop = &generic_ro_fops;
+ 	    inode->i_data.a_ops = &isofs_aops;
++	    buf = cd_read_raw_sector(inode,0);
++	    if(buf)
++	    {
++		    if(buf[15] == 2 && (buf[18]&(1<<5)))
++		    {
++			inode->i_data.a_ops = &isofs_aops_form2;
++			inode->i_size = (inode->i_size/2048)*FORM2_DATA_SIZE+
++					(inode->i_size%2048);
++		    }
++		    kfree(buf);
++	    }
+ 	  } else if (S_ISDIR(inode->i_mode)) {
+ 	    inode->i_op = &isofs_dir_inode_operations;
+ 	    inode->i_fop = &isofs_dir_operations;
+@@ -1430,12 +1638,43 @@
+ 
+ static int __init init_iso9660_fs(void)
+ {
+-        return register_filesystem(&iso9660_fs_type);
++	int err;
++        err = register_filesystem(&iso9660_fs_type);
++        if(err < 0) return err;
++
++	last_buf = kmalloc(CD_FRAMESIZE_RAW,GFP_KERNEL);
++	if(last_buf == NULL) return -ENOMEM;
++
++	kisofsd_pid = kernel_thread(kisofsd_thread, NULL, 
++			CLONE_FS | CLONE_FILES | CLONE_SIGHAND);
++	if(kisofsd_pid > 0) 
++	{
++		kisofsd_running = 1;
++		return 0;
++	}
++
++	printk("init_iso9660_fs: kernel_thread failed.\n");
++	unregister_filesystem(&iso9660_fs_type);
++	return -1;
+ }
+ 
+ static void __exit exit_iso9660_fs(void)
+ {
+-        unregister_filesystem(&iso9660_fs_type);
++	int ret;
++	ret = kill_proc(kisofsd_pid, SIGTERM, 1);
++	if(!ret) {
++		/* Wait 10 seconds */
++		int count = 10 * 100;
++		while (kisofsd_running && --count) {
++			current->state = TASK_INTERRUPTIBLE;
++			schedule_timeout(1);
++		}
++
++		if(!count)
++			printk("Giving up on killing kisofsd !");
++	}
++	unregister_filesystem(&iso9660_fs_type);
++	kfree(last_buf);
+ }
+ 
+ EXPORT_NO_SYMBOLS;

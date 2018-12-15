@@ -1,0 +1,439 @@
+Date: Wed, 29 Sep 2004 11:46:07 -0700 (PDT)
+From: Ram Pai <>
+Subject: Re: [PATCH/RFC] Simplified Readahead
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2004/9/29/198
+
+On Mon, 27 Sep 2004, Steven Pratt wrote:
+> Ram Pai wrote:
+> 
+> >On Mon, 2004-09-27 at 08:30, Steven Pratt wrote:
+> > 
+> >
+> >>Ram Pai wrote:
+> >> 
+> >>
+> >>>On Fri, 24 Sep 2004, Ram Pai wrote: 
+> >>>
+> >>> 
+> >>>
+> >>>>On Thu, 23 Sep 2004, Steven Pratt wrote:
+> >>>> 
+> >>>> 
+> >>>>
+> >
+> > ..snip..
+> > 
+> >
+> >>>To summarize you noticed 3 problems:
+> >>>
+> >>>1. page cache hits not handled properly.
+> >>>2. readahead thrashing not accounted.
+> >>>3. read congestion not accounted.
+I have enclosed 5 patches that address each of the issues.
+1 . Code is obtuse and hard to maintain
+	The best I could do is update the comments to reflect the
+	current code. Hopefully that should help. 
+	attached patch 1_comment.patch takes care of that part to
+	some extent.
+2. page cache hits not handled properly.
+	I fixed this by decrementing the size of the next readahead window
+	by the number of pages hit in the page cache. Now it slowly
+	accomodates the page cache hits. 
+	attached patch 2_cachehits.patch takes care of this issue.
+3. queue congestion not handled.
+	The fix is: call force_page_cache_readahead() if we are 
+	populating pages in the current window.
+	And call do_page_cache_readahead() if we are populating
+	pages in the ahead window. However if do_page_cache_readahead()
+	return with congestion, the readahead window is collapsed back 
+	to size zero. This will ensure that the next time ahead window
+	is attempted to populate.
+	attached patch 3_queuecongestion.patch handles this issue.
+4. page thrash handled ineffectively.
+	The fix is: on page thrash detection shutdown readahead.
+	attached patch 4_pagethrash.patch handles this issue.
+5. slow read path is too slow.
+	I could not figure out a way to atleast-read-the-requested-
+	number-of-pages if readahead is shutdown, without incorporating
+	the readsize parameter to page_cache_readahead(). So had
+	to pick some of your code in filemap.c to do that. Thanks!
+	attached patch 5_fixedslowread.patch handles this issue.
+Apart from this you have noticed other issues
+6.  cache lookup done unneccessrily twice for pagecache_hits.
+	I have not handled this issue currently. But should be doable
+	if I introducing a flag, which notes when readahead is
+	shutdown by pagecahche hits. And hence attempts to lookup
+	the page only once.
+And you have other features in your patch which will be the real
+differentiating factors.
+7.  exponential expand and shrink of window sizes.
+8.  overlapped read of current window and ahead window. 
+	( I think both are  desirable feature )
+I did run some premilinary tests using your patch and the above patches
+and found 
+your patch was doing slightly better on iozone and sysbench.
+however the above patch were doing slightly better with DSS workload.
+But my setup is rather tiny compared to your setup, so my comparison
+is rather incomplete. 
+RP
+--- tmp/mm/readahead.c	2004-09-29 17:45:02.120703232 -0700
++++ linux-2.6.8/mm/readahead.c	2004-09-29 17:45:12.043194784 -0700
+@@ -139,8 +139,7 @@ out:
+  * start:	Page index at which we started the readahead
+  * size:	Number of pages in that read
+  *              Together, these form the "current window".
+- *              Together, start and size represent the `readahead window'.
+- * next_size:   The number of pages to read on the next readahead miss.
++ * next_size:   The number of pages to read in the next "ahead window".
+  *              Has the magical value -1UL if readahead has been disabled.
+  * prev_page:   The page which the readahead algorithm most-recently inspected.
+  *              prev_page is mainly an optimisation: if page_cache_readahead
+@@ -149,6 +148,12 @@ out:
+  *		changes.
+  * ahead_start,
+  * ahead_size:  Together, these form the "ahead window".
++ * currnt_wnd_hit: The average number of pages accessed in current 
++ * 		'current window'
++ * average:	Tracks the average linearity of read requests. This value is
++ * 		used to (a) determine if "ahead window" has to be read in or not
++ * 		(b) determine the number of pages to read into the new 
++ * 				"current window"
+  * ra_pages:	The externally controlled max readahead for this fd.
+  *
+  * When readahead is in the "maximally shrunk" state (next_size == -1UL),
+@@ -159,9 +164,9 @@ out:
+  *
+  * The readahead code manages two windows - the "current" and the "ahead"
+  * windows.  The intent is that while the application is walking the pages
+- * in the current window, I/O is underway on the ahead window.  When the
+- * current window is fully traversed, it is replaced by the ahead window
+- * and the ahead window is invalidated.  When this copying happens, the
++ * in the "current window", I/O is underway on the "ahead window".  When the
++ * "current window" is fully traversed, it is replaced by the "ahead window"
++ * and the "ahead window" is invalidated.  When this copying happens, the
+  * new current window's pages are probably still locked.  When I/O has
+  * completed, we submit a new batch of I/O, creating a new ahead window.
+  *
+@@ -171,11 +176,12 @@ out:
+  *       ^start           ^start+size
+  *                        ^ahead_start     ^ahead_start+ahead_size
+  *
+- *         ^ When this page is read, we submit I/O for the
+- *           ahead window.
++ *         ^ we submit I/O for the ahead window only if the reads
++ *           in the past are sufficiently linear with an average
++ *           linearity that is greater than the max readahead size.
+  *
+  * A `readahead hit' occurs when a read request is made against a page which is
+- * inside the current window.  Hits are good, and the window size (next_size)
++ * inside the "current window".  Hits are good, and the window size (next_size)
+  * is grown aggressively when hits occur.  Two pages are added to the next
+  * window size on each hit, which will end up doubling the next window size by
+  * the time I/O is submitted for it.
+@@ -183,18 +189,17 @@ out:
+  * If readahead hits are more sparse (say, the application is only reading
+  * every second page) then the window will build more slowly.
+  *
+- * On a readahead miss (the application seeked away) the readahead window is
+- * shrunk by 25%.  We don't want to drop it too aggressively, because it is a
+- * good assumption that an application which has built a good readahead window
+- * will continue to perform linear reads.  Either at the new file position, or
+- * at the old one after another seek.
++ * On a "current window" miss (the application seeked away) the readahead 
++ * window is shrunk by 2 pages.  We don't want to drop it too aggressively, 
++ * because it is a good assumption that an application which has built a 
++ * good readahead window will continue to perform linear reads.  Either 
++ * at the new file position, or at the old one after another seek.
+  *
+  * After enough misses, readahead is fully disabled. (next_size = -1UL).
+  *
+- * There is a special-case: if the first page which the application tries to
+- * read happens to be the first page of the file, it is assumed that a linear
+- * read is about to happen and the window is immediately set to half of the
+- * device maximum.
++ * There is a special-case: Irrespective of which page in the file is accessed
++ * the first time, it is assumed that a linear read is about to happen and the 
++ * window is immediately set to half of the max readahead size.
+  * 
+  * A page request at (start + size) is not a miss at all - it's just a part of
+  * sequential file reading.
+@@ -443,9 +448,12 @@ page_cache_readahead(struct address_spac
+ 			/*
+ 			 * Control now returns, probably to sleep until I/O
+ 			 * completes against the first ahead page.
+-			 * When the second page in the old ahead window is
+-			 * requested, control will return here and more I/O
+-			 * will be submitted to build the new ahead window.
++			 * When some page in the old "ahead window" (which is 
++			 * now the "current window") is requested, more I/O 
++			 * will be submitted to build the new ahead window, 
++			 * provided the past read patterns have demonstrated 
++			 * that the pages in the ahead window are not wasted
++			 * exessively.
+ 			 */
+ 			goto out;
+ 		}
+@@ -460,7 +468,8 @@ do_io:
+ 			 /* Heuristic: there is a high probability
+ 			  * that around  ra->average number of
+ 			  * pages shall be accessed in the next
+-			  * current window.
++			  * current window. So we just bring in
++			  * that many pages.
+ 			  */
+ 			average = ra->average;
+ 			if (ra->currnt_wnd_hit > average)
+@@ -492,7 +501,7 @@ do_io:
+ 			/*
+ 			 * If the average io-size is more than maximum
+ 			 * readahead size of the file the io pattern is
+-			 * sequential. Hence  bring in the readahead window
++			 * linear. Hence  bring in the readahead window
+ 			 * immediately.
+ 			 * If the average io-size is less than maximum
+ 			 * readahead size of the file the io pattern is--- linux-2.6.8/mm/readahead.c	2004-09-29 17:47:02.677375832 -0700
++++ linux-2.6.8.comment/mm/readahead.c	2004-09-29 17:39:00.880620072 -0700
+@@ -329,18 +329,16 @@ int do_page_cache_readahead(struct addre
+  * occasionally.
+  */
+ static inline void
+-check_ra_success(struct file_ra_state *ra, pgoff_t attempt,
+-			pgoff_t actual, pgoff_t orig_next_size)
++check_ra_success(struct file_ra_state *ra, pgoff_t attempt, pgoff_t actual)
+ {
+-	if (actual == 0) {
+-		if (orig_next_size > 1) {
+-			ra->next_size = orig_next_size - 1;
+-			if (ra->ahead_size)
+-				ra->ahead_size = ra->next_size;
+-		} else {
+-			ra->next_size = -1UL;
+-			ra->size = 0;
+-		}
++	/* 
++	 * decrement window size by the number of pages hitting 
++	 * the page cache
++	 */
++	ra->next_size -= attempt - actual;
++	if (ra->next_size <= 0) {
++		ra->next_size = -1UL;
++		ra->size = 0;
+ 	}
+ }
+ 
+@@ -353,7 +351,6 @@ page_cache_readahead(struct address_spac
+ 			struct file *filp, unsigned long offset)
+ {
+ 	unsigned max;
+-	unsigned orig_next_size;
+ 	unsigned actual;
+ 	int first_access=0;
+ 	unsigned long average;
+@@ -377,7 +374,6 @@ page_cache_readahead(struct address_spac
+ 	if (max == 0)
+ 		goto out;	/* No readahead */
+ 
+-	orig_next_size = ra->next_size;
+ 
+ 	if (ra->next_size == 0) {
+ 		/*
+@@ -489,7 +485,7 @@ do_io:
+ 			 * time, the ahead window might get closed if all
+ 			 * the pages are already in the cache.
+ 			 */
+-			check_ra_success(ra, ra->size, actual, orig_next_size);
++			check_ra_success(ra, ra->size, actual);
+ 		}
+ 	} else {
+ 		/*
+@@ -516,8 +512,7 @@ do_io:
+ 				ra->ahead_size = ra->next_size;
+ 				actual = do_page_cache_readahead(mapping, filp,
+ 					ra->ahead_start, ra->ahead_size);
+-				check_ra_success(ra, ra->ahead_size,
+-						actual, orig_next_size);
++				check_ra_success(ra, ra->ahead_size, actual);
+ 			}
+ 		}
+ 	}--- linux-2.6.8/mm/readahead.c	2004-09-29 17:48:17.780958352 -0700
++++ linux-2.6.8.comment.pagecachehit/mm/readahead.c	2004-09-29 17:52:49.299681232 -0700
+@@ -314,10 +314,11 @@ int force_page_cache_readahead(struct ad
+ int do_page_cache_readahead(struct address_space *mapping, struct file *filp,
+ 			unsigned long offset, unsigned long nr_to_read)
+ {
+-	if (!bdi_read_congested(mapping->backing_dev_info))
+-		return __do_page_cache_readahead(mapping, filp,
+-						offset, nr_to_read);
+-	return 0;
++	if (bdi_read_congested(mapping->backing_dev_info))
++		return -BDI_read_congested;
++
++	return __do_page_cache_readahead(mapping, filp,
++				offset, nr_to_read);
+ }
+ 
+ /*
+@@ -477,16 +478,9 @@ do_io:
+ 		ra->size = ra->next_size;
+ 		ra->ahead_start = 0;		/* Invalidate these */
+ 		ra->ahead_size = 0;
+-		actual = do_page_cache_readahead(mapping, filp, offset,
++		actual = force_page_cache_readahead(mapping, filp, offset,
+ 						 ra->size);
+-		if(!first_access) {
+-			/*
+-			 * do not adjust the readahead window size the first
+-			 * time, the ahead window might get closed if all
+-			 * the pages are already in the cache.
+-			 */
+-			check_ra_success(ra, ra->size, actual);
+-		}
++		check_ra_success(ra, ra->size, actual);
+ 	} else {
+ 		/*
+ 		 * This read request is within the current window.  It may be
+@@ -512,7 +506,17 @@ do_io:
+ 				ra->ahead_size = ra->next_size;
+ 				actual = do_page_cache_readahead(mapping, filp,
+ 					ra->ahead_start, ra->ahead_size);
+-				check_ra_success(ra, ra->ahead_size, actual);
++				if (actual == -BDI_read_congested) {
++					/* queue is congested and no pages
++					 * are read. So just behave as if
++					 * readahead was not attempted at all.
++					 */
++					ra->ahead_start = 0;
++					ra->ahead_size = 0;
++				} else {
++					check_ra_success(ra, ra->ahead_size, 
++							actual);
++				}
+ 			}
+ 		}
+ 	}--- linux-2.6.8/mm/readahead.c	2004-09-29 17:53:37.120411376 -0700
++++ linux-2.6.8.comment.pagecachehit.queuecongestion/mm/readahead.c	2004-09-29 17:55:47.662565952 -0700
+@@ -535,10 +535,8 @@ out:
+  * if we are getting misses against sequential file offsets.  If so, and this
+  * persists then resume readahead.
+  *
+- * Otherwise we're thrashing, so shrink the readahead window by three pages.
+- * This is because it is grown by two pages on a readahead hit.  Theory being
+- * that the readahead window size will stabilise around the maximum level at
+- * which there is no thrashing.
++ * Otherwise we're thrashing, close the readahead window. There is no point 
++ * reading ahead if page-thrashing is noticed.
+  */
+ void handle_ra_miss(struct address_space *mapping,
+ 		struct file_ra_state *ra, pgoff_t offset)
+@@ -561,11 +559,8 @@ void handle_ra_miss(struct address_space
+ 		}
+ 		ra->prev_page = offset;
+ 	} else {
+-		const unsigned long min = get_min_readahead(ra);
+-
+-		ra->next_size -= 3;
+-		if (ra->next_size < min)
+-			ra->next_size = min;
++		ra->next_size = -1UL;
++		ra->size = 0;
+ 	}
+ }
+ --- linux-2.6.8/mm/readahead.c	2004-09-29 17:57:00.133548688 -0700
++++ linux-2.6.8.comment.pagecachehit.queuecongestion.pagethrash/mm/readahead.c	2004-09-29 18:12:58.967783728 -0700
+@@ -346,13 +346,19 @@ check_ra_success(struct file_ra_state *r
+ /*
+  * page_cache_readahead is the main function.  If performs the adaptive
+  * readahead window size management and submits the readahead I/O.
++ *
++ * TOBEDONE: the size parameter is currently used to read the requested
++ * number of pages, only when the readahead is disabled. This parameter
++ * can be used to do more usefully in ramping up quickly readahead size
++ * as well as overlaping read of current window and readahead window.
+  */
+-void
++unsigned long
+ page_cache_readahead(struct address_space *mapping, struct file_ra_state *ra,
+-			struct file *filp, unsigned long offset)
++			struct file *filp, unsigned long offset,
++			unsigned long size)
+ {
+-	unsigned max;
+-	unsigned actual;
++	unsigned long max, min;
++	unsigned long actual;
+ 	int first_access=0;
+ 	unsigned long average;
+ 
+@@ -375,6 +381,20 @@ page_cache_readahead(struct address_spac
+ 	if (max == 0)
+ 		goto out;	/* No readahead */
+ 
++	if (ra->next_size == -1UL) {
++		unsigned long s_size;
++		/*
++		 * Well readahead is disabled! So just read as many
++		 * pages requested for now.
++		 */
++		min = get_min_readahead(ra);
++		s_size = min((unsigned long)(max), (unsigned long)size);
++		handle_ra_miss(mapping, ra, offset, s_size);
++		(void )force_page_cache_readahead(mapping, filp, 
++					offset, s_size);
++		return s_size;
++	}
++
+ 
+ 	if (ra->next_size == 0) {
+ 		/*
+@@ -521,7 +541,10 @@ do_io:
+ 		}
+ 	}
+ out:
+-	return;
++	 /* 
++	  * handled the request for page 'offset'. Hence return 1.
++	  */
++	return 1;
+ }
+ 
+ 
+@@ -538,26 +561,27 @@ out:
+  * Otherwise we're thrashing, close the readahead window. There is no point 
+  * reading ahead if page-thrashing is noticed.
+  */
+-void handle_ra_miss(struct address_space *mapping,
+-		struct file_ra_state *ra, pgoff_t offset)
++void 
++handle_ra_miss(struct address_space *mapping, struct file_ra_state *ra, 
++		pgoff_t offset, unsigned long size)
+ {
+ 	if (ra->next_size == -1UL) {
+-		const unsigned long max = get_max_readahead(ra);
+-
+ 		if (offset != ra->prev_page + 1) {
+-			ra->size = ra->size?ra->size-1:0; /* Not sequential */
++			ra->size += size - 2;
+ 		} else {
+-			ra->size++;			/* A sequential read */
++			const unsigned long max = get_max_readahead(ra);
++			ra->size += size;
+ 			if (ra->size >= max) {		/* Resume readahead */
+-				ra->start = offset - max;
++				ra->start = offset + size - max;
+ 				ra->next_size = max;
+ 				ra->size = max;
+ 				ra->ahead_start = 0;
+ 				ra->ahead_size = 0;
+ 				ra->average = max / 2;
++				ra->currnt_wnd_hit = 0;
+ 			}
+ 		}
+-		ra->prev_page = offset;
++		ra->prev_page = offset + size - 1;
+ 	} else {
+ 		ra->next_size = -1UL;
+ 		ra->size = 0;

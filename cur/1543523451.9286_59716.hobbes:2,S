@@ -1,0 +1,477 @@
+Date: Tue, 25 Jan 2000 09:43:54 +0100
+From:  almesber@lrc ...
+Subject: [PATCH] root-hopping for pre-2.3.41-3
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/1/25/111
+
+Hi Linus,
+I'm sending you a patch for pre-2.3.41-3 that allows the use of chroot to
+change the root directory from an initrd or similar to a mounted file
+system, and to cleanly unmount the former root. This is much cleaner than
+the current "change_root on exit from linuxrc" magic, and it also allows
+again the use of NFS-root with parameter selection at run time.
+In the long run, this change obsoletes the following kernel features:
+ - /proc/sys/kernel/real-root-dev
+ - kernel-based NFS root
+ - kernel-based BOOTP/RARP
+ - /linuxrc, change_root, and all the magic surrounding them
+In particular, the patch addresses the following three problems:
+ - /proc/mounts and quota warning messages had meaningless and possibly
+   ambiguous path names after a chroot. My patch prefixes the path names
+   with the number of the (non-root) device where the path name
+   construction stopped, which makes them unambiguous.
+   As a side-effect, struct vfsmount.mnt_dirname is no longer read
+   (fs/super.c still maintains it, though). I didn't eliminate it
+   completely in case something out there still accesses it.
+ - with the proliferation of kernel threads, it has become increasingly
+   unlikely that our root file system is ever sufficiently idle to
+   unmount (i.e. after initrd), even though nobody is actually using it.
+   Also, our "next root" will keep the "old root" busy be being mounted.
+   This patch adds two umount flags MNT_DETACH and MNT_CHROOT to help
+   unmounting almost idle file systems.
+    - MNT_DETACH: detaches file systems mounted on top of the file system
+      we're trying to get rid of. They become the roots of their own
+      directory hierarchies. (Obviously, excessive use of this feature
+      can cause headache ;-)
+    - MNT_CHROOT: root and cwd of all processes referencing the root of
+      the file system are changed to current->fs->root. This is mainly
+      for kernel threads which may not share the fs structure with init.
+   MNT_DETACH and MNT_CHROOT are only performed if the unmount succeeds,
+   i.e. if the file system is busy for any other reason, the flags are
+   ignored.
+ - do_umount turned attempts to umount ROOT_DEV into a read-only remount
+   even if our root has changed. Now it applies this magic only if we're
+   trying to umount current->fs->root.
+I've tested the patch with 2.3.40 and got a clean build with
+pre-2.3.41-3, so I'm reasonably confident that it doesn't cause any major
+trouble. A few people have downloaded earlier versions of my patch and I
+didn't get any negative feedback, and one favorable comment. Not sure if
+they actually tried to run it, though :-)
+There is one change where I'm not 100% sure if it's correct: I've moved
+sb->s_root = NULL;  in fs/super.c:d_umount after operations which may
+sleep. I don't think there is any race on this, particularly in the
+intended usage scenario, but it's probably better if you have a quick
+look at it.
+A patch to util-linux and some usage examples are in
+ftp://icaftp.epfl.ch/pub/people/almesber/misc/umount-root-5.tar.gz
+Once this patch is in, I can work on updating Documentation/initrd.txt,
+which is rather misleading nowadays.
+Cheers, Werner
+-- 
+  _________________________________________________________________________
+ / Werner Almesberger, ICA, EPFL, CH       werner.almesberger@ica.epfl.ch /
+/_IN_N_032__Tel_+41_21_693_6621__Fax_+41_21_693_6610_____________________/
+--- linux/fs/dcache.c.orig	Fri Jan  7 01:21:23 2000
++++ linux/fs/dcache.c	Tue Jan 25 07:59:58 2000
+@@ -302,7 +302,7 @@
+  * child dentries were freed. This allows a non-destructive
+  * test for unmounting a device.
+  */
+-int is_root_busy(struct dentry *root)
++int __is_root_busy(struct dentry *root,int ignore_mount_points,int ignore)
+ {
+ 	struct dentry *this_parent = root;
+ 	struct list_head *next;
+@@ -314,15 +314,20 @@
+ 	while (next != &this_parent->d_subdirs) {
+ 		struct list_head *tmp = next;
+ 		struct dentry *dentry = list_entry(tmp, struct dentry, d_child);
++		int effective_count;
+ 		next = tmp->next;
++		effective_count = dentry->d_count;
++		/* Mount points may not count */
++		if (ignore_mount_points && dentry->d_mounts != dentry)
++			effective_count--;
+ 		/* Decrement count for unused children */
+-		count += (dentry->d_count - 1);
++		count += (effective_count - 1);
+ 		if (!list_empty(&dentry->d_subdirs)) {
+ 			this_parent = dentry;
+ 			goto repeat;
+ 		}
+ 		/* root is busy if any leaf is busy */
+-		if (dentry->d_count)
++		if (effective_count)
+ 			return 1;
+ 	}
+ 	/*
+@@ -333,7 +338,12 @@
+ 		this_parent = this_parent->d_parent;
+ 		goto resume;
+ 	}
+-	return (count > 1); /* remaining users? */
++	return (count > 1+ignore); /* remaining users? */
++}
++
++int is_root_busy(struct dentry *root)
++{
++	return __is_root_busy(root,0,0);
+ }
+ 
+ /*
+@@ -704,7 +714,8 @@
+ /*
+  * "buflen" should be PAGE_SIZE or more.
+  */
+-char * d_path(struct dentry *dentry, char *buffer, int buflen)
++static char * __d_path(struct dentry *dentry, char *buffer, int buflen,
++    kdev_t *need_dev)
+ {
+ 	char * end = buffer+buflen;
+ 	char * retval;
+@@ -712,6 +723,7 @@
+ 
+ 	*--end = '\0';
+ 	buflen--;
++	if (need_dev) *need_dev = 0;
+ 	if (!IS_ROOT(dentry) && list_empty(&dentry->d_hash)) {
+ 		buflen -= 10;
+ 		end -= 10;
+@@ -730,8 +742,10 @@
+ 			break;
+ 		dentry = dentry->d_covers;
+ 		parent = dentry->d_parent;
+-		if (dentry == parent)
++		if (dentry == parent) {
++			if (need_dev) *need_dev = dentry->d_sb->s_dev;
+ 			break;
++		}
+ 		namelen = dentry->d_name.len;
+ 		buflen -= namelen + 1;
+ 		if (buflen < 0)
+@@ -743,6 +757,28 @@
+ 		dentry = parent;
+ 	}
+ 	return retval;
++}
++
++char * d_path(struct dentry *dentry, char *buffer, int buflen)
++{
++	return __d_path(dentry,buffer,buflen,NULL);
++}
++
++char * d_dev_path(struct dentry *dentry, char *buffer, int buflen)
++{
++	char *path,*prefix;
++	kdev_t need_dev;
++	int length;
++
++	path = __d_path(dentry,buffer,buflen,&need_dev);
++	if (!need_dev) return path;
++	prefix = kdevname(need_dev);
++	length = strlen(prefix);
++	if (path >= buffer+length) {
++		path -= length;
++		memcpy(path,prefix,length);
++	}
++	return path;
+ }
+ 
+ /*
+--- linux/fs/dquot.c.orig	Tue Dec  7 02:09:28 1999
++++ linux/fs/dquot.c	Tue Jan 25 07:59:58 2000
+@@ -797,17 +797,22 @@
+ 	return 0;
+ }
+ 
+-static void print_warning(struct dquot *dquot, int flag, char *fmtstr, ...)
++static void print_warning(struct dquot *dquot, int flag, const char *fmtstr)
+ {
+-	va_list args;
++	struct dentry *root;
++	char *path, *buffer;
+ 
+ 	if (!need_print_warning(dquot, flag))
+ 		return;
+-	va_start(args, fmtstr);
+-	vsprintf(quotamessage, fmtstr, args);
+-	va_end(args);
++	root = dquot->dq_mnt->mnt_sb->s_root;
++	dget(root);
++	buffer = (char *) __get_free_page(GFP_KERNEL);
++	path = buffer ? d_dev_path(root, buffer, PAGE_SIZE) : "?";
++	sprintf(quotamessage, fmtstr, path, quotatypes[dquot->dq_type]);
++	free_page((unsigned long) buffer);
+ 	tty_write_message(current->tty, quotamessage);
+ 	dquot->dq_flags |= flag;
++	dput(root);
+ }
+ 
+ static inline char ignore_hardlimit(struct dquot *dquot)
+@@ -817,16 +822,13 @@
+ 
+ static int check_idq(struct dquot *dquot, u_long inodes)
+ {
+-	short type = dquot->dq_type;
+-
+ 	if (inodes <= 0 || dquot->dq_flags & DQ_FAKE)
+ 		return QUOTA_OK;
+ 
+ 	if (dquot->dq_ihardlimit &&
+ 	   (dquot->dq_curinodes + inodes) > dquot->dq_ihardlimit &&
+             !ignore_hardlimit(dquot)) {
+-		print_warning(dquot, DQ_INODES, "%s: write failed, %s file limit reached\n",
+-			      dquot->dq_mnt->mnt_dirname, quotatypes[type]);
++		print_warning(dquot, DQ_INODES, "%s: write failed, %s file limit reached\n");
+ 		return NO_QUOTA;
+ 	}
+ 
+@@ -834,17 +836,15 @@
+ 	   (dquot->dq_curinodes + inodes) > dquot->dq_isoftlimit &&
+ 	    dquot->dq_itime && CURRENT_TIME >= dquot->dq_itime &&
+             !ignore_hardlimit(dquot)) {
+-		print_warning(dquot, DQ_INODES, "%s: warning, %s file quota exceeded too long.\n",
+-				dquot->dq_mnt->mnt_dirname, quotatypes[type]);
++		print_warning(dquot, DQ_INODES, "%s: warning, %s file quota exceeded too long.\n");
+ 		return NO_QUOTA;
+ 	}
+ 
+ 	if (dquot->dq_isoftlimit &&
+ 	   (dquot->dq_curinodes + inodes) > dquot->dq_isoftlimit &&
+ 	    dquot->dq_itime == 0) {
+-		print_warning(dquot, 0, "%s: warning, %s file quota exceeded\n",
+-				dquot->dq_mnt->mnt_dirname, quotatypes[type]);
+-		dquot->dq_itime = CURRENT_TIME + dquot->dq_mnt->mnt_dquot.inode_expire[type];
++		print_warning(dquot, 0, "%s: warning, %s file quota exceeded\n");
++		dquot->dq_itime = CURRENT_TIME + dquot->dq_mnt->mnt_dquot.inode_expire[dquot->dq_type];
+ 	}
+ 
+ 	return QUOTA_OK;
+@@ -852,8 +852,6 @@
+ 
+ static int check_bdq(struct dquot *dquot, u_long blocks, char prealloc)
+ {
+-	short type = dquot->dq_type;
+-
+ 	if (blocks <= 0 || dquot->dq_flags & DQ_FAKE)
+ 		return QUOTA_OK;
+ 
+@@ -861,8 +859,7 @@
+ 	   (dquot->dq_curblocks + blocks) > dquot->dq_bhardlimit &&
+             !ignore_hardlimit(dquot)) {
+ 		if (!prealloc)
+-			print_warning(dquot, DQ_BLKS, "%s: write failed, %s disk limit reached.\n",
+-					dquot->dq_mnt->mnt_dirname, quotatypes[type]);
++			print_warning(dquot, DQ_BLKS, "%s: write failed, %s disk limit reached.\n");
+ 		return NO_QUOTA;
+ 	}
+ 
+@@ -871,8 +868,7 @@
+ 	    dquot->dq_btime && CURRENT_TIME >= dquot->dq_btime &&
+             !ignore_hardlimit(dquot)) {
+ 		if (!prealloc)
+-			print_warning(dquot, DQ_BLKS, "%s: write failed, %s disk quota exceeded too long.\n",
+-					dquot->dq_mnt->mnt_dirname, quotatypes[type]);
++			print_warning(dquot, DQ_BLKS, "%s: write failed, %s disk quota exceeded too long.\n");
+ 		return NO_QUOTA;
+ 	}
+ 
+@@ -880,9 +876,8 @@
+ 	   (dquot->dq_curblocks + blocks) > dquot->dq_bsoftlimit &&
+ 	    dquot->dq_btime == 0) {
+ 		if (!prealloc) {
+-			print_warning(dquot, 0, "%s: warning, %s disk quota exceeded\n",
+-					dquot->dq_mnt->mnt_dirname, quotatypes[type]);
+-			dquot->dq_btime = CURRENT_TIME + dquot->dq_mnt->mnt_dquot.block_expire[type];
++			print_warning(dquot, 0, "%s: warning, %s disk quota exceeded\n");
++			dquot->dq_btime = CURRENT_TIME + dquot->dq_mnt->mnt_dquot.block_expire[dquot->dq_type];
+ 		}
+ 		else
+ 			/*
+--- linux/fs/super.c.orig	Tue Jan 25 07:54:02 2000
++++ linux/fs/super.c	Tue Jan 25 07:59:58 2000
+@@ -307,11 +307,15 @@
+ 	struct proc_nfs_info *nfs_infop;
+ 	struct nfs_server *nfss;
+ 	int len = 0;
++	char *path,*buffer = (char *) __get_free_page(GFP_KERNEL);
+ 
++	if (!buffer) return 0;
+ 	while ( tmp && len < PAGE_SIZE - 160)
+ 	{
++		path = d_dev_path(tmp->mnt_sb->s_root,buffer,PAGE_SIZE);
+ 		len += sprintf( buf + len, "%s %s %s %s",
+-			tmp->mnt_devname, tmp->mnt_dirname, tmp->mnt_sb->s_type->name,
++			tmp->mnt_devname, path,
++			tmp->mnt_sb->s_type->name,
+ 			tmp->mnt_flags & MS_RDONLY ? "ro" : "rw" );
+ 		for (fs_infop = fs_info; fs_infop->flag; fs_infop++) {
+ 		  if (tmp->mnt_flags & fs_infop->flag) {
+@@ -368,6 +372,7 @@
+ 		tmp = tmp->mnt_next;
+ 	}
+ 
++	free_page((unsigned long) buffer);
+ 	return len;
+ }
+ 
+@@ -467,6 +472,72 @@
+ 	return NULL;
+ }
+ 
++static int count_fs_refs(const struct dentry *root)
++{
++	struct task_struct *p;
++	int count = 0;
++
++	read_lock(&tasklist_lock);
++	for_each_task(p) {
++		if (!p->fs) continue;
++		if (p->fs->root == root) count++;
++		if (p->fs->pwd == root) count++;
++	}
++	read_unlock(&tasklist_lock);
++	return count;
++}
++
++static void chroot_fs_refs(const struct dentry *root)
++{
++	struct task_struct *p;
++
++	read_lock(&tasklist_lock);
++	for_each_task(p) {
++		if (!p->fs) continue;
++		if (p->fs->root == root) {
++			dput(p->fs->root);
++			p->fs->root = dget(current->fs->root);
++			printk(KERN_DEBUG "chroot_fs_refs: changed root of "
++			    "process %d\n",p->pid);
++		}
++		if (p->fs->pwd == root) {
++			dput(p->fs->pwd);
++			p->fs->pwd = dget(current->fs->root);
++			printk(KERN_DEBUG "chroot_fs_refs: changed cwd of "
++			    "process %d\n",p->pid);
++		}
++	}
++	read_unlock(&tasklist_lock);
++}
++
++static void detach_mount_points(struct super_block *sb)
++{
++	struct super_block *s;
++
++	for (s = sb_entry(super_blocks.next); s != sb_entry(&super_blocks); 
++	    s = sb_entry(s->s_list.next)) {
++		struct dentry *root,*covered;
++
++		if (!s->s_dev || s == sb) continue;
++		root = s->s_root;
++ 		covered = root->d_covers;
++		if (covered->d_sb != sb) continue;
++		if (covered->d_inode->i_count != 1) {
++			printk(KERN_CRIT "detach_mount_points: inode %ld on %s "
++			    "count %d (must be 1)\n",covered->d_inode->i_ino,
++			    kdevname(sb->s_dev),covered->d_inode->i_count);
++			continue;
++		}
++		covered->d_mounts = covered; /* l'art pour l'art ... */
++		dput(covered);
++		root->d_covers = root;
++		printk(KERN_DEBUG "detached %s (count %d)",kdevname(s->s_dev),
++		    root->d_count);
++		printk(" from %s (count %d)\n",kdevname(sb->s_dev),
++		    sb->s_root->d_count);
++	}
++}
++
+ asmlinkage long sys_ustat(dev_t dev, struct ustat * ubuf)
+ {
+         struct super_block *s;
+@@ -607,24 +678,43 @@
+ 			kdevname(dev));
+ }
+ 
+-static int d_umount(struct super_block * sb)
++static int d_umount(struct super_block * sb, int flags)
+ {
+ 	struct dentry * root = sb->s_root;
+ 	struct dentry * covered = root->d_covers;
++	int ignore;
+ 
+-	if (root->d_count != 1)
++	/*
++	 * The check for root here is redundant, but if any change to do_mount
++	 * makes us get here with MNT_CHROOT set anyway, we better be careful.
++	 */
++	ignore = (flags & MNT_CHROOT) && root != current->fs->root ?
++	    count_fs_refs(root) : 0;
++	if (root->d_count != 1 &&
++	    (!(flags & MNT_DETACH) || __is_root_busy(sb->s_root,1,ignore)))
+ 		return -EBUSY;
+ 
+ 	if (root->d_inode->i_state)
+ 		return -EBUSY;
+ 
+-	sb->s_root = NULL;
+-
+ 	if (covered != root) {
+ 		root->d_covers = root;
+ 		covered->d_mounts = covered;
+ 		dput(covered);
+ 	}
++
++	/* fsync_dev may sleep, so we must disconnect the dentries first */
++	if (flags & MNT_DETACH)
++		detach_mount_points(sb);
++	if (ignore)
++		chroot_fs_refs(root);
++	if (flags & (MNT_DETACH | MNT_CHROOT)) {
++		shrink_dcache_sb(sb);
++		fsync_dev(sb->s_dev);
++	}
++
++	sb->s_root = NULL;
++
+ 	dput(root);
+ 	return 0;
+ }
+@@ -681,7 +771,7 @@
+ 	shrink_dcache_sb(sb);
+ 	fsync_dev(dev);
+ 
+-	if (dev==ROOT_DEV && !unmount_root) {
++	if (sb->s_root == current->fs->root && !unmount_root) {
+ 		/*
+ 		 * Special case for "unmounting" root ...
+ 		 * we just try to remount it readonly.
+@@ -692,7 +782,7 @@
+ 		return ERR_PTR(retval);
+ 	}
+ 
+-	retval = d_umount(sb);
++	retval = d_umount(sb,flags);
+ 	if (retval)
+ 		goto out;
+ 
+--- linux/include/linux/dcache.h.orig	Fri Jan  7 01:21:23 2000
++++ linux/include/linux/dcache.h	Tue Jan 25 07:59:58 2000
+@@ -150,6 +150,7 @@
+ 
+ /* test whether root is busy without destroying dcache */
+ extern int is_root_busy(struct dentry *);
++extern int __is_root_busy(struct dentry *,int ignore_mount_points,int offset);
+ 
+ /*
+  * This adds the entry to the hash queues.
+@@ -176,6 +177,7 @@
+ 
+ /* write full pathname into buffer and return start of pathname */
+ extern char * d_path(struct dentry *, char *, int);
++extern char * d_dev_path(struct dentry *dentry, char *buffer, int buflen);
+ 
+ /* Allocation counts.. */
+ static __inline__ struct dentry * dget(struct dentry *dentry)
+--- linux/include/linux/mount.h.orig	Fri Nov 12 13:36:13 1999
++++ linux/include/linux/mount.h	Tue Jan 25 07:59:58 2000
+@@ -43,5 +43,7 @@
+  */
+  
+ #define MNT_FORCE	0x00000001	/* Attempt to forcibily umount */
++#define MNT_DETACH	0x00000002	/* Detach mounted file systems */
++#define MNT_CHROOT	0x00000004	/* chroot processes at FS root */
+ 
+ #endif /* _LINUX_MOUNT_H */

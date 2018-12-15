@@ -1,0 +1,496 @@
+Date: Sun, 13 Aug 2000 00:47:53 +1000
+From: Andrew Morton <>
+Subject: Yet another low latency patch
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/8/12/51
+
+This is an updated low-latency patch.  It achieves sub-two-millisecond
+scheduling for all sane (and some insane) workloads.  There are a few
+exceptions, covered below.
+There are eighteen rescheduling points, briefly described in the patch
+itself.  Two scheduling points were added to the VM and a few to the
+VFS.
+It has been tested with all of Quintela's memory stressers, netperf,
+lmbench, bonnie++, Benno's workload and random other stuff.  In each of
+these tests no performance degradation was measurable, both with and
+without the presence of 1024Hz scheduling pressure.
+All testing was with a 500MHz UP x86.  SMP testing was for stability
+only.
+Remaining problems are:
+- Poor device drivers
+- The blkdev_close() path still has large scheduling stalls.  This is
+  triggered by running `lilo' when there are a lot of dirty buffers. 
+  Not rocket science to fix, but possibly not very pointful.
+- The do_try_to_free_pages -> kmem_cache_reap path can cause 2.5
+  millisec hits.  This is tricky to fix.
+- No attempt to address slow /proc readers.  Not able to demonstrate
+  any delays over 1.5 millisecs from this.
+- Benno's `latencytest' tool is odd.  It claims that it sees ~30
+  millisecond scheduling bumps.  Same with Ingo's patch.  It is not
+  obvious what is going on here.  When his background workload is run
+  against `amlat' everything is fine.
+Patch against 2.4.0-test6 is attached.
+The patch will be maintained at
+	
+http://www.uow.edu.au/~andrewm/linux/schedlat.html#downloads
+That site also holds various testing and measurement tools which were
+developed to support this effort.--- linux-2.4.0-test6/include/linux/sched.h	Fri Aug 11 19:06:12 2000
++++ linux-akpm/include/linux/sched.h	Sat Aug 12 16:24:09 2000
+@@ -147,6 +147,9 @@
+ extern signed long FASTCALL(schedule_timeout(signed long timeout));
+ asmlinkage void schedule(void);
+ 
++#define conditional_schedule_needed() (current->need_resched)
++#define conditional_schedule() do { if (conditional_schedule_needed()) schedule(); } while (0)
++
+ /*
+  * The default fd array needs to be at least BITS_PER_LONG,
+  * as this is the granularity returned by copy_fdset().
+--- linux-2.4.0-test6/include/linux/mm.h	Fri Aug 11 19:06:12 2000
++++ linux-akpm/include/linux/mm.h	Sat Aug 12 16:24:09 2000
+@@ -178,6 +178,10 @@
+ 				/* bits 21-30 unused */
+ #define PG_reserved		31
+ 
++/* Actions for zap_page_range() */
++#define ZPR_FLUSH_CACHE		1	/* Do flush_cache_range() prior to releasing pages */
++#define ZPR_FLUSH_TLB		2	/* Do flush_tlb_range() after releasing pages */
++#define ZPR_COND_RESCHED	4	/* Do a conditional_schedule() occasionally */
+ 
+ /* Make it prettier to test the above... */
+ #define Page_Uptodate(page)	test_bit(PG_uptodate, &(page)->flags)
+@@ -359,7 +363,7 @@
+ 
+ extern int map_zero_setup(struct vm_area_struct *);
+ 
+-extern void zap_page_range(struct mm_struct *mm, unsigned long address, unsigned long size);
++extern void zap_page_range(struct mm_struct *mm, unsigned long address, unsigned long size, int actions);
+ extern int copy_page_range(struct mm_struct *dst, struct mm_struct *src, struct vm_area_struct *vma);
+ extern int remap_page_range(unsigned long from, unsigned long to, unsigned long size, pgprot_t prot);
+ extern int zeromap_page_range(unsigned long from, unsigned long size, pgprot_t prot);
+--- linux-2.4.0-test6/mm/filemap.c	Fri Aug 11 19:06:13 2000
++++ linux-akpm/mm/filemap.c	Sat Aug 12 16:24:09 2000
+@@ -160,6 +160,7 @@
+ 	start = (lstart + PAGE_CACHE_SIZE - 1) >> PAGE_CACHE_SHIFT;
+ 
+ repeat:
++	conditional_schedule();		/* sys_unlink() */
+ 	head = &mapping->pages;
+ 	spin_lock(&pagecache_lock);
+ 	curr = head->next;
+@@ -262,6 +263,8 @@
+ 	/* we need pagemap_lru_lock for list_del() ... subtle code below */
+ 	spin_lock(&pagemap_lru_lock);
+ 	while (count > 0 && (page_lru = lru_cache.prev) != &lru_cache) {
++		if (conditional_schedule_needed())
++			goto out_resched;
+ 		page = list_entry(page_lru, struct page, lru);
+ 		list_del(page_lru);
+ 
+@@ -378,6 +381,10 @@
+ 	spin_unlock(&pagemap_lru_lock);
+ 
+ 	return ret;
++out_resched:
++	spin_unlock(&pagemap_lru_lock);
++	schedule();
++	return ret;
+ }
+ 
+ static inline struct page * __find_page_nolock(struct address_space *mapping, unsigned long offset, struct page *page)
+@@ -456,6 +463,7 @@
+ 
+ 		page_cache_get(page);
+ 		spin_unlock(&pagecache_lock);
++		conditional_schedule();		/* sys_msync() */
+ 		lock_page(page);
+ 
+ 		/* The buffers could have been free'd while we waited for the page lock */
+@@ -1087,6 +1095,7 @@
+ 		 * "pos" here (the actor routine has to update the user buffer
+ 		 * pointers and the remaining count).
+ 		 */
++		conditional_schedule();		/* sys_read() */
+ 		nr = actor(desc, page, offset, nr);
+ 		offset += nr;
+ 		index += offset >> PAGE_CACHE_SHIFT;
+@@ -1539,6 +1548,7 @@
+ 	 * vma/file is guaranteed to exist in the unmap/sync cases because
+ 	 * mmap_sem is held.
+ 	 */
++	conditional_schedule();		/* sys_msync() */
+ 	return page->mapping->a_ops->writepage(file, page);
+ }
+ 
+@@ -1676,6 +1686,7 @@
+ 	if (address >= end)
+ 		BUG();
+ 	do {
++		conditional_schedule();		/* unmapping large mapped files */
+ 		error |= filemap_sync_pmd_range(dir, address, end - address, vma, flags);
+ 		address = (address + PGDIR_SIZE) & PGDIR_MASK;
+ 		dir++;
+@@ -2026,9 +2037,8 @@
+ 	if (vma->vm_flags & VM_LOCKED)
+ 		return -EINVAL;
+ 
+-	flush_cache_range(vma->vm_mm, start, end);
+-	zap_page_range(vma->vm_mm, start, end - start);
+-	flush_tlb_range(vma->vm_mm, start, end);
++	zap_page_range(vma->vm_mm, start, end - start,
++			ZPR_FLUSH_CACHE|ZPR_FLUSH_TLB|ZPR_COND_RESCHED);	/* sys_madvise(MADV_DONTNEED) */
+ 	return 0;
+ }
+ 
+@@ -2492,6 +2502,7 @@
+ 		unsigned long bytes, index, offset;
+ 		char *kaddr;
+ 
++		conditional_schedule();		/* sys_write() */
+ 		/*
+ 		 * Try to find the page in the cache. If it isn't there,
+ 		 * allocate a free page.
+--- linux-2.4.0-test6/fs/buffer.c	Fri Aug 11 19:06:12 2000
++++ linux-akpm/fs/buffer.c	Sat Aug 12 16:24:09 2000
+@@ -2152,6 +2152,7 @@
+ 				__wait_on_buffer(p);
+ 		} else if (buffer_dirty(p))
+ 			ll_rw_block(WRITE, 1, &p);
++		conditional_schedule();		/* sys_msync() */
+ 	} while (tmp != bh);
+ }
+ 
+--- linux-2.4.0-test6/fs/dcache.c	Fri Aug 11 19:06:12 2000
++++ linux-akpm/fs/dcache.c	Sat Aug 12 16:24:09 2000
+@@ -301,7 +301,7 @@
+  * removed.
+  * Called with dcache_lock, drops it and then regains.
+  */
+-static inline void prune_one_dentry(struct dentry * dentry)
++static inline void prune_one_dentry(struct dentry * dentry, int *resched_count)
+ {
+ 	struct dentry * parent;
+ 
+@@ -312,6 +312,10 @@
+ 	d_free(dentry);
+ 	if (parent != dentry)
+ 		dput(parent);
++	if ((*resched_count)++ == 10) {
++		resched_count = 0;		/* Hack buys 0.6% in bonnie++ */
++		conditional_schedule();		/* pruning many dentries (sys_rmdir) */
++	}
+ 	spin_lock(&dcache_lock);
+ }
+ 
+@@ -330,6 +334,8 @@
+  
+ void prune_dcache(int count)
+ {
++	int resched_count = 0;
++
+ 	spin_lock(&dcache_lock);
+ 	for (;;) {
+ 		struct dentry *dentry;
+@@ -347,7 +353,7 @@
+ 		if (atomic_read(&dentry->d_count))
+ 			BUG();
+ 
+-		prune_one_dentry(dentry);
++		prune_one_dentry(dentry, &resched_count);
+ 		if (!--count)
+ 			break;
+ 	}
+@@ -380,6 +386,7 @@
+ {
+ 	struct list_head *tmp, *next;
+ 	struct dentry *dentry;
++	int resched_count = 0;
+ 
+ 	/*
+ 	 * Pass one ... move the dentries for the specified
+@@ -413,7 +420,7 @@
+ 		dentry_stat.nr_unused--;
+ 		list_del(tmp);
+ 		INIT_LIST_HEAD(tmp);
+-		prune_one_dentry(dentry);
++		prune_one_dentry(dentry, &resched_count);
+ 		goto repeat;
+ 	}
+ 	spin_unlock(&dcache_lock);
+@@ -482,7 +489,7 @@
+ {
+ 	struct dentry *this_parent = parent;
+ 	struct list_head *next;
+-	int found = 0;
++	int found = 0, count = 0;
+ 
+ 	spin_lock(&dcache_lock);
+ repeat:
+@@ -497,6 +504,13 @@
+ 			list_add(&dentry->d_lru, dentry_unused.prev);
+ 			found++;
+ 		}
++
++		if (count++ == 500 && found > 10) {
++			count = 0;
++			if (conditional_schedule_needed())	/* Typically sys_rmdir() */
++				goto out;
++		}
++
+ 		/*
+ 		 * Descend a level if the d_subdirs list is non-empty.
+ 		 */
+@@ -521,6 +535,7 @@
+ #endif
+ 		goto resume;
+ 	}
++out:
+ 	spin_unlock(&dcache_lock);
+ 	return found;
+ }
+@@ -536,8 +551,10 @@
+ {
+ 	int found;
+ 
+-	while ((found = select_parent(parent)) != 0)
++	while ((found = select_parent(parent)) != 0) {
+ 		prune_dcache(found);
++		conditional_schedule();		/* Typically sys_rmdir() */
++	}
+ }
+ 
+ /*
+--- linux-2.4.0-test6/fs/inode.c	Fri Aug 11 19:06:12 2000
++++ linux-akpm/fs/inode.c	Sat Aug 12 16:24:09 2000
+@@ -200,7 +200,7 @@
+ 		spin_unlock(&inode_lock);
+ 
+ 		write_inode(inode, sync);
+-
++		conditional_schedule();		/* kupdate: sync_old_inodes() */
+ 		spin_lock(&inode_lock);
+ 		inode->i_state &= ~I_LOCK;
+ 		wake_up(&inode->i_wait);
+--- linux-2.4.0-test6/mm/memory.c	Fri Aug 11 19:06:13 2000
++++ linux-akpm/mm/memory.c	Sat Aug 12 16:24:09 2000
+@@ -243,6 +243,7 @@
+ 					goto out;
+ 				src_pte++;
+ 				dst_pte++;
++				conditional_schedule();		/* sys_fork(), with a large shm seg */
+ 			} while ((unsigned long)src_pte & PTE_TABLE_MASK);
+ 		
+ cont_copy_pmd_range:	src_pmd++;
+@@ -347,7 +348,7 @@
+ /*
+  * remove user pages in a given range.
+  */
+-void zap_page_range(struct mm_struct *mm, unsigned long address, unsigned long size)
++static void do_zap_page_range(struct mm_struct *mm, unsigned long address, unsigned long size)
+ {
+ 	pgd_t * dir;
+ 	unsigned long end = address + size;
+@@ -381,6 +382,25 @@
+ 		mm->rss = 0;
+ }
+ 
++#define MAX_ZAP_BYTES 256*PAGE_SIZE
++
++void zap_page_range(struct mm_struct *mm, unsigned long address, unsigned long size, int actions)
++{
++	while (size) {
++		unsigned long chunk = size;
++		if (actions & ZPR_COND_RESCHED && chunk > MAX_ZAP_BYTES)
++			chunk = MAX_ZAP_BYTES;
++		if (actions & ZPR_FLUSH_CACHE)
++			flush_cache_range(mm, address, address + chunk);
++		do_zap_page_range(mm, address, chunk);
++		if (actions & ZPR_FLUSH_TLB)
++			flush_tlb_range(mm, address, address + chunk);
++		if (actions & ZPR_COND_RESCHED)
++			conditional_schedule();
++		address += chunk;
++		size -= chunk;
++	}
++}
+ 
+ /*
+  * Do a quick page-table lookup for a single page. 
+@@ -960,9 +980,7 @@
+ 
+ 		/* mapping wholly truncated? */
+ 		if (mpnt->vm_pgoff >= pgoff) {
+-			flush_cache_range(mm, start, end);
+-			zap_page_range(mm, start, len);
+-			flush_tlb_range(mm, start, end);
++			zap_page_range(mm, start, len, ZPR_FLUSH_CACHE|ZPR_FLUSH_TLB);
+ 			continue;
+ 		}
+ 
+@@ -979,9 +997,7 @@
+ 			partial_clear(mpnt, start);
+ 			start = (start + ~PAGE_MASK) & PAGE_MASK;
+ 		}
+-		flush_cache_range(mm, start, end);
+-		zap_page_range(mm, start, len);
+-		flush_tlb_range(mm, start, end);
++		zap_page_range(mm, start, len, ZPR_FLUSH_CACHE|ZPR_FLUSH_TLB);
+ 	} while ((mpnt = mpnt->vm_next_share) != NULL);
+ out_unlock:
+ 	spin_unlock(&mapping->i_shared_lock);
+@@ -1233,7 +1249,9 @@
+ 
+ 	pgd = pgd_offset(mm, address);
+ 	pmd = pmd_alloc(pgd, address);
+-	
++
++	conditional_schedule();		/* Pinning down many physical pages (kiobufs, mlockall) */
++
+ 	if (pmd) {
+ 		pte_t * pte = pte_alloc(pmd, address);
+ 		if (pte)
+--- linux-2.4.0-test6/mm/mmap.c	Sun Jul 30 02:28:18 2000
++++ linux-akpm/mm/mmap.c	Sat Aug 12 16:24:09 2000
+@@ -340,9 +340,8 @@
+ 	vma->vm_file = NULL;
+ 	fput(file);
+ 	/* Undo any partial mapping done by a device driver. */
+-	flush_cache_range(mm, vma->vm_start, vma->vm_end);
+-	zap_page_range(mm, vma->vm_start, vma->vm_end - vma->vm_start);
+-	flush_tlb_range(mm, vma->vm_start, vma->vm_end);
++	zap_page_range(mm, vma->vm_start, vma->vm_end - vma->vm_start,
++			ZPR_FLUSH_CACHE|ZPR_FLUSH_TLB);
+ free_vma:
+ 	kmem_cache_free(vm_area_cachep, vma);
+ 	return error;
+@@ -711,10 +710,8 @@
+ 		}
+ 		remove_shared_vm_struct(mpnt);
+ 		mm->map_count--;
+-
+-		flush_cache_range(mm, st, end);
+-		zap_page_range(mm, st, size);
+-		flush_tlb_range(mm, st, end);
++		zap_page_range(mm, st, size,
++			ZPR_FLUSH_CACHE|ZPR_FLUSH_TLB|ZPR_COND_RESCHED);	/* sys_munmap() */
+ 
+ 		/*
+ 		 * Fix the mapping, and free the old area if it wasn't reused.
+@@ -864,8 +861,7 @@
+ 		}
+ 		mm->map_count--;
+ 		remove_shared_vm_struct(mpnt);
+-		flush_cache_range(mm, start, end);
+-		zap_page_range(mm, start, size);
++		zap_page_range(mm, start, size, ZPR_COND_RESCHED|ZPR_FLUSH_CACHE);      /* sys_exit() */
+ 		if (mpnt->vm_file)
+ 			fput(mpnt->vm_file);
+ 		kmem_cache_free(vm_area_cachep, mpnt);
+--- linux-2.4.0-test6/mm/mremap.c	Sat Jun 24 15:39:47 2000
++++ linux-akpm/mm/mremap.c	Sat Aug 12 16:24:09 2000
+@@ -118,8 +118,7 @@
+ 	flush_cache_range(mm, new_addr, new_addr + len);
+ 	while ((offset += PAGE_SIZE) < len)
+ 		move_one_page(mm, new_addr + offset, old_addr + offset);
+-	zap_page_range(mm, new_addr, len);
+-	flush_tlb_range(mm, new_addr, new_addr + len);
++	zap_page_range(mm, new_addr, len, ZPR_FLUSH_TLB);
+ 	return -1;
+ }
+ 
+--- linux-2.4.0-test6/mm/vmscan.c	Fri Aug 11 19:06:13 2000
++++ linux-akpm/mm/vmscan.c	Sat Aug 12 16:24:20 2000
+@@ -293,6 +293,8 @@
+ 			return result;
+ 		if (!mm->swap_cnt)
+ 			return 0;
++		if (conditional_schedule_needed())
++			return 0;
+ 		address = (address + PGDIR_SIZE) & PGDIR_MASK;
+ 		pgdir++;
+ 	} while (address && (address < end));
+@@ -313,6 +315,7 @@
+ 	 * Find the proper vm-area after freezing the vma chain 
+ 	 * and ptes.
+ 	 */
++continue_scan:
+ 	vmlist_access_lock(mm);
+ 	vma = find_vma(mm, address);
+ 	if (vma) {
+@@ -323,6 +326,14 @@
+ 			int result = swap_out_vma(mm, vma, address, gfp_mask);
+ 			if (result)
+ 				return result;
++			if (!mm->swap_cnt)
++				break;
++			if (conditional_schedule_needed()) {
++				vmlist_access_unlock(mm);
++				schedule();
++				address = mm->swap_address;
++				goto continue_scan;
++			}
+ 			vma = vma->vm_next;
+ 			if (!vma)
+ 				break;
+@@ -529,6 +540,7 @@
+ 				goto done;
+ 
+ 			while (shm_swap(priority, gfp_mask)) {
++				conditional_schedule();		/* required if there's much sysv shm */
+ 				if (!--count)
+ 					goto done;
+ 			}
+--- linux-2.4.0-test6/ipc/shm.c	Tue Jul 11 22:21:17 2000
++++ linux-akpm/ipc/shm.c	Sat Aug 12 16:24:09 2000
+@@ -619,6 +619,7 @@
+ 	for (i = 0, rss = 0, swp = 0; i < pages ; i++) {
+ 		pte_t pte;
+ 		pte = dir[i/PTES_PER_PAGE][i%PTES_PER_PAGE];
++		conditional_schedule();		/* releasing large shm segs */
+ 		if (pte_none(pte))
+ 			continue;
+ 		if (pte_present(pte)) {
+--- linux-2.4.0-test6/drivers/char/mem.c	Sat Jun 24 15:39:43 2000
++++ linux-akpm/drivers/char/mem.c	Sat Aug 12 16:24:09 2000
+@@ -373,8 +373,7 @@
+ 		if (count > size)
+ 			count = size;
+ 
+-		flush_cache_range(mm, addr, addr + count);
+-		zap_page_range(mm, addr, count);
++		zap_page_range(mm, addr, count, ZPR_FLUSH_CACHE);
+         	zeromap_page_range(addr, count, PAGE_COPY);
+         	flush_tlb_range(mm, addr, addr + count);
+ 
+--- linux-2.4.0-test6/fs/ext2/truncate.c	Fri Dec  3 10:24:49 1999
++++ linux-akpm/fs/ext2/truncate.c	Sat Aug 12 16:24:09 2000
+@@ -295,6 +295,7 @@
+ 		retry |= trunc_indirect(inode,
+ 					offset + (i * addr_per_block),
+ 					dind, dind_bh);
++		conditional_schedule();		/* truncation of large files */
+ 	}
+ 	/*
+ 	 * Check the block and dispose of the dind_bh buffer.
+--- linux-2.4.0-test6/fs/ext2/namei.c	Sat Jun 24 15:39:46 2000
++++ linux-akpm/fs/ext2/namei.c	Sat Aug 12 16:24:09 2000
+@@ -90,6 +90,8 @@
+ 		struct ext2_dir_entry_2 * de;
+ 		char * dlimit;
+ 
++		conditional_schedule();		/* Searching large directories */
++
+ 		if ((block % NAMEI_RA_BLOCKS) == 0 && toread) {
+ 			ll_rw_block (READ, toread, bh_read);
+ 			toread = 0;
+@@ -229,6 +231,7 @@
+ 	offset = 0;
+ 	de = (struct ext2_dir_entry_2 *) bh->b_data;
+ 	while (1) {
++		conditional_schedule();		/* Adding to a large directory */
+ 		if ((char *)de >= sb->s_blocksize + bh->b_data) {
+ 			brelse (bh);
+ 			bh = NULL;

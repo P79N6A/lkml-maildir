@@ -1,0 +1,94 @@
+Date: Thu, 1 Jan 2009 22:11:10 -0500
+From: Theodore Tso <>
+Subject: Re: 2.6.28 ext4, xen and lvm volume becomes ro after snapshot
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2009/1/1/116
+
+On Sat, Dec 27, 2008 at 10:19:52AM +0100, Andreas Sundstrom wrote:
+> Theodore Tso wrote:
+> > On Fri, Dec 26, 2008 at 11:00:11PM +0100, Andreas Sundstrom wrote:
+> >> But I enabled debugfs and did
+> >> "echo 3 > /sys/kernel/debug/jbd2/jbd2-debug" and reproduced the problem
+> >> by taking a snapshot while the system was live.
+> >> I hope this had the same effect as your proposed change.
+> > 
+> > Thanks, that was helpful.  Can you try applying this patch, and let me
+> > know whether the printk triggers?
+> 
+> No problem
+> 
+Hi Andreas,
+Can you try this patch?  This should (hopefully!) allow you to mount
+ext4 in a Xen guest without needing to explicitly disable barriers.
+If it works, it's what I plan to push to Linus.
+         	     	       	      	      	 - Ted
+jbd2: Add barrier not supported test to journal_wait_on_commit_record
+Xen doesn't report that barriers are not supported until buffer I/O is
+reported as completed, instead of when the buffer I/O is submitted.
+Add a check and a fallback codepath to journal_wait_on_commit_record()
+to detect this case, so that attempts to mount ext4 filesystems on
+LVM/devicemapper devices on Xen guests don't blow up with an "Aborting
+journal on device XXX"; "Remounting filesystem read-only" error.
+Thanks to Andreas Sundstrom for reporting this issue.
+Signed-off-by: "Theodore Ts'o" <tytso@mit.edu>
+---
+diff --git a/fs/jbd2/commit.c b/fs/jbd2/commit.c
+index bd1fad0..4b87547 100644
+--- a/fs/jbd2/commit.c
++++ b/fs/jbd2/commit.c
+@@ -25,6 +25,7 @@
+ #include <linux/crc32.h>
+ #include <linux/writeback.h>
+ #include <linux/backing-dev.h>
++#include <linux/bio.h>
+ 
+ /*
+  * Default IO end handler for temporary BJ_IO buffer_heads.
+@@ -168,12 +169,34 @@ static int journal_submit_commit_record(journal_t *journal,
+  * This function along with journal_submit_commit_record
+  * allows to write the commit record asynchronously.
+  */
+-static int journal_wait_on_commit_record(struct buffer_head *bh)
++static int journal_wait_on_commit_record(journal_t *journal, 
++					 struct buffer_head *bh)
+ {
+ 	int ret = 0;
+ 
++retry:
+ 	clear_buffer_dirty(bh);
+ 	wait_on_buffer(bh);
++	if (buffer_eopnotsupp(bh) && (journal->j_flags & JBD2_BARRIER)) {
++		printk(KERN_WARNING
++		       "JBD2: wait_on_commit_record: sync failed on %s - "
++		       "disabling barriers\n", journal->j_devname);
++		spin_lock(&journal->j_state_lock);
++		journal->j_flags &= ~JBD2_BARRIER;
++		spin_unlock(&journal->j_state_lock);
++
++		lock_buffer(bh);
++		clear_buffer_dirty(bh);
++		set_buffer_uptodate(bh);
++		bh->b_end_io = journal_end_buffer_io_sync;
++
++		ret = submit_bh(WRITE_SYNC, bh);
++		if (ret) {
++			unlock_buffer(bh);
++			return ret;
++		}
++		goto retry;
++	}
+ 
+ 	if (unlikely(!buffer_uptodate(bh)))
+ 		ret = -EIO;
+@@ -802,7 +825,7 @@ wait_for_iobuf:
+ 			__jbd2_journal_abort_hard(journal);
+ 	}
+ 	if (!err && !is_journal_aborted(journal))
+-		err = journal_wait_on_commit_record(cbh);
++		err = journal_wait_on_commit_record(journal, cbh);
+ 
+ 	if (err)
+ 		jbd2_journal_abort(journal, err);

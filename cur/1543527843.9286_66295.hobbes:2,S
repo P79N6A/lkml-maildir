@@ -1,0 +1,379 @@
+Date: Mon, 28 Feb 2000 11:15:51 -0600
+From:  nathan.zook@amd ...
+Subject: RE: [PATCH] fancy new memory detection, for pre-patch-2.3.48-2
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/2/28/111
+
+I would like to sketch my rational for the assembly-side coding which I
+have, which is much more code than I would like.  As always, what goes in is
+your call.
+Concern:  The bios which I have seen that blows away the input ecx will
+continue to do so if the spec extends the report.
+Solution: Keep track of the largest ecx out seen, and stop making calls if
+we are in danger of overflowing the buffer.
+It has been suggested that we can rely on WinTel to ensure the backwards
+compatibility of the new biosen.  I don't support that position.
+Concern:  Some bios might hit random code which returns cf clear, ecx held
+constant, and edx copied to eax--the first few calls, after which they
+scribble on the HD (or worse).
+Solution: Aggressively test the registers (and data) for compliance.  Test
+that buffer writes actually occur.  Abort if anything is out of bounds.
+I believe I fully understand what you are driving towards in the 16-bit
+code.  As a professional validator, I'm not going to send you code which
+makes avoidable dangerous bios call without warning you first.  That's a
+"call" I'm not going to make. ;-)
+You specifically mentioned es:di being changed as a don't care.  The problem
+is that the ACPI spec (Table 14.2) describes es:di out as, "Return Address
+Range Descriptor pointer.  Same value as on input."
+http://www.teleport.com/~acpi/DOWNLOADS/ACPIspec10b.pdf
+So the spec _requires_ me to read es:di out to find where the data is.  (I
+believe that if it is NOT the same as es:di in, my only defensible course is
+to abort & dump all the data.)
+Similarly if ecx out is <20.  If some clod ignores ecx in and gives me
+extended data, I can ignore the data.  But if he gives me less than 20 bytes
+back, I don't know how to extend it.  Since a bios returning less than 20
+bytes is clearly non-compliant in an essential fashion, I again abort & dump
+all data.
+I believe that so far, I have described code which is "simple, stupid, and
+straightforward".  What I have NOT described is code which checks that the
+data is actually written, or that the written data makes any sense at all.
+If a bios "blowing up" is not a concern, then the overlap/wrap checking must
+of course be withdrawn.  (This part of the code is clearly neither stupid
+nor straightforward.)  Note that wrap checking will catch random data 50%
+per call, and that overlapping checking catches 2/3 of the surviving random
+data each call after the first.
+While my current code tests to see if the buffer is written essentially for
+free, it is simple enough to add a direct test.
+Finally, I worried that some bios might return more regions than our buffer
+can hold.  It seemed good to me to allow the user to set configuration
+options that would drop reports of regions we can do without--regions of
+zero length, or of reserved or unknown type.  (I said can, not want to!)
+The other alternative is to terminate calls, but bioses often seem to report
+available ram last rather than first.
+Encapsulating both the e820 & the e801 code in their own #ifdef CONFIG_
+seemed to me to be a simple way to ensure that someone with a "blows up if
+you make this call" bios did not need to hack the code.
+There is also code to warn some hacker who would try to make the call with
+ecx_in < 20.
+Nathan
+This has been setup.S on my system for some time.  You will note that the
+address, size pair returned is transformed into base, top.  This
+dramatically simplifies all other code (especially the overlap checking),
+and is the same code needed to test for wrapping.
+--- linux-2.3.47/arch/i386/boot/setup.S	Sun Feb 20 22:37:09 2000
++++ linux-2.3.47w10/arch/i386/boot/setup.S	Tue Feb 22 16:02:37 2000
+@@ -259,8 +259,15 @@
+ 
+ 	xorl	%eax, %eax
+ 	movl	%eax, (0x1e0)
+-#ifndef STANDARD_MEMORY_BIOS_CALL
+ 	movb	%al, (E820NR)
++
++#ifdef CONFIG_MEM_e820
++
++# There are some biosen which behave unpredictably if int 15-e820 is
+called.
++# We dare not tempt fate with them.
++
++# See Documentation/e820.txt for explanation of this section.
++
+ # Try three different memory detection schemes.  First, try
+ # e820h, which lets us assemble a memory map, then try e801h,
+ # which returns a 32-bit memory size, and finally 88h, which
+@@ -270,48 +277,191 @@
+ # the memory map from hell.  e820h returns memory classified into
+ # a whole bunch of different types, and allows memory holes and
+ # everything.  We scan through this memory map and build a list
+-# of the first 32 memory areas, which we return at [E820MAP].
+-#
++# of the first memory areas, which we return at [E820MAP].
++# 
+ 
+-meme820:
+-	movl	$0x534d4150, %edx		# ascii `SMAP'
+-	xorl	%ebx, %ebx			# continuation counter
+-	movw	$E820MAP, %di			# point into the whitelist
++meme820:	
++	xorl	%ebx,		%ebx		# continuation counter
++	movw	%ax,		(E820_ERR_CODE)	# zero out error flag
++
++	movw	$E820MAP + 2,	%di		# point into the whitelist
+ 						# so we can have the bios
+ 						# directly write into it.
+ 
++
++	
++# E820_MAX_LEN is sizeof(e820_mem_region)  Someone must have gotten tired
+of
++# hearing about the errors w/o knowing how to fix them...
++#if ACPI_MEM_FIX > E820_MAX_LEN
++	movw	$ACPI_MEM_FIX,	(E820_MAXL_PTR)
++#else
++	movw	$E820_MAX_LEN,	(E820_MAXL_PTR)
++#endif
++
++
+ jmpe820:
+-	movl	$0x0000e820, %eax		# e820, upper word zeroed
+-	movl	$20, %ecx			# size of the e820rec
+-	pushw	%ds				# data record.
+-	popw	%es
++	movw	$E820_HEADROOM,	%cx
++	subw	%di,		%cx		# total space remaining -
+per-
++						# report bookkeeping
++	movw	$ACPI_MEM_MANY,	%dx
++	cmpw	(E820_MAXL_PTR),%cx
++	jc	e820out0			# out of room
++
++
++# E820_MIN_LEN = 20	
++#if	ACPI_MEM_FIX < 20			
++BOZO:  This is a violation of the ACPI SMAP spec.
++#else
++	movl	$ACPI_MEM_FIX,	%ecx
++#endif
++
++#ifdef  CONFIG_ACPI_SMAP_BADR
++	movl	$0xfecd98ab,	%edx		# choker if no data written
++	movl	%edx,		4(%di)
++	movl	%edx,		12(%di)
++#endif
++	movw	%ds,		%ax		# es:di is data pointer
++	pushw	%di				# push record pointer
++	movw	%ax,		%es
++	movl	$0x0000e820,	%eax		# e820, upper word zeroed
++	movl	$0x534d4150,	%edx		# ascii `SMAP'
++	push	%ds				# and data segment
++
+ 	int	$0x15				# make the call
+-	jc	bail820				# fall to e801 if it fails
++	pop	%ds
++	movw	$ACPI_MEM_ABORT,%dx
++	jc	e820out2			# a error if not on 1st pass
++	
++
++	movw	$ACPI_MEM_GSPEC,%dx
++	cmpl	$0x534d4150,	%eax		# check the return is `SMAP'
++	jne	e820out2
++	
++	movw	%es,		%ax		# spec says %es:%di
+unmolested
++	movw	%ds,		%dx		# & that data is placed at 
++	cmpw	%dx,		%ax		# %es:%di out, so if %es:%di
++	movw	$ACPI_MEM_GSPEC,%dx		# change, we cannot proceed
++	popw	%ax
++	jne	e820out0
++
++	cmpw	%ax,		%di
++	jne	e820out0
++
++
++# NOTE:  Spec SAYS %ecx out <= %ecx in, but we have seen sloppy bioses
+which
++# might not stick with this.  We keep up with the longest to date to avoid
++# overruns & test for the violation in setup.c
++
++	movw	$E820_HEADROOM,	%ax		# check if entire buffer
++	subw	%di,		%ax		# overflowed
++	movzwl	%ax,		%eax
++	cmpl	%ecx,		%eax
++	movw	$ACPI_MEM_BUFF,	%dx
++	jc	e820out0
++
++	cmpw	$E820_MIN_LEN,	%cx		# minimum length for spec
++	movw	$ACPI_MEM_SHORTD,%dx
++	jc	e820out0
++
++	cmpw	%cx,		(E820_MAXL_PTR)	# is this a new max length
++	jnc	no_new_max			# for return data?
++	movw	%cx,		(E820_MAXL_PTR)
++no_new_max:
++
++
++	movw	%cx,	     E820_REP_LEN(%di)	# # of bytes read
++
++#ifdef	CONFIG_ACPI_SMAP_ADZR
++	movl	E820_SIZE(%di),		%eax	# ignore zero-length
++	orl	E820_SIZE+4(%di),		%eax	# regions
++	je	againe820
++#endif
+ 
+-	cmpl	$0x534d4150, %eax		# check the return is `SMAP'
+-	jne	bail820				# fall to e801 if it fails
++# Two regions overlap iff the top of each is above the bottom of the other.
++# we use this fact in the following code:
+ 
+-#	cmpl	$1, 16(%di)			# is this usable memory?
+-#	jne	again820
++	incb	(E820NR)			# Even if we reject this
+record,
++						# it may prove usefull for
+debug
++						# to see it.
++
++# First transform base, length pair into base, top pairs.
++# Note: E820_BASE = E820_TOP
++	movl	E820_SIZE(%di),			%edx
++	movl	E820_BASE(%di),			%eax
++	addl	%eax,				%edx
++	movl	E820_SIZE+4(%di),		%ecx
++	movl	%edx,				E820_TOP(%di)
++	adcl	E820_BASE+4(%di),		%ecx
++	movl	%ecx,				E820_TOP+4(%di)
++
++#ifdef  CONFIG_ACPI_SMAP_BADR
++	movw	$ACPI_MEM_WRAP,			%dx
++	jc	e820out0
++
++	cmpw	$E820MAP + 2,			%di	# Don't test first
++	je	end_badr				# region.
++
++	cmpl	E820_TOP-E820_REC_SIZE(%di),	%eax
++	movl	E820_BASE+4(%di),		%eax
++	sbbl	E820_TOP+4-E820_REC_SIZE(%di),	%eax
++	movl	E820_TOP(%di),			%edx
++	setcb	%al
++	cmpl	E820_BASE-E820_REC_SIZE(%di),	%edx
++	sbbl	E820_BASE+4-E820_REC_SIZE(%di),	%ecx
++	setab	%cl
++	
++	movw	$ACPI_MEM_OVLY,			%dx
++	andb	%cl,				%al
++	jne	e820out0
++#endif
++end_badr:
++	
++#if defined( CONFIG_ACPI_MEM_ADDR) || defined( CONFIG_ACPI_MEM_ADUR)
++	decb	(E820NR)		# Just because we drop these
++#endif		# records doesn't mean we cannot validate them!  It's
+simpler
++		# to back the counter off now.
++
++#ifdef	CONFIG_ACPI_MEM_ADRR
++	cmpl	$E820_RESERVED,	E820_TYPE(%di)
++	je	againe820
++#endif
+ 
+-	# If this is usable memory, we save it by simply advancing %di by
+-	# sizeof(e820rec).
+-	#
+-good820:
+-	movb	(E820NR), %al			# up to 32 entries
+-	cmpb	$E820MAX, %al
+-	jnl	bail820
++#ifdef	CONFIG_ACPI_MEM_ADUR
++	cmpl	$E820_UNKNOWN,	E820_TYPE(%di)	# known are 1-3. check
++	je	againe820			# 0 and >3
++	cmpl	$E820_NVS,	E820_TYPE(%di)
++	ja	againe820
++#endif	
+ 
++#if defined( CONFIG_ACPI_MEM_ADDR) || defined( CONFIG_ACPI_MEM_ADUR)
+ 	incb	(E820NR)
+-	movw	%di, %ax
+-	addw	$20, %ax
+-	movw	%ax, %di
+-again820:
+-	cmpl	$0, %ebx			# check to see if
+-	jne	jmpe820				# %ebx is set to EOF
+-bail820:
++#endif
++
++	addw	$E820_REC_SIZE,	%di		# point %di at next record
++
++againe820:
++	cmpl	$0,		%ebx		# check to see if %ebx is
++	jne	jmpe820				# set to EOF
++
++	movw	$0,		%dx		# no errors!
++	jmp	e820out0	
++
+ 
+ 
++e820out2:
++	addw	$2,		%sp		# correct stack
++e820out0:
++
++	mov	%dx,		(E820_ERR_CODE)	# report error type
++						# go to e801 routine
++
++
++#endif	# CONFIG_MEM_e820
++
++
++#ifdef CONFIG_MEM_e801
++# There are some bioses which don't even like e801.  We avoid these as
+well.
++
+ # method E801H:
+ # memory size is in 1k chunksizes, to avoid confusing loadlin.
+ # we store the 0xe801 memory size in a completely different place,
+@@ -331,12 +481,12 @@
+ 	andl	$0xffff, %ecx			# clear sign extend
+  	addl	%ecx, (0x1e0)			# and add lower memory into
+ 						# total size.
++#endif # CONFIG_MEM_e801
+ 
+ # Ye Olde Traditional Methode.  Returns the memory size (up to 16mb or
+ # 64mb, depending on the bios) in ax.
+ mem88:
+ 
+-#endif
+ 	movb	$0x88, %ah
+ 	int	$0x15
+ 	movw	%ax, (2)
+> -----Original Message-----
+> From: Linus Torvalds [mailto:torvalds@transmeta.com]
+> Sent: Saturday, February 26, 2000 10:54 PM
+> To: david parsons
+> Cc: linux-kernel@vger.rutgers.edu; Zook, Nathan
+> Subject: Re: [PATCH] fancy new memory detection, for 
+> pre-patch-2.3.48-2
+> 
+> 
+> 
+> 
+> On Sat, 26 Feb 2000, david parsons wrote:
+> > 
+> > >  - do the old-style calls regardless
+> > 
+> >     The e801 call is broken on some new bioses -- I've got 
+> some Pentium II
+> >     boxes where e801 cheerfully returns 550mb on a machine 
+> that only has
+> >     128mb of core.   
+> 
+> That's fine. I'm not advocating _using_ the value. I'm really 
+> advocating:
+> 
+>  - the 16-bit assembly language does all the calls, and 
+> gathers all the
+>    information.
+>  - the 16-bit assembly language does NOT try to maek sense of the
+>    information, In particular, it doesn't try to figure out 
+> whether the
+>    information is broken or not, or _which_ of the memory 
+> information it
+>    should use.
+>  - in short, the 16-bit assembly code is STUPID.
+> 
+>  - ..and all the real WORK is done in C. In an __init section 
+> that gets
+>    thrown away. Not in unreadable assembly code. Especially not if the
+>    rules are arbitrary and pretty much made up to match BIOS 
+> bugs in the
+>    first place.
+> 
+> See my argument?
+> 
+> 		Linus
+> 
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

@@ -1,0 +1,183 @@
+Date: Thu, 22 Apr 1999 09:40:46 -0400
+From: Jim Zelenka <>
+Subject: Re: 2. I need to do block I/O, both synchronously and asynchronously.
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/4/22/30
+
+Richard Dynes <rdynes@varcom.com> writes:
+>> 2. I need to do block I/O, both synchronously and asynchronously.
+>static struct  wait_queue    *data_wait_queue = NULL;
+>interruptible_sleep_on(&data_wait_queue);
+>wake_up_interruptible(&data_wait_queue);
+I appreciate the hint, but things still aren't clear to me.
+How do I issue the I/O? What's the right way to construct
+a scatter-gather list? I believe I'm putting together a valid
+set of buffer_head structures, but I'm getting bitten by
+ll_rw_block() freaking out.
+I'll append a sample of the code I'm talking about to this
+message in case anyone's wondering...
+Thanks,
+Jim.Zelenka@cs.cmu.edu
+(my apologies for the fact that this is not extensively
+documented- these are the platform-specific back-ends
+to a larger storage system that I'm porting into the
+linux kernel)
+/*
+ * Caller holds I/O lock here
+ *
+ * Take a list of buffers (entlist) and issue
+ * them asynchronously. This list is guaranteed to be
+ * contiguous on the disk, and either entirely reads or
+ * entirely writes.
+ */
+nasd_status_t
+nasd_od_io_launch_internal(
+  nasd_odc_ent_t  *entlist)
+{
+  struct buffer_head *bharr[NASD_IO_MAX_COALESCE], *bh;
+  nasd_odc_ent_t *e;
+  int i, dir;
+  NASD_IO_INC_STAT(pull_ios);
+  dir = entlist->iodir;
+nasd_printf("LAUNCH INTERNAL list 0x%lx\n", (unsigned long)entlist);
+  for(i=0,e=entlist;e;e=e->inext,i++) {
+nasd_printf("LAUNCH INTERNAL sect %u\n", (unsigned)e->real_sectno);
+    NASD_ASSERT((e->io_flags&NASD_CI_DISPATCH) == NASD_CI_DISPATCH);
+    NASD_ASSERT(e->iodir == dir);
+    NASD_ASSERT(i < NASD_IO_MAX_COALESCE);
+    bh = bharr[i] = &e->rbh;
+    bh->b_next = NULL;
+    bh->b_blocknr = e->real_sectno;
+    bh->b_size = NASD_OD_BASIC_BLOCKSIZE;
+    bh->b_dev = nasd_od_linux_kdev;
+    bh->b_rdev = nasd_od_linux_kdev;
+    bh->b_rsector = e->real_sectno;
+    bh->b_this_page = NULL;
+    bh->b_state = 0;
+    bh->b_next_free = NULL;
+    bh->b_count = 1;
+    bh->b_data = e->data.buf;
+    bh->b_list = BUF_CLEAN;
+    bh->b_flushtime = 0;
+    init_waitqueue(&bh->b_wait);
+    bh->b_pprev = NULL;
+    bh->b_prev_free = NULL;
+    bh->b_reqnext = NULL;
+    bh->b_end_io = nasd_od_k_io_done;
+    bh->b_dev_id = e;
+    NASD_ASSERT((e->io_flags&NASD_CI_DISPATCH) == NASD_CI_DISPATCH);
+    NASD_ASSERT(e->iodir == dir);
+#if NASD_DRIVE_DEBUG_PHYS_OUTSTANDING > 0
+    e->kbuf = bh;
+#endif /* NASD_DRIVE_DEBUG_PHYS_OUTSTANDING > 0 */
+  }
+  NASD_ASSERT(i > 0);
+  entlist->io_flags |= NASD_CI_IOHEAD;
+  if (dir == NASD_U_READ) {
+    ll_rw_block(READA, i, bharr);
+  }
+  else if (dir == NASD_U_WRITE) {
+    ll_rw_block(WRITEA, i, bharr);
+  }
+  else {
+    NASD_PANIC();
+  }
+  return(NASD_SUCCESS);
+}
+nasd_status_t
+nasd_od_k_blkio(
+  nasd_odc_ent_t   *ent,   /* not guaranteed to be "real" */
+  nasd_blkno_t      sectno,
+  void             *buf,
+  int               len,
+  int               iodir,
+  void            (*finish_proc)(struct buffer_head *, int))
+{
+  struct buffer_head *bh, real_bh;
+  bh = &real_bh;
+nasd_printf("nasd_od_k_blkio %d bytes\n", len);
+  bh->b_next = NULL;
+  bh->b_blocknr = sectno;
+  bh->b_size = len;
+  bh->b_dev = nasd_od_linux_kdev;
+  bh->b_rdev = nasd_od_linux_kdev;
+  bh->b_rsector = sectno;
+  bh->b_this_page = NULL;
+  bh->b_state = 0;
+  bh->b_next_free = NULL;
+  bh->b_count = 1;
+  bh->b_data = buf;
+  bh->b_list = BUF_CLEAN;
+  bh->b_flushtime = 0;
+  init_waitqueue(&bh->b_wait);
+  bh->b_pprev = NULL;
+  bh->b_prev_free = NULL;
+  bh->b_reqnext = NULL;
+  bh->b_end_io = finish_proc;
+  bh->b_dev_id = ent;
+  nasd_od_io_sync_launch(sectno);
+  NASD_IO_TM_LAUNCH(ent);
+  if (iodir == NASD_U_READ) {
+    ll_rw_block(READA, 1, &bh);
+  }
+  else if (iodir == NASD_U_WRITE) {
+    ll_rw_block(WRITEA, 1, &bh);
+  }
+  else {
+    NASD_PANIC();
+  }
+  wait_on_buffer(bh);
+  NASD_IO_TM_COMPLETE(ent);
+  NASD_ASSERT(bh->b_count == 1);
+  if (test_bit(BH_Uptodate, &bh->b_state)) {
+    return(NASD_SUCCESS);
+  }
+  else {
+    nasd_printf("DRIVE ERROR: failed completing blkio\n");
+    NASD_PANIC();
+    return(NASD_FAIL);
+  }
+}
+void
+nasd_od_io_sys_flush_block(
+  nasd_odc_ent_t  *ent)
+{
+  nasd_status_t rc;
+nasd_printf("nasd_od_io_sys_flush_block\n");
+  NASD_IO_INC_SIZE_STAT(1,write);
+  nasd_od_io_sync_launch(ent->real_sectno);
+  NASD_IO_TM_LAUNCH(ent);
+  rc = nasd_od_k_blkio(ent, ent->real_sectno, ent->data.buf,
+    NASD_OD_BASIC_BLOCKSIZE, NASD_U_WRITE,
+    nasd_od_k_blkio_done);
+  if (rc != NASD_SUCCESS) {
+    NASD_PANIC();
+  }
+  NASD_IO_TM_COMPLETE(ent);
+  nasd_od_io_last_completed_sect = ent->real_sectno;
+}
+void
+nasd_od_k_blkio_done(
+  struct buffer_head  *bh,
+  int                  uptodate)
+{
+  if (uptodate) {
+    set_bit(BH_Uptodate, &bh->b_state);
+  }
+  else {
+    clear_bit(BH_Uptodate, &bh->b_state);
+  }
+nasd_printf("nasd_od_k_blkio_done\n");
+  /*
+   * This is for synchronous I/O, so the thread
+   * waiting on this block does the rest
+   */
+}
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

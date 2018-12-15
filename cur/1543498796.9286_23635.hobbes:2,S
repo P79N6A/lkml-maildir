@@ -1,0 +1,193 @@
+Date: Fri, 11 Jun 1999 07:18:06 -0400
+From:  dledford@redhat ...
+Subject: Re: [Fwd: PIII patches]
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/6/11/213
+
+Jason Hartman wrote:
+> 
+> At 01:48 AM 06/09/1999 -0400, dledford@redhat.com wrote:
+> >
+> >-------- Original Message --------
+> >From: dledford@redhat.com
+> >Subject: PIII patches
+> >To: Linus Torvalds <torvalds@transmeta.com>,MOLNAR Ingo
+> ><mingo@chiara.csoma.elte.hu>, zab@redhat.com,Dave Miller
+> ><davem@redhat.com>,"Stephen C. Tweedie" <sct@redhat.com>
+> >
+> >These are my current PIII patches.  The first patch is the base PIII/FXSAVE
+> >support.  It was done along the lines of what Linus suggested (and I agreed
+> >with) in that we don't fiddle around doing FXSAVE to FSAVE conversions.  We
+> >use fnstenv and fldenv in order to get the various control bits that we need
+> >and then simply copy the 80bit fpu register values into the user_i387 struct.
+> 
+> Although I think using hardware for reading the FPU tagword is a good
+> idea I don't think using FNSTENV on every state save is the right
+> thing to do.
+> 
+> The common state save need is just to switch tasks.  This doesn't require
+> the state saved in a user friendly format.  So the fnstenv is typically
+> overhead.
+It's a tradeoff.  Since we use lazy FPU saves anyway, both the fxsave and the
+fnstenv are skipped by non-fpu app context switches.  On apps that do use the
+FPU though, signals are an example of a bad time to do the fpu conversion in
+hardware.  For example, assume apps A and B both use the fpu.  App A gets put
+to sleep, app B starts plugging away on the FPU.  We would have saved the FPU
+state of A already during the context switch.  If we then take an interrupt
+that ends up generating a signal to App A, then we need to put the FPU state
+info into the signal stack.  As a result, we have to save state of App B,
+restore App A state, save the tag word (and whatever else we want) and then
+copy that into the signal stack, then go from there.  Generally speaking, it
+adds a good amount of overhead to the signal path and if the signal handler in
+App A didn't want to do any more FPU stuff, then we would have failed on our
+lazy FPU saves.  It also adds complexity.  That's why I did it the way I did. 
+Better to just get the fpu save stuff out of the way and have everything at
+hand instead of changing all kinds of code paths for these kinds of
+save/restore/save tag word hacks.
+> The exceptional case and the monitoring case (ptrace) should happen
+> infrequently (we'll I don't really have any ptrace numbers), and when
+> they do they can be expected to be non-performance critical.  If you
+> want performance the FP exceptions should all be masked.
+> 
+> Removing FNSTENV alone won't work because, pending exceptions may
+> linger and not be masked...  Some exception ~reset~ is needed.
+Not possible with the various *save instructions on the PIII.  I spent many an
+hour tracking this down, but using fwait with fxsave will result in a cpu
+reset.  Using fstenv instead of fnstenv will result in a cpu reset (either
+before or after the fxsave).  I didn't try doing an fninit, but even that
+wouldn't work since you would be doing so *after* the fxsave so anything that
+would get changed as a result of the fninit forcing the immediate running of
+the exception handler would get lost.
+> Therefore FXSAVE followed by FNINIT will handle everything.  Using
+> FNINIT also makes the resulting state exactly as it does when
+> FNSAVE is used.
+That is a side effect of FSAVE, but not something we rely upon (or really need
+or possibly want to be honest).  We do an fninit the first time an app uses
+the FPU, so doing so here would be redundant and would preclude the ability to
+leave behind a certain fpu state should we wish to.
+> When an exceptional or ptrace case does come up the state can
+> be restored and then saved with FNSAVE directly into user memory.
+Sure, lets take a 100+ cycle hit to restore using FXRSTOR, then take a 200+
+cycle hit to do an FSAVE.  I didn't bother to measure the FNSTENV instruction,
+but my guess was that the amount of effort needed to copy 28 bytes followed by
+copying 80bits 8 times is less than the hit you have listed above. 
+Furthermore, the way I did it gets rid of *all* fsave/frstor operations.  The
+hope (and again, I didn't measure it) being that an FNSTENV and FLDENV would
+be enough faster than FSAVE/FRSTOR that we would actually end up ahead in the
+long run.
+> (I believe Linus suggested saving directly into user mem previously.)
+> In the exceptional case where the state hasn't changed yet (hasn't
+> been saved and reinited) then no restore is needed, just the
+> appropriate saving and reinit.
+> 
+> Finally some memory may be saved in the task struct.
+Hmmm...not a whole lot.  I only use 32bytes aside from the 512byte FXSAVE
+struct.  FNSTENV needs 28 of those 32 bytes, and the last bit are padding
+since we need 16byte alignment.  In that case you mention, the best you could
+do is either not have any legacy FPU state storage space, in which case you
+save 32 bytes (and are required to always do your fsave/fstenv stuff directly
+into user space or onto the stack) or you can do *at best* 4 bytes better than
+me by moving the fstenv space to the end of the struct so you don't have a
+padding byte.  I have yet to find a way to get the tag word out of the CPU
+without doing either fstenv or fsave.  So as far as I can tell, you would have
+to do one of the two.
+> >Caveats:  This patch doesn't set the OSXMMEXCEPT bit in cr4 since we don't
+> >have the new exception handler yet.  This needs written.  Once this is
+> >written, the various tests that are current something like
+> >
+> >if ( (len > 95) &&
+> >     (boot_cpu_data.x86_capability & X86_FEATURE_XMM) &&
+> >     (boot_cpu_data.cr4_features & X86_CR4_OSFXSR) ) {
+> >}
+> >
+> >can be compressed to test just the len and features for X86_CR4_OSXMMEXCEPT.
+> 
+> Before I was able to dig up an SSE patch I made my own changes to the
+> 2.3.3 kernel to support SSE.  I have also added an SSE exception handler,
+> but I have come across an issue that needs discussion.
+> 
+> The issue is signalling the task of the error.  There were a few
+> possibilties for the signal:
+> 
+> 1) Take over a remaining signal - I see one lost and one unsused.
+>      This is probably a bad idea...
+>  or
+> 
+> 2) Signal the task with SIGFPE and
+>    a) Set the fpstate pointer of sigcontext to point to the fxsaved
+>       state only when the exception is an SSE exception.
+>  or
+>    b) Change nothing in the sigcontext and create a new syscall for
+>       the user to retrieve the extended info.  (Though by Doug Ledford)
+>  and/or
+> 3) The task may inform the kernel is wishes to always have the
+>      sigcontext sent with fxsaved state.  This request would be
+>      denied if the processor didn't actually support FXSAVE/FXRSTOR.
+>      This bit check could prevent all FP specific state overhead if my
+>      FNSTENV suggestion is implemented.
+> 
+> You can guess my preference - 2a & eventually 3.  And here is why:
+> 
+> If a task creates an SSE exception is must either know about SSE or
+> be executing what it thought was bad opcodes (do we really care about
+> their task in that case?)  If they know about the opcodes and unmask SSE
+> exceptions, then they should have read the docs about Linux SSE support
+> and know that we point fpstate to the fxsaved area.  I believe the
+> current deafult handle is simply to exit and doesn't bother with
+> fpstate at all => no problem there.
+Hmmm....and when you have an app that uses the regular FP registers for
+certain ops and the XMM registers for other things, how exactly does the app
+know if the SIGFPE is for a regular FP op or an SSE op at the time it gets the
+signal (and has to interpret that pointer)?
+> Additionally if my above FNSTENV suggestion is implemented then there
+> will be no need to perform the FP state 'conversion' even in the absence
+> of 3.
+Are you going to flag each app that uses SSE as SSE using so that a normal FP
+exception also passes an SSE struct?  If you don't, then you still have to
+deal with conversions whenever you get a SIGFPE that doesn't use SSE (and for
+all non-SSE using apps that expect a normal FPU save struct).  Additionally,
+you have to tell the app somehow (or else the app has to try and guess what it
+is by the contents of the struct, and I could see that method having problems
+being deterministic).
+> >So, I welcome any comments.  Linus, how do these look to you?  Personally, I
+> >would like to quit maintaining them separately, so if there are issues you
+> >have with the first patch, let me know and I'll see if I can get it fixed.
+> >It's currently against 2.2.9 BTW.  Has it been tested?  I've been running with
+> >the first patch for over a month now (mostly, I've done code reordering and
+> >other tweaking in that time, but the base code has been done for a while) and
+> >the second patch just almost as long.
+> 
+> I'd like to see the development split up too.  It would be nice
+> to keep SSE apart from non-SSE PIII work also.
+> 
+> >
+> >-------- End Original Message --------
+> >
+> >As per my last remark.  The patches can be found at
+> >
+http://www.redhat.com/~dledford/linux_kernel.html
+> >
+> >The first patch I talked about is named PIII.patch and the second one is the
+> >PIII-raid.patch.  Enjoy.
+> 
+> I will try to release a patch with in a week which has the support
+> for 2a built upon my work with the 2.3.x kernels.  I suppose
+> competing patches suck, but I would guess a merge of the two
+> may be the right answer.
+> 
+> I heard once that x.even.x kernels were meant for bug fixes and
+> x.odd.x kernels were meant for experimental work.  Is that true?
+> 
+> Jason Hartman
+-- 
+  Doug Ledford   <dledford@redhat.com>
+   Opinions expressed are my own, but
+      they should be everybody's.
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

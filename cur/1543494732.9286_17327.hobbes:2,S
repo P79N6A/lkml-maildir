@@ -1,0 +1,407 @@
+Date: Wed, 5 May 1999 21:52:33 +0200 (CEST)
+From: Andrea Arcangeli <>
+Subject: Re: [patch] SMP race fix [was Re: SMP lockup & 3c509 on 2.2.x [aka. the Deadly 'ping -f']]
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/5/5/191
+
+On Wed, 5 May 1999, Linus Torvalds wrote:
+>IRQ_INPROGRESS works the way it works on purpose: it's only cleared after
+>a successful execution of the irq handler - and it is left pending if
+>there was no irq handler etc..
+So far so good. But my argument is that the kenrel set the inprogress bit
+also if IRQ_DISABLED _was_ set. My whole compliant about the current
+inprogress-bit-design is that currently if you set IRQ_DISABLED then
+you'll __never__ have a way to discover when the irq will finish. By
+looking the inprogress bit you won't know if the IRQ is still running or
+if the IRQ_INPROGRESS bit is been set by a an irq that was spinning on the
+controller_lock (on the other CPU) while we was setting the IRQ_DISABLED
+bit, and then such irq who seen IRQ_DISABLED will return leaving
+IRQ_INPROGRESS enabled _forever_. And this is the _only_ reason my first
+patch was not working properly (and the only thing I fixed with the second
+patch).
+>Your "while ()" was not reliable, and that's the part that needs fixing. 
+With my second patch applyed the loop of the first patch it's perfectly
+reliable (too much expensive though, really no need to also
+synchronize_irq()) since before starting the loop we set the IRQ_DISABLED
+bit and so with the IRQ_INPROGRESS design fixed, we are sure that the
+IRQ_INPROGRESS bit will go away _exactly_ when the last irq is expired and
+no other irqs will be allowed to run or to set INPROGRESS after DISABLED
+is been set. Only when the irq is finished disable_irq() can return.
+>For example, your while patch will loop forever if an irq tries to
+>synchronize with itself (instead of just returning like the original code
+>did). Don't try to fix it up by changing code that works fine.
+I don't understand your point here. But synchronize_irq shouldn't be used
+at all. From a point of view it's too much aggressive (no need to wait
+_all_ irqs), from another point of view it is unrelialable (see below).
+>> This my second incremental patch make sure to have a relialable
+>> IRQ_INPROGRESS value, to allow us to safely loop while(in_progress) at the
+>> end of disable_irq().
+>
+>See above why it's not safe at all, even with your changes.
+I can't still see why it's not safe. It's perfectly safe according to me
+(once the irq-inprogress design get fixed).
+>> Really with this new patch I removed the need to clear the IRQINPROGRESS
+>> bit upon irq_enable() and so I think this patch alone would just fix the
+>> SMP race (the problem is that we was doing a enable_irq while the irq was
+>> running and so we was allowing a second irq to reenter nested in the irq
+>> handler).
+>
+>No.
+Yes instead ;).
+>If people are doing random enable_irq() calls, then everything will break
+>anyway.
+People is not doing enable_irq() random call. But people does:
+	disable_irq()
+	enable_irq()
+and they currently are clearing a IRQ_INPROGRESS bit and they are allowing
+a second edge-ioapic to reenter in itself (probably I forgot to tell that
+I think the problem should be reproducible only with edge-level triggered
+irqs). And the bug is that synchronize_irq() is not able to wait for irqs:
+the only piece of code that is able to wait is my while() once the
+IRQ_INPROGRESS design is changed in my more useful way.
+>"enable_irq()" is only valid after a "disable_irq()" has been called. 
+I'll try to explain below why enable_irq() is corruptin the INPROGRESS bit
+even if it gets recalled _always_ after a disable_irq(). That's the bug I
+seen this morning when I sent you the first email, but probably I am not
+been good enough to explain the race I seen (I was very strict in time...
+sigh).
+>And "disable_irq()" will synchronously wait for the irq handler to have
+>exited (it has to - otherwise you'd see the case where somebody calls
+No. That's my whole point and the cause of the race. Think if
+synchronize_irq() runs a bit before handle_irq_event() had the time to
+increase global_irq_count (think the edge-ioapic case that will repeat
+if pending is set).
+See the relevant code:
+[..] * this is what is run in the disable_irq() cpu
+void synchronize_irq(void)
+{
+        if (atomic_read(&global_irq_count)) {
+	    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                /* Stupid approach */
+                cli();
+                sti();
+        }
+}
+[..] and here the edge-ioapic irq on the second CPU
+        /*
+         * Edge triggered interrupts need to remember
+         * pending events.
+         */
+        for (;;) {
+		--- here disable_irq runs the synchronize_irq() and
+		    the only irq in the system is this one, and it's
+		    not yet accounted by the *_irq_count data ---
+                handle_IRQ_event(irq, regs, action);
+		^^^^^^^^^^^^^^^^
+[..]
+int handle_IRQ_event(unsigned int irq, struct pt_regs * regs, struct
+irqaction * action)
+{
+        int status;
+        int cpu = smp_processor_id();
+        irq_enter(cpu, irq);
+	^^^^^^^^^
+        status = 1;     /* Force the "do bottom halves" bit */
+[..]
+static inline void irq_enter(int cpu, unsigned int irq)
+{
+        hardirq_enter(cpu);
+	^^^^^^^^^^^^^
+        while (test_bit(0,&global_irq_lock)) {
+                /* nothing */;
+        }
+[..]
+static inline void hardirq_enter(int cpu)
+{
+        ++local_irq_count[cpu];
+        atomic_inc(&global_irq_count); (too late, synchronize_irq is just
+	^^^^^^^^^^^^^^^^^^^^^^^^^^^^^	returned thinking I don't exist)
+}
+[..]
+disable_irq() can run the synchronize_irq() while global_irq_count is
+zero, and as I just said when global_irq_count is zero sync_irq become a
+nono. So disable_irq() returns, but the irq handler has still to run!
+But if there woudln't be an enable_irq() after the disable_irq()
+everything would be fine even with this SMP race (at least in the ne2k and
+3c509 case) because the disable_irq() and the irq are running on different
+CPUs. But it's when enable_irq() runs too early that a secondary
+edge-ioapic irq become allowed to run over the first one and so you get
+the lockup. This is the race I seen. And happens for real I am sure: I
+written a irq_tracer to get the confirm of that (I had the same report by
+both M.H.VanLeeuwen and Taneli Vähäkangas this morning; one of their CPU
+locked up with two eth0-irq running in the same cpu). The reason I written
+the irq tracer was just to see if I had to concentrate myself about the
+possibility of irq handler that was recursing on itself. I was just
+thinking hard about that possibility looking at the asm of the .text.lock
+and the SYSRQ+P and with my irq_tracer I had the confirm my guess was
+right.
+>Now, I fully expect that there can be (and is) a bug somewhere there, but
+I think the only race is the one I discovered and fixed.
+>you're in "random walk" mode, and you just walk over the code without
+You are quite right ;). It's that when I see something that I would see in
+another way I can't resist to change it ;)).
+I have a new patch for you that I think should go into the stable kernel
+and it's only composed by race fixes (the one above included, others with
+minor priority (priority is a function of probability for races ;)). It's
+huge though. So right now I'll repost only the relevant fix (this time
+only _one_ single patch against 2.2.7) for the popular SMP lockup. I also
+removed completly the bogus synchronize_irq() and I put a while() with a
+barrier. A rmb() probably would allow the CPU to see faster the change of
+the inprogress bit but it would generate a flood of LOCK signal on the
+bus, and this time is not needed for synchronization (we just resolved SMP
+sync with the irq controller lock).
+Index: arch/i386/kernel/irq.c
+===================================================================
+RCS file: /var/cvs/linux/arch/i386/kernel/irq.c,v
+retrieving revision 1.1.1.4
+diff -u -r1.1.1.4 irq.c
+--- irq.c	1999/04/17 14:21:26	1.1.1.4
++++ linux/arch/i386/kernel/irq.c	1999/05/05 16:18:27
+@@ -242,8 +242,11 @@
+ 		status = desc->status & ~IRQ_REPLAY;
+ 		action = NULL;
+ 		if (!(status & (IRQ_DISABLED | IRQ_INPROGRESS)))
++		{
+ 			action = desc->action;
+-		desc->status = status | IRQ_INPROGRESS;
++			status |= IRQ_INPROGRESS;
++		}
++		desc->status = status;
+ 	}
+ 	spin_unlock(&irq_controller_lock);
+ 
+@@ -747,7 +759,7 @@
+  * hardware disable after having gotten the irq
+  * controller lock. 
+  */
+-void disable_irq(unsigned int irq)
++static inline __disable_irq(unsigned int irq)
+ {
+ 	unsigned long flags;
+ 
+@@ -757,11 +769,20 @@
+ 		irq_desc[irq].handler->disable(irq);
+ 	}
+ 	spin_unlock_irqrestore(&irq_controller_lock, flags);
++}
+ 
+-	if (irq_desc[irq].status & IRQ_INPROGRESS)
+-		synchronize_irq();
++void disable_irq(unsigned int irq)
++{
++	__disable_irq(irq);
++	while (irq_desc[irq].status & IRQ_INPROGRESS)
++		barrier();
+ }
+ 
++void disable_irq_nosync(unsigned int irq)
++{
++	__disable_irq(irq);
++}
++
+ void enable_irq(unsigned int irq)
+ {
+ 	unsigned long flags;
+@@ -769,7 +790,7 @@
+ 	spin_lock_irqsave(&irq_controller_lock, flags);
+ 	switch (irq_desc[irq].depth) {
+ 	case 1:
+-		irq_desc[irq].status &= ~(IRQ_DISABLED | IRQ_INPROGRESS);
++		irq_desc[irq].status &= ~IRQ_DISABLED;
+ 		irq_desc[irq].handler->enable(irq);
+ 		/* fall throught */
+ 	default:
+@@ -951,7 +972,7 @@
+ 	for (i = NR_IRQS-1; i > 0; i--) {
+ 		if (!irq_desc[i].action) {
+ 			unsigned int status = irq_desc[i].status | IRQ_AUTODETECT;
+-			irq_desc[i].status = status & ~IRQ_INPROGRESS;
++			irq_desc[i].status = status & ~(IRQ_INPROGRESS|IRQ_DISABLED);
+ 			irq_desc[i].handler->startup(i);
+ 		}
+ 	}
+@@ -976,6 +997,7 @@
+ 		/* It triggered already - consider it spurious. */
+ 		if (status & IRQ_INPROGRESS) {
+ 			irq_desc[i].status = status & ~IRQ_AUTODETECT;
++			irq_desc[i].status |= IRQ_DISABLED;
+ 			irq_desc[i].handler->shutdown(i);
+ 		}
+ 	}
+@@ -1006,6 +1028,7 @@
+ 			nr_irqs++;
+ 		}
+ 		irq_desc[i].status = status & ~IRQ_AUTODETECT;
++		irq_desc[i].status |= IRQ_DISABLED;
+ 		irq_desc[i].handler->shutdown(i);
+ 	}
+ 	spin_unlock_irq(&irq_controller_lock);
+Index: arch/i386/kernel/io_apic.c
+===================================================================
+RCS file: /var/cvs/linux/arch/i386/kernel/io_apic.c,v
+retrieving revision 1.1.1.5
+retrieving revision 1.1.2.9
+diff -u -r1.1.1.5 -r1.1.2.9
+--- io_apic.c	1999/04/17 14:21:26	1.1.1.5
++++ linux/arch/i386/kernel/io_apic.c	1999/05/05 12:20:24	1.1.2.9
+@@ -1060,8 +1060,9 @@
+ 	if (!(status & (IRQ_DISABLED | IRQ_INPROGRESS))) {
+ 		action = desc->action;
+ 		status &= ~IRQ_PENDING;
++		status |= IRQ_INPROGRESS;
+ 	}
+-	desc->status = status | IRQ_INPROGRESS;
++	desc->status = status;
+ 	spin_unlock(&irq_controller_lock);
+ 
+ 	/*
+@@ -1112,8 +1113,9 @@
+ 	action = NULL;
+ 	if (!(status & (IRQ_DISABLED | IRQ_INPROGRESS))) {
+ 		action = desc->action;
++		status |= IRQ_INPROGRESS;
+ 	}
+-	desc->status = status | IRQ_INPROGRESS;
++	desc->status = status;
+ 
+ 	ack_APIC_irq();
+ 	spin_unlock(&irq_controller_lock);
+Index: arch/i386/kernel/visws_apic.c
+===================================================================
+RCS file: /var/cvs/linux/arch/i386/kernel/visws_apic.c,v
+retrieving revision 1.1.1.1
+retrieving revision 1.1.2.2
+diff -u -r1.1.1.1 -r1.1.2.2
+--- visws_apic.c	1999/01/23 16:25:26	1.1.1.1
++++ linux/arch/i386/kernel/visws_apic.c	1999/05/05 12:20:24	1.1.2.2
+@@ -204,8 +204,11 @@
+ 		status = desc->status & ~IRQ_REPLAY;
+ 		action = NULL;
+ 		if (!(status & (IRQ_DISABLED | IRQ_INPROGRESS)))
++		{
+ 			action = desc->action;
+-		desc->status = status | IRQ_INPROGRESS;
++			status |= IRQ_INPROGRESS;
++		}
++		desc->status = status;
+ 	}
+ 	spin_unlock(&irq_controller_lock);
+ 
+Index: /usr/src/linux/drivers/net/8390.c
+===================================================================
+RCS file: /var/cvs/linux/drivers/net/8390.c,v
+retrieving revision 1.1.1.2
+diff -u -r1.1.1.2 8390.c
+--- 8390.c	1999/03/09 00:52:48	1.1.1.2
++++ linux/drivers/net/8390.c	1999/05/05 16:19:33
+@@ -257,8 +257,7 @@
+ 
+ 		/* Ugly but a reset can be slow, yet must be protected */
+ 		
+-		disable_irq(dev->irq);
+-		synchronize_irq();
++		disable_irq_nosync(dev->irq);
+ 		spin_lock(&ei_local->page_lock);
+ 		
+ 		/* Try to restart the card.  Perhaps the user has fixed something. */
+@@ -286,8 +285,7 @@
+ 	 *	Slow phase with lock held.
+ 	 */
+ 	 
+-	disable_irq(dev->irq);
+-	synchronize_irq();
++	disable_irq_nosync(dev->irq);
+ 	
+ 	spin_lock(&ei_local->page_lock);
+ 	
+Index: /usr/src/linux/drivers/net/3c509.c
+===================================================================
+RCS file: /var/cvs/linux/drivers/net/3c509.c,v
+retrieving revision 1.1.1.2
+diff -u -r1.1.1.2 3c509.c
+--- 3c509.c	1999/03/24 00:45:40	1.1.1.2
++++ linux/drivers/net/3c509.c	1999/05/05 16:18:59
+@@ -568,7 +568,7 @@
+ 		 */
+ 
+ #ifdef __SMP__
+-		disable_irq(dev->irq);
++		disable_irq_nosync(dev->irq);
+ 	    	spin_lock(&lp->lock);
+ #endif	    	
+ 	    
+Index: /usr/src/linux/include/asm/irq.h
+===================================================================
+RCS file: /var/cvs/linux/include/asm-i386/irq.h,v
+retrieving revision 1.1.1.2
+retrieving revision 1.1.2.3
+diff -u -r1.1.1.2 -r1.1.2.3
+--- irq.h	1999/02/20 15:41:37	1.1.1.2
++++ linux/include/asm-i386/irq.h	1999/05/05 12:31:37	1.1.2.3
+@@ -29,6 +29,7 @@
+ }
+ 
+ extern void disable_irq(unsigned int);
++extern void disable_irq_nosync(unsigned int);
+ extern void enable_irq(unsigned int);
+ 
+ #endif /* _ASM_IRQ_H */
+All changes above are _strictly_ needed according to me and they continue
+to make sense to me. Maybe I missing something but it seems to me that you
+didn't seen my point (due my first strict and probably very very confused
+explanation).
+To convince still more myself and you now that I have a bit more of time
+I'll try write a little SMP trace of what I think it's happening:
+start with 0 irq running
+	CPU0				CPU1
+	----------			-------------
+	edge_io_apic_IRQ
+	set inprogress bit
+	handle_irq_event()
+	edge_io_apic_IRQ
+	set pending bit
+	return nested irq
+					disable_irq()
+					spin_lock(controller)
+					set disabled bit
+	handle_irq_event returns
+	spin_lock(controller)
+					spin_unlock(controller)
+					ah inprogress is set so do a
+					synchronize_irq() nono ;)
+					global_irq_count == 0 so return
+					here the code think that no irqN
+					are running on the other CPUs
+	got the controller lock
+	ah but pending is still true
+	so unlock(controller) and then
+	issue a new handle_irq_event()
+					spin_lock(eth0)
+	spin_lock(eth0)
+					finished critical section
+					spin_unlock(eth0)
+	go ahead in critical section
+					enable_irq(eth0-irq)
+					clear inprogress and disabled bits
+					so allow other irqs to run
+	edge_io_apic_IRQ
+	disabled and inprogress was clear
+	go ahead and set inprogress
+	handle_irq_event
+	spin_lock(eth0) -> deadlock
+Still make sense to me. Subtle I know, but so it's been far more fun ;).
+Maybe I am dreaming...
+Comments?
+Andrea Arcangeli
+PS. I had no reports about my patches so far (maybe because they was
+consfused due the lack of time from my part..) so I don't know yet if real
+world is happy or not... (I debugged everything in my mind and I have to
+admit that this make me a bit worried about possible not-tolerant-faults ;).
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

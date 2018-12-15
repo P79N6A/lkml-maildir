@@ -1,0 +1,453 @@
+Date: Thu, 9 Sep 1999 00:10:49 +0200 (CEST)
+From: Andrea Arcangeli <>
+Subject: [patch] oom fixes for 2.3.17
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/9/8/149
+
+I ported my 2.2.x-oom fixes to 2.3.17.
+Description of the patch:
+o	avoids init to get a sigsegv from the signal code due oom
+o	improves the oom detection in the signal-frame code
+o	send the sigbus if we are trying to write beyond the end of
+	a shared mapping in the 386 case (__verify_write())
+o	on ia32 avoids the kernel to sigkill a task running with iopl > 0,
+	send a sigterm instead (so X _won't_ screw-up the graphic card
+	anymore)
+o	page-cache oom friendly by breaking the loop at the first GFP fail
+o	page-cache nopage operation fixed to correctly kill the process
+	instead of sending the SIGBUS when necessary
+o	send a sigkill to the current task it triggered an OOM condition
+	by reading the ptrace data. Theorically if an iopl application
+	would go oom while reading a process MM, then it could get
+	a sigkill too, but I am not worried about that since usually
+	the debuggers doesn't need iopl() privilegies ;).
+o	remove the obsoleted lowlevel oom() function and replace it
+	with a sigkill where necessary
+diff -urN 2.3.17/arch/alpha/kernel/signal.c 2.3.17-oom/arch/alpha/kernel/signal.c
+--- 2.3.17/arch/alpha/kernel/signal.c	Sun Aug  1 18:11:07 1999
++++ 2.3.17-oom/arch/alpha/kernel/signal.c	Wed Sep  8 19:50:32 1999
+@@ -437,6 +437,8 @@
+ 		err |= __copy_to_user(frame->extramask, &set->sig[1], 
+ 				      sizeof(frame->extramask));
+ 	}
++	if (err)
++		goto give_sigsegv;
+ 
+ 	/* Set up to return from userspace.  If provided, use a stub
+ 	   already in userspace.  */
+@@ -499,6 +501,8 @@
+ 	err |= setup_sigcontext(&frame->uc.uc_mcontext, regs, sw,
+ 				set->sig[0], oldsp);
+ 	err |= __copy_to_user(&frame->uc.uc_sigmask, set, sizeof(*set));
++	if (err)
++		goto give_sigsegv;
+ 
+ 	/* Set up to return from userspace.  If provided, use a stub
+ 	   already in userspace.  */
+diff -urN 2.3.17/arch/alpha/mm/fault.c 2.3.17-oom/arch/alpha/mm/fault.c
+--- 2.3.17/arch/alpha/mm/fault.c	Fri Aug 20 17:42:19 1999
++++ 2.3.17-oom/arch/alpha/mm/fault.c	Wed Sep  8 20:43:28 1999
+@@ -130,13 +130,13 @@
+ 	 * make sure we exit gracefully rather than endlessly redo
+ 	 * the fault.
+ 	 */
++survive:
+ 	fault = handle_mm_fault(current, vma, address, cause > 0);
+-	up(&mm->mmap_sem);
+-
+ 	if (fault < 0)
+ 		goto out_of_memory;
+ 	if (fault == 0)
+ 		goto do_sigbus;
++	up(&mm->mmap_sem);
+ 
+ 	return;
+ 
+@@ -177,13 +177,23 @@
+  * us unable to handle the page fault gracefully.
+  */
+ out_of_memory:
+-	printk(KERN_ALERT "VM: killing process %s(%d)\n",
+-	       current->comm, current->pid);
+-	if (!user_mode(regs))
+-		goto no_context;
+-	do_exit(SIGKILL);
++	if (current->pid == 1)
++	{
++		current->policy |= SCHED_YIELD;
++		schedule();
++		goto survive;
++	}
++	up(&mm->mmap_sem);
++	if (user_mode(regs))
++	{
++		printk(KERN_ALERT "VM: killing process %s(%d)\n",
++		       current->comm, current->pid);
++		do_exit(SIGKILL);
++	}
++	goto no_context;
+ 
+ do_sigbus:
++	up(&mm->mmap_sem);
+ 	/*
+ 	 * Send a sigbus, regardless of whether we were in kernel
+ 	 * or user mode.
+diff -urN 2.3.17/arch/i386/kernel/signal.c 2.3.17-oom/arch/i386/kernel/signal.c
+--- 2.3.17/arch/i386/kernel/signal.c	Sun Aug  1 18:11:08 1999
++++ 2.3.17-oom/arch/i386/kernel/signal.c	Wed Sep  8 19:58:06 1999
+@@ -419,13 +419,19 @@
+ 		           ? current->exec_domain->signal_invmap[sig]
+ 		           : sig),
+ 		          &frame->sig);
++	if (err)
++		goto give_sigsegv;
+ 
+ 	err |= setup_sigcontext(&frame->sc, &frame->fpstate, regs, set->sig[0]);
++	if (err)
++		goto give_sigsegv;
+ 
+ 	if (_NSIG_WORDS > 1) {
+ 		err |= __copy_to_user(frame->extramask, &set->sig[1],
+ 				      sizeof(frame->extramask));
+ 	}
++	if (err)
++		goto give_sigsegv;
+ 
+ 	/* Set up to return from userspace.  If provided, use a stub
+ 	   already in userspace.  */
+@@ -486,6 +492,8 @@
+ 	err |= __put_user(&frame->info, &frame->pinfo);
+ 	err |= __put_user(&frame->uc, &frame->puc);
+ 	err |= __copy_to_user(&frame->info, info, sizeof(*info));
++	if (err)
++		goto give_sigsegv;
+ 
+ 	/* Create the ucontext.  */
+ 	err |= __put_user(0, &frame->uc.uc_flags);
+@@ -497,6 +505,8 @@
+ 	err |= setup_sigcontext(&frame->uc.uc_mcontext, &frame->fpstate,
+ 			        regs, set->sig[0]);
+ 	err |= __copy_to_user(&frame->uc.uc_sigmask, set, sizeof(*set));
++	if (err)
++		goto give_sigsegv;
+ 
+ 	/* Set up to return from userspace.  If provided, use a stub
+ 	   already in userspace.  */
+diff -urN 2.3.17/arch/i386/mm/fault.c 2.3.17-oom/arch/i386/mm/fault.c
+--- 2.3.17/arch/i386/mm/fault.c	Thu Aug 12 02:53:18 1999
++++ 2.3.17-oom/arch/i386/mm/fault.c	Wed Sep  8 20:05:05 1999
+@@ -31,6 +31,7 @@
+ {
+ 	struct vm_area_struct * vma;
+ 	unsigned long start = (unsigned long) addr;
++	int fault;
+ 
+ 	if (!size)
+ 		return 1;
+@@ -50,8 +51,12 @@
+ 	start &= PAGE_MASK;
+ 
+ 	for (;;) {
+-		if (handle_mm_fault(current, vma, start, 1) <= 0)
+-			goto bad_area;
++survive:
++		fault =  handle_mm_fault(current, vma, start, 1);
++		if (!fault)
++			goto do_sigbus;
++		if (fault < 0)
++			goto out_of_memory;
+ 		if (!size)
+ 			break;
+ 		size--;
+@@ -74,6 +79,19 @@
+ 
+ bad_area:
+ 	return 0;
++
++do_sigbus:
++	force_sig(SIGBUS, current);
++	goto bad_area;
++
++out_of_memory:
++	if (current->pid == 1)
++	{
++		current->policy |= SCHED_YIELD;
++		schedule();
++		goto survive;
++	}
++	goto bad_area;
+ }
+ 
+ asmlinkage void do_invalid_op(struct pt_regs *, unsigned long);
+@@ -163,6 +181,7 @@
+ 	 * make sure we exit gracefully rather than endlessly redo
+ 	 * the fault.
+ 	 */
++survive:
+ 	{
+ 		int fault = handle_mm_fault(tsk, vma, address, write);
+ 		if (fault < 0)
+@@ -262,10 +281,33 @@
+  * us unable to handle the page fault gracefully.
+  */
+ out_of_memory:
++	if (tsk->pid == 1)
++	{
++		tsk->policy |= SCHED_YIELD;
++		schedule();
++		goto survive;
++	}
+ 	up(&mm->mmap_sem);
+-	printk("VM: killing process %s\n", tsk->comm);
+ 	if (error_code & 4)
+-		do_exit(SIGKILL);
++	{
++		if (!((regs->eflags >> 12) & 3))
++		{
++			printk(KERN_ALERT "VM: killing process %s\n",
++			       tsk->comm);
++			do_exit(SIGKILL);
++		}
++		else
++		{
++			/*
++			 * The task is running with privilegies and so we
++			 * trust it and we give it a chance to die gracefully.
++			 */
++			printk(KERN_ALERT "VM: terminating process %s\n",
++			       tsk->comm);
++			force_sig(SIGTERM, current);
++			return;
++		}
++	}
+ 	goto no_context;
+ 
+ do_sigbus:
+diff -urN 2.3.17/include/linux/mm.h 2.3.17-oom/include/linux/mm.h
+--- 2.3.17/include/linux/mm.h	Wed Sep  8 18:18:56 1999
++++ 2.3.17-oom/include/linux/mm.h	Wed Sep  8 22:30:54 1999
+@@ -325,7 +325,6 @@
+ extern unsigned long paging_init(unsigned long start_mem, unsigned long end_mem);
+ extern void mem_init(unsigned long start_mem, unsigned long end_mem);
+ extern void show_mem(void);
+-extern void oom(struct task_struct * tsk);
+ extern void si_meminfo(struct sysinfo * val);
+ extern void swapin_readahead(unsigned long);
+ 
+diff -urN 2.3.17/kernel/ptrace.c 2.3.17-oom/kernel/ptrace.c
+--- 2.3.17/kernel/ptrace.c	Wed Sep  8 00:26:08 1999
++++ 2.3.17-oom/kernel/ptrace.c	Wed Sep  8 19:36:04 1999
+@@ -24,6 +24,7 @@
+ 	pmd_t * pgmiddle;
+ 	pte_t * pgtable;
+ 	unsigned long page;
++	int fault;
+ 
+ repeat:
+ 	pgdir = pgd_offset(vma->vm_mm, addr);
+@@ -64,8 +65,12 @@
+ 
+ fault_in_page:
+ 	/* -1: out of memory. 0 - unmapped page */
+-	if (handle_mm_fault(tsk, vma, addr, write) > 0)
++	fault = handle_mm_fault(tsk, vma, addr, write);
++	if (fault > 0)
+ 		goto repeat;
++	if (fault < 0)
++		/* the out of memory is been triggered by the current task. */
++		force_sig(SIGKILL, current);
+ 	return 0;
+ 
+ bad_pgd:
+diff -urN 2.3.17/mm/filemap.c 2.3.17-oom/mm/filemap.c
+--- 2.3.17/mm/filemap.c	Wed Sep  8 18:18:57 1999
++++ 2.3.17-oom/mm/filemap.c	Wed Sep  8 23:18:53 1999
+@@ -530,7 +530,7 @@
+  * This adds the requested page to the page cache if it isn't already there,
+  * and schedules an I/O to read in its contents from disk.
+  */
+-static inline void page_cache_read(struct file * file, unsigned long offset) 
++static inline int page_cache_read(struct file * file, unsigned long offset) 
+ {
+ 	unsigned long new_page;
+ 	struct inode *inode = file->f_dentry->d_inode;
+@@ -541,17 +541,17 @@
+ 	page = __find_page_nolock(inode, offset, *hash); 
+ 	spin_unlock(&pagecache_lock);
+ 	if (page)
+-		return;
++		return 1;
+ 
+ 	new_page = page_cache_alloc();
+ 	if (!new_page)
+-		return;
++		return 0;
+ 	page = page_cache_entry(new_page);
+ 
+ 	if (!add_to_page_cache_unique(page, inode, offset, hash)) {
+ 		inode->i_op->readpage(file, page);
+ 		page_cache_release(page);
+-		return;
++		return 1;
+ 	}
+ 
+ 	/*
+@@ -559,14 +559,14 @@
+ 	 * raced with us and added our page to the cache first.
+ 	 */
+ 	page_cache_free(new_page);
+-	return;
++	return 1;
+ }
+ 
+ /*
+  * Read in an entire cluster at once.  A cluster is usually a 64k-
+  * aligned block that includes the address requested in "offset."
+  */
+-static void read_cluster_nonblocking(struct file * file,
++static int read_cluster_nonblocking(struct file * file,
+ 	unsigned long offset)
+ {
+ 	off_t filesize = file->f_dentry->d_inode->i_size;
+@@ -574,11 +574,12 @@
+ 
+ 	offset = CLUSTER_OFFSET(offset);
+ 	while ((pages-- > 0) && (offset < filesize)) {
+-		page_cache_read(file, offset);
++		if (!page_cache_read(file, offset))
++			return 0;
+ 		offset += PAGE_CACHE_SIZE;
+ 	}
+ 
+-	return;
++	return 1;
+ }
+ 
+ /* 
+@@ -912,7 +913,8 @@
+ 	ahead = 0;
+ 	while (ahead < max_ahead) {
+ 		ahead += PAGE_CACHE_SIZE;
+-		page_cache_read(filp, raend + ahead);
++		if (!page_cache_read(filp, raend + ahead))
++			break;
+ 	}
+ /*
+  * If we tried to read ahead some pages,
+@@ -1347,7 +1349,7 @@
+ 			flush_page_to_ram(new_page);
+ 		}
+ 		page_cache_release(page);
+-		return new_page;
++		return new_page ? : -1;
+ 	}
+ 		
+ 	flush_page_to_ram(old_page);
+@@ -1361,10 +1363,13 @@
+ 	 * Otherwise, we're off the end of a privately mapped file,
+ 	 * so we need to map a zero page.
+ 	 */
+-	if (offset < inode->i_size)
+-		read_cluster_nonblocking(file, offset);
+-	else
+-		page_cache_read(file, offset);
++	if (offset < inode->i_size) {
++		if (!read_cluster_nonblocking(file, offset))
++			return -1;
++	} else {
++		if (!page_cache_read(file, offset))
++			return -1;
++	}
+ 
+ 	/*
+ 	 * The page we want has now been added to the page cache.
+diff -urN 2.3.17/mm/memory.c 2.3.17-oom/mm/memory.c
+--- 2.3.17/mm/memory.c	Wed Sep  8 00:26:08 1999
++++ 2.3.17-oom/mm/memory.c	Wed Sep  8 23:03:06 1999
+@@ -69,16 +69,6 @@
+ mem_map_t * mem_map = NULL;
+ 
+ /*
+- * oom() prints a message (so that the user knows why the process died),
+- * and gives the process an untrappable SIGKILL.
+- */
+-void oom(struct task_struct * task)
+-{
+-	printk("\nOut of memory for %s.\n", task->comm);
+-	force_sig(SIGKILL, task);
+-}
+-
+-/*
+  * Note: this doesn't free the actual pages themselves. That
+  * has been handled earlier when unmapping all the memory regions.
+  */
+@@ -732,13 +722,13 @@
+ 	pmd = pmd_alloc(pgd, address);
+ 	if (!pmd) {
+ 		free_page(page);
+-		oom(tsk);
++		force_sig(SIGKILL, tsk);
+ 		return 0;
+ 	}
+ 	pte = pte_alloc(pmd, address);
+ 	if (!pte) {
+ 		free_page(page);
+-		oom(tsk);
++		force_sig(SIGKILL, tsk);
+ 		return 0;
+ 	}
+ 	if (!pte_none(*pte)) {
+o	swap_out() is now allowed to refresh the swap counter only at
+	once per loop. max_cnt is an unsigned long.
+diff -urN 2.3.17/mm/vmscan.c 2.3.17-oom/mm/vmscan.c
+--- 2.3.17/mm/vmscan.c	Wed Sep  8 00:26:08 1999
++++ 2.3.17-oom/mm/vmscan.c	Wed Sep  8 23:12:07 1999
+@@ -327,6 +327,7 @@
+ 	struct task_struct * p;
+ 	int counter;
+ 	int __ret = 0;
++	int assign = 0;
+ 
+ 	lock_kernel();
+ 	/* 
+@@ -346,12 +347,9 @@
+ 	counter = nr_threads / (priority+1);
+ 	if (counter < 1)
+ 		counter = 1;
+-	if (counter > nr_threads)
+-		counter = nr_threads;
+ 
+ 	for (; counter >= 0; counter--) {
+-		int assign = 0;
+-		int max_cnt = 0;
++		unsigned long max_cnt = 0;
+ 		struct mm_struct *best = NULL;
+ 		int pid = 0;
+ 	select:
+@@ -364,7 +362,7 @@
+ 	 		if (mm->rss <= 0)
+ 				continue;
+ 			/* Refresh swap_cnt? */
+-			if (assign)
++			if (assign == 1)
+ 				mm->swap_cnt = mm->rss;
+ 			if (mm->swap_cnt > max_cnt) {
+ 				max_cnt = mm->swap_cnt;
+@@ -373,6 +371,8 @@
+ 			}
+ 		}
+ 		read_unlock(&tasklist_lock);
++		if (assign == 1)
++			assign = 2;
+ 		if (!best) {
+ 			if (!assign) {
+ 				assign = 1;
+Andrea
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

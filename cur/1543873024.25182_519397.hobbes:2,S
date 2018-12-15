@@ -1,0 +1,328 @@
+Date: Mon, 12 Mar 2007 23:33:39 -0700 (PDT)
+From: Trent Piepho <>
+Subject: Re: [RFC PATCH 1/3] Add ability to keep track of callers of symbol_(get|put)
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2007/3/13/43
+
+On Tue, 13 Mar 2007, Rusty Russell wrote:
+> Hi Trent,
+>
+> 	Patch looks good, just one comment:
+>
+> On Mon, 2007-03-12 at 07:07 -0700, Trent Piepho wrote:
+> > +       use = already_uses(a, b);
+> > +       if (!use) {
+> > +           printk(KERN_ERR "module %s trying to un-use a module, %s, which "
+> > +                  "it is not using", a->name, b->name);
+> > +            return 0;
+> > +       }
+>
+> s/return 0/BUG()/.  This is potentially quite a nasty bug.
+Ok, I did that before, I'll change it back.
+Note that the reference counting isn't perfect when it comes to catching
+mistakes.
+The fundamental problem is that when a module is loaded and linked, all the
+modules that it used symbols from gain a "use".  To be symmetric, when a
+module is unloaded all the modules it used symbols from should lose a
+"use".  Except, there is no record of what modules gained a "use" at link
+time.  Suppose module 1 uses a symbol from module 2.  At link time, a
+module_use that "1 uses 2" is created.  Now say 1 does a symbol_put() on
+something in 2, with no matching get.  The "1 uses 2" goes away.  When 1 is
+unloaded, there is no way to tell that "1 uses 2", deleted by the extra
+put, is missing.
+If it's wanted, I think I could fix this.  I'd have a separate count of
+static uses vs dynamic uses.From: Trent Piepho <xyzzy@speakeasy.org>
+Add ability to keep track of callers of symbol_(get|put)
+When a module uses symbol_get() to increase the ref count of another
+module, there is no record what module called symbol_get().  A module can
+show up as having other users, but there is no way to tell who those
+users are.
+This adds that ability to symbol_put() and symbol_get().
+__symbol_get() and __symbol_put() gain another parameter, which specifies
+the module that is doing the getting or putting.  symbol_put_addr() is
+renamed to __symbol_put_addr() and has the same parameter added.  The
+module can be NULL, in which case the symbol's owner's refcount is
+incremented without recording who did it, as was the case before.
+The macros symbol_get(), symbol_put(), and symbol_put_addr() will use
+THIS_MODULE as the getter/putter and so don't have an extra parameter.  A
+macro symbol_put_user() is added that allows specifying the putting
+module.
+The module_use structure that keeps track of one module's use of another
+gains a count member.  The module_use will not go away until the count
+goes down to zero.  The count wasn't necessary before because a module
+could only use another module once, when the module was linked in, and
+un-use that module once, when it was unloaded.
+When a module calls symbol_get() to get a symbol from module that owns
+the symbol, the ref count of the owning module is _not_ incremented if
+the getting module was already listed as using the owning module.
+Rather, the count of that module_use is incremented.
+When a module is loaded and the kernel module linker is resolving
+symbols, it will not increment the module_use count for each symbol used,
+but will just leave it at one.  We don't count each symbol resolved,
+because during module unloading we wouldn't know how many times to
+decrement the module_use count.
+When the module is unloaded, the module_use count will only be
+decremented by one, which should bring it to zero.  If it's not zero,
+then the remaining count is the number of symbol_get()s the module did
+that were unmatched with a symbol_put().
+Signed-off-by: Trent Piepho <xyzzy@speakeasy.org>
+diff --git a/include/linux/module.h b/include/linux/module.h
+--- a/include/linux/module.h
++++ b/include/linux/module.h
+@@ -167,9 +167,10 @@ struct notifier_block;
+ #ifdef CONFIG_MODULES
+ 
+ /* Get/put a kernel symbol (calls must be symmetric) */
+-void *__symbol_get(const char *symbol);
++void *__symbol_get(const char *symbol, struct module *user);
+ void *__symbol_get_gpl(const char *symbol);
+-#define symbol_get(x) ((typeof(&x))(__symbol_get(MODULE_SYMBOL_PREFIX #x)))
++#define symbol_get(x) ((typeof(&x))(__symbol_get(MODULE_SYMBOL_PREFIX #x, \
++			THIS_MODULE)))
+ 
+ #ifndef __GENKSYMS__
+ #ifdef CONFIG_MODVERSIONS
+@@ -386,9 +387,11 @@ extern void __module_put_and_exit(struct
+ 
+ #ifdef CONFIG_MODULE_UNLOAD
+ unsigned int module_refcount(struct module *mod);
+-void __symbol_put(const char *symbol);
+-#define symbol_put(x) __symbol_put(MODULE_SYMBOL_PREFIX #x)
+-void symbol_put_addr(void *addr);
++void __symbol_put(const char *symbol, struct module *user);
++#define symbol_put(x) __symbol_put(MODULE_SYMBOL_PREFIX #x, THIS_MODULE)
++#define symbol_put_user(x,u) __symbol_put(MODULE_SYMBOL_PREFIX #x, (u))
++void __symbol_put_addr(void *addr, struct module *user);
++#define symbol_put_addr(x) __symbol_put_addr((x), THIS_MODULE)
+ 
+ /* Sometimes we know we already have a refcount, and it's easier not
+    to handle the error case (which only happens with rmmod --wait). */
+diff --git a/kernel/module.c b/kernel/module.c
+--- a/kernel/module.c
++++ b/kernel/module.c
+@@ -516,30 +516,54 @@ struct module_use
+ {
+ 	struct list_head list;
+ 	struct module *module_which_uses;
++	int count;
+ };
+ 
+-/* Does a already use b? */
+-static int already_uses(struct module *a, struct module *b)
++/*
++ * Does a already use b?  Return NULL if it doesn't, a pointer to the
++ * relevant module_use structure if it does. 
++ */
++static struct module_use *already_uses(struct module *a, struct module *b)
+ {
+ 	struct module_use *use;
+ 
+ 	list_for_each_entry(use, &b->modules_which_use_me, list) {
+ 		if (use->module_which_uses == a) {
+ 			DEBUGP("%s uses %s!\n", a->name, b->name);
+-			return 1;
++			return use;
+ 		}
+ 	}
+ 	DEBUGP("%s does not use %s!\n", a->name, b->name);
+-	return 0;
+-}
+-
+-/* Module a uses b */
+-static int use_module(struct module *a, struct module *b)
++	return NULL;
++}
++
++/*
++ * Module a uses b.  If module a is a _new_ user of module b, module b's ref
++ * count will be incremented.  If a is not a new user of b, and inc is true,
++ * then the use count (i.e.  how many times a uses b) will be incremented.  If a
++ * is NULL, then the ref count will just always be incremented.
++ */
++static int use_module(struct module *a, struct module *b, bool inc)
+ {
+ 	struct module_use *use;
+ 	int no_warn;
+ 
+-	if (b == NULL || already_uses(a, b)) return 1;
++	if (b == NULL)
++		return 1;
++
++	DEBUGP("%s: %s uses %s\n", __FUNCTION__, a?a->name:"(unknown)",
++	       b->name);
++	if (a == NULL)
++		return strong_try_module_get(b);
++
++	use = already_uses(a, b);
++	if (use) {
++		if (inc)
++			use->count++;
++		DEBUGP("%s: %s already used %s, count now at %d\n",
++		       __FUNCTION__, a->name, b->name, use->count);
++		return 1;
++	}
+ 
+ 	if (!strong_try_module_get(b))
+ 		return 0;
+@@ -553,11 +577,50 @@ static int use_module(struct module *a, 
+ 	}
+ 
+ 	use->module_which_uses = a;
++	use->count = 1;
+ 	list_add(&use->list, &b->modules_which_use_me);
+ 	no_warn = sysfs_create_link(b->holders_dir, &a->mkobj.kobj, a->name);
+ 	return 1;
+ }
+ 
++/*
++ * Module a is "un-using" module b.  The use count is decremented, and if
++ * it reaches zero the module_use is removed and module b's ref-count is
++ * decremented.  Returns number of remaining uses.  If a is NULL, then
++ * just decrement b's ref count.
++ */
++static int unuse_module(struct module *a, struct module *b)
++{
++	struct module_use *use;
++
++	DEBUGP("%s: unuse %s by %s\n", __FUNCTION__, b->name, 
++	       a?a->name:"(unknown)");
++	if (!a) {
++		module_put(b);
++		return 0;
++	}
++
++	use = already_uses(a, b);
++	if (!use) {
++	    printk(KERN_ERR "module %s trying to un-use a module, %s, which "
++	           "it is not using", a->name, b->name);
++            BUG();
++	}
++
++	DEBUGP("%s: %s used %s %d time(s)\n", __FUNCTION__, 
++	       a->name, b->name, use->count);
++	if (!--(use->count)) {
++		DEBUGP("%s: removing module_use structure and sysfs link\n", 
++		       __FUNCTION__);
++		list_del(&use->list);
++		kfree(use);
++		sysfs_remove_link(b->holders_dir, a->name);
++		module_put(b);
++		return 0;
++	}
++	return use->count;
++}
++
+ /* Clear the unload stuff of the module. */
+ static void module_unload_free(struct module *mod)
+ {
+@@ -569,10 +632,14 @@ static void module_unload_free(struct mo
+ 		list_for_each_entry(use, &i->modules_which_use_me, list) {
+ 			if (use->module_which_uses == mod) {
+ 				DEBUGP("%s unusing %s\n", mod->name, i->name);
+-				module_put(i);
+-				list_del(&use->list);
+-				kfree(use);
+-				sysfs_remove_link(i->holders_dir, mod->name);
++				if (unuse_module(mod, i)) {
++					/* Someone messed up! */
++					printk(KERN_ERR "module %s unloading "
++					       "but still has uses of %s\n", 
++					       mod->name, i->name);
++					while (unuse_module(mod, i))
++						;
++				}
+ 				/* There can be at most one match. */
+ 				break;
+ 			}
+@@ -755,32 +822,41 @@ static void print_unload_info(struct seq
+ 		seq_printf(m, "-");
+ }
+ 
+-void __symbol_put(const char *symbol)
++void __symbol_put(const char *symbol, struct module *user)
+ {
+ 	struct module *owner;
+ 	unsigned long flags;
+ 	const unsigned long *crc;
+ 
++	DEBUGP("%s: putting symbol %s by %s\n", __FUNCTION__, symbol, 
++	       user?user->name:"(unknown)");
+ 	spin_lock_irqsave(&modlist_lock, flags);
+ 	if (!__find_symbol(symbol, &owner, &crc, 1))
+ 		BUG();
+-	module_put(owner);
++
++	if (owner)
++		unuse_module(user, owner);
+ 	spin_unlock_irqrestore(&modlist_lock, flags);
+ }
+ EXPORT_SYMBOL(__symbol_put);
+ 
+-void symbol_put_addr(void *addr)
++void __symbol_put_addr(void *addr, struct module *user)
+ {
+ 	struct module *modaddr;
+-
++	unsigned long flags;
++
++	DEBUGP("%s: putting %p by %s\n", __FUNCTION__, addr, 
++	       user?user->name:"(unknown)");
+ 	if (core_kernel_text((unsigned long)addr))
+ 		return;
+ 
+ 	if (!(modaddr = module_text_address((unsigned long)addr)))
+ 		BUG();
+-	module_put(modaddr);
+-}
+-EXPORT_SYMBOL_GPL(symbol_put_addr);
++	spin_lock_irqsave(&modlist_lock, flags);
++	unuse_module(user, modaddr);
++	spin_unlock_irqrestore(&modlist_lock, flags);
++}
++EXPORT_SYMBOL_GPL(__symbol_put_addr);
+ 
+ static ssize_t show_refcnt(struct module_attribute *mattr,
+ 			   struct module *mod, char *buffer)
+@@ -818,7 +894,7 @@ static inline void module_unload_free(st
+ {
+ }
+ 
+-static inline int use_module(struct module *a, struct module *b)
++static inline int use_module(struct module *a, struct module *b, bool inc)
+ {
+ 	return strong_try_module_get(b);
+ }
+@@ -961,7 +1037,7 @@ static unsigned long resolve_symbol(Elf_
+ 	if (ret) {
+ 		/* use_module can fail due to OOM, or module unloading */
+ 		if (!check_version(sechdrs, versindex, name, mod, crc) ||
+-		    !use_module(mod, owner))
++		    !use_module(mod, owner, false))
+ 			ret = 0;
+ 	}
+ 	return ret;
+@@ -1223,15 +1299,19 @@ static void free_module(struct module *m
+ 	module_free(mod, mod->module_core);
+ }
+ 
+-void *__symbol_get(const char *symbol)
++void *__symbol_get(const char *symbol, struct module *user)
+ {
+ 	struct module *owner;
+ 	unsigned long value, flags;
+ 	const unsigned long *crc;
+ 
++	DEBUGP("%s: get symbol %s by %s\n", __FUNCTION__, symbol, 
++	       user?user->name:"(unknown)");
+ 	spin_lock_irqsave(&modlist_lock, flags);
+ 	value = __find_symbol(symbol, &owner, &crc, 1);
+-	if (value && !strong_try_module_get(owner))
++	DEBUGP("%s: symbol %s is 0WN3D by %s\n", __FUNCTION__, symbol, 
++	       value?(owner?owner->name:"yer mom"):"no one");
++	if (value && owner && !use_module(user, owner, true))
+ 		value = 0;
+ 	spin_unlock_irqrestore(&modlist_lock, flags);
+ 

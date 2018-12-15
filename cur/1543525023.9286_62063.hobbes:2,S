@@ -1,0 +1,1339 @@
+Date: Wed, 9 Feb 2000 08:28:17 +0100
+From: Jakub Jelinek <>
+Subject: Security fixes for rt signals (updated patch)
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/2/9/21
+
+Hi!
+I've updated my siginfo patch to 2.3.43-pre5.
+Currently, the kernel has a bunch of kernel stack leaks to userland which
+are a serious security issue. Basically, if one runs rgrep 'si_code.*=' in
+the kernel tree, all but sys_kill are broken.
+One solution for that is to put a memset(&info, 0, sizeof(siginfo_t));
+before every force_sig_info/send_sig_info and related siginfo structure
+setup. But sizeof(siginfo_t) is 128 and in my tree there are more than 100
+places which would need the memset.
+Instead of that, I've coded a solution which speeds up siginfo handling both
+in the kernel and when copying to userland by only copying what's needed
+from the siginfo structure and not always the whole 128 byte structure (each
+is copied 3 times - once into the signal queue, once in dequeue_signal and
+once into userland). So it makes a little bit difference whether you're
+moving 20 or 128 bytes of data.
+Userland generated siginfo is always moved as a 128 chunk of data, while
+kernel generated siginfo gets some bits of si_code filled with the
+identification on what siginfo union members are actually used.
+When copying siginfo to userland, those bits get sign extended from the 15th
+bit, so userland does not see any difference.
+There are two architecture specific routines, copy_siginfo and
+copy_siginfo_to_user, which actually move siginfo around and ports are free
+to decide how to implement them, provided that the copy_siginfo_to_user does
+not leak any data which is should not be set for a particular union type and
+clears the internal bits of si_code. So this patch basically tries to avoid
+current and future kernel stack leaks into userland, if the author obeys
+these rules:
+Before calling send_sig_info/force_sig_info, you should either:
+a) play safe and bzero the whole structure before setting up fields
+b) fill si_signo, si_errno and si_code
+   and, depending on si_code, some other fields
+   - if si_code is < 0, then the whole structure must be cleared first
+   - if si_code is __SI_FAULT style (ILL_*, SEGV_*, BUS_*, TRAP_*, FPE_*, EMT_*),
+     then si_addr must be filled (and si_trapno as well on sparc/sparc64)
+   - if si_code is __SI_KILL style (the most common, e.g. SI_USER, SI_KERNEL),
+     then si_uid and si_pid must be filled
+   - if si_code is __SI_POLL style (POLL_*), then si_fd and si_band must be
+     filled
+   - if si_code is __SI_CHLD style (CLD_*), then si_pid, si_uid16 (using SET_SIGINFO_UID16),
+     si_cld_uid (this is unfortunate due to uid32 changes), si_status,
+     si_utime and si_stime must be filled
+This has an additional advantage for multiple ABI architectures
+(sparc64(sparc), ia64(ia32), ...) that the kernel knows what the semantics
+of a particular siginfo structure is and can convert it correctly
+(previously, sparc64 used to convert e.g. based on signr, but that's very
+wrong, e.g. you can call notify_parent with any signal you like and it would
+work only for SIGCLD and not for the other signals).
+In addition to this, this patch adds siginfo for a few kernel generated
+fault signals on i386.
+Plus this patch as per rth's suggestion, it does not check if a non-rt signal is still
+pending in the queue because it is never.
+Please apply.
+--- linux/fs/fcntl.c.jj	Tue Dec 14 09:53:27 1999
++++ linux/fs/fcntl.c	Wed Feb  9 08:07:36 2000
+@@ -259,8 +259,7 @@ out:
+ 
+ /* Table to convert sigio signal codes into poll band bitmaps */
+ 
+-static int band_table[NSIGPOLL+1] = {
+-	~0,
++static int band_table[NSIGPOLL] = {
+ 	POLLIN | POLLRDNORM,			/* POLL_IN */
+ 	POLLOUT | POLLWRNORM | POLLWRBAND,	/* POLL_OUT */
+ 	POLLIN | POLLRDNORM | POLLMSG,		/* POLL_MSG */
+@@ -290,10 +289,15 @@ static void send_sigio_to_task(struct ta
+ 			si.si_signo = fown->signum;
+ 			si.si_errno = 0;
+ 		        si.si_code  = reason;
+-			if (reason < 0 || reason > NSIGPOLL)
++		        /* Make sure we are called with one of the POLL_*
++			   reasons, otherwise we could leak kernel stack into
++			   userspace.  */
++		        if ((reason & __SI_MASK) != __SI_POLL)
++		        	BUG();
++			if (reason - POLL_IN > NSIGPOLL)
+ 				si.si_band  = ~0;
+ 			else
+-				si.si_band = band_table[reason];
++				si.si_band = band_table[reason - POLL_IN];
+ 			si.si_fd    = fa->fa_fd;
+ 			if (!send_sig_info(fown->signum, &si, p))
+ 				break;
+--- linux/kernel/signal.c.jj	Fri Jan 21 18:48:31 2000
++++ linux/kernel/signal.c	Wed Feb  9 08:07:36 2000
+@@ -142,18 +142,20 @@ printk("SIG dequeue (%s:%d): %d ", curre
+ 		if (q) {
+ 			if ((*pp = q->next) == NULL)
+ 				current->sigqueue_tail = pp;
+-			*info = q->info;
++			copy_siginfo(info, &q->info);
+ 			kmem_cache_free(signal_queue_cachep,q);
+ 			atomic_dec(&nr_queued_signals);
+ 
+ 			/* then see if this signal is still pending. */
+-			q = *pp;
+-			while (q) {
+-				if (q->info.si_signo == sig) {
+-					reset = 0;
+-					break;
++			if (sig >= SIGRTMIN) {
++				q = *pp;
++				while (q) {
++					if (q->info.si_signo == sig) {
++						reset = 0;
++						break;
++					}
++					q = q->next;
+ 				}
+-				q = q->next;
+ 			}
+ 		} else {
+ 			/* Ok, it wasn't in the queue.  It must have
+@@ -332,7 +334,7 @@ printk("SIG queue (%s:%d): %d ", t->comm
+ 				q->info.si_uid = 0;
+ 				break;
+ 			default:
+-				q->info = *info;
++				copy_siginfo(&q->info, info);
+ 				break;
+ 		}
+ 	} else {
+@@ -556,16 +558,18 @@ void
+ notify_parent(struct task_struct *tsk, int sig)
+ {
+ 	struct siginfo info;
+-	int why;
++	int why, status;
+ 
+ 	info.si_signo = sig;
+ 	info.si_errno = 0;
+ 	info.si_pid = tsk->pid;
++	info.si_uid = tsk->uid;
+ 
+ 	/* FIXME: find out whether or not this is supposed to be c*time. */
+ 	info.si_utime = tsk->times.tms_utime;
+ 	info.si_stime = tsk->times.tms_stime;
+ 
++	status = tsk->exit_code & 0x7f;
+ 	why = SI_KERNEL;	/* shouldn't happen */
+ 	switch (tsk->state) {
+ 	case TASK_ZOMBIE:
+@@ -573,12 +577,17 @@ notify_parent(struct task_struct *tsk, i
+ 			why = CLD_DUMPED;
+ 		else if (tsk->exit_code & 0x7f)
+ 			why = CLD_KILLED;
+-		else
++		else {
+ 			why = CLD_EXITED;
++			status = tsk->exit_code >> 8;
++		}
+ 		break;
+ 	case TASK_STOPPED:
+ 		/* FIXME -- can we deduce CLD_TRAPPED or CLD_CONTINUED? */
+-		why = CLD_STOPPED;
++		if (tsk->flags & PF_PTRACED)
++			why = CLD_TRAPPED;
++		else
++			why = CLD_STOPPED;
+ 		break;
+ 
+ 	default:
+@@ -587,6 +596,7 @@ notify_parent(struct task_struct *tsk, i
+ 		break;
+ 	}
+ 	info.si_code = why;
++	info.si_status = status;
+ 
+ 	send_sig_info(sig, &info, tsk->p_pptr);
+ 	wake_up_interruptible(&tsk->p_pptr->wait_chldexit);
+@@ -755,7 +765,7 @@ sys_rt_sigtimedwait(const sigset_t *uthe
+ 	if (sig) {
+ 		ret = sig;
+ 		if (uinfo) {
+-			if (copy_to_user(uinfo, &info, sizeof(siginfo_t)))
++			if (copy_siginfo_to_user(uinfo, &info))
+ 				ret = -EFAULT;
+ 		}
+ 	} else {
+@@ -772,8 +782,6 @@ sys_kill(int pid, int sig)
+ {
+ 	struct siginfo info;
+ 
+-	memset(&info, 0, sizeof(info));
+-	
+ 	info.si_signo = sig;
+ 	info.si_errno = 0;
+ 	info.si_code = SI_USER;
+--- linux/include/linux/kernel.h.jj	Tue Oct 19 19:22:19 1999
++++ linux/include/linux/kernel.h	Wed Feb  9 08:07:36 2000
+@@ -42,7 +42,6 @@
+ #define FASTCALL(x)	x
+ #endif
+ 
+-extern void math_error(void);
+ extern struct notifier_block *panic_notifier_list;
+ NORET_TYPE void panic(const char * fmt, ...)
+ 	__attribute__ ((NORET_AND format (printf, 1, 2)));
+--- linux/include/asm-i386/siginfo.h.jj	Tue Feb  1 02:11:34 2000
++++ linux/include/asm-i386/siginfo.h	Wed Feb  9 08:09:26 2000
+@@ -77,17 +77,36 @@ typedef struct siginfo {
+ #define si_band		_sifields._sigpoll._band
+ #define si_fd		_sifields._sigpoll._fd
+ 
++#ifdef __KERNEL__
++#define __SI_MASK	0xffff0000
++#define __SI_KILL	(0 << 16)
++#define __SI_TIMER	(1 << 16)
++#define __SI_POLL	(2 << 16)
++#define __SI_FAULT	(3 << 16)
++#define __SI_CHLD	(4 << 16)
++#define __SI_RT		(5 << 16)
++#define __SI_CODE(T,N)	((T) << 16 | ((N) & 0xffff))
++#else
++#define __SI_KILL	0
++#define __SI_TIMER	0
++#define __SI_POLL	0
++#define __SI_FAULT	0
++#define __SI_CHLD	0
++#define __SI_RT		0
++#define __SI_CODE(T,N)	(N)
++#endif
++
+ /*
+  * si_code values
+  * Digital reserves positive values for kernel-generated signals.
+  */
+-#define SI_USER		0	/* sent by kill, sigsend, raise */
+-#define SI_KERNEL	0x80	/* sent by the kernel from somewhere */
+-#define SI_QUEUE	-1	/* sent by sigqueue */
+-#define SI_TIMER	-2	/* sent by timer expiration */
+-#define SI_MESGQ	-3	/* sent by real time mesq state change */
+-#define SI_ASYNCIO	-4	/* sent by AIO completion */
+-#define SI_SIGIO	-5	/* sent by queued SIGIO */
++#define SI_USER		0		/* sent by kill, sigsend, raise */
++#define SI_KERNEL	0x80		/* sent by the kernel from somewhere */
++#define SI_QUEUE	-1		/* sent by sigqueue */
++#define SI_TIMER __SI_CODE(__SI_TIMER,-2) /* sent by timer expiration */
++#define SI_MESGQ	-3		/* sent by real time mesq state change */
++#define SI_ASYNCIO	-4		/* sent by AIO completion */
++#define SI_SIGIO	-5		/* sent by queued SIGIO */
+ 
+ #define SI_FROMUSER(siptr)	((siptr)->si_code <= 0)
+ #define SI_FROMKERNEL(siptr)	((siptr)->si_code > 0)
+@@ -95,71 +114,71 @@ typedef struct siginfo {
+ /*
+  * SIGILL si_codes
+  */
+-#define ILL_ILLOPC	1	/* illegal opcode */
+-#define ILL_ILLOPN	2	/* illegal operand */
+-#define ILL_ILLADR	3	/* illegal addressing mode */
+-#define ILL_ILLTRP	4	/* illegal trap */
+-#define ILL_PRVOPC	5	/* privileged opcode */
+-#define ILL_PRVREG	6	/* privileged register */
+-#define ILL_COPROC	7	/* coprocessor error */
+-#define ILL_BADSTK	8	/* internal stack error */
++#define ILL_ILLOPC	(__SI_FAULT|1)	/* illegal opcode */
++#define ILL_ILLOPN	(__SI_FAULT|2)	/* illegal operand */
++#define ILL_ILLADR	(__SI_FAULT|3)	/* illegal addressing mode */
++#define ILL_ILLTRP	(__SI_FAULT|4)	/* illegal trap */
++#define ILL_PRVOPC	(__SI_FAULT|5)	/* privileged opcode */
++#define ILL_PRVREG	(__SI_FAULT|6)	/* privileged register */
++#define ILL_COPROC	(__SI_FAULT|7)	/* coprocessor error */
++#define ILL_BADSTK	(__SI_FAULT|8)	/* internal stack error */
+ #define NSIGILL		8
+ 
+ /*
+  * SIGFPE si_codes
+  */
+-#define FPE_INTDIV	1	/* integer divide by zero */
+-#define FPE_INTOVF	2	/* integer overflow */
+-#define FPE_FLTDIV	3	/* floating point divide by zero */
+-#define FPE_FLTOVF	4	/* floating point overflow */
+-#define FPE_FLTUND	5	/* floating point underflow */
+-#define FPE_FLTRES	6	/* floating point inexact result */
+-#define FPE_FLTINV	7	/* floating point invalid operation */
+-#define FPE_FLTSUB	8	/* subscript out of range */
++#define FPE_INTDIV	(__SI_FAULT|1)	/* integer divide by zero */
++#define FPE_INTOVF	(__SI_FAULT|2)	/* integer overflow */
++#define FPE_FLTDIV	(__SI_FAULT|3)	/* floating point divide by zero */
++#define FPE_FLTOVF	(__SI_FAULT|4)	/* floating point overflow */
++#define FPE_FLTUND	(__SI_FAULT|5)	/* floating point underflow */
++#define FPE_FLTRES	(__SI_FAULT|6)	/* floating point inexact result */
++#define FPE_FLTINV	(__SI_FAULT|7)	/* floating point invalid operation */
++#define FPE_FLTSUB	(__SI_FAULT|8)	/* subscript out of range */
+ #define NSIGFPE		8
+ 
+ /*
+  * SIGSEGV si_codes
+  */
+-#define SEGV_MAPERR	1	/* address not mapped to object */
+-#define SEGV_ACCERR	2	/* invalid permissions for mapped object */
++#define SEGV_MAPERR	(__SI_FAULT|1)	/* address not mapped to object */
++#define SEGV_ACCERR	(__SI_FAULT|2)	/* invalid permissions for mapped object */
+ #define NSIGSEGV	2
+ 
+ /*
+  * SIGBUS si_codes
+  */
+-#define BUS_ADRALN	1	/* invalid address alignment */
+-#define BUS_ADRERR	2	/* non-existant physical address */
+-#define BUS_OBJERR	3	/* object specific hardware error */
++#define BUS_ADRALN	(__SI_FAULT|1)	/* invalid address alignment */
++#define BUS_ADRERR	(__SI_FAULT|2)	/* non-existant physical address */
++#define BUS_OBJERR	(__SI_FAULT|3)	/* object specific hardware error */
+ #define NSIGBUS		3
+ 
+ /*
+  * SIGTRAP si_codes
+  */
+-#define TRAP_BRKPT	1	/* process breakpoint */
+-#define TRAP_TRACE	2	/* process trace trap */
++#define TRAP_BRKPT	(__SI_FAULT|1)	/* process breakpoint */
++#define TRAP_TRACE	(__SI_FAULT|2)	/* process trace trap */
+ #define NSIGTRAP	2
+ 
+ /*
+  * SIGCHLD si_codes
+  */
+-#define CLD_EXITED	1	/* child has exited */
+-#define CLD_KILLED	2	/* child was killed */
+-#define CLD_DUMPED	3	/* child terminated abnormally */
+-#define CLD_TRAPPED	4	/* traced child has trapped */
+-#define CLD_STOPPED	5	/* child has stopped */
+-#define CLD_CONTINUED	6	/* stopped child has continued */
++#define CLD_EXITED	(__SI_CHLD|1)	/* child has exited */
++#define CLD_KILLED	(__SI_CHLD|2)	/* child was killed */
++#define CLD_DUMPED	(__SI_CHLD|3)	/* child terminated abnormally */
++#define CLD_TRAPPED	(__SI_CHLD|4)	/* traced child has trapped */
++#define CLD_STOPPED	(__SI_CHLD|5)	/* child has stopped */
++#define CLD_CONTINUED	(__SI_CHLD|6)	/* stopped child has continued */
+ #define NSIGCHLD	6
+ 
+ /*
+  * SIGPOLL si_codes
+  */
+-#define POLL_IN		1	/* data input available */
+-#define POLL_OUT	2	/* output buffers available */
+-#define POLL_MSG	3	/* input message available */
+-#define POLL_ERR	4	/* i/o error */
+-#define POLL_PRI	5	/* high priority input available */
+-#define POLL_HUP	6	/* device disconnected */
++#define POLL_IN		(__SI_POLL|1)	/* data input available */
++#define POLL_OUT	(__SI_POLL|2)	/* output buffers available */
++#define POLL_MSG	(__SI_POLL|3)	/* input message available */
++#define POLL_ERR	(__SI_POLL|4)	/* i/o error */
++#define POLL_PRI	(__SI_POLL|5)	/* high priority input available */
++#define POLL_HUP	(__SI_POLL|6)	/* device disconnected */
+ #define NSIGPOLL	6
+ 
+ /*
+@@ -193,5 +212,21 @@ typedef struct sigevent {
+ 
+ #define sigev_notify_function	_sigev_un._sigev_thread._function
+ #define sigev_notify_attributes	_sigev_un._sigev_thread._attribute
++
++#ifdef __KERNEL__
++#include <linux/string.h>
++
++extern inline void copy_siginfo(siginfo_t *to, siginfo_t *from)
++{
++	if (from->si_code < 0)
++		*to = *from;
++	else
++		/* _sigchld is currently the largest know union member */
++		memcpy(to, from, 3*sizeof(int) + sizeof(from->_sifields._sigchld));
++}
++
++extern int copy_siginfo_to_user(siginfo_t *to, siginfo_t *from);
++
++#endif /* __KERNEL__ */
+ 
+ #endif
+--- linux/include/asm-sparc/siginfo.h.jj	Tue Feb  1 08:37:19 2000
++++ linux/include/asm-sparc/siginfo.h	Wed Feb  9 08:10:57 2000
+@@ -82,22 +82,36 @@ typedef struct siginfo {
+ #define si_fd		_sifields._sigpoll._fd
+ 
+ #ifdef __KERNEL__
+-#define __SI_MASK	0
++#define __SI_MASK	0xffff0000
++#define __SI_KILL	(0 << 16)
++#define __SI_TIMER	(1 << 16)
++#define __SI_POLL	(2 << 16)
++#define __SI_FAULT	(3 << 16)
++#define __SI_CHLD	(4 << 16)
++#define __SI_RT		(5 << 16)
++#define __SI_CODE(T,N)	((T) << 16 | ((N) & 0xffff))
++#else
++#define __SI_KILL	0
++#define __SI_TIMER	0
++#define __SI_POLL	0
+ #define __SI_FAULT	0
++#define __SI_CHLD	0
++#define __SI_RT		0
++#define __SI_CODE(T,N)	(N)
+ #endif
+ 
+ /*
+  * si_code values
+  * Digital reserves positive values for kernel-generated signals.
+  */
+-#define SI_NOINFO	32767	/* no information in siginfo_t */
+-#define SI_USER		0	/* sent by kill, sigsend, raise */
+-#define SI_KERNEL	0x80	/* sent by the kernel from somewhere */
+-#define SI_QUEUE	-1	/* sent by sigqueue */
+-#define SI_TIMER	-2	/* sent by timer expiration */
+-#define SI_MESGQ	-3	/* sent by real time mesq state change */
+-#define SI_ASYNCIO	-4	/* sent by AIO completion */
+-#define SI_SIGIO	-5	/* sent by queued SIGIO */
++#define SI_NOINFO	32767		/* no information in siginfo_t */
++#define SI_USER		0		/* sent by kill, sigsend, raise */
++#define SI_KERNEL	0x80		/* sent by the kernel from somewhere */
++#define SI_QUEUE	-1		/* sent by sigqueue */
++#define SI_TIMER __SI_CODE(__SI_TIMER,-2) /* sent by timer expiration */
++#define SI_MESGQ	-3		/* sent by real time mesq state change */
++#define SI_ASYNCIO	-4		/* sent by AIO completion */
++#define SI_SIGIO	-5		/* sent by queued SIGIO */
+ 
+ #define SI_FROMUSER(siptr)	((siptr)->si_code <= 0)
+ #define SI_FROMKERNEL(siptr)	((siptr)->si_code > 0)
+@@ -105,77 +119,77 @@ typedef struct siginfo {
+ /*
+  * SIGILL si_codes
+  */
+-#define ILL_ILLOPC	1	/* illegal opcode */
+-#define ILL_ILLOPN	2	/* illegal operand */
+-#define ILL_ILLADR	3	/* illegal addressing mode */
+-#define ILL_ILLTRP	4	/* illegal trap */
+-#define ILL_PRVOPC	5	/* privileged opcode */
+-#define ILL_PRVREG	6	/* privileged register */
+-#define ILL_COPROC	7	/* coprocessor error */
+-#define ILL_BADSTK	8	/* internal stack error */
++#define ILL_ILLOPC	(__SI_FAULT|1)	/* illegal opcode */
++#define ILL_ILLOPN	(__SI_FAULT|2)	/* illegal operand */
++#define ILL_ILLADR	(__SI_FAULT|3)	/* illegal addressing mode */
++#define ILL_ILLTRP	(__SI_FAULT|4)	/* illegal trap */
++#define ILL_PRVOPC	(__SI_FAULT|5)	/* privileged opcode */
++#define ILL_PRVREG	(__SI_FAULT|6)	/* privileged register */
++#define ILL_COPROC	(__SI_FAULT|7)	/* coprocessor error */
++#define ILL_BADSTK	(__SI_FAULT|8)	/* internal stack error */
+ #define NSIGILL		8
+ 
+ /*
+  * SIGFPE si_codes
+  */
+-#define FPE_INTDIV	1	/* integer divide by zero */
+-#define FPE_INTOVF	2	/* integer overflow */
+-#define FPE_FLTDIV	3	/* floating point divide by zero */
+-#define FPE_FLTOVF	4	/* floating point overflow */
+-#define FPE_FLTUND	5	/* floating point underflow */
+-#define FPE_FLTRES	6	/* floating point inexact result */
+-#define FPE_FLTINV	7	/* floating point invalid operation */
+-#define FPE_FLTSUB	8	/* subscript out of range */
++#define FPE_INTDIV	(__SI_FAULT|1)	/* integer divide by zero */
++#define FPE_INTOVF	(__SI_FAULT|2)	/* integer overflow */
++#define FPE_FLTDIV	(__SI_FAULT|3)	/* floating point divide by zero */
++#define FPE_FLTOVF	(__SI_FAULT|4)	/* floating point overflow */
++#define FPE_FLTUND	(__SI_FAULT|5)	/* floating point underflow */
++#define FPE_FLTRES	(__SI_FAULT|6)	/* floating point inexact result */
++#define FPE_FLTINV	(__SI_FAULT|7)	/* floating point invalid operation */
++#define FPE_FLTSUB	(__SI_FAULT|8)	/* subscript out of range */
+ #define NSIGFPE		8
+ 
+ /*
+  * SIGSEGV si_codes
+  */
+-#define SEGV_MAPERR	1	/* address not mapped to object */
+-#define SEGV_ACCERR	2	/* invalid permissions for mapped object */
++#define SEGV_MAPERR	(__SI_FAULT|1)	/* address not mapped to object */
++#define SEGV_ACCERR	(__SI_FAULT|2)	/* invalid permissions for mapped object */
+ #define NSIGSEGV	2
+ 
+ /*
+  * SIGBUS si_codes
+  */
+-#define BUS_ADRALN	1	/* invalid address alignment */
+-#define BUS_ADRERR	2	/* non-existant physical address */
+-#define BUS_OBJERR	3	/* object specific hardware error */
++#define BUS_ADRALN	(__SI_FAULT|1)	/* invalid address alignment */
++#define BUS_ADRERR	(__SI_FAULT|2)	/* non-existant physical address */
++#define BUS_OBJERR	(__SI_FAULT|3)	/* object specific hardware error */
+ #define NSIGBUS		3
+ 
+ /*
+  * SIGTRAP si_codes
+  */
+-#define TRAP_BRKPT	1	/* process breakpoint */
+-#define TRAP_TRACE	2	/* process trace trap */
++#define TRAP_BRKPT	(__SI_FAULT|1)	/* process breakpoint */
++#define TRAP_TRACE	(__SI_FAULT|2)	/* process trace trap */
+ #define NSIGTRAP	2
+ 
+ /*
+  * SIGCHLD si_codes
+  */
+-#define CLD_EXITED	1	/* child has exited */
+-#define CLD_KILLED	2	/* child was killed */
+-#define CLD_DUMPED	3	/* child terminated abnormally */
+-#define CLD_TRAPPED	4	/* traced child has trapped */
+-#define CLD_STOPPED	5	/* child has stopped */
+-#define CLD_CONTINUED	6	/* stopped child has continued */
++#define CLD_EXITED	(__SI_CHLD|1)	/* child has exited */
++#define CLD_KILLED	(__SI_CHLD|2)	/* child was killed */
++#define CLD_DUMPED	(__SI_CHLD|3)	/* child terminated abnormally */
++#define CLD_TRAPPED	(__SI_CHLD|4)	/* traced child has trapped */
++#define CLD_STOPPED	(__SI_CHLD|5)	/* child has stopped */
++#define CLD_CONTINUED	(__SI_CHLD|6)	/* stopped child has continued */
+ #define NSIGCHLD	6
+ 
+ /*
+  * SIGPOLL si_codes
+  */
+-#define POLL_IN		1	/* data input available */
+-#define POLL_OUT	2	/* output buffers available */
+-#define POLL_MSG	3	/* input message available */
+-#define POLL_ERR	4	/* i/o error */
+-#define POLL_PRI	5	/* high priority input available */
+-#define POLL_HUP	6	/* device disconnected */
++#define POLL_IN		(__SI_POLL|1)	/* data input available */
++#define POLL_OUT	(__SI_POLL|2)	/* output buffers available */
++#define POLL_MSG	(__SI_POLL|3)	/* input message available */
++#define POLL_ERR	(__SI_POLL|4)	/* i/o error */
++#define POLL_PRI	(__SI_POLL|5)	/* high priority input available */
++#define POLL_HUP	(__SI_POLL|6)	/* device disconnected */
+ #define NSIGPOLL	6
+ 
+ /*
+  * SIGEMT si_codes
+  */
+-#define EMT_TAGOVF	1	/* tag overflow */
++#define EMT_TAGOVF	(__SI_FAULT|1)	/* tag overflow */
+ #define NSIGEMT		1
+ 
+ /*
+@@ -206,6 +220,23 @@ typedef struct sigevent {
+ 		} _sigev_thread;
+ 	} _sigev_un;
+ } sigevent_t;
++
++#ifdef __KERNEL__
++
++#include <linux/string.h>
++
++extern inline void copy_siginfo(siginfo_t *to, siginfo_t *from)
++{
++	if (from->si_code < 0)
++		*to = *from;
++	else
++		/* _sigchld is currently the largest know union member */
++		memcpy(to, from, 3*sizeof(int) + sizeof(from->_sifields._sigchld));
++}
++
++extern int copy_siginfo_to_user(siginfo_t *to, siginfo_t *from);
++
++#endif /* __KERNEL__ */
+ 
+ #define sigev_notify_function	_sigev_un._sigev_thread._function
+ #define sigev_notify_attributes	_sigev_un._sigev_thread._attribute
+--- linux/include/asm-sparc64/siginfo.h.jj	Tue Jan 25 20:17:08 2000
++++ linux/include/asm-sparc64/siginfo.h	Wed Feb  9 08:12:08 2000
+@@ -142,22 +142,36 @@ typedef struct siginfo32 {
+ #define si_fd		_sifields._sigpoll._fd
+ 
+ #ifdef __KERNEL__
+-#define __SI_MASK	0
++#define __SI_MASK	0xffff0000
++#define __SI_KILL	(0 << 16)
++#define __SI_TIMER	(1 << 16)
++#define __SI_POLL	(2 << 16)
++#define __SI_FAULT	(3 << 16)
++#define __SI_CHLD	(4 << 16)
++#define __SI_RT		(5 << 16)
++#define __SI_CODE(T,N)	((T) << 16 | ((N) & 0xffff))
++#else
++#define __SI_KILL	0
++#define __SI_TIMER	0
++#define __SI_POLL	0
+ #define __SI_FAULT	0
++#define __SI_CHLD	0
++#define __SI_RT		0
++#define __SI_CODE(T,N)	(N)
+ #endif
+ 
+ /*
+  * si_code values
+  * Digital reserves positive values for kernel-generated signals.
+  */
+-#define SI_NOINFO	32767	/* no information in siginfo_t */
+-#define SI_USER		0	/* sent by kill, sigsend, raise */
+-#define SI_KERNEL	0x80	/* sent by the kernel from somewhere */
+-#define SI_QUEUE	-1	/* sent by sigqueue */
+-#define SI_TIMER	-2	/* sent by timer expiration */
+-#define SI_MESGQ	-3	/* sent by real time mesq state change */
+-#define SI_ASYNCIO	-4	/* sent by AIO completion */
+-#define SI_SIGIO	-5	/* sent by queued SIGIO */
++#define SI_NOINFO	32767		/* no information in siginfo_t */
++#define SI_USER		0		/* sent by kill, sigsend, raise */
++#define SI_KERNEL	0x80		/* sent by the kernel from somewhere */
++#define SI_QUEUE	-1		/* sent by sigqueue */
++#define SI_TIMER __SI_CODE(__SI_TIMER,-2) /* sent by timer expiration */
++#define SI_MESGQ	-3		/* sent by real time mesq state change */
++#define SI_ASYNCIO	-4		/* sent by AIO completion */
++#define SI_SIGIO	-5		/* sent by queued SIGIO */
+ 
+ #define SI_FROMUSER(siptr)	((siptr)->si_code <= 0)
+ #define SI_FROMKERNEL(siptr)	((siptr)->si_code > 0)
+@@ -165,77 +179,77 @@ typedef struct siginfo32 {
+ /*
+  * SIGILL si_codes
+  */
+-#define ILL_ILLOPC	1	/* illegal opcode */
+-#define ILL_ILLOPN	2	/* illegal operand */
+-#define ILL_ILLADR	3	/* illegal addressing mode */
+-#define ILL_ILLTRP	4	/* illegal trap */
+-#define ILL_PRVOPC	5	/* privileged opcode */
+-#define ILL_PRVREG	6	/* privileged register */
+-#define ILL_COPROC	7	/* coprocessor error */
+-#define ILL_BADSTK	8	/* internal stack error */
++#define ILL_ILLOPC	(__SI_FAULT|1)	/* illegal opcode */
++#define ILL_ILLOPN	(__SI_FAULT|2)	/* illegal operand */
++#define ILL_ILLADR	(__SI_FAULT|3)	/* illegal addressing mode */
++#define ILL_ILLTRP	(__SI_FAULT|4)	/* illegal trap */
++#define ILL_PRVOPC	(__SI_FAULT|5)	/* privileged opcode */
++#define ILL_PRVREG	(__SI_FAULT|6)	/* privileged register */
++#define ILL_COPROC	(__SI_FAULT|7)	/* coprocessor error */
++#define ILL_BADSTK	(__SI_FAULT|8)	/* internal stack error */
+ #define NSIGILL		8
+ 
+ /*
+  * SIGFPE si_codes
+  */
+-#define FPE_INTDIV	1	/* integer divide by zero */
+-#define FPE_INTOVF	2	/* integer overflow */
+-#define FPE_FLTDIV	3	/* floating point divide by zero */
+-#define FPE_FLTOVF	4	/* floating point overflow */
+-#define FPE_FLTUND	5	/* floating point underflow */
+-#define FPE_FLTRES	6	/* floating point inexact result */
+-#define FPE_FLTINV	7	/* floating point invalid operation */
+-#define FPE_FLTSUB	8	/* subscript out of range */
++#define FPE_INTDIV	(__SI_FAULT|1)	/* integer divide by zero */
++#define FPE_INTOVF	(__SI_FAULT|2)	/* integer overflow */
++#define FPE_FLTDIV	(__SI_FAULT|3)	/* floating point divide by zero */
++#define FPE_FLTOVF	(__SI_FAULT|4)	/* floating point overflow */
++#define FPE_FLTUND	(__SI_FAULT|5)	/* floating point underflow */
++#define FPE_FLTRES	(__SI_FAULT|6)	/* floating point inexact result */
++#define FPE_FLTINV	(__SI_FAULT|7)	/* floating point invalid operation */
++#define FPE_FLTSUB	(__SI_FAULT|8)	/* subscript out of range */
+ #define NSIGFPE		8
+ 
+ /*
+  * SIGSEGV si_codes
+  */
+-#define SEGV_MAPERR	1	/* address not mapped to object */
+-#define SEGV_ACCERR	2	/* invalid permissions for mapped object */
++#define SEGV_MAPERR	(__SI_FAULT|1)	/* address not mapped to object */
++#define SEGV_ACCERR	(__SI_FAULT|2)	/* invalid permissions for mapped object */
+ #define NSIGSEGV	2
+ 
+ /*
+  * SIGBUS si_codes
+  */
+-#define BUS_ADRALN	1	/* invalid address alignment */
+-#define BUS_ADRERR	2	/* non-existant physical address */
+-#define BUS_OBJERR	3	/* object specific hardware error */
++#define BUS_ADRALN	(__SI_FAULT|1)	/* invalid address alignment */
++#define BUS_ADRERR	(__SI_FAULT|2)	/* non-existant physical address */
++#define BUS_OBJERR	(__SI_FAULT|3)	/* object specific hardware error */
+ #define NSIGBUS		3
+ 
+ /*
+  * SIGTRAP si_codes
+  */
+-#define TRAP_BRKPT	1	/* process breakpoint */
+-#define TRAP_TRACE	2	/* process trace trap */
++#define TRAP_BRKPT	(__SI_FAULT|1)	/* process breakpoint */
++#define TRAP_TRACE	(__SI_FAULT|2)	/* process trace trap */
+ #define NSIGTRAP	2
+ 
+ /*
+  * SIGCHLD si_codes
+  */
+-#define CLD_EXITED	1	/* child has exited */
+-#define CLD_KILLED	2	/* child was killed */
+-#define CLD_DUMPED	3	/* child terminated abnormally */
+-#define CLD_TRAPPED	4	/* traced child has trapped */
+-#define CLD_STOPPED	5	/* child has stopped */
+-#define CLD_CONTINUED	6	/* stopped child has continued */
++#define CLD_EXITED	(__SI_CHLD|1)	/* child has exited */
++#define CLD_KILLED	(__SI_CHLD|2)	/* child was killed */
++#define CLD_DUMPED	(__SI_CHLD|3)	/* child terminated abnormally */
++#define CLD_TRAPPED	(__SI_CHLD|4)	/* traced child has trapped */
++#define CLD_STOPPED	(__SI_CHLD|5)	/* child has stopped */
++#define CLD_CONTINUED	(__SI_CHLD|6)	/* stopped child has continued */
+ #define NSIGCHLD	6
+ 
+ /*
+  * SIGPOLL si_codes
+  */
+-#define POLL_IN		1	/* data input available */
+-#define POLL_OUT	2	/* output buffers available */
+-#define POLL_MSG	3	/* input message available */
+-#define POLL_ERR	4	/* i/o error */
+-#define POLL_PRI	5	/* high priority input available */
+-#define POLL_HUP	6	/* device disconnected */
++#define POLL_IN		(__SI_POLL|1)	/* data input available */
++#define POLL_OUT	(__SI_POLL|2)	/* output buffers available */
++#define POLL_MSG	(__SI_POLL|3)	/* input message available */
++#define POLL_ERR	(__SI_POLL|4)	/* i/o error */
++#define POLL_PRI	(__SI_POLL|5)	/* high priority input available */
++#define POLL_HUP	(__SI_POLL|6)	/* device disconnected */
+ #define NSIGPOLL	6
+ 
+ /*
+  * SIGEMT si_codes
+  */
+-#define EMT_TAGOVF	1	/* tag overflow */
++#define EMT_TAGOVF	(__SI_FAULT|1)	/* tag overflow */
+ #define NSIGEMT		1
+ 
+ /*
+@@ -283,6 +297,20 @@ typedef struct sigevent32 {
+ 		} _sigev_thread;
+ 	} _sigev_un;
+ } sigevent_t32;
++
++#include <linux/string.h>
++
++extern inline void copy_siginfo(siginfo_t *to, siginfo_t *from)
++{
++	if (from->si_code < 0)
++		*to = *from;
++	else
++		/* _sigchld is currently the largest know union member */
++		memcpy(to, from, 4*sizeof(int) + sizeof(from->_sifields._sigchld));
++}
++
++extern int copy_siginfo_to_user(siginfo_t *to, siginfo_t *from);
++extern int copy_siginfo_to_user32(siginfo_t32 *to, siginfo_t *from);
+ 
+ #endif /* __KERNEL__ */
+ 
+--- linux/arch/i386/mm/fault.c.jj	Thu Jan 20 18:51:42 2000
++++ linux/arch/i386/mm/fault.c	Wed Feb  9 08:07:36 2000
+@@ -124,13 +124,14 @@ asmlinkage void do_page_fault(struct pt_
+ 	unsigned long page;
+ 	unsigned long fixup;
+ 	int write;
+-	int si_code = SEGV_MAPERR;
++	siginfo_t info;
+ 
+ 	/* get the address */
+ 	__asm__("movl %%cr2,%0":"=r" (address));
+ 
+ 	tsk = current;
+ 	mm = tsk->mm;
++	info.si_code = SEGV_MAPERR;
+ 
+ 	/*
+ 	 * If we're in an interrupt or have no user
+@@ -165,9 +166,8 @@ asmlinkage void do_page_fault(struct pt_
+  * we can handle it..
+  */
+ good_area:
++	info.si_code = SEGV_ACCERR;
+ 	write = 0;
+-	si_code = SEGV_ACCERR;
+-
+ 	switch (error_code & 3) {
+ 		default:	/* 3: write, present */
+ #ifdef TEST_VERIFY_AREA
+@@ -220,14 +220,14 @@ bad_area:
+ 
+ 	/* User mode accesses just cause a SIGSEGV */
+ 	if (error_code & 4) {
+-		struct siginfo si;
+ 		tsk->thread.cr2 = address;
+ 		tsk->thread.error_code = error_code;
+ 		tsk->thread.trap_no = 14;
+-		si.si_signo = SIGSEGV;
+-		si.si_code = si_code;
+-		si.si_addr = (void*) address;
+-		force_sig_info(SIGSEGV, &si, tsk);
++		info.si_signo = SIGSEGV;
++		info.si_errno = 0;
++		/* info.si_code has been set above */
++		info.si_addr = (void *)address;
++		force_sig_info(SIGSEGV, &info, tsk);
+ 		return;
+ 	}
+ 
+@@ -304,7 +304,11 @@ do_sigbus:
+ 	tsk->thread.cr2 = address;
+ 	tsk->thread.error_code = error_code;
+ 	tsk->thread.trap_no = 14;
+-	force_sig(SIGBUS, tsk);
++	info.si_code = SIGBUS;
++	info.si_errno = 0;
++	info.si_code = BUS_ADRERR;
++	info.si_addr = (void *)address;
++	force_sig_info(SIGBUS, &info, tsk);
+ 
+ 	/* Kernel mode? Handle exceptions or die */
+ 	if (!(error_code & 4))
+--- linux/arch/i386/kernel/i8259.c.jj	Thu Jan 20 18:51:42 2000
++++ linux/arch/i386/kernel/i8259.c	Wed Feb  9 08:07:36 2000
+@@ -368,10 +368,11 @@ void init_8259A(int auto_eoi)
+  
+ static void math_error_irq(int cpl, void *dev_id, struct pt_regs *regs)
+ {
++	extern void math_error(void *);
+ 	outb(0,0xF0);
+ 	if (ignore_irq13 || !boot_cpu_data.hard_math)
+ 		return;
+-	math_error();
++	math_error((void *)regs->eip);
+ }
+ 
+ static struct irqaction irq13 = { math_error_irq, 0, 0, "fpu", NULL, NULL };
+--- linux/arch/i386/kernel/traps.c.jj	Wed Feb  9 08:03:38 2000
++++ linux/arch/i386/kernel/traps.c	Wed Feb  9 08:07:36 2000
+@@ -81,6 +81,20 @@ asmlinkage void do_##name(struct pt_regs
+ 	force_sig(signr, tsk); \
+ }
+ 
++#define DO_ERROR_INFO(trapnr, signr, str, name, tsk, sicode, siaddr) \
++asmlinkage void do_##name(struct pt_regs * regs, long error_code) \
++{ \
++	siginfo_t info; \
++	tsk->thread.error_code = error_code; \
++	tsk->thread.trap_no = trapnr; \
++	die_if_no_fixup(str,regs,error_code); \
++	info.si_signo = signr; \
++	info.si_errno = 0; \
++	info.si_code = sicode; \
++	info.si_addr = (void *)siaddr; \
++	force_sig_info(signr, &info, tsk); \
++}
++
+ #define DO_VM86_ERROR(trapnr, signr, str, name, tsk) \
+ asmlinkage void do_##name(struct pt_regs * regs, long error_code) \
+ { \
+@@ -98,6 +112,28 @@ out: \
+ 	unlock_kernel(); \
+ }
+ 
++#define DO_VM86_ERROR_INFO(trapnr, signr, str, name, tsk, sicode, siaddr) \
++asmlinkage void do_##name(struct pt_regs * regs, long error_code) \
++{ \
++	siginfo_t info; \
++	lock_kernel(); \
++	if (regs->eflags & VM_MASK) { \
++		if (!handle_vm86_trap((struct kernel_vm86_regs *) regs, error_code, trapnr)) \
++			goto out; \
++		/* else fall through */ \
++	} \
++	tsk->thread.error_code = error_code; \
++	tsk->thread.trap_no = trapnr; \
++	info.si_signo = signr; \
++	info.si_errno = 0; \
++	info.si_code = sicode; \
++	info.si_addr = (void *)siaddr; \
++	force_sig_info(signr, &info, tsk); \
++	die_if_kernel(str,regs,error_code); \
++out: \
++	unlock_kernel(); \
++}
++
+ void page_exception(void);
+ 
+ asmlinkage void divide_error(void);
+@@ -259,35 +295,32 @@ static void die_if_no_fixup(const char *
+ 	}
+ }
+ 
+-DO_VM86_ERROR( 0, SIGFPE,  "divide error", divide_error, current)
++static inline unsigned long get_cr2(void)
++{
++	unsigned long address;
++
++	/* get the address */
++	__asm__("movl %%cr2,%0":"=r" (address));
++	return address;
++}
++
++DO_VM86_ERROR_INFO( 0, SIGFPE,  "divide error", divide_error, current, FPE_INTDIV, regs->eip)
+ DO_VM86_ERROR( 3, SIGTRAP, "int3", int3, current)
+ DO_VM86_ERROR( 4, SIGSEGV, "overflow", overflow, current)
+ DO_VM86_ERROR( 5, SIGSEGV, "bounds", bounds, current)
+-DO_ERROR( 6, SIGILL,  "invalid operand", invalid_op, current)
++DO_ERROR_INFO( 6, SIGILL,  "invalid operand", invalid_op, current, ILL_ILLOPN, regs->eip)
+ DO_VM86_ERROR( 7, SIGSEGV, "device not available", device_not_available, current)
+ DO_ERROR( 8, SIGSEGV, "double fault", double_fault, current)
+ DO_ERROR( 9, SIGFPE,  "coprocessor segment overrun", coprocessor_segment_overrun, current)
+ DO_ERROR(10, SIGSEGV, "invalid TSS", invalid_TSS, current)
+ DO_ERROR(11, SIGBUS,  "segment not present", segment_not_present, current)
+ DO_ERROR(12, SIGBUS,  "stack segment", stack_segment, current)
+-DO_ERROR(17, SIGSEGV, "alignment check", alignment_check, current)
++DO_ERROR_INFO(17, SIGBUS, "alignment check", alignment_check, current, BUS_ADRALN, get_cr2())
+ DO_ERROR(18, SIGSEGV, "reserved", reserved, current)
+ /* I don't have documents for this but it does seem to cover the cache
+    flush from user space exception some people get. */
+ DO_ERROR(19, SIGSEGV, "cache flush denied", cache_flush_denied, current)
+ 
+-asmlinkage void cache_flush_denied(struct pt_regs * regs, long error_code)
+-{
+-	if (regs->eflags & VM_MASK) {
+-		handle_vm86_fault((struct kernel_vm86_regs *) regs, error_code);
+-		return;
+-	}
+-	die_if_kernel("cache flush denied",regs,error_code);
+-	current->thread.error_code = error_code;
+-	current->thread.trap_no = 19;
+-	force_sig(SIGSEGV, current);
+-}
+-
+ asmlinkage void do_general_protection(struct pt_regs * regs, long error_code)
+ {
+ 	if (regs->eflags & VM_MASK)
+@@ -485,6 +518,7 @@ asmlinkage void do_debug(struct pt_regs 
+ {
+ 	unsigned int condition;
+ 	struct task_struct *tsk = current;
++	siginfo_t info;
+ 
+ 	__asm__ __volatile__("movl %%db6,%0" : "=r" (condition));
+ 
+@@ -519,7 +553,11 @@ asmlinkage void do_debug(struct pt_regs 
+ 	/* Ok, finally something we can handle */
+ 	tsk->thread.trap_no = 1;
+ 	tsk->thread.error_code = error_code;
+-	force_sig(SIGTRAP, tsk);
++	info.si_signo = SIGTRAP;
++	info.si_errno = 0;
++	info.si_code = TRAP_BRKPT;
++	info.si_addr = (void *)regs->eip;
++	force_sig_info(SIGTRAP, &info, tsk);
+ 	return;
+ 
+ debug_vm86:
+@@ -544,9 +582,10 @@ clear_TF:
+  * the correct behaviour even in the presence of the asynchronous
+  * IRQ13 behaviour
+  */
+-void math_error(void)
++void math_error(void *eip)
+ {
+ 	struct task_struct * task;
++	siginfo_t info;
+ 
+ 	/*
+ 	 * Save the info for the exception handler
+@@ -556,13 +595,52 @@ void math_error(void)
+ 	save_fpu(task);
+ 	task->thread.trap_no = 16;
+ 	task->thread.error_code = 0;
+-	force_sig(SIGFPE, task);
++	info.si_signo = SIGFPE;
++	info.si_errno = 0;
++	info.si_code = __SI_FAULT;
++	info.si_addr = eip;
++	/*
++	 * (~cwd & swd) will mask out exceptions that are not set to unmasked
++	 * status.  0x3f is the exception bits in these regs, 0x200 is the
++	 * C1 reg you need in case of a stack fault, 0x040 is the stack
++	 * fault bit.  We should only be taking one exception at a time,
++	 * so if this combination doesn't produce any single exception,
++	 * then we have a bad program that isn't syncronizing its FPU usage
++	 * and it will suffer the consequences since we won't be able to
++	 * fully reproduce the context of the exception
++	 */
++	switch(((~task->thread.i387.hard.cwd) &
++		task->thread.i387.hard.swd & 0x3f) |
++	       (task->thread.i387.hard.swd & 0x240)) {
++		case 0x000:
++		default:
++			break;
++		case 0x001: /* Invalid Op */
++		case 0x040: /* Stack Fault */
++		case 0x240: /* Stack Fault | Direction */
++			info.si_code = FPE_FLTINV;
++			break;
++		case 0x002: /* Denormalize */
++		case 0x010: /* Underflow */
++			info.si_code = FPE_FLTUND;
++			break;
++		case 0x004: /* Zero Divide */
++			info.si_code = FPE_FLTDIV;
++			break;
++		case 0x008: /* Overflow */
++			info.si_code = FPE_FLTOVF;
++			break;
++		case 0x020: /* Precision */
++			info.si_code = FPE_FLTRES;
++			break;
++	}
++	force_sig_info(SIGFPE, &info, task);
+ }
+ 
+ asmlinkage void do_coprocessor_error(struct pt_regs * regs, long error_code)
+ {
+ 	ignore_irq13 = 1;
+-	math_error();
++	math_error((void *)regs->eip);
+ }
+ 
+ asmlinkage void do_spurious_interrupt_bug(struct pt_regs * regs,
+--- linux/arch/i386/kernel/signal.c.jj	Fri Jan 21 18:48:31 2000
++++ linux/arch/i386/kernel/signal.c	Wed Feb  9 08:07:36 2000
+@@ -30,6 +30,41 @@ asmlinkage int sys_wait4(pid_t pid, unsi
+ 			 int options, unsigned long *ru);
+ asmlinkage int FASTCALL(do_signal(struct pt_regs *regs, sigset_t *oldset));
+ 
++int copy_siginfo_to_user(siginfo_t *to, siginfo_t *from)
++{
++	if (!access_ok (VERIFY_WRITE, to, sizeof(siginfo_t)))
++		return -EFAULT;
++	if (from->si_code < 0)
++		return __copy_to_user(to, from, sizeof(siginfo_t));
++	else {
++		int err;
++
++		/* If you change siginfo_t structure, please be sure
++		   this code is fixed accordingly.
++		   It should never copy any pad contained in the structure
++		   to avoid security leaks, but must copy the generic
++		   3 ints plus the relevant union member.  */
++		err = __put_user(from->si_signo, &to->si_signo);
++		err |= __put_user(from->si_errno, &to->si_errno);
++		err |= __put_user((short)from->si_code, &to->si_code);
++		/* First 32bits of unions are always present.  */
++		err |= __put_user(from->si_pid, &to->si_pid);
++		switch (from->si_code >> 16) {
++		case __SI_FAULT >> 16:
++			break;
++		case __SI_CHLD >> 16:
++			err |= __put_user(from->si_utime, &to->si_utime);
++			err |= __put_user(from->si_stime, &to->si_stime);
++			err |= __put_user(from->si_status, &to->si_status);
++		default:
++			err |= __put_user(from->si_uid, &to->si_uid);
++			break;
++		/* case __SI_RT: This is not generated by the kernel as of now.  */
++		}
++		return err;
++	}
++}
++
+ /*
+  * Atomically swap in the new signal mask, and wait for a signal.
+  */
+@@ -485,7 +520,7 @@ static void setup_rt_frame(int sig, stru
+ 			  &frame->sig);
+ 	err |= __put_user(&frame->info, &frame->pinfo);
+ 	err |= __put_user(&frame->uc, &frame->puc);
+-	err |= __copy_to_user(&frame->info, info, sizeof(*info));
++	err |= copy_siginfo_to_user(&frame->info, info);
+ 
+ 	/* Create the ucontext.  */
+ 	err |= __put_user(0, &frame->uc.uc_flags);
+--- linux/arch/sparc/kernel/signal.c.jj	Sat Jan 22 03:22:54 2000
++++ linux/arch/sparc/kernel/signal.c	Wed Feb  9 08:07:36 2000
+@@ -94,6 +94,38 @@ struct rt_signal_frame {
+ 	__siginfo_fpu_t		fpu_state;
+ };
+ 
++int copy_siginfo_to_user(siginfo_t *to, siginfo_t *from)
++{
++	if (!access_ok(VERIFY_WRITE, to, sizeof(siginfo_t)))
++		return -EFAULT;
++	if (from->si_code < 0)
++		return __copy_to_user(to, from, sizeof(siginfo_t));
++	else {
++		int err;
++
++		/* If you change siginfo_t structure, please be sure
++		   this code is fixed accordingly.
++		   It should never copy any pad contained in the structure
++		   to avoid security leaks, but must copy the generic
++		   3 ints plus the relevant union member.  */
++		err = __put_user(from->si_signo, &to->si_signo);
++		err |= __put_user(from->si_errno, &to->si_errno);
++		err |= __put_user((short)from->si_code, &to->si_code);
++		switch (from->si_code >> 16) {
++		case __SI_CHLD >> 16:
++			err |= __put_user(from->si_utime, &to->si_utime);
++			err |= __put_user(from->si_stime, &to->si_stime);
++		/* case __SI_RT: This is not generated by the kernel as of now.  */
++			err |= __put_user(from->si_status, &to->si_status);
++		default:
++			err |= __put_user(from->si_uid, &to->si_uid);
++			err |= __put_user(from->si_pid, &to->si_pid);
++			break;
++		}
++		return err;
++	}
++}
++
+ /* Align macros */
+ #define SF_ALIGNEDSZ  (((sizeof(struct signal_sframe) + 7) & (~7)))
+ #define NF_ALIGNEDSZ  (((sizeof(struct new_signal_frame) + 7) & (~7)))
+@@ -709,7 +741,7 @@ new_setup_rt_frame(struct k_sigaction *k
+ 	err |= __copy_to_user(sf, (char *) regs->u_regs [UREG_FP],
+ 			      sizeof (struct reg_window));	
+ 
+-	err |= __copy_to_user(&sf->info, info, sizeof(siginfo_t));
++	err |= copy_siginfo_to_user(&sf->info, info);
+ 
+ 	if (err)
+ 		goto sigsegv;
+--- linux/arch/sparc64/kernel/signal.c.jj	Tue Dec 21 07:05:52 1999
++++ linux/arch/sparc64/kernel/signal.c	Wed Feb  9 08:07:36 2000
+@@ -42,6 +42,37 @@ asmlinkage int do_signal(sigset_t *oldse
+ /* #define DEBUG_SIGNALS_TRACE 1 */
+ /* #define DEBUG_SIGNALS_MAPS 1 */
+ 
++int copy_siginfo_to_user(siginfo_t *to, siginfo_t *from)
++{
++	if (!access_ok (VERIFY_WRITE, to, sizeof(siginfo_t)))
++		return -EFAULT;
++	if (from->si_code < 0)
++		return __copy_to_user(to, from, sizeof(siginfo_t));
++	else {
++		int err;
++
++		/* If you change siginfo_t structure, please be sure
++		   this code is fixed accordingly.
++		   It should never copy any pad contained in the structure
++		   to avoid security leaks, but must copy the generic
++		   3 ints plus the relevant union member.  */
++		err = __put_user(*(long *)&from->si_signo, (long *)&to->si_signo);
++		err |= __put_user((short)from->si_code, &to->si_code);
++		switch (from->si_code >> 16) {
++		case __SI_CHLD >> 16:
++			err |= __put_user(from->si_utime, &to->si_utime);
++			err |= __put_user(from->si_stime, &to->si_stime);
++		case __SI_FAULT >> 16:
++			err |= __put_user(from->si_trapno, &to->si_trapno);
++		default:
++			err |= __put_user(from->si_addr, &to->si_addr);
++			break;
++		/* case __SI_RT: This is not generated by the kernel as of now.  */
++		}
++		return err;
++	}
++}
++
+ /* {set, get}context() needed for 64-bit SparcLinux userland. */
+ asmlinkage void sparc64_set_context(struct pt_regs *regs)
+ {
+@@ -512,7 +543,7 @@ setup_rt_frame(struct k_sigaction *ka, s
+ 			    sizeof(struct reg_window));
+ 
+ 	if (info)
+-		err |= copy_to_user(&sf->info, info, sizeof(siginfo_t));
++		err |= copy_siginfo_to_user(&sf->info, info);
+ 	else {
+ 		err |= __put_user(signo, &sf->info.si_signo);
+ 		err |= __put_user(SI_NOINFO, &sf->info.si_code);
+--- linux/arch/sparc64/kernel/signal32.c.jj	Sat Jan 22 03:22:54 2000
++++ linux/arch/sparc64/kernel/signal32.c	Wed Feb  9 08:07:36 2000
+@@ -108,17 +108,21 @@ int copy_siginfo_to_user32(siginfo_t32 *
+ 	if (!access_ok (VERIFY_WRITE, to, sizeof(siginfo_t32)))
+ 		return -EFAULT;
+ 
++	/* If you change siginfo_t structure, please be sure
++	   this code is fixed accordingly.
++	   It should never copy any pad contained in the structure
++	   to avoid security leaks, but must copy the generic
++	   3 ints plus the relevant union member.
++	   This routine must convert siginfo from 64bit to 32bit as well
++	   at the same time.  */
+ 	err = __put_user(from->si_signo, &to->si_signo);
+ 	err |= __put_user(from->si_errno, &to->si_errno);
+-	err |= __put_user(from->si_code, &to->si_code);
++	err |= __put_user((short)from->si_code, &to->si_code);
+ 	if (from->si_code < 0)
+ 		err |= __copy_to_user(&to->_sifields._pad, &from->_sifields._pad, SI_PAD_SIZE);
+ 	else {
+-		int signo = from->si_signo;
+-		if (from->si_code == SI_USER || from->si_code == SI_KERNEL)
+-			signo = SIGRTMIN;
+-		switch (signo) {
+-		case SIGCHLD:
++		switch (from->si_code >> 16) {
++		case __SI_CHLD >> 16:
+ 			err |= __put_user(from->si_utime, &to->si_utime);
+ 			err |= __put_user(from->si_stime, &to->si_stime);
+ 			err |= __put_user(from->si_status, &to->si_status);
+@@ -126,14 +130,11 @@ int copy_siginfo_to_user32(siginfo_t32 *
+ 			err |= __put_user(from->si_pid, &to->si_pid);
+ 			err |= __put_user(from->si_uid, &to->si_uid);
+ 			break;
+-		case SIGSEGV:
+-		case SIGILL:
+-		case SIGFPE:
+-		case SIGBUS:
+-		case SIGEMT:
++		case __SI_FAULT >> 16:
+ 			err |= __put_user(from->si_trapno, &to->si_trapno);
+ 			err |= __put_user((long)from->si_addr, &to->si_addr);
+ 			break;
++		/* case __SI_RT: This is not generated by the kernel as of now.  */
+ 		}
+ 	}
+ 	return err;
+--- linux/arch/sparc64/kernel/sys_sparc32.c.jj	Sat Jan 22 03:22:54 2000
++++ linux/arch/sparc64/kernel/sys_sparc32.c	Wed Feb  9 08:07:36 2000
+@@ -2071,43 +2071,84 @@ asmlinkage int sys32_rt_sigpending(sigse
+ 	return ret;
+ }
+ 
+-extern asmlinkage int
+-sys_rt_sigtimedwait(const sigset_t *uthese, siginfo_t *uinfo,
+-		    const struct timespec *uts, size_t sigsetsize);
+-
+ asmlinkage int
+ sys32_rt_sigtimedwait(sigset_t32 *uthese, siginfo_t32 *uinfo,
+ 		      struct timespec32 *uts, __kernel_size_t32 sigsetsize)
+ {
+-	sigset_t s;
+-	sigset_t32 s32;
+-	struct timespec t;
+-	int ret;
+-	mm_segment_t old_fs = get_fs();
++	int ret, sig;
++	sigset_t these;
++	sigset_t32 these32;
++	struct timespec ts;
+ 	siginfo_t info;
+-		
+-	if (copy_from_user (&s32, uthese, sizeof(sigset_t32)))
++	long timeout = 0;
++
++	/* XXX: Don't preclude handling different sized sigset_t's.  */
++	if (sigsetsize != sizeof(sigset_t))
++		return -EINVAL;
++
++	if (copy_from_user (&these32, uthese, sizeof(sigset_t32)))
+ 		return -EFAULT;
++
+ 	switch (_NSIG_WORDS) {
+-	case 4: s.sig[3] = s32.sig[6] | (((long)s32.sig[7]) << 32);
+-	case 3: s.sig[2] = s32.sig[4] | (((long)s32.sig[5]) << 32);
+-	case 2: s.sig[1] = s32.sig[2] | (((long)s32.sig[3]) << 32);
+-	case 1: s.sig[0] = s32.sig[0] | (((long)s32.sig[1]) << 32);
++	case 4: these.sig[3] = these32.sig[6] | (((long)these32.sig[7]) << 32);
++	case 3: these.sig[2] = these32.sig[4] | (((long)these32.sig[5]) << 32);
++	case 2: these.sig[1] = these32.sig[2] | (((long)these32.sig[3]) << 32);
++	case 1: these.sig[0] = these32.sig[0] | (((long)these32.sig[1]) << 32);
+ 	}
++		
++	/*
++	 * Invert the set of allowed signals to get those we
++	 * want to block.
++	 */
++	sigdelsetmask(&these, sigmask(SIGKILL)|sigmask(SIGSTOP));
++	signotset(&these);
++
+ 	if (uts) {
+-		ret = get_user (t.tv_sec, &uts->tv_sec);
+-		ret |= __get_user (t.tv_nsec, &uts->tv_nsec);
+-		if (ret)
+-			return -EFAULT;
++		if (get_user (ts.tv_sec, &uts->tv_sec) ||
++		    get_user (ts.tv_nsec, &uts->tv_nsec))
++			return -EINVAL;
++		if (ts.tv_nsec >= 1000000000L || ts.tv_nsec < 0
++		    || ts.tv_sec < 0)
++			return -EINVAL;
+ 	}
+-	set_fs (KERNEL_DS);
+-	ret = sys_rt_sigtimedwait(&s, &info, &t, sigsetsize);
+-	set_fs (old_fs);
+-	if (ret >= 0 && uinfo) {
+-		extern int copy_siginfo_to_user32(siginfo_t32 *, siginfo_t *);
+-		if (copy_siginfo_to_user32(uinfo, &info))
+-			ret = -EFAULT;
++
++	spin_lock_irq(&current->sigmask_lock);
++	sig = dequeue_signal(&these, &info);
++	if (!sig) {
++		/* None ready -- temporarily unblock those we're interested
++		   in so that we'll be awakened when they arrive.  */
++		sigset_t oldblocked = current->blocked;
++		sigandsets(&current->blocked, &current->blocked, &these);
++		recalc_sigpending(current);
++		spin_unlock_irq(&current->sigmask_lock);
++
++		timeout = MAX_SCHEDULE_TIMEOUT;
++		if (uts)
++			timeout = (timespec_to_jiffies(&ts)
++				   + (ts.tv_sec || ts.tv_nsec));
++
++		current->state = TASK_INTERRUPTIBLE;
++		timeout = schedule_timeout(timeout);
++
++		spin_lock_irq(&current->sigmask_lock);
++		sig = dequeue_signal(&these, &info);
++		current->blocked = oldblocked;
++		recalc_sigpending(current);
+ 	}
++	spin_unlock_irq(&current->sigmask_lock);
++
++	if (sig) {
++		ret = sig;
++		if (uinfo) {
++			if (copy_siginfo_to_user32(uinfo, &info))
++				ret = -EFAULT;
++		}
++	} else {
++		ret = -EAGAIN;
++		if (timeout)
++			ret = -EINTR;
++	}
++
+ 	return ret;
+ }
+ 
+Cheers,
+    Jakub
+___________________________________________________________________
+Jakub Jelinek | jakub@redhat.com | 
+http://sunsite.mff.cuni.cz/~jj
+Linux version 2.3.43 on a sparc64 machine (1343.49 BogoMips)
+___________________________________________________________________
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

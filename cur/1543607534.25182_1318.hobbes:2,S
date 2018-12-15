@@ -1,0 +1,215 @@
+Date: Fri, 26 Oct 2001 09:57:02 -0700 (PDT)
+From: Linus Torvalds <>
+Subject: Re: xmm2 - monitor Linux MM active/inactive lists graphically
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2001/10/26/54
+
+On 26 Oct 2001, Zlatko Calusic wrote:
+>
+> When I find some time, I'll dig around that code. It is very
+> interesting part of the kernel, I'm sure, I just didn't have enough
+> time so far, to spend hacking on that part.
+Attached is a very untested patch (but hey, it compiles, so it must work,
+right?) against 2.4.14-pre2, that makes the batching be a high/low
+watermark thing instead. It actually simplified the code, but that is, of
+course, assuming that it works at all ;)
+(If I got the comparisons wrong, of if I update the counts wrong, your IO
+queue will probably stop cold. So be careful. The code is obvious
+enough, but typos and thinkos happen).
+		Linus
+diff -u --recursive pre2/linux/drivers/block/ll_rw_blk.c linux/drivers/block/ll_rw_blk.c
+--- pre2/linux/drivers/block/ll_rw_blk.c	Fri Oct 26 09:48:25 2001
++++ linux/drivers/block/ll_rw_blk.c	Fri Oct 26 09:53:54 2001
+@@ -140,21 +140,23 @@
+ 		return &blk_dev[MAJOR(dev)].request_queue;
+ }
+ 
+-static int __blk_cleanup_queue(struct list_head *head)
++static int __blk_cleanup_queue(struct request_list *list)
+ {
++	struct list_head *head = &list->free;
+ 	struct request *rq;
+ 	int i = 0;
+ 
+-	if (list_empty(head))
+-		return 0;
+-
+-	do {
++	while (!list_empty(head)) {
+ 		rq = list_entry(head->next, struct request, queue);
+ 		list_del(&rq->queue);
+ 		kmem_cache_free(request_cachep, rq);
+ 		i++;
+-	} while (!list_empty(head));
++	};
+ 
++	if (i != list->count)
++		printk("request list leak!\n");
++
++	list->count = 0;
+ 	return i;
+ }
+ 
+@@ -176,10 +178,8 @@
+ {
+ 	int count = queue_nr_requests;
+ 
+-	count -= __blk_cleanup_queue(&q->request_freelist[READ]);
+-	count -= __blk_cleanup_queue(&q->request_freelist[WRITE]);
+-	count -= __blk_cleanup_queue(&q->pending_freelist[READ]);
+-	count -= __blk_cleanup_queue(&q->pending_freelist[WRITE]);
++	count -= __blk_cleanup_queue(&q->rq[READ]);
++	count -= __blk_cleanup_queue(&q->rq[WRITE]);
+ 
+ 	if (count)
+ 		printk("blk_cleanup_queue: leaked requests (%d)\n", count);
+@@ -331,11 +331,10 @@
+ 	struct request *rq;
+ 	int i;
+ 
+-	INIT_LIST_HEAD(&q->request_freelist[READ]);
+-	INIT_LIST_HEAD(&q->request_freelist[WRITE]);
+-	INIT_LIST_HEAD(&q->pending_freelist[READ]);
+-	INIT_LIST_HEAD(&q->pending_freelist[WRITE]);
+-	q->pending_free[READ] = q->pending_free[WRITE] = 0;
++	INIT_LIST_HEAD(&q->rq[READ].free);
++	INIT_LIST_HEAD(&q->rq[WRITE].free);
++	q->rq[READ].count = 0;
++	q->rq[WRITE].count = 0;
+ 
+ 	/*
+ 	 * Divide requests in half between read and write
+@@ -349,7 +348,8 @@
+ 		}
+ 		memset(rq, 0, sizeof(struct request));
+ 		rq->rq_status = RQ_INACTIVE;
+-		list_add(&rq->queue, &q->request_freelist[i & 1]);
++		list_add(&rq->queue, &q->rq[i&1].free);
++		q->rq[i&1].count++;
+ 	}
+ 
+ 	init_waitqueue_head(&q->wait_for_request);
+@@ -423,10 +423,12 @@
+ static inline struct request *get_request(request_queue_t *q, int rw)
+ {
+ 	struct request *rq = NULL;
++	struct request_list *rl = q->rq + rw;
+ 
+-	if (!list_empty(&q->request_freelist[rw])) {
+-		rq = blkdev_free_rq(&q->request_freelist[rw]);
++	if (!list_empty(&rl->free)) {
++		rq = blkdev_free_rq(&rl->free);
+ 		list_del(&rq->queue);
++		rl->count--;
+ 		rq->rq_status = RQ_ACTIVE;
+ 		rq->special = NULL;
+ 		rq->q = q;
+@@ -443,17 +445,13 @@
+ 	register struct request *rq;
+ 	DECLARE_WAITQUEUE(wait, current);
+ 
++	generic_unplug_device(q);
+ 	add_wait_queue_exclusive(&q->wait_for_request, &wait);
+-	for (;;) {
+-		__set_current_state(TASK_UNINTERRUPTIBLE);
+-		spin_lock_irq(&io_request_lock);
+-		rq = get_request(q, rw);
+-		spin_unlock_irq(&io_request_lock);
+-		if (rq)
+-			break;
+-		generic_unplug_device(q);
+-		schedule();
+-	}
++	do {
++		set_current_state(TASK_UNINTERRUPTIBLE);
++		if (q->rq[rw].count < batch_requests)
++			schedule();
++	} while ((rq = get_request(q,rw)) == NULL);
+ 	remove_wait_queue(&q->wait_for_request, &wait);
+ 	current->state = TASK_RUNNING;
+ 	return rq;
+@@ -542,15 +540,6 @@
+ 	list_add(&req->queue, insert_here);
+ }
+ 
+-inline void blk_refill_freelist(request_queue_t *q, int rw)
+-{
+-	if (q->pending_free[rw]) {
+-		list_splice(&q->pending_freelist[rw], &q->request_freelist[rw]);
+-		INIT_LIST_HEAD(&q->pending_freelist[rw]);
+-		q->pending_free[rw] = 0;
+-	}
+-}
+-
+ /*
+  * Must be called with io_request_lock held and interrupts disabled
+  */
+@@ -564,28 +553,12 @@
+ 
+ 	/*
+ 	 * Request may not have originated from ll_rw_blk. if not,
+-	 * asumme it has free buffers and check waiters
++	 * assume it has free buffers and check waiters
+ 	 */
+ 	if (q) {
+-		/*
+-		 * If nobody is waiting for requests, don't bother
+-		 * batching up.
+-		 */
+-		if (!list_empty(&q->request_freelist[rw])) {
+-			list_add(&req->queue, &q->request_freelist[rw]);
+-			return;
+-		}
+-
+-		/*
+-		 * Add to pending free list and batch wakeups
+-		 */
+-		list_add(&req->queue, &q->pending_freelist[rw]);
+-
+-		if (++q->pending_free[rw] >= batch_requests) {
+-			int wake_up = q->pending_free[rw];
+-			blk_refill_freelist(q, rw);
+-			wake_up_nr(&q->wait_for_request, wake_up);
+-		}
++		list_add(&req->queue, &q->rq[rw].free);
++		if (++q->rq[rw].count >= batch_requests && waitqueue_active(&q->wait_for_request))
++			wake_up(&q->wait_for_request);
+ 	}
+ }
+ 
+@@ -1144,7 +1117,7 @@
+ 	/*
+ 	 * Batch frees according to queue length
+ 	 */
+-	batch_requests = queue_nr_requests/3;
++	batch_requests = queue_nr_requests/4;
+ 	printk("block: %d slots per queue, batch=%d\n", queue_nr_requests, batch_requests);
+ 
+ #ifdef CONFIG_AMIGA_Z2RAM
+diff -u --recursive pre2/linux/include/linux/blkdev.h linux/include/linux/blkdev.h
+--- pre2/linux/include/linux/blkdev.h	Tue Oct 23 22:01:01 2001
++++ linux/include/linux/blkdev.h	Fri Oct 26 09:36:41 2001
+@@ -66,14 +66,17 @@
+  */
+ #define QUEUE_NR_REQUESTS	8192
+ 
++struct request_list {
++	unsigned int count;
++	struct list_head free;
++};
++
+ struct request_queue
+ {
+ 	/*
+ 	 * the queue request freelist, one for reads and one for writes
+ 	 */
+-	struct list_head	request_freelist[2];
+-	struct list_head	pending_freelist[2];
+-	int			pending_free[2];
++	struct request_list	rq[2];
+ 
+ 	/*
+ 	 * Together with queue_head for cacheline sharing

@@ -1,0 +1,382 @@
+Date: Thu, 24 Aug 2000 11:31:06 +1000 (EST)
+From: Neil Brown <>
+Subject: PATCH - final (I hope) tidy up for generic_make_request interface
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/8/23/187
+
+Linus, 
+ The following patch (against test7-pre7) makes some changes to the
+ responsibilities of 
+    ll_rw_block,  generic_make_request, and q->make_request_fn
+ -  generic_make_request should be seen as the interface between block
+    devices and clients of block devices.
+    As block devices "own" b_rsector and b_rdev, and the client "owns"
+    b_blocknr and b_rev, the conversion is now done in
+    generic_make_request.
+ - ll_rw_block is bottom-end of the buffer-cache/page-cache
+   systems. It does any processing specific to the caches.
+ - q->make_request_fn does the work for the device.  It shouldn't
+   contain anything generic.
+ So this patch:
+  - moves the assignment of b_rsector and b_rdev into
+    generic_make_request.
+  - moves the buffer_mapped test out of __make_request, and into
+    ll_rw_block
+  - moves create_bounce out of __make_request and into
+    generic_make_request, as potentially any client might use high
+    memory, and ever driver needs a bounce buffer.
+  - fixes rd.c which was using b_dev and b_blocknr instead of b_rdev
+    and b_rsector.
+  - fixes a number of little bugs in raid where b_rdev was being used
+    instead of b_dev (I thought I had got them all - just shows how
+    much a well-designed interface can help).
+  - moves the device_readonly test into generic_make_request
+  - renames __make_request to elevator_make_request to more clearly
+    display its function.
+NeilBrown
+--- ./fs/buffer.c	2000/08/24 00:39:55	1.1
++++ ./fs/buffer.c	2000/08/24 00:40:38
+@@ -1839,7 +1839,6 @@
+ 	int		pageind;
+ 	int		bhind;
+ 	int		offset;
+-	int		sectors = size>>9;
+ 	unsigned long	blocknr;
+ 	struct kiobuf *	iobuf = NULL;
+ 	struct page *	map;
+@@ -1891,9 +1890,8 @@
+ 				tmp->b_this_page = tmp;
+ 
+ 				init_buffer(tmp, end_buffer_io_kiobuf, iobuf);
+-				tmp->b_rdev = tmp->b_dev = dev;
++				tmp->b_dev = dev;
+ 				tmp->b_blocknr = blocknr;
+-				tmp->b_rsector = blocknr*sectors;
+ 				tmp->b_state = (1 << BH_Mapped) | (1 << BH_Lock) | (1 << BH_Req);
+ 
+ 				if (rw == WRITE) {
+--- ./drivers/block/ll_rw_blk.c	2000/08/24 00:33:55	1.1
++++ ./drivers/block/ll_rw_blk.c	2000/08/24 01:27:48
+@@ -417,7 +417,7 @@
+  *    blk_init_queue() must be paired with a blk_cleanup-queue() call
+  *    when the block device is deactivated (such as at module unload).
+  **/
+-static int __make_request(request_queue_t * q, int rw,  struct buffer_head * bh);
++static int elevator_make_request(request_queue_t * q, int rw,  struct buffer_head * bh);
+ void blk_init_queue(request_queue_t * q, request_fn_proc * rfn)
+ {
+ 	INIT_LIST_HEAD(&q->queue_head);
+@@ -429,7 +429,7 @@
+ 	q->back_merge_fn       	= ll_back_merge_fn;
+ 	q->front_merge_fn      	= ll_front_merge_fn;
+ 	q->merge_requests_fn	= ll_merge_requests_fn;
+-	q->make_request_fn	= __make_request;
++	q->make_request_fn	= elevator_make_request;
+ 	q->plug_tq.sync		= 0;
+ 	q->plug_tq.routine	= &generic_unplug_device;
+ 	q->plug_tq.data		= q;
+@@ -676,7 +676,7 @@
+ 	attempt_merge(q, blkdev_entry_to_request(prev), max_sectors, max_segments);
+ }
+ 
+-static int __make_request(request_queue_t * q, int rw,
++static int elevator_make_request(request_queue_t * q, int rw,
+ 				  struct buffer_head * bh)
+ {
+ 	unsigned int sector, count;
+@@ -703,22 +703,6 @@
+ 			goto end_io;
+ 	}
+ 
+-	/* We'd better have a real physical mapping!
+-	   Check this bit only if the buffer was dirty and just locked
+-	   down by us so at this point flushpage will block and
+-	   won't clear the mapped bit under us. */
+-	if (!buffer_mapped(bh))
+-		BUG();
+-
+-	/*
+-	 * Temporary solution - in 2.5 this will be done by the lowlevel
+-	 * driver. Create a bounce buffer if the buffer data points into
+-	 * high memory - keep the original buffer otherwise.
+-	 */
+-#if CONFIG_HIGHMEM
+-	bh = create_bounce(rw, bh);
+-#endif
+-
+ /* look for a free request. */
+ 	/*
+ 	 * Try to coalesce the new request with old requests
+@@ -833,12 +817,14 @@
+ {
+ 	int major = MAJOR(bh->b_rdev);
+ 	request_queue_t *q;
++	unsigned int sector, count;
++
++	count = bh->b_size >> 9;
++	bh->b_rsector = sector = bh->b_blocknr * count;
++	bh->b_rdev = bh->b_rdev;
++	
+ 	if (blk_size[major]) {
+ 		unsigned long maxsector = (blk_size[major][MINOR(bh->b_rdev)] << 1) + 1;
+-		unsigned int sector, count;
+-
+-		count = bh->b_size >> 9;
+-		sector = bh->b_rsector;
+ 
+ 		if (maxsector < count || maxsector - count < sector) {
+ 			bh->b_state &= (1 << BH_Lock) | (1 << BH_Mapped);
+@@ -860,6 +846,15 @@
+ 	}
+ 
+ 	/*
++	 * Temporary solution - in 2.5 this will be done by the lowlevel
++	 * driver. Create a bounce buffer if the buffer data points into
++	 * high memory - keep the original buffer otherwise.
++	 */
++#if CONFIG_HIGHMEM
++	bh = create_bounce(rw, bh);
++#endif
++
++	/*
+ 	 * Resolve the mapping until finished. (drivers are
+ 	 * still free to implement/resolve their own stacking
+ 	 * by explicitly returning 0)
+@@ -877,6 +872,13 @@
+ 			break;
+ 		}
+ 
++		if ((rw & WRITE) && is_read_only(bh->b_rdev)) {
++			printk(KERN_NOTICE "Can't write to read-only device %s\n",
++			       kdevname(bh->b_rdev));
++			buffer_IO_error(bh);
++			break;
++		}
++
+ 	}
+ 	while (q->make_request_fn(q, rw, bh));
+ }
+@@ -914,12 +916,6 @@
+ 		}
+ 	}
+ 
+-	if ((rw & WRITE) && is_read_only(bhs[0]->b_dev)) {
+-		printk(KERN_NOTICE "Can't write to read-only device %s\n",
+-		       kdevname(bhs[0]->b_dev));
+-		goto sorry;
+-	}
+-
+ 	for (i = 0; i < nr; i++) {
+ 		bh = bhs[i];
+ 
+@@ -953,12 +949,12 @@
+ 			
+ 		}
+ 
+-		/*
+-		 * First step, 'identity mapping' - RAID or LVM might
+-		 * further remap this.
+-		 */
+-		bh->b_rdev = bh->b_dev;
+-		bh->b_rsector = bh->b_blocknr * (bh->b_size>>9);
++		/* We'd better have a real physical mapping!
++		   Check this bit only if the buffer was dirty and just locked
++		   down by us so at this point flushpage will block and
++		   won't clear the mapped bit under us. */
++		if (!buffer_mapped(bh))
++			BUG();
+ 
+ 		generic_make_request(rw, bh);
+ 	}
+--- ./drivers/block/rd.c	2000/08/24 00:53:02	1.1
++++ ./drivers/block/rd.c	2000/08/24 00:53:28
+@@ -226,7 +226,7 @@
+ 	}
+ 
+ 	sbh = CURRENT->bh;
+-	rbh = getblk(sbh->b_dev, sbh->b_blocknr, sbh->b_size);
++	rbh = getblk(sbh->b_rdev, sbh->b_rsector/(sbh->b_size>>9), sbh->b_size);
+ 	if (CURRENT->cmd == READ) {
+ 		if (sbh != rbh)
+ 			memcpy(CURRENT->buffer, rbh->b_data, rbh->b_size);
+--- ./drivers/block/raid1.c	2000/08/24 00:41:27	1.1
++++ ./drivers/block/raid1.c	2000/08/24 00:58:50
+@@ -371,7 +371,7 @@
+ {
+ 	struct buffer_head *bh = r1_bh->master_bh;
+ 
+-	io_request_done(bh->b_rsector, mddev_to_conf(r1_bh->mddev),
++	io_request_done(bh->b_blocknr*(bh->b_size>>9), mddev_to_conf(r1_bh->mddev),
+ 			test_bit(R1BH_SyncPhase, &r1_bh->state));
+ 
+ 	bh->b_end_io(bh, uptodate);
+@@ -601,8 +601,6 @@
+ 		memcpy(bh_req, bh, sizeof(*bh));
+ 		bh_req->b_blocknr = bh->b_rsector * sectors;
+ 		bh_req->b_dev = mirror->dev;
+-		bh_req->b_rdev = mirror->dev;
+-	/*	bh_req->b_rsector = bh->n_rsector; */
+ 		bh_req->b_end_io = raid1_end_request;
+ 		bh_req->b_private = r1_bh;
+ 		generic_make_request (rw, bh_req);
+@@ -645,8 +643,6 @@
+  	 */
+ 		mbh->b_blocknr    = bh->b_rsector * sectors;
+ 		mbh->b_dev        = conf->mirrors[i].dev;
+-		mbh->b_rdev	  = conf->mirrors[i].dev;
+-		mbh->b_rsector	  = bh->b_rsector;
+ 		mbh->b_state      = (1<<BH_Req) | (1<<BH_Dirty) |
+ 						(1<<BH_Mapped) | (1<<BH_Lock);
+ 
+@@ -1157,8 +1153,6 @@
+ 				 */
+ 					mbh->b_blocknr    = bh->b_blocknr;
+ 					mbh->b_dev        = conf->mirrors[i].dev;
+-					mbh->b_rdev	  = conf->mirrors[i].dev;
+-					mbh->b_rsector	  = bh->b_blocknr * sectors;
+ 					mbh->b_state      = (1<<BH_Req) | (1<<BH_Dirty) |
+ 						(1<<BH_Mapped) | (1<<BH_Lock);
+ 					atomic_set(&mbh->b_count, 1);
+@@ -1181,7 +1175,7 @@
+ 					struct buffer_head *bh1 = mbh;
+ 					mbh = mbh->b_next;
+ 					generic_make_request(WRITE, bh1);
+-					md_sync_acct(bh1->b_rdev, bh1->b_size/512);
++					md_sync_acct(bh1->b_dev, bh1->b_size/512);
+ 				}
+ 			} else {
+ 				dev = bh->b_dev;
+@@ -1192,7 +1186,6 @@
+ 				} else {
+ 					printk (REDIRECT_SECTOR,
+ 						partition_name(bh->b_dev), bh->b_blocknr);
+-					bh->b_rdev = bh->b_dev;
+ 					generic_make_request(READ, bh);
+ 				}
+ 			}
+@@ -1209,7 +1202,6 @@
+ 			} else {
+ 				printk (REDIRECT_SECTOR,
+ 					partition_name(bh->b_dev), bh->b_blocknr);
+-				bh->b_rdev = bh->b_dev;
+ 				generic_make_request (r1_bh->cmd, bh);
+ 			}
+ 			break;
+@@ -1392,7 +1384,6 @@
+ 	bh->b_size = bsize;
+ 	bh->b_list = BUF_LOCKED;
+ 	bh->b_dev = mirror->dev;
+-	bh->b_rdev = mirror->dev;
+ 	bh->b_state = (1<<BH_Req) | (1<<BH_Mapped);
+ 	if (!bh->b_page)
+ 		BUG();
+@@ -1402,11 +1393,10 @@
+ 		BUG();
+ 	bh->b_end_io = end_sync_read;
+ 	bh->b_private = r1_bh;
+-	bh->b_rsector = block_nr<<1;
+ 	init_waitqueue_head(&bh->b_wait);
+ 
+ 	generic_make_request(READ, bh);
+-	md_sync_acct(bh->b_rdev, bh->b_size/512);
++	md_sync_acct(bh->b_dev, bh->b_size/512);
+ 
+ 	return (bsize >> 10);
+ 
+--- ./drivers/block/raid5.c	2000/08/24 00:45:40	1.1
++++ ./drivers/block/raid5.c	2000/08/24 00:49:51
+@@ -644,9 +644,6 @@
+ 	bh->b_data = b_data;
+ 	bh->b_page = b_page;
+ 
+-	bh->b_rdev	= conf->disks[i].dev;
+-	bh->b_rsector	= sh->sector;
+-
+ 	bh->b_state	= (1 << BH_Req) | (1 << BH_Mapped);
+ 	bh->b_size	= sh->size;
+ 	bh->b_list	= BUF_LOCKED;
+@@ -1068,11 +1065,11 @@
+ 				if (!operational[i] && !conf->resync_parity) {
+ 					PRINTK("writing spare %d\n", i);
+ 					atomic_inc(&sh->nr_pending);
+-					bh->b_dev = bh->b_rdev = conf->spare->dev;
++					bh->b_dev = conf->spare->dev;
+ 					generic_make_request(WRITE, bh);
+ 				} else {
+ 					atomic_inc(&sh->nr_pending);
+-					bh->b_dev = bh->b_rdev = conf->disks[i].dev;
++					bh->b_dev = conf->disks[i].dev;
+ 					generic_make_request(WRITE, bh);
+ 				}
+ 				atomic_dec(&bh->b_count);
+@@ -1111,7 +1108,7 @@
+ 			continue;
+ 		lock_get_bh(sh->bh_old[i]);
+ 		atomic_inc(&sh->nr_pending);
+-		sh->bh_old[i]->b_dev = sh->bh_old[i]->b_rdev = conf->disks[i].dev;
++		sh->bh_old[i]->b_dev = conf->disks[i].dev;
+ 		generic_make_request(READ, sh->bh_old[i]);
+ 		atomic_dec(&sh->bh_old[i]->b_count);
+ 	}
+@@ -1156,7 +1153,7 @@
+ 			raid5_build_block(sh, sh->bh_old[i], i);
+ 			lock_get_bh(sh->bh_old[i]);
+ 			atomic_inc(&sh->nr_pending);
+-			sh->bh_old[i]->b_dev = sh->bh_old[i]->b_rdev = conf->disks[i].dev;
++			sh->bh_old[i]->b_dev = conf->disks[i].dev;
+ 			generic_make_request(READ, sh->bh_old[i]);
+ 			atomic_dec(&sh->bh_old[i]->b_count);
+ 		}
+@@ -1185,7 +1182,7 @@
+ #endif
+ 		lock_get_bh(sh->bh_req[i]);
+ 		atomic_inc(&sh->nr_pending);
+-		sh->bh_req[i]->b_dev = sh->bh_req[i]->b_rdev = conf->disks[i].dev;
++		sh->bh_req[i]->b_dev = conf->disks[i].dev;
+ 		generic_make_request(READ, sh->bh_req[i]);
+ 		atomic_dec(&sh->bh_req[i]->b_count);
+ 	}
+@@ -1221,9 +1218,9 @@
+ 			raid5_build_block(sh, bh, i);
+ 			lock_get_bh(bh);
+ 			atomic_inc(&sh->nr_pending);
+-			bh->b_dev = bh->b_rdev = conf->disks[i].dev;
++			bh->b_dev = conf->disks[i].dev;
+ 			generic_make_request(READ, bh);
+-			md_sync_acct(bh->b_rdev, bh->b_size/512);
++			md_sync_acct(bh->b_dev, bh->b_size/512);
+ 			atomic_dec(&sh->bh_old[i]->b_count);
+ 		}
+ 		PRINTK("handle_stripe_sync() %lu, phase READ_OLD, pending %d buffers\n", sh->sector, md_atomic_read(&sh->nr_pending));
+@@ -1250,9 +1247,9 @@
+ 				}
+ 				atomic_inc(&sh->nr_pending);
+ 				lock_get_bh(bh);
+-				bh->b_dev = bh->b_rdev = conf->spare->dev;
++				bh->b_dev = conf->spare->dev;
+ 				generic_make_request(WRITE, bh);
+-				md_sync_acct(bh->b_rdev, bh->b_size/512);
++				md_sync_acct(bh->b_dev, bh->b_size/512);
+ 				atomic_dec(&bh->b_count);
+ 		PRINTK("handle_stripe_sync() %lu, phase WRITE, pending %d buffers\n", sh->sector, md_atomic_read(&sh->nr_pending));
+ 			}
+@@ -1276,9 +1273,9 @@
+ 		atomic_set_buffer_dirty(bh);
+ 		lock_get_bh(bh);
+ 		atomic_inc(&sh->nr_pending);
+-		bh->b_dev = bh->b_rdev = conf->disks[pd_idx].dev;
++		bh->b_dev = conf->disks[pd_idx].dev;
+ 		generic_make_request(WRITE, bh);
+-		md_sync_acct(bh->b_rdev, bh->b_size/512);
++		md_sync_acct(bh->b_dev, bh->b_size/512);
+ 		atomic_dec(&bh->b_count);
+ 		PRINTK("handle_stripe_sync() %lu phase WRITE, pending %d buffers\n",
+ 			sh->sector, md_atomic_read(&sh->nr_pending));
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+Please read the FAQ at 
+http://www.tux.org/lkml/

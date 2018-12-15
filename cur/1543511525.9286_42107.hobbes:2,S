@@ -1,0 +1,447 @@
+Date: Mon, 04 Oct 1999 23:34:49 +0200
+From: Martin Schenk <>
+Subject: faster fsync and real fdatasync [patch against 2.3.18]
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/10/4/114
+
+The following patch contains two changes to the way fsyncing is done in
+the
+kernel:
+- keeps changed pages at the end of of inode->i_pages and has
+inode->i_drtypages
+  point to these pages, thus omitting an O(number of cached pages)
+search upon fsync(fd).
+  [this can save a lot of CPU-time if you sync a big file that is mostly
+cached in memory]
+- adds a flag I_RDIRTY (set by mark_inode_dirty) to mark an inode
+"really" dirty (=meta-data
+  other than mtime/ctime changed) and changes ext2_sync_file to only
+sync the inode if I_RDIRTY
+  is set (fsync sets it explicitly so mtime/ctime changes get
+committed).
+  [this can save you a lot of seeks if you fdatasync often]
+You have to define CONFIG_FASTSYNC to enable the changesdiff -urN linuxelf-2.3.orig/fs/buffer.c linuxelf-2.3/fs/buffer.c
+--- linuxelf-2.3.orig/fs/buffer.c	Mon Oct  4 21:18:55 1999
++++ linuxelf-2.3/fs/buffer.c	Mon Oct  4 22:58:29 1999
+@@ -364,6 +364,14 @@
+ 
+ 	/* We need to protect against concurrent writers.. */
+ 	down(&inode->i_sem);
++#ifdef CONFIG_FASTSYNC
++    {   /* make sure the inode is synced, even if there are no important changes */
++        extern spinlock_t inode_lock;
++        spin_lock(&inode_lock);
++        inode->i_state |= I_RDIRTY;  
++        spin_unlock(&inode_lock);
++    }
++#endif
+ 	err = file->f_op->fsync(file, dentry);
+ 	up(&inode->i_sem);
+ 
+diff -urN linuxelf-2.3.orig/fs/ext2/file.c linuxelf-2.3/fs/ext2/file.c
+--- linuxelf-2.3.orig/fs/ext2/file.c	Mon Oct  4 21:19:31 1999
++++ linuxelf-2.3/fs/ext2/file.c	Mon Oct  4 21:11:58 1999
+@@ -119,7 +119,11 @@
+ 		struct inode *inode = file->f_dentry->d_inode;
+ 		remove_suid(inode);
+ 		inode->i_ctime = inode->i_mtime = CURRENT_TIME;
++#ifdef CONFIG_FASTSYNC  /* only set I_DIRTY, not I_RDIRTY -> fdatasync does not write inode */
++        mark_inode_time_dirty(inode);
++#else
+ 		mark_inode_dirty(inode);
++#endif
+ 	}
+ 	return retval;
+ }
+diff -urN linuxelf-2.3.orig/fs/ext2/fsync.c linuxelf-2.3/fs/ext2/fsync.c
+--- linuxelf-2.3.orig/fs/ext2/fsync.c	Tue Jun 29 18:22:08 1999
++++ linuxelf-2.3/fs/ext2/fsync.c	Mon Oct  4 21:04:28 1999
+@@ -131,8 +131,11 @@
+ 		 * Don't sync fast links!
+ 		 */
+ 		goto skip;
+-
++#ifdef CONFIG_FASTSYNC
++	err = generic_buffer_fast_fdatasync(inode, 0, ~0UL);
++#else
+ 	err = generic_buffer_fdatasync(inode, 0, ~0UL);
++#endif
+ 
+ 	for (wait=0; wait<=1; wait++)
+ 	{
+@@ -147,6 +150,26 @@
+ 				      wait);
+ 	}
+ skip:
++#ifdef CONFIG_FASTSYNC
++    /* only sync if really dirty (more than just mtime/ctime changed) */
++    if (inode->i_state & I_RDIRTY)
++    {
++        extern spinlock_t inode_lock;
++        int ierr;
++        ierr = ext2_sync_inode(inode);
++        /* ext2_sync_inode does not remove I_DIRTY/I_RDIRTY 
++            (this is done in sync_one in fs/inode.c - but this is static and does some
++            other things with I_LOCK so it might not be appropriate here)
++           so we remove the flags here) */
++        if (!ierr) {
++            spin_lock(&inode_lock);
++            inode->i_state &= ~(I_DIRTY | I_RDIRTY);
++            spin_unlock(&inode_lock);
++        }
++        else err |= ierr;
++    }
++#else
+ 	err |= ext2_sync_inode (inode);
++#endif
+ 	return err ? -EIO : 0;
+ }
+diff -urN linuxelf-2.3.orig/fs/inode.c linuxelf-2.3/fs/inode.c
+--- linuxelf-2.3.orig/fs/inode.c	Mon Oct  4 21:16:36 1999
++++ linuxelf-2.3/fs/inode.c	Mon Oct  4 21:20:12 1999
+@@ -85,6 +85,38 @@
+ 
+ 	if (sb) {
+ 		spin_lock(&inode_lock);
++#ifndef CONFIG_FASTSYNC
++		if (!(inode->i_state & I_DIRTY)) {
++			inode->i_state |= I_DIRTY;
++			/* Only add valid (ie hashed) inodes to the dirty list */
++			if (!list_empty(&inode->i_hash)) {
++				list_del(&inode->i_list);
++				list_add(&inode->i_list, &sb->s_dirty);
++			}
++#else
++        /* we set I_DIRTY and I_RDIRTY, so that fdatasync is going to write the inode.
++           we test against I_RDIRTY, because it is the stricter criteria
++        */
++        if (!(inode->i_state & I_RDIRTY)) {
++            /* Only add valid inodes if have not yet done so in mark_inode_time_dirty */
++            if (!(inode->i_state & I_DIRTY) && !list_empty(&inode->i_hash)) {
++				list_del(&inode->i_list);
++				list_add(&inode->i_list, &sb->s_dirty);
++			}
++            inode->i_state |= I_DIRTY | I_RDIRTY;
++#endif
++		}
++		spin_unlock(&inode_lock);
++	}
++}
++
++#ifdef CONFIG_FASTSYNC
++void __mark_inode_time_dirty(struct inode *inode)
++{
++	struct super_block * sb = inode->i_sb;
++
++	if (sb) {
++		spin_lock(&inode_lock);
+ 		if (!(inode->i_state & I_DIRTY)) {
+ 			inode->i_state |= I_DIRTY;
+ 			/* Only add valid (ie hashed) inodes to the dirty list */
+@@ -96,6 +128,7 @@
+ 		spin_unlock(&inode_lock);
+ 	}
+ }
++#endif
+ 
+ static void __wait_on_inode(struct inode * inode)
+ {
+@@ -155,7 +188,16 @@
+ 		write_inode(inode);
+ 
+ 		spin_lock(&inode_lock);
++#ifndef CONFIG_FASTSYNC
+ 		inode->i_state &= ~I_LOCK;
++#else
++        inode->i_state &= ~(I_LOCK | I_RDIRTY); 
++        /* if I_DIRTY can be set at this place (write_inode_now seems to indicate this)
++            then it might be necessary to do:
++                inode->i_state &= ~I_LOCK;
++                if (!(inode->i_state & I_DIRTY)) inode->i_state &= ~I_RDIRTY;
++        */
++#endif
+ 		wake_up(&inode->i_wait);
+ 	}
+ }
+diff -urN linuxelf-2.3.orig/include/linux/fs.h linuxelf-2.3/include/linux/fs.h
+--- linuxelf-2.3.orig/include/linux/fs.h	Sat Oct  2 23:02:19 1999
++++ linuxelf-2.3/include/linux/fs.h	Mon Oct  4 21:04:45 1999
+@@ -351,6 +351,9 @@
+ 	struct file_lock	*i_flock;
+ 	struct vm_area_struct	*i_mmap;
+ 	struct page		*i_pages;
++#ifdef CONFIG_FASTSYNC
++    struct page     *i_drtypages;   /* possibly dirty pages (at the end of i_pages) */
++#endif
+ 	spinlock_t		i_shared_lock;
+ 	struct dquot		*i_dquot[MAXQUOTAS];
+ 	struct pipe_inode_info	*i_pipe;
+@@ -392,14 +395,30 @@
+ #define I_DIRTY		1
+ #define I_LOCK		2
+ #define I_FREEING	4
++#ifdef CONFIG_FASTSYNC
++#define I_RDIRTY    8   /* inode is really dirty (not just mtime/ctime) so even fdatasync has to write it */
++#endif
+ 
+ extern void __mark_inode_dirty(struct inode *);
+ static inline void mark_inode_dirty(struct inode *inode)
+ {
++#ifndef CONFIG_FASTSYNC
+ 	if (!(inode->i_state & I_DIRTY))
++#else
++    if (!(inode->i_state & I_RDIRTY))
++#endif
+ 		__mark_inode_dirty(inode);
+ }
+ 
++#ifdef CONFIG_FASTSYNC
++extern void __mark_inode_time_dirty(struct inode *);
++static inline void mark_inode_time_dirty(struct inode *inode)
++{
++    if (!(inode->i_state & I_DIRTY))
++        __mark_inode_time_dirty(inode);
++}
++#endif
++
+ struct fown_struct {
+ 	int pid;		/* pid or -pgrp where SIGIO should be sent */
+ 	uid_t uid, euid;	/* uid/euid of process setting the owner */
+@@ -953,6 +972,9 @@
+ extern int block_fsync(struct file *, struct dentry *);
+ extern int file_fsync(struct file *, struct dentry *);
+ extern int generic_buffer_fdatasync(struct inode *inode, unsigned long start, unsigned long end);
++#ifdef CONFIG_FASTSYNC
++extern int generic_buffer_fast_fdatasync(struct inode *inode, unsigned long start, unsigned long end);
++#endif
+ 
+ extern int inode_change_ok(struct inode *, struct iattr *);
+ extern void inode_setattr(struct inode *, struct iattr *);
+diff -urN linuxelf-2.3.orig/include/linux/mm.h linuxelf-2.3/include/linux/mm.h
+--- linuxelf-2.3.orig/include/linux/mm.h	Sat Oct  2 23:10:50 1999
++++ linuxelf-2.3/include/linux/mm.h	Mon Oct  4 21:14:11 1999
+@@ -154,6 +154,11 @@
+ #define PG_skip			10
+ #define PG_swap_entry		11
+ #define PG_BIGMEM		12
++#ifdef CONFIG_FASTSYNC
++#define PG_PDirty       13  /* page might be dirty (flag to check if we have to move
++                               the page to the "dirty" section of page-list of the inode
++                            */
++#endif
+ 				/* bits 21-30 unused */
+ #define PG_reserved		31
+ 
+@@ -202,6 +207,11 @@
+ #define PageBIGMEM(page)	(test_bit(PG_BIGMEM, &(page)->flags))
+ #else
+ #define PageBIGMEM(page) 0 /* needed to optimize away at compile time */
++#endif
++#ifdef CONFIG_FASTSYNC
++#define PagePDirty(page)    (test_bit(PG_PDirty, &(page)->flags))
++#define SetPagePDirty(page) (set_bit(PG_PDirty, &(page)->flags))
++#define ClearPagePDirty(page)   (clear_bit(PG_PDirty, &(page)->flags))
+ #endif
+ 
+ /*
+diff -urN linuxelf-2.3.orig/include/linux/pagemap.h linuxelf-2.3/include/linux/pagemap.h
+--- linuxelf-2.3.orig/include/linux/pagemap.h	Sat Sep 18 00:57:06 1999
++++ linuxelf-2.3/include/linux/pagemap.h	Mon Oct  4 21:14:11 1999
+@@ -96,6 +96,11 @@
+ 	page->prev = NULL;
+ 	if ((page->next = *p) != NULL)
+ 		page->next->prev = page;
++#ifdef CONFIG_FASTSYNC
++    else inode->i_drtypages=page;   /* First page is the last in the list until we move
++                                       dirty pages to the end
++                                    */
++#endif
+ 	*p = page;
+ }
+ 
+diff -urN linuxelf-2.3.orig/mm/filemap.c linuxelf-2.3/mm/filemap.c
+--- linuxelf-2.3.orig/mm/filemap.c	Sat Oct  2 23:39:00 1999
++++ linuxelf-2.3/mm/filemap.c	Mon Oct  4 22:32:25 1999
+@@ -85,6 +85,12 @@
+ 	prev = page->prev;
+ 	if (inode->i_pages == page)
+ 		inode->i_pages = next;
++#ifdef CONFIG_FASTSYNC
++    if (inode->i_drtypages == page) {
++        if (next) inode->i_drtypages=next;
++        else inode->i_drtypages=prev;
++    }
++#endif
+ 	if (next)
+ 		next->prev = prev;
+ 	if (prev)
+@@ -93,6 +99,33 @@
+ 	page->prev = NULL;
+ }
+ 
++#ifdef CONFIG_FASTSYNC
++/* this has to be called whenever a page might get dirty */
++static inline void move_page_to_inode_queue_end(struct inode * inode, struct page * page)
++{
++    struct page *d=inode->i_drtypages;
++    struct page *p, *n, *ndrty;
++    if (page==d) /* page==i_drtypages: move not necessary */
++        return;
++
++    spin_lock(&pagecache_lock);
++    p=page->prev;
++    n=page->next;
++    ndrty=d->next;
++    /* remove page from beginning */
++    if (p) p->next=n;
++    else inode->i_pages=n;  /* first in list */
++    if (n) n->prev=p;
++    /* move page to the end */
++    page->prev=d;
++    page->next=ndrty;
++    if (ndrty) ndrty->prev=page;
++    d->next=page;
++
++    spin_unlock(&pagecache_lock);
++}
++#endif
++
+ /*
+  * Remove a page from the page cache and free it. Caller has to make
+  * sure the page is locked and that nobody else uses it - or that usage
+@@ -400,6 +433,11 @@
+  *
+  * Start the IO..
+  */
++
++#ifdef TEST_FASTSYNC
++static int drty_ok;
++#endif
++
+ static int writeout_one_page(struct page *page)
+ {
+ 	struct buffer_head *bh, *head = page->buffers;
+@@ -408,7 +446,11 @@
+ 	do {
+ 		if (buffer_locked(bh) || !buffer_dirty(bh) || !buffer_uptodate(bh))
+ 			continue;
+-
++#ifdef TEST_FASTSYNC
++        if (!drty_ok) { /* uh, uh - this should not happen :-( */
++            printk("FASTSYNC does not work :-(\n");
++        }
++#endif
+ 		bh->b_flushtime = 0;
+ 		ll_rw_block(WRITE, 1, &bh);	
+ 	} while ((bh = bh->b_this_page) != head);
+@@ -466,6 +508,64 @@
+ 	return retval;
+ }
+ 
++#ifdef CONFIG_FASTSYNC
++static int do_buffer_fast_fdatasync(struct inode *inode, unsigned long start, unsigned long end, int (*fn)(struct page *))
++{
++	struct page *next;
++    struct page *page=NULL;
++	int retval = 0;
++    int clear_drty=0;
++
++	start &= PAGE_MASK;
++
++    if (fn==waitfor_one_page && !start && (end==~0UL)) {
++        clear_drty=1;   /* move the drty-pointer to end of the list and mark the pages
++                           as not dirty */
++    }
++
++	spin_lock(&pagecache_lock);
++#ifdef TEST_FASTSYNC            /* test run: look whether we got all the dirty pages ! */
++    next = inode->i_pages;      /* scan all the pages, check whether we missed something */
++    drty_ok = 0;
++#else
++	next = inode->i_drtypages;  /* start at the end of the list,
++                                   where all the possibly dirty pages are */
++#endif
++	while (next) {
++        page = next;
++		next = page->next;
++#ifdef TEST_FASTSYNC
++        if (page==inode->i_drtypages) drty_ok=1;
++#endif
++        if (clear_drty) ClearPagePDirty(page);        
++		if (!page->buffers)
++			continue;
++		if (page->offset >= end)
++			continue;
++		if (page->offset < start)
++			continue;
++
++		get_page(page);
++		spin_unlock(&pagecache_lock);
++		lock_page(page);
++
++		/* The buffers could have been free'd while we waited for the page lock */
++		if (page->buffers)
++			retval |= fn(page);
++
++		UnlockPage(page);
++		spin_lock(&pagecache_lock);
++		next = page->next;
++		page_cache_release(page);
++	}
++    if (page && clear_drty) inode->i_drtypages=page;  /* dirty-list-pointer points at the end */
++    
++	spin_unlock(&pagecache_lock);
++
++	return retval;
++}
++#endif
++
+ /*
+  * Two-stage data sync: first start the IO, then go back and
+  * collect the information..
+@@ -479,6 +579,17 @@
+ 	return retval;
+ }
+ 
++#ifdef CONFIG_FASTSYNC
++int generic_buffer_fast_fdatasync(struct inode *inode, unsigned long start, unsigned long end)
++{
++    int retval;
++
++	retval = do_buffer_fast_fdatasync(inode, start, end, writeout_one_page);
++	retval |= do_buffer_fast_fdatasync(inode, start, end, waitfor_one_page);
++	return retval;
++}
++#endif
++
+ /*
+  * This adds a page to the page cache, starting out as locked,
+  * owned by us, referenced, but not uptodate and with no errors.
+@@ -1856,8 +1967,24 @@
+ 			pos += status;
+ 			buf += status;
+ 			if (pos > inode->i_size)
++#ifndef CONFIG_FASTSYNC
+ 				inode->i_size = pos;
++#else
++            {   /* we have to mark the inode dirty as the filesize changed and
++                   ext2_file_write only does mark_inode_time_dirty */
++                inode->i_size = pos;
++                mark_inode_dirty(inode);
++            }
++#endif
+ 		}
++#ifdef CONFIG_FASTSYNC
++        /* page might have become dirty */
++        if (!PagePDirty(page)) {    
++            /* not yet marked possibly dirty: mark and move to the end of the list */
++            SetPagePDirty(page);
++            move_page_to_inode_queue_end(inode, page);
++        }
++#endif
+ 		/* Mark it unlocked again and drop the page.. */
+ 		UnlockPage(page);
+ 		page_cache_release(page);

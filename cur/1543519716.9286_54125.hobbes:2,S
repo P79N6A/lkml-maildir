@@ -1,0 +1,339 @@
+Date: Fri, 17 Dec 1999 23:59:27 +0100
+From: Bernhard Brueck <>
+Subject:  linux-kernel@vger ...
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/12/17/156
+
+Hello,
+there was some discussion about large directories with ext2 filesystem.
+At least the slowdown for sequential access of files (ls -l, du, Backups, ...)
+can be removed without changing the layout of the directories.
+When there are a lot of files in a directory the lookup of filenames 
+becomes a bottleneck. Even when the files are accessed in the same
+order as they appear in the directory the running time is O(n²).
+The idea to solve this problem (for seq. read access) is quite 
+simple. Normally the search would allways start at the first entry 
+in the directory. When the position of the last successfull lookup
+is stored it becomes possible to start the search at the next(!) entry.
+Only when nothing was found the first part of the directory must 
+be examined as well.
+Here are some numbers from my machine:
+-----------------------------------------------------------
+                        original        patched
+-----------------------------------------------------------
+du news         real    5m3.961s        1m8.203s
+(~30000 files)  user    0m1.700s        0m1.130s
+                sys     4m25.030s       0m22.680s
+tar news        real    11m24.282s      8m13.102s
+                user    0m38.850s       0m36.910s
+                sys     5m50.410s       1m31.790s
+du  usr         real    0m33.536s       0m28.371s
+                user    0m0.330s        0m0.350s
+                sys     0m2.750s        0m2.640s
+tar usr         real    1m36.901s       1m35.923s
+                user    0m2.380s        0m2.470s
+                sys     0m28.120s       0m27.300s
+The patch stores a single position in a static struct. That's 
+possible not the best solution but i think the main idea is worth
+for a closer examination.
+Regards,
+        Bernhard--- v2.3.33/fs/ext2/namei.c	Thu Dec 16 17:33:44 1999
++++ linux/fs/ext2/namei.c	Fri Dec 17 21:20:42 1999
+@@ -16,6 +16,8 @@
+  *        David S. Miller (davem@caip.rutgers.edu), 1995
+  *  Directory entry file type support and forward compatibility hooks
+  *  	for B-tree directories by Theodore Ts'o (tytso@mit.edu), 1998
++ *  improved entry lookups by
++ *      Bernhard Brueck (kernel@brueck.muc.de), 1999
+  */
+ 
+ #include <linux/fs.h>
+@@ -49,116 +51,179 @@
+ }
+ 
+ /*
+- *	ext2_find_entry()
+- *
+- * finds an entry in the specified directory with the wanted name. It
+- * returns the cache buffer in which the entry was found, and the entry
+- * itself (as a parameter - res_dir). It does NOT read the inode of the
+- * entry - you'll have to do that yourself if you want to.
++ *  Find an entry inside a part of a single block 
+  */
+-static struct buffer_head * ext2_find_entry (struct inode * dir,
+-					     const char * const name, int namelen,
+-					     struct ext2_dir_entry_2 ** res_dir)
++static struct ext2_dir_entry_2* ext2_find_entry_in_block( const char * const name, 
++							  int namelen, 
++							  struct buffer_head *bh, 
++							  unsigned int start,
++							  unsigned int end)
++{
++    char* dlimit;
++    struct ext2_dir_entry_2 *de;
++
++    dlimit = bh->b_data + end - namelen;
++    de = (struct ext2_dir_entry_2 *)((char *)bh->b_data + start);
++    
++    while ((char *)de <= dlimit ) {
++	    unsigned int de_len;
++	    if(ext2_match (namelen, name, de))
++		    return de;
++
++	    de_len = le16_to_cpu(de->rec_len);
++	    (char *)de += de_len;	    
++
++	    /* prevent looping on a bad block */
++	    if (de_len <= 0)
++		    break;       
++    }
++    return NULL;
++}
++
++struct buffer_head * ext2_breada(struct inode * inode, int block, int *err)
+ {
+-	struct super_block * sb;
+-	struct buffer_head * bh_use[NAMEI_RA_SIZE];
+ 	struct buffer_head * bh_read[NAMEI_RA_SIZE];
+-	unsigned long offset;
+-	int block, toread, i, err;
+-
+-	*res_dir = NULL;
+-	sb = dir->i_sb;
++	int i, toread;
+ 
+-	if (namelen > EXT2_NAME_LEN)
++	bh_read[0] = ext2_getblk (inode, block, 0, err);
++	if (!bh_read[0] )
+ 		return NULL;
++	
++	if (buffer_uptodate(bh_read[0])) 
++		return bh_read[0];
+ 
+-	memset (bh_use, 0, sizeof (bh_use));
+-	toread = 0;
+-	for (block = 0; block < NAMEI_RA_SIZE; ++block) {
+-		struct buffer_head * bh;
+-
+-		if ((block << EXT2_BLOCK_SIZE_BITS (sb)) >= dir->i_size)
++	/* read ahead up to NAMEI_RA_SIZE blocks */
++	toread = 1;
++	++block;
++	for (i = 1; (block < inode->i_blocks) && (i < NAMEI_RA_SIZE); block++, i++) {
++		struct buffer_head *bh;
++		bh = ext2_getblk (inode, block, 0 , err);
++		if (!bh)
+ 			break;
+-		bh = ext2_getblk (dir, block, 0, &err);
+-		bh_use[block] = bh;
+-		if (bh && !buffer_uptodate(bh))
++		if (!buffer_uptodate(bh)) 
+ 			bh_read[toread++] = bh;
+-	}
++		else
++			brelse (bh);
++	}					
++	ll_rw_block (READ, toread, bh_read);
++	wait_on_buffer (bh_read[0]);	
+ 
+-	for (block = 0, offset = 0; offset < dir->i_size; block++) {
+-		struct buffer_head * bh;
+-		struct ext2_dir_entry_2 * de;
+-		char * dlimit;
+-
+-		if ((block % NAMEI_RA_BLOCKS) == 0 && toread) {
+-			ll_rw_block (READ, toread, bh_read);
+-			toread = 0;
+-		}
+-		bh = bh_use[block % NAMEI_RA_SIZE];
+-		if (!bh) {
++	while (--toread > 0)
++		brelse (bh_read[toread]);
++
++	if (buffer_uptodate(bh_read[0])) 
++		return bh_read[0];
++
++	brelse (bh_read[0]);
++	*err = -EIO;
++	return NULL;
++}
++
++
++/* last entry found */
++static struct {
++    struct super_block * sb;
++    unsigned long ino;      
++    unsigned long offset;
++} last_hit = { 0, 0, 0 };
++
++/*
++ *  Find an entry inside a part of a directory
++ */
++static struct buffer_head * ext2_find_range(struct inode * dir,
++					    const char * const name, int namelen,
++					    unsigned int from, unsigned int to,
++					    struct ext2_dir_entry_2 ** res_dir)
++{
++	int err; 
++	unsigned int blocksize, end, start, offset;
++	
++	blocksize = dir->i_sb->s_blocksize;
++	end = blocksize;
++	start = from % blocksize;
++
++	for (offset = from - start; offset < to; offset += blocksize ) { 
++		struct ext2_dir_entry_2 *de;
++		struct buffer_head *bh;
++
++		bh = ext2_breada (dir, offset >> EXT2_BLOCK_SIZE_BITS(dir->i_sb), &err);
++		if (!bh)
++			break;
++
++		if (!buffer_uptodate(bh)) {
+ #if 0
+-			ext2_error (sb, "ext2_find_entry",
++			ext2_error (dir->i_sb, "ext2_find_entry",
+ 				    "directory #%lu contains a hole at offset %lu",
+ 				    dir->i_ino, offset);
+ #endif
+-			offset += sb->s_blocksize;
++			brelse (bh);
+ 			continue;
+ 		}
+-		wait_on_buffer (bh);
+-		if (!buffer_uptodate(bh)) {
+-			/*
+-			 * read error: all bets are off
+-			 */
+-			break;
+-		}
+-
+-		de = (struct ext2_dir_entry_2 *) bh->b_data;
+-		dlimit = bh->b_data + sb->s_blocksize;
+-		while ((char *) de < dlimit) {
+-			/* this code is executed quadratically often */
+-			/* do minimal checking `by hand' */
+-			int de_len;
+-
+-			if ((char *) de + namelen <= dlimit &&
+-			    ext2_match (namelen, name, de)) {
+-				/* found a match -
+-				   just to be sure, do a full check */
+-				if (!ext2_check_dir_entry("ext2_find_entry",
+-							  dir, de, bh, offset))
+-					goto failure;
+-				for (i = 0; i < NAMEI_RA_SIZE; ++i) {
+-					if (bh_use[i] != bh)
+-						brelse (bh_use[i]);
+-				}
+-				*res_dir = de;
+-				return bh;
++		if ( offset + blocksize > dir->i_size )
++			end = to % blocksize;
++		
++		de = ext2_find_entry_in_block (name, namelen, bh, start, end);
++		start = 0;
++		if (de) {
++			offset += (char*)de - bh->b_data;
++			/* found  a match - just to be sure, do a full check */
++			if (!ext2_check_dir_entry("ext2_find_entry", dir, de, bh, offset)) {
++				brelse (bh);
++				goto out;
+ 			}
+-			/* prevent looping on a bad block */
+-			de_len = le16_to_cpu(de->rec_len);
+-			if (de_len <= 0)
+-				goto failure;
+-			offset += de_len;
+-			de = (struct ext2_dir_entry_2 *)
+-				((char *) de + de_len);
+-		}
++			/* memorize the match */
++			last_hit.sb     = dir->i_sb;
++			last_hit.ino    = dir->i_ino;
++			last_hit.offset = offset + le16_to_cpu(de->rec_len); 
++			*res_dir        = de;
+ 
++			return bh;
++		}
+ 		brelse (bh);
+-		if (((block + NAMEI_RA_SIZE) << EXT2_BLOCK_SIZE_BITS (sb)) >=
+-		    dir->i_size)
+-			bh = NULL;
+-		else
+-			bh = ext2_getblk (dir, block + NAMEI_RA_SIZE, 0, &err);
+-		bh_use[block % NAMEI_RA_SIZE] = bh;
+-		if (bh && !buffer_uptodate(bh))
+-			bh_read[toread++] = bh;
+ 	}
+-
+-failure:
+-	for (i = 0; i < NAMEI_RA_SIZE; ++i)
+-		brelse (bh_use[i]);
++out:
+ 	return NULL;
+ }
+ 
++
++/*
++ *    ext2_find_entry()
++ *
++ * finds an entry in the specified directory with the wanted name. It
++ * returns the cache buffer in which the entry was found, and the entry
++ * itself (as a parameter - res_dir). It does NOT read the inode of the
++ * entry - you'll have to do that yourself if you want to.
++ */
++static struct buffer_head * ext2_find_entry (struct inode * dir,
++					     const char * const name, 
++					     int namelen,
++					     struct ext2_dir_entry_2 ** res_dir)
++{
++      struct buffer_head *bh;
++      *res_dir = 0;
++
++      if (namelen > EXT2_NAME_LEN)
++              return NULL;
++
++      if ( last_hit.sb == dir->i_sb || last_hit.ino == dir->i_ino ) {
++	      /*
++	       *  if the same directory is searched again then we start 
++	       *  looking at the position where the last entry was found
++	       */
++	      bh = ext2_find_range( dir, name, namelen, 
++				    last_hit.offset, dir->i_size, res_dir );
++	      if (!bh) {
++		      bh =  ext2_find_range( dir, name, namelen, 
++					     0, last_hit.offset, res_dir );
++	      }
++      } else {
++              bh = ext2_find_range( dir, name, namelen, 
++				    0, dir->i_size, res_dir );
++      }
++      return bh;
++}
++
++
+ struct dentry *ext2_lookup(struct inode * dir, struct dentry *dentry)
+ {
+ 	struct inode * inode;
+@@ -317,6 +382,8 @@
+ 	struct ext2_dir_entry_2 * de, * pde;
+ 	int i;
+ 
++	last_hit.sb = 0;
++
+ 	i = 0;
+ 	pde = NULL;
+ 	de = (struct ext2_dir_entry_2 *) bh->b_data;
+@@ -881,5 +948,8 @@
+ 	brelse (dir_bh);
+ 	brelse (old_bh);
+ 	brelse (new_bh);
++
++	last_hit.sb = 0;
++
+ 	return retval;
+ }

@@ -1,0 +1,1700 @@
+Date: Sun, 26 Mar 2000 21:26:49 +0200
+From: "Peter De Schrijver (mind)" <>
+Subject: pcmcia support for ibmtr in 2.3.99pre3
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/3/26/94
+
+Hi,
+The attached patch adds pcmcia support for ibmtr to 2.3.99pre3. Also the
+tokenring pccard can now safely be removed while online.
+Peter.
+diff -urP linux-2.3.99-pre3/linux/drivers/net/pcmcia/Config.in linux-2.3.99pre2/drivers/net/pcmcia/Config.in
+--- linux-2.3.99-pre3/linux/drivers/net/pcmcia/Config.in	Tue Mar 21 21:39:17 2000
++++ linux-2.3.99pre2/drivers/net/pcmcia/Config.in	Mon Mar 20 19:23:47 2000
+@@ -15,6 +15,7 @@
+    dep_tristate '  SMC 91Cxx PCMCIA support' CONFIG_PCMCIA_SMC91C92 $CONFIG_PCMCIA
+    dep_tristate '  Xircom 16-bit PCMCIA support' CONFIG_PCMCIA_XIRC2PS $CONFIG_PCMCIA
+    dep_tristate '  COM20020 ARCnet PCMCIA support' CONFIG_ARCNET_COM20020_CS $CONFIG_ARCNET_COM20020 $CONFIG_ARCNET $CONFIG_PCMCIA
++   dep_tristate '  IBM PCMCIA tokenring adapter support' CONFIG_PCMCIA_IBMTR $CONFIG_PCMCIA_IBMTR $CONFIG_TR $CONFIG_PCMCIA
+ 
+    if [ "$CONFIG_CARDBUS" = "y" ]; then
+       dep_tristate '  3Com 3c575 CardBus support' CONFIG_PCMCIA_3C575 m
+diff -urP linux-2.3.99-pre3/linux/drivers/net/pcmcia/Makefile linux-2.3.99pre2/drivers/net/pcmcia/Makefile
+--- linux-2.3.99-pre3/linux/drivers/net/pcmcia/Makefile	Mon Mar 20 16:56:33 2000
++++ linux-2.3.99pre2/drivers/net/pcmcia/Makefile	Mon Mar 20 19:23:36 2000
+@@ -39,9 +39,18 @@
+ obj-$(CONFIG_PCMCIA_3C575)	+= 3c575_cb.o
+ obj-$(CONFIG_PCMCIA_XIRTULIP)	+= xircom_tulip_cb.o
+ 
++obj-$(CONFIG_PCMCIA_IBMTR)	+= ibmtr_cs.o
++
+ O_OBJS		:= $(filter-out $(export-objs), $(obj-y))
+ OX_OBJS		:= $(filter     $(export-objs), $(obj-y))
+ M_OBJS		:= $(filter-out $(export-objs), $(obj-m))
+ MX_OBJS		:= $(filter     $(export-objs), $(obj-m))
+ 
+ include $(TOPDIR)/Rules.make
++
++.ibmtr.o: ../tokenring/ibmtr.c
++	$(CC) $(CFLAGS) -D__NO_VERSION__ -DPCMCIA -c -o $@ ../tokenring/ibmtr.c
++
++ibmtr_cs.o: .ibmtr.o ibmtr_cs.c
++	$(CC) $(CFLAGS) -DPCMCIA -c -o .$@ ibmtr_cs.c
++	$(LD) -r -o $@ .$@ .ibmtr.o
+diff -urP linux-2.3.99-pre3/linux/drivers/net/pcmcia/ibmtr_cs.c linux-2.3.99pre2/drivers/net/pcmcia/ibmtr_cs.c
+--- linux-2.3.99-pre3/linux/drivers/net/pcmcia/ibmtr_cs.c	Thu Jan  1 01:00:00 1970
++++ linux-2.3.99pre2/drivers/net/pcmcia/ibmtr_cs.c	Sun Mar  5 01:06:03 2000
+@@ -0,0 +1,635 @@
++/*======================================================================
++
++    A PCMCIA token-ring driver for IBM-based cards
++
++    This driver supports the IBM PCMCIA Token-Ring Card.
++    Written by Steve Kipisz, kipisz@vnet.ibm.com or
++                             bungy@ibm.net
++
++    Written 1995,1996.
++
++    This code is based on pcnet_cs.c from David Hinds.
++    
++    V2.2.0 February 1999 - Mike Phillips phillim@amtrak.com
++
++    Linux V2.2.x presented significant changes to the underlying
++    ibmtr.c code.  Mainly the code became a lot more organized and
++    modular.
++
++    This caused the old PCMCIA Token Ring driver to give up and go 
++    home early. Instead of just patching the old code to make it 
++    work, the PCMCIA code has been streamlined, updated and possibly
++    improved.
++
++    This code now only contains code required for the Card Services.
++    All we do here is set the card up enough so that the real ibmtr.c
++    driver can find it and work with it properly.
++
++    i.e. We set up the io port, irq, mmio memory and shared ram memory.
++    This enables ibmtr_probe in ibmtr.c to find the card and configure it
++    as though it was a normal ISA and/or PnP card.
++
++    There is some confusion with the difference between available shared
++    ram and the amount actually reserved from memory.  ibmtr.c sets up
++    several offsets depending upon the actual on-board memory, not the
++    reserved memory.  We need to get around this to allow the cards to 
++    work with other cards in restricted memory space.  Therefore the 
++    pcmcia_reality_check function.
++
++    TODO
++	- Write the suspend / resume functions. 
++	- Fix Kernel Oops when removing card before ifconfig down
++
++    CHANGES
++
++    v2.2.5 April 1999 Mike Phillips (phillim@amtrak.com)
++    Obscure bug fix, required changed to ibmtr.c not ibmtr_cs.c
++    
++    v2.2.7 May 1999 Mike Phillips (phillim@amtrak.com)
++    Updated to version 2.2.7 to match the first version of the kernel
++    that the modification to ibmtr.c were incorporated into.
++    
++	
++======================================================================*/
++
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/init.h>
++#include <linux/sched.h>
++#include <linux/ptrace.h>
++#include <linux/malloc.h>
++#include <linux/string.h>
++#include <linux/timer.h>
++#include <linux/delay.h>
++#include <asm/io.h>
++#include <asm/system.h>
++
++#include <linux/netdevice.h>
++#include <linux/trdevice.h>
++#include <linux/ibmtr.h>
++
++#include <pcmcia/version.h>
++#include <pcmcia/cs_types.h>
++#include <pcmcia/cs.h>
++#include <pcmcia/cistpl.h>
++#include <pcmcia/ds.h>
++
++#define PCMCIA_DEBUG 10
++#ifdef PCMCIA_DEBUG
++static int pc_debug = PCMCIA_DEBUG;
++MODULE_PARM(pc_debug, "i");
++#define DEBUG(n, args...) if (pc_debug>(n)) printk(KERN_DEBUG args)
++static char *version =
++"ibmtr_cs.c 1.10 1996/01/06 05:19:00 (Steve Kipisz)\n"
++"           2.2.7 1999/05/03 12:00:00 (Mike Phillips)\n" ;
++#else
++#define DEBUG(n, args...)
++#endif
++
++/*====================================================================*/
++
++/* Parameters that can be set with 'insmod' */
++
++/* Bit map of interrupts to choose from */
++static u_int irq_mask = 0xdeb8;
++static int irq_list[4] = { -1 };
++
++/* MMIO base address */
++static u_long mmiobase = 0;
++
++/* SRAM base address */
++static u_long srambase = 0;
++
++/* SRAM size 8,16,32,64 */
++static u_long sramsize = 16;
++
++/* Ringspeed 4,16 */
++static int ringspeed = 16;
++
++MODULE_PARM(irq_mask, "i");
++MODULE_PARM(irq_list, "1-4i");
++MODULE_PARM(mmiobase, "i");
++MODULE_PARM(srambase, "i");
++MODULE_PARM(sramsize, "i");
++MODULE_PARM(ringspeed, "i");
++
++/*====================================================================*/
++
++static void ibmtr_config(dev_link_t *link);
++static void ibmtr_hw_setup(struct net_device *dev);
++static void ibmtr_release(u_long arg);
++static int ibmtr_event(event_t event, int priority,
++                       event_callback_args_t *args);
++
++static dev_info_t dev_info = "ibmtr_cs";
++
++static dev_link_t *ibmtr_attach(void);
++static void ibmtr_detach(dev_link_t *);
++
++static dev_link_t *dev_list = NULL;
++
++extern int ibmtr_probe(struct net_device *dev);
++unsigned char pcmcia_reality_check(unsigned char gss);
++
++extern int trdev_init(struct net_device *dev);
++extern void tok_interrupt(int irq, struct pt_regs *regs);
++extern int tok_init_card(struct net_device *dev);
++extern unsigned char get_sram_size(struct tok_info *ti);
++
++/*====================================================================*/
++
++typedef struct ibmtr_dev_t {
++    dev_link_t		link;
++    struct net_device	*dev; /* Changed for 2.2.0 */
++    dev_node_t          node;
++    window_handle_t     sram_win_handle;
++    struct tok_info	ti;
++} ibmtr_dev_t;
++
++/*======================================================================
++
++    This bit of code is used to avoid unregistering network devices
++    at inappropriate times.  2.2 and later kernels are fairly picky
++    about when this can happen.
++    
++======================================================================*/
++
++static void flush_stale_links(void)
++{
++    dev_link_t *link, *next;
++    for (link = dev_list; link; link = next) {
++	next = link->next;
++	if (link->state & DEV_STALE_LINK)
++	    ibmtr_detach(link);
++    }
++}
++
++/*====================================================================*/
++
++static void cs_error(client_handle_t handle, int func, int ret)
++{
++    error_info_t err = { func, ret };
++    CardServices(ReportError, handle, &err);
++}
++
++/*======================================================================
++
++    ibmtr_attach() creates an "instance" of the driver, allocating
++    local data structures for one device.  The device is registered
++    with Card Services.
++
++======================================================================*/
++
++static dev_link_t *ibmtr_attach(void)
++{
++    ibmtr_dev_t *info;
++    dev_link_t *link;
++    struct net_device *dev;
++    client_reg_t client_reg;
++    int i, ret;
++    
++    DEBUG(0, "ibmtr_attach()\n");
++    flush_stale_links();
++
++    /* Create new token-ring device */
++    info = kmalloc(sizeof(*info), GFP_KERNEL);
++    if (!info) return NULL;
++    memset(info, 0, sizeof(*info));
++    link = &info->link; link->priv = info;
++
++    link->release.function = &ibmtr_release;
++    link->release.data = (u_long)link;
++    link->io.Attributes1 = IO_DATA_PATH_WIDTH_8;
++    link->io.NumPorts1 = 4;
++    link->io.IOAddrLines = 16;
++    link->irq.Attributes = IRQ_TYPE_EXCLUSIVE | IRQ_HANDLE_PRESENT;
++    link->irq.IRQInfo1 = IRQ_INFO2_VALID|IRQ_LEVEL_ID;
++    if (irq_list[0] == -1)
++	link->irq.IRQInfo2 = irq_mask;
++    else
++	for (i = 0; i < 4; i++)
++	    link->irq.IRQInfo2 |= 1 << irq_list[i];
++    link->irq.Handler = &tok_interrupt;
++    link->conf.Attributes = CONF_ENABLE_IRQ;
++    link->conf.Vcc = 50;
++    link->conf.IntType = INT_MEMORY_AND_IO;
++    link->conf.Present = PRESENT_OPTION;
++
++    dev = init_trdev(NULL,0);
++    dev->priv = &info->ti;
++    link->irq.Instance = info->dev = dev;
++    
++    if (dev == NULL) {
++	ibmtr_detach(link);
++        return NULL;
++    }
++
++    dev->init = &ibmtr_probe;
++
++#if 0
++    dev->tbusy = 1; 
++#endif
++
++    /* Register with Card Services */
++    link->next = dev_list;
++    dev_list = link;
++    client_reg.dev_info = &dev_info;
++    client_reg.Attributes = INFO_IO_CLIENT | INFO_CARD_SHARE;
++    client_reg.EventMask =
++        CS_EVENT_CARD_INSERTION | CS_EVENT_CARD_REMOVAL |
++        CS_EVENT_RESET_PHYSICAL | CS_EVENT_CARD_RESET |
++        CS_EVENT_PM_SUSPEND | CS_EVENT_PM_RESUME;
++    client_reg.event_handler = &ibmtr_event;
++    client_reg.Version = 0x0210;
++    client_reg.event_callback_args.client_data = link;
++    ret = CardServices(RegisterClient, &link->handle, &client_reg);
++    if (ret != 0) {
++        cs_error(link->handle, RegisterClient, ret);
++        ibmtr_detach(link);
++        return NULL;
++    }
++
++    return link;
++} /* ibmtr_attach */
++
++/*======================================================================
++
++    This deletes a driver "instance".  The device is de-registered
++    with Card Services.  If it has been released, all local data
++    structures are freed.  Otherwise, the structures will be freed
++    when the device is released.
++
++======================================================================*/
++
++static void ibmtr_detach(dev_link_t *link)
++{
++    struct ibmtr_dev_t *info = link->priv;
++    dev_link_t **linkp;
++    struct net_device *dev; 
++    long flags;
++
++
++    DEBUG(0, "ibmtr_detach(0x%p)\n", link);
++
++    /* Locate device structure */
++    for (linkp = &dev_list; *linkp; linkp = &(*linkp)->next)
++        if (*linkp == link) break;
++    if (*linkp == NULL)
++        return;
++
++    dev = info->dev;
++    
++    save_flags(flags);
++    cli();
++    {
++	struct tok_info *ti = (struct tok_info *)dev->priv;
++	if (ti->tr_timer.next) del_timer(&(ti->tr_timer));
++    }
++    if (link->state & DEV_RELEASE_PENDING) {
++        del_timer(&link->release);
++        link->state &= ~DEV_RELEASE_PENDING;
++    }
++    restore_flags(flags);
++
++    if (link->state & DEV_CONFIG) {
++        ibmtr_release((u_long)link);
++        if (link->state & DEV_STALE_CONFIG) {
++            link->state |= DEV_STALE_LINK;
++            return;
++        }
++    }
++
++    if (link->handle)
++        CardServices(DeregisterClient, link->handle);
++
++    /* Unlink device structure, free bits */
++    *linkp = link->next;
++    if (link->dev)
++	unregister_trdev(info->dev);
++    kfree(info);
++
++} /* ibmtr_detach */
++
++/*======================================================================
++
++    ibmtr_config() is scheduled to run after a CARD_INSERTION event
++    is received, to configure the PCMCIA socket, and to make the
++    token-ring device available to the system.
++
++======================================================================*/
++
++#define CS_CHECK(fn, args...) \
++while ((last_ret=CardServices(last_fn=(fn), args))!=0) goto cs_failed
++
++static void ibmtr_config(dev_link_t *link)
++{
++    client_handle_t handle = link->handle;
++    ibmtr_dev_t *info = link->priv;
++    struct net_device *dev = info->dev;
++    struct tok_info *ti = dev->priv;
++    tuple_t tuple;
++    cisparse_t parse;
++    win_req_t req;
++    memreq_t mem;
++    int i, last_ret, last_fn;
++    u_char buf[64];
++    unsigned char Shared_Ram_Base;
++
++    DEBUG(0, "ibmtr_config(0x%p)\n", link);
++
++    tuple.Attributes = 0;
++    tuple.TupleData = buf;
++    tuple.TupleDataMax = 64;
++    tuple.TupleOffset = 0;
++    tuple.DesiredTuple = CISTPL_CONFIG;
++    CS_CHECK(GetFirstTuple, handle, &tuple);
++    CS_CHECK(GetTupleData, handle, &tuple);
++    CS_CHECK(ParseTuple, handle, &tuple, &parse);
++    link->conf.ConfigBase = parse.config.base;
++
++    /* Configure card */
++    link->state |= DEV_CONFIG;
++
++    link->conf.ConfigIndex = 0x61;
++
++    /* Determine if this is PRIMARY or ALTERNATE. */
++
++    /* Try PRIMARY card at 0xA20-0xA23 */
++    link->io.BasePort1 = 0xA20;
++    i = CardServices(RequestIO, link->handle, &link->io);
++    if (i == CS_SUCCESS) {
++	memcpy(info->node.dev_name, "tr0\0", 4);
++    } else {
++	/* Couldn't get 0xA20-0xA23.  Try ALTERNATE at 0xA24-0xA27. */
++	link->io.BasePort1 = 0xA24;
++	CS_CHECK(RequestIO, link->handle, &link->io);
++	memcpy(info->node.dev_name, "tr1\0", 4);
++    }
++    dev->base_addr = link->io.BasePort1;
++
++    CS_CHECK(RequestIRQ, link->handle, &link->irq);
++    dev->irq = link->irq.AssignedIRQ;
++    ti->irq = link->irq.AssignedIRQ;
++    ti->global_int_enable=GLOBAL_INT_ENABLE+((dev->irq==9) ? 2 : dev->irq);
++
++    /* Allocate the MMIO memory window */
++    req.Attributes = WIN_DATA_WIDTH_16|WIN_MEMORY_TYPE_CM|WIN_ENABLE;
++    req.Attributes |= WIN_USE_WAIT|WIN_STRICT_ALIGN;
++    req.Base = mmiobase;
++    req.Size = 0x2000;
++    req.AccessSpeed = 250;
++    link->win = (window_handle_t) link->handle;
++    CS_CHECK(RequestWindow, &link->win, &req);
++    mem.CardOffset = req.Base;
++    mem.Page = 0;
++    CS_CHECK(MapMemPage, link->win, &mem);
++    ti->mmio = (u_long)ioremap(req.Base, req.Size);
++
++    /* Allocate the SRAM memory window */
++    req.Attributes = WIN_DATA_WIDTH_16|WIN_MEMORY_TYPE_CM|WIN_ENABLE;
++    req.Attributes |= WIN_USE_WAIT|WIN_MAP_BELOW_1MB;
++    req.Base = srambase;
++    req.Size = sramsize * 1024;
++    req.AccessSpeed = 250;
++    info->sram_win_handle = (window_handle_t)link->handle;
++    CS_CHECK(RequestWindow, &info->sram_win_handle, &req);
++
++    mem.CardOffset = req.Base;
++    mem.Page = 0;
++    CS_CHECK(MapMemPage, info->sram_win_handle, &mem);
++    Shared_Ram_Base = req.Base >> 12;
++   
++    ti->sram = 0;
++    ti->sram_base = Shared_Ram_Base;
++    
++    CS_CHECK(RequestConfiguration, link->handle, &link->conf);
++
++    /*  Set up the Token-Ring Controller Configuration Register and
++        turn on the card.  Check the "Local Area Network Credit Card
++        Adapters Technical Reference"  SC30-3585 for this info.  */
++    ibmtr_hw_setup(dev);
++
++#if 0
++    dev->tbusy = 0;
++#endif
++
++    i = register_trdev(dev);
++    
++    if (i != 0) {
++	printk(KERN_NOTICE "ibmtr_cs: register_trdev() failed\n");
++	goto failed;
++    }
++
++    link->dev = &info->node;
++    link->state &= ~DEV_CONFIG_PENDING;
++
++    printk(KERN_INFO "%s: port %#3lx, irq %d,",
++           dev->name, dev->base_addr, dev->irq);
++    printk (" mmio %#5lx,", (u_long)ti->mmio);
++    printk (" sram %#5lx,", (u_long)ti->sram_base << 12);
++    printk ("\n" KERN_INFO "  hwaddr=");
++    for (i = 0; i < TR_ALEN; i++)
++        printk("%02X", dev->dev_addr[i]);
++    printk("\n");
++    return;
++
++cs_failed:
++    cs_error(link->handle, last_fn, last_ret);
++failed:
++    ibmtr_release((u_long)link);
++} /* ibmtr_config */
++
++/*======================================================================
++
++    After a card is removed, ibmtr_release() will unregister the net
++    device, and release the PCMCIA configuration.  If the device is
++    still open, this will be postponed until it is closed.
++
++======================================================================*/
++
++static void ibmtr_release(u_long arg)
++{
++    dev_link_t *link = (dev_link_t *)arg;
++    ibmtr_dev_t *info = link->priv;
++    struct net_device *dev = info->dev;
++    struct tok_info *ti=(struct tok_info *) dev->priv;
++
++    DEBUG(0, "ibmtr_release(0x%p)\n", link);
++
++    if (link->open) {
++	DEBUG(1, "ibmtr_cs: release postponed, '%s' "
++	      "still open\n", info->node.dev_name);
++        link->state |= DEV_STALE_CONFIG;
++        return;
++    }
++
++    ti->open_status=CLOSED;
++
++    CardServices(ReleaseConfiguration, link->handle);
++    CardServices(ReleaseIO, link->handle, &link->io);
++    CardServices(ReleaseIRQ, link->handle, &link->irq);
++    if (link->win) {
++	struct tok_info *ti = dev->priv;
++	iounmap((void *)ti->mmio);
++	CardServices(ReleaseWindow, link->win);
++	CardServices(ReleaseWindow, info->sram_win_handle);
++    }
++
++    link->state &= ~(DEV_CONFIG | DEV_RELEASE_PENDING);
++
++} /* ibmtr_release */
++
++/*======================================================================
++
++    The card status event handler.  Mostly, this schedules other
++    stuff to run after an event is received.  A CARD_REMOVAL event
++    also sets some flags to discourage the net drivers from trying
++    to talk to the card any more.
++
++======================================================================*/
++
++static int ibmtr_event(event_t event, int priority,
++                       event_callback_args_t *args)
++{
++    dev_link_t *link = args->client_data;
++    ibmtr_dev_t *info = link->priv;
++    struct net_device *dev = info->dev;
++
++    DEBUG(1, "ibmtr_event(0x%06x)\n", event);
++    
++    switch (event) {
++    case CS_EVENT_CARD_REMOVAL:
++        link->state &= ~DEV_PRESENT;
++        if (link->state & DEV_CONFIG) {
++#if 0
++            dev->tbusy = 1; dev->start = 0;
++#endif
++            link->release.expires = jiffies + HZ/20;
++            link->state |= DEV_RELEASE_PENDING;
++            add_timer(&link->release);
++        }
++        break;
++    case CS_EVENT_CARD_INSERTION:
++        link->state |= DEV_PRESENT;
++	ibmtr_config(link); 
++	break;
++    case CS_EVENT_PM_SUSPEND:
++        link->state |= DEV_SUSPEND;
++        /* Fall through... */
++    case CS_EVENT_RESET_PHYSICAL:
++        if (link->state & DEV_CONFIG) {
++#if 0
++            if (link->open) {
++                dev->tbusy = 1; dev->start = 0;
++            }
++#endif
++            CardServices(ReleaseConfiguration, link->handle);
++        }
++        break;
++    case CS_EVENT_PM_RESUME:
++        link->state &= ~DEV_SUSPEND;
++        /* Fall through... */
++    case CS_EVENT_CARD_RESET:
++        if (link->state & DEV_CONFIG) {
++            CardServices(RequestConfiguration, link->handle, &link->conf);
++            if (link->open) {
++		(dev->init)(dev);
++#if 0
++                dev->tbusy = 0; dev->start = 1;
++#endif
++            }
++        }
++        break;
++    }
++    return 0;
++} /* ibmtr_event */
++
++/*====================================================================*/
++
++static void ibmtr_hw_setup(struct net_device *dev)
++{
++    struct tok_info *ti = dev->priv;
++    int i; 
++
++    /* Bizarre IBM behavior, there are 16 bits of information we
++       need to set, but the card only allows us to send 4 bits at a 
++       time.  For each byte sent to base_addr, bits 7-4 tell the
++       card which part of the 16 bits we are setting, bits 3-0 contain 
++       the actual information */
++
++    /* First nibble provides 4 bits of mmio */
++    i = ((int)ti->mmio >> 16) & 0x0F;
++    outb(i, dev->base_addr);
++
++    /* Second nibble provides 3 bits of mmio */
++    i = 0x10 | (((int)ti->mmio >> 12) & 0x0E);
++    outb(i, dev->base_addr);
++
++    /* Third nibble, hard-coded values */
++    i = 0x26;
++    outb(i, dev->base_addr);
++
++    /* Fourth nibble sets shared ram page size */
++
++    /* 8 = 00, 16 = 01, 32 = 10, 64 = 11 */          
++        
++    i = (sramsize >> 4) & 0x07; 
++    i = ((i == 4) ? 3 : i) << 2;
++    i |= 0x30;
++
++    if (ringspeed == 16)
++	i |= 2;
++    if (dev->base_addr == 0xA24)
++	i |= 1;
++    outb(i, dev->base_addr);
++
++    /* X40 will release the card for use */
++
++    outb(0x40, dev->base_addr);
++    
++    return;
++}
++
++/*======================================================================
++  
++    A sweet little function that circumvents the problem with
++    ibmtr.c trying to use more memory than we can allocate for
++    the PCMCIA card.  ibmtr.c just assumes that if a card has 
++    64K of shared ram, the entire 64K must be mapped into memory,
++    whereas resources are sometimes a little tight in card services
++    so we fool ibmtr.c into thinking the card has less memory on
++    it than it has.
++    
++======================================================================*/
++
++unsigned char pcmcia_reality_check(unsigned char gss)
++{
++    return (gss < sramsize) ? sramsize : gss;
++}
++
++/*====================================================================*/
++
++static int __init init_ibmtr_cs(void)
++{
++    servinfo_t serv;
++    DEBUG(0, "%s\n", version);
++    CardServices(GetCardServicesInfo, &serv);
++    if (serv.Revision != CS_RELEASE_CODE) {
++        printk(KERN_NOTICE "ibmtr_cs: Card Services release "
++	       "does not match!\n");
++        return -1;
++    }
++    register_pccard_driver(&dev_info, &ibmtr_attach, &ibmtr_detach);
++    return 0;
++}
++
++static void __exit exit_ibmtr_cs(void)
++{
++    DEBUG(0, "ibmtr_cs: unloading\n");
++    unregister_pccard_driver(&dev_info);
++    while (dev_list != NULL)
++        ibmtr_detach(dev_list);
++}
++
++module_init(init_ibmtr_cs);
++module_exit(exit_ibmtr_cs);
+diff -urP linux-2.3.99-pre3/linux/drivers/net/tokenring/ibmtr.c linux-2.3.99pre2/drivers/net/tokenring/ibmtr.c
+--- linux-2.3.99-pre3/linux/drivers/net/tokenring/ibmtr.c	Thu Mar  2 19:15:30 2000
++++ linux-2.3.99pre2/drivers/net/tokenring/ibmtr.c	Sun Mar  5 00:52:10 2000
+@@ -88,6 +88,9 @@
+  *      to support windowing into on adapter shared ram.
+  *      i.e. Use LANAID to setup a PnP configuration with 16K RAM. Paging
+  *      will shift this 16K window over the entire available shared RAM.
++ *
++ *      Changes by Peter De Schrijver (p2@mind.be) :
++ *      + fixed a problem with PCMCIA card removal
+  */
+ 
+ /* change the define of IBMTR_DEBUG_MESSAGES to a nonzero value 
+@@ -161,13 +164,13 @@
+ #include <linux/stddef.h>
+ #include <linux/init.h>
+ #include <linux/spinlock.h>
++#include <linux/ibmtr.h>
+ #include <net/checksum.h>
+ 
+ #include <asm/io.h>
+ #include <asm/system.h>
+ #include <asm/bitops.h>
+ 
+-#include "ibmtr.h"
+ 
+ 
+ #define DPRINTK(format, args...) printk("%s: " format, dev->name , ## args)
+@@ -814,6 +817,9 @@
+ 
+ 	int i;
+ 
++	if(ti->open_status==CLOSED)
++		return;
++
+ 	address[0] = address[1] = address[2] = address[3] = 0;
+ 
+ 	mclist = dev->mc_list;
+@@ -870,26 +876,28 @@
+ 
+ 	struct tok_info *ti=(struct tok_info *) dev->priv;
+ 
+-	netif_stop_queue(dev);
+-	SET_PAGE(ti->srb_page);	
+-	isa_writeb(DIR_CLOSE_ADAPTER,
+-	       ti->srb + offsetof(struct srb_close_adapter, command));
+-	isa_writeb(CMD_IN_SRB, ti->mmio + ACA_OFFSET + ACA_SET + ISRA_ODD);
+-
+-	ti->open_status=CLOSED;
+-
+-	sleep_on(&ti->wait_for_tok_int);
+-
+-	SET_PAGE(ti->srb_page);
+-	if (isa_readb(ti->srb + offsetof(struct srb_close_adapter, ret_code)))
+-		DPRINTK("close adapter failed: %02X\n",
+-			(int)isa_readb(ti->srb + offsetof(struct srb_close_adapter, ret_code)));
++	if(ti->open_status!=CLOSED) {
++		netif_stop_queue(dev);
++		SET_PAGE(ti->srb_page);	
++		isa_writeb(DIR_CLOSE_ADAPTER,
++	       	ti->srb + offsetof(struct srb_close_adapter, command));
++		isa_writeb(CMD_IN_SRB, ti->mmio + ACA_OFFSET + ACA_SET + ISRA_ODD);
++
++		ti->open_status=CLOSED;
++
++		sleep_on(&ti->wait_for_tok_int);
++
++		SET_PAGE(ti->srb_page);
++		if (isa_readb(ti->srb + offsetof(struct srb_close_adapter, ret_code)))
++			DPRINTK("close adapter failed: %02X\n",
++				(int)isa_readb(ti->srb + offsetof(struct srb_close_adapter, ret_code)));
+ 
+ #ifdef PCMCIA
+-	ti->sram = 0 ;
++		ti->sram = 0 ;
+ #endif
+-	DPRINTK("Adapter closed.\n");
+-	MOD_DEC_USE_COUNT;
++		DPRINTK("Adapter closed.\n");
++		MOD_DEC_USE_COUNT;
++	}
+ 
+ 	return 0;
+ }
+@@ -937,6 +945,7 @@
+     		if (status == 0xFF)
+        		{
+ 		          DPRINTK("PCMCIA card removed.\n");
++                          ti->open_status=CLOSED;
+ 			  goto return_point ; 
+        		}
+ 
+@@ -944,6 +953,7 @@
+       	        if ( isa_readb (ti->mmio + ACA_OFFSET + ACA_RW + ISRP_EVEN) == 0xFF)
+     	        {
+          		 DPRINTK("PCMCIA card removed.\n");
++                         ti->open_status=CLOSED;
+ 			 goto return_point ; 
+       		}
+ #endif
+diff -urP linux-2.3.99-pre3/linux/include/linux/ibmtr.h linux-2.3.99pre2/include/linux/ibmtr.h
+--- linux-2.3.99-pre3/linux/include/linux/ibmtr.h	Thu Jan  1 01:00:00 1970
++++ linux-2.3.99pre2/include/linux/ibmtr.h	Thu Mar  2 19:15:30 2000
+@@ -0,0 +1,454 @@
++/* Definitions for an IBM Token Ring card. */
++/* This file is distributed under the GNU GPL   */
++
++/* ported to the Alpha architecture 02/20/96 (just used the HZ macro) */
++
++#define TR_RETRY_INTERVAL (5*HZ) /* 500 on PC = 5 s */
++#define TR_RESET_INTERVAL (HZ/20) /* 5 on PC = 50 ms */
++#define TR_BUSY_INTERVAL (HZ/5) /* 5 on PC = 200 ms */
++#define TR_SPIN_INTERVAL (3*HZ) /* 3 seconds before init timeout */
++#define TR_RETRIES 6            /* number of open retries */ 
++
++#define TR_ISA 1
++#define TR_MCA 2
++#define TR_ISAPNP 3
++#define NOTOK 0
++#define TOKDEBUG 1
++
++#define IBMTR_SHARED_RAM_SIZE 0x10000
++#define IBMTR_IO_EXTENT 4
++#define IBMTR_MAX_ADAPTERS 2
++
++#define CHANNEL_ID      0X1F30
++#define AIP             0X1F00
++#define AIPCHKSUM1      0X1F60
++#define AIPCHKSUM2      0X1FF0
++#define AIPADAPTYPE     0X1FA0
++#define AIPDATARATE     0X1FA2
++#define AIPEARLYTOKEN   0X1FA4
++#define AIPAVAILSHRAM   0X1FA6
++#define AIPSHRAMPAGE    0X1FA8
++#define AIP4MBDHB       0X1FAA
++#define AIP16MBDHB      0X1FAC
++#define AIPFID		0X1FBA
++
++/* Note, 0xA20 == 0x220 since motherboard decodes 10 bits.  I left everything
++   the way my documentation had it, ie: 0x0A20.     */
++#define ADAPTINTCNTRL   0x02f0  /* Adapter interrupt control */
++#define ADAPTRESET      0x1     /* Control Adapter reset (add to base) */
++#define ADAPTRESETREL   0x2     /* Release Adapter from reset ( """)  */
++#define ADAPTINTREL	0x3 	/* Adapter interrupt release */
++
++#define MMIOStartLocP   0x0a20  /* Primary adapter's starting MMIO area */
++#define MMIOStartLocA   0x0a24  /* Alternate adapter's starting MMIO area */
++
++#define GLOBAL_INT_ENABLE 0x02f0
++
++/* MMIO bits 0-4 select register */
++#define RRR_EVEN        0x00    /* Shared RAM relocation registers - even and odd */
++/* Used to set the starting address of shared RAM  */
++/* Bits 1 through 7 of this register map to bits 13 through 19 of the shared RAM address.*/
++/* ie: 0x02 sets RAM address to ...ato!  issy su wazzoo !! GODZILLA!!! */
++#define RRR_ODD         0x01
++/* Bits 2 and 3 of this register can be read to determine shared RAM size */
++/* 00 for 8k, 01 for 16k, 10 for 32k, 11 for 64k  */
++#define WRBR_EVEN       0x02    /* Write region base registers - even and odd */
++#define WRBR_ODD        0x03
++#define WWOR_EVEN       0x04    /* Write window open registers - even and odd */
++#define WWOR_ODD        0x05
++#define WWCR_EVEN       0x06    /* Write window close registers - even and odd */
++#define WWCR_ODD        0x07
++
++/* Interrupt status registers - PC system  - even and odd */
++#define ISRP_EVEN       0x08
++
++#define TCR_INT 0x10    /* Bit 4 - Timer interrupt.  The TVR_EVEN timer has
++                                                                   expired. */
++#define ERR_INT 0x08    /* Bit 3 - Error interrupt.  The adapter has had an
++                                                                   internal error. */
++#define ACCESS_INT 0x04    /* Bit 2 - Access interrupt.  You have attempted to
++                                                           write to an invalid area of shared RAM or an invalid
++                                                                   register within the MMIO. */
++/*      In addition, the following bits within ISRP_EVEN can be turned on or off by you */
++/*      to control the interrupt processing:   */
++#define INT_IRQ 0x80    /* Bit 7 - If 0 the adapter will issue a CHCK, if 1 and
++                                                              IRQ.  This should normally be set (by you) to 1.  */
++#define INT_ENABLE 0x40 /* Bit 6 - Interrupt enable.  If 0, no interrupts will
++                                                                   occur.  If 1, interrupts will occur normally.
++                                                                   Normally set to 1.  */
++/* Bit 0 - Primary or alternate adapter.  Set to zero if this adapter is the primary adapter,*/
++/*         1 if this adapter is the alternate adapter. */
++
++
++#define ISRP_ODD        0x09
++
++#define ADAP_CHK_INT 0x40 /* Bit 6 - Adapter check.  the adapter has
++                             encountered a serious problem and has closed
++                             itself.  Whoa.  */
++#define SRB_RESP_INT 0x20 /* Bit 5 - SRB response.  The adapter has accepted
++                             an SRB request and set the return code within
++                             the SRB. */
++#define ASB_FREE_INT 0x10 /* Bit 4 - ASB free.  The adapter has read the ASB
++                                                                          and this area can be safely reused. This interrupt
++                                                                          is only used if your application has set the ASB
++                                                                          free request bit in ISRA_ODD or if an error was
++                                                                detected in your response. */
++#define ARB_CMD_INT  0x08 /* Bit 3 - ARB command.  The adapter has given you a
++                                                                          command for action.  The command is located in the
++                                                                          ARB area of shared memory. */
++#define SSB_RESP_INT 0x04 /* Bit 2 - SSB response.  The adapter has posted a
++                                                                          response to your SRB (the response is located in
++                                                                          the SSB area of shared memory). */
++/* Bit 1 - Bridge frame forward complete. */
++
++
++
++#define ISRA_EVEN       0x0A    /* Interrupt status registers - adapter  - even and odd */
++/* Bit 7 - Internal parity error (on adapter's internal bus) */
++/* Bit 6 - Timer interrupt pending */
++/* Bit 5 - Access interrupt (attempt by adapter to access illegal address) */
++/* Bit 4 - Adapter microcode problem (microcode dead-man timer expired) */
++/* Bit 3 - Adapter processor check status */
++/* Bit 2 - Reserved */
++/* Bit 1 - Adapter hardware interrupt mask (prevents internal interrupts) */
++/* Bit 0 - Adapter software interrupt mask (prevents internal software interrupts) */
++
++#define ISRA_ODD        0x0B
++#define CMD_IN_SRB 0x20 /* Bit 5  - Indicates that you have placed a new
++                           command in the SRB and are ready for the adapter to
++                           process the command. */
++#define RESP_IN_ASB 0x10 /* Bit 4 - Indicates that you have placed a response
++                                                                    (an ASB) in the shared RAM which is available for
++                                                                         the adapter's use. */
++/* Bit 3 - Indicates that you are ready to put an SRB in the shared RAM, but that a previous */
++/*         command is still pending.  The adapter will then interrupt you when the previous */
++/*         command is completed */
++/* Bit 2 - Indicates that you are ready to put an ASB in the shared RAM, but that a previous */
++/*         ASB is still pending.  The adapter will then interrupt you when the previous ASB */
++/*         is copied.  */
++#define ARB_FREE 0x2
++#define SSB_FREE 0x1
++
++#define TCR_EVEN        0x0C    /* Timer control registers - even and odd */
++#define TCR_ODD         0x0D
++#define TVR_EVEN        0x0E    /* Timer value registers - even and odd */
++#define TVR_ODD         0x0F
++#define SRPR_EVEN       0x18    /* Shared RAM paging registers - even and odd */
++#define SRPR_ENABLE_PAGING 0xc0
++#define SRPR_ODD        0x19 /* Not used. */
++#define TOKREAD         0x60
++#define TOKOR           0x40
++#define TOKAND          0x20
++#define TOKWRITE        0x00
++
++/* MMIO bits 5-6 select operation */
++/* 00 is used to write to a register */
++/* 01 is used to bitwise AND a byte with a register */
++/* 10 is used to bitwise OR a byte with a register  */
++/* 11 is used to read from a register */
++
++/* MMIO bits 7-8 select area of interest.. see below */
++/* 00 selects attachment control area. */
++/* 01 is reserved. */
++/* 10 selects adapter identification area A containing the adapter encoded address. */
++/* 11 selects the adapter identification area B containing test patterns. */
++
++#define PCCHANNELID 5049434F3631313039393020
++#define MCCHANNELID 4D4152533633583435313820
++
++#define ACA_OFFSET 0x1e00
++#define ACA_SET 0x40
++#define ACA_RESET 0x20
++#define ACA_RW 0x00
++
++#ifdef ENABLE_PAGING
++#define SET_PAGE(x) (isa_writeb((x), \
++  ti->mmio + ACA_OFFSET + ACA_RW + SRPR_EVEN))
++#else
++#define SET_PAGE(x)
++#endif
++
++typedef enum { IN_PROGRESS, SUCCESS, FAILURE, CLOSED } open_state;
++
++/* do_tok_int possible values */
++#define FIRST_INT 1
++#define NOT_FIRST 2
++
++struct tok_info {
++	unsigned char irq;
++	__u32 mmio;
++	unsigned char hw_address[32];
++	unsigned char adapter_type;
++	unsigned char data_rate;
++	unsigned char token_release;
++	unsigned char avail_shared_ram;
++	unsigned char shared_ram_paging;
++	unsigned short dhb_size4mb;
++	unsigned short rbuf_len4;
++	unsigned short rbuf_cnt4;
++	unsigned short maxmtu4;
++	unsigned short dhb_size16mb;
++	unsigned short rbuf_len16;
++	unsigned short rbuf_cnt16;
++	unsigned short maxmtu16;
++	/* Additions by David Morris       */
++	unsigned char do_tok_int;
++	wait_queue_head_t wait_for_tok_int;
++	wait_queue_head_t wait_for_reset;
++	unsigned char sram_base;
++	/* Additions by Peter De Schrijver */
++	unsigned char page_mask;          /* mask to select RAM page to Map*/
++	unsigned char mapped_ram_size;    /* size of RAM page */
++	__u32 sram;                       /* Shared memory base address */
++	__u32 init_srb;                   /* Initial System Request Block address */
++	__u32 srb;                        /* System Request Block address */
++	__u32 ssb;                        /* System Status Block address */
++	__u32 arb;                        /* Adapter Request Block address */
++	__u32 asb;                        /* Adapter Status Block address */
++        __u8  init_srb_page;
++        __u8  srb_page;
++        __u8  ssb_page;
++        __u8  arb_page;
++        __u8  asb_page;
++	unsigned short exsap_station_id;
++	unsigned short global_int_enable;
++	struct sk_buff *current_skb;
++	struct net_device_stats tr_stats;
++	unsigned char auto_ringspeedsave;
++	open_state open_status;
++	unsigned char readlog_pending;
++	unsigned short adapter_int_enable; /* Adapter-specific int enable */
++        struct timer_list tr_timer;
++	unsigned char ring_speed;
++	__u32 func_addr;
++	unsigned int retry_count;
++	spinlock_t lock;		/* SMP protection */
++};
++
++/* token ring adapter commands */
++#define DIR_INTERRUPT 		0x00 /* struct srb_interrupt */
++#define DIR_MOD_OPEN_PARAMS 	0x01
++#define DIR_OPEN_ADAPTER 	0x03 /* struct dir_open_adapter */
++#define DIR_CLOSE_ADAPTER   	0x04
++#define DIR_SET_GRP_ADDR    	0x06
++#define DIR_SET_FUNC_ADDR   	0x07 /* struct srb_set_funct_addr */
++#define DIR_READ_LOG 		0x08 /* struct srb_read_log */
++#define DLC_OPEN_SAP 		0x15 /* struct dlc_open_sap */
++#define DLC_CLOSE_SAP       	0x16
++#define DATA_LOST 		0x20 /* struct asb_rec */
++#define REC_DATA 		0x81 /* struct arb_rec_req */
++#define XMIT_DATA_REQ 		0x82 /* struct arb_xmit_req */
++#define DLC_STATUS 		0x83 /* struct arb_dlc_status */
++#define RING_STAT_CHANGE    	0x84 /* struct dlc_open_sap ??? */
++
++/* DIR_OPEN_ADAPTER options */
++#define OPEN_PASS_BCON_MAC 0x0100
++#define NUM_RCV_BUF 2
++#define RCV_BUF_LEN 1024
++#define DHB_LENGTH 2048
++#define NUM_DHB 2
++#define DLC_MAX_SAP 2
++#define DLC_MAX_STA 1
++
++/* DLC_OPEN_SAP options */
++#define MAX_I_FIELD 0x0088
++#define SAP_OPEN_IND_SAP 0x04
++#define SAP_OPEN_PRIORITY 0x20
++#define SAP_OPEN_STATION_CNT 0x1
++#define XMIT_DIR_FRAME 0x0A
++#define XMIT_UI_FRAME  0x0d
++#define XMIT_XID_CMD   0x0e
++#define XMIT_TEST_CMD  0x11
++
++/* srb close return code */
++#define SIGNAL_LOSS  0x8000
++#define HARD_ERROR   0x4000
++#define XMIT_BEACON  0x1000
++#define LOBE_FAULT   0x0800
++#define AUTO_REMOVAL 0x0400
++#define REMOVE_RECV  0x0100
++#define LOG_OVERFLOW 0x0080
++#define RING_RECOVER 0x0020
++
++struct srb_init_response {
++	unsigned char command;
++	unsigned char init_status;
++	unsigned char init_status_2;
++	unsigned char reserved[3];
++	__u16 bring_up_code;
++	__u16 encoded_address;
++	__u16 level_address;
++	__u16 adapter_address;
++	__u16 parms_address;
++	__u16 mac_address;
++};
++
++struct dir_open_adapter {
++	unsigned char command;
++	char reserved[7];
++	__u16 open_options;
++	unsigned char node_address[6];
++	unsigned char group_address[4];
++	unsigned char funct_address[4];
++	__u16 num_rcv_buf;
++	__u16 rcv_buf_len;
++	__u16 dhb_length;
++	unsigned char num_dhb;
++	char reserved2;
++	unsigned char dlc_max_sap;
++	unsigned char dlc_max_sta;
++	unsigned char dlc_max_gsap;
++	unsigned char dlc_max_gmem;
++	unsigned char dlc_t1_tick_1;
++	unsigned char dlc_t2_tick_1;
++	unsigned char dlc_ti_tick_1;
++	unsigned char dlc_t1_tick_2;
++	unsigned char dlc_t2_tick_2;
++	unsigned char dlc_ti_tick_2;
++	unsigned char product_id[18];
++};
++
++struct srb_open_response {
++	unsigned char command;
++	unsigned char reserved1;
++	unsigned char ret_code;
++	unsigned char reserved2[3];
++	__u16 error_code;
++	__u16 asb_addr;
++	__u16 srb_addr;
++	__u16 arb_addr;
++	__u16 ssb_addr;
++};
++
++struct dlc_open_sap {
++	unsigned char command;
++	unsigned char reserved1;
++	unsigned char ret_code;
++	unsigned char reserved2;
++	__u16 station_id;
++	unsigned char timer_t1;
++	unsigned char timer_t2;
++	unsigned char timer_ti;
++	unsigned char maxout;
++	unsigned char maxin;
++	unsigned char maxout_incr;
++	unsigned char max_retry_count;
++	unsigned char gsap_max_mem;
++	__u16 max_i_field;
++	unsigned char sap_value;
++	unsigned char sap_options;
++	unsigned char station_count;
++	unsigned char sap_gsap_mem;
++	unsigned char gsap[0];
++};
++
++struct srb_xmit {
++	unsigned char command;
++	unsigned char cmd_corr;
++	unsigned char ret_code;
++	unsigned char reserved1;
++	__u16 station_id;
++};
++
++struct srb_interrupt {
++	unsigned char command;
++	unsigned char cmd_corr;
++	unsigned char ret_code;
++};
++
++struct srb_read_log {
++	unsigned char command;
++	unsigned char reserved1;
++	unsigned char ret_code;
++	unsigned char reserved2;
++	unsigned char line_errors;
++	unsigned char internal_errors;
++	unsigned char burst_errors;
++	unsigned char A_C_errors;
++	unsigned char abort_delimiters;
++	unsigned char reserved3;
++	unsigned char lost_frames;
++	unsigned char recv_congest_count;
++	unsigned char frame_copied_errors;
++	unsigned char frequency_errors;
++	unsigned char token_errors;
++};
++
++struct asb_xmit_resp {
++	unsigned char command;
++	unsigned char cmd_corr;
++	unsigned char ret_code;
++	unsigned char reserved;
++	__u16 station_id;
++	__u16 frame_length;
++	unsigned char hdr_length;
++	unsigned char rsap_value;
++};
++
++struct arb_xmit_req {
++	unsigned char command;
++	unsigned char cmd_corr;
++	unsigned char reserved1[2];
++	__u16 station_id;
++	__u16 dhb_address;
++};
++
++struct arb_rec_req {
++	unsigned char command;
++	unsigned char reserved1[3];
++	__u16 station_id;
++	__u16 rec_buf_addr;
++	unsigned char lan_hdr_len;
++	unsigned char dlc_hdr_len;
++	__u16 frame_len;
++	unsigned char msg_type;
++};
++
++struct asb_rec {
++	unsigned char command;
++	unsigned char reserved1;
++	unsigned char ret_code;
++	unsigned char reserved2;
++	__u16 station_id;
++	__u16 rec_buf_addr;
++};
++
++struct rec_buf {
++  /*	unsigned char reserved1[2]; */
++	__u16 buf_ptr;
++	unsigned char reserved2;
++	__u16 buf_len;
++	unsigned char data[0];
++};
++
++struct arb_dlc_status {
++	unsigned char command;
++	unsigned char reserved1[3];
++	__u16 station_id;
++	__u16 status;
++	unsigned char frmr_data[5];
++	unsigned char access_prio;
++	unsigned char rem_addr[TR_ALEN];
++	unsigned char rsap_value;
++};
++
++struct arb_ring_stat_change {
++	unsigned char command;
++	unsigned char reserved1[5];
++	__u16 ring_status;
++};
++
++struct srb_close_adapter {
++	unsigned char command;
++	unsigned char reserved1;
++	unsigned char ret_code;
++};
++
++struct srb_set_funct_addr {
++	unsigned char command;
++	unsigned char reserved1;
++	unsigned char ret_code;
++	unsigned char reserved2[3];
++	unsigned char funct_address[4];
++};
++
+--- linux-2.3.99-pre3/linux/drivers/net/tokenring/ibmtr.h	Thu Mar  2 19:15:30 2000
++++ /dev/null	Wed Mar  3 18:20:11 1999
+@@ -1,454 +0,0 @@
+-/* Definitions for an IBM Token Ring card. */
+-/* This file is distributed under the GNU GPL   */
+-
+-/* ported to the Alpha architecture 02/20/96 (just used the HZ macro) */
+-
+-#define TR_RETRY_INTERVAL (5*HZ) /* 500 on PC = 5 s */
+-#define TR_RESET_INTERVAL (HZ/20) /* 5 on PC = 50 ms */
+-#define TR_BUSY_INTERVAL (HZ/5) /* 5 on PC = 200 ms */
+-#define TR_SPIN_INTERVAL (3*HZ) /* 3 seconds before init timeout */
+-#define TR_RETRIES 6            /* number of open retries */ 
+-
+-#define TR_ISA 1
+-#define TR_MCA 2
+-#define TR_ISAPNP 3
+-#define NOTOK 0
+-#define TOKDEBUG 1
+-
+-#define IBMTR_SHARED_RAM_SIZE 0x10000
+-#define IBMTR_IO_EXTENT 4
+-#define IBMTR_MAX_ADAPTERS 2
+-
+-#define CHANNEL_ID      0X1F30
+-#define AIP             0X1F00
+-#define AIPCHKSUM1      0X1F60
+-#define AIPCHKSUM2      0X1FF0
+-#define AIPADAPTYPE     0X1FA0
+-#define AIPDATARATE     0X1FA2
+-#define AIPEARLYTOKEN   0X1FA4
+-#define AIPAVAILSHRAM   0X1FA6
+-#define AIPSHRAMPAGE    0X1FA8
+-#define AIP4MBDHB       0X1FAA
+-#define AIP16MBDHB      0X1FAC
+-#define AIPFID		0X1FBA
+-
+-/* Note, 0xA20 == 0x220 since motherboard decodes 10 bits.  I left everything
+-   the way my documentation had it, ie: 0x0A20.     */
+-#define ADAPTINTCNTRL   0x02f0  /* Adapter interrupt control */
+-#define ADAPTRESET      0x1     /* Control Adapter reset (add to base) */
+-#define ADAPTRESETREL   0x2     /* Release Adapter from reset ( """)  */
+-#define ADAPTINTREL	0x3 	/* Adapter interrupt release */
+-
+-#define MMIOStartLocP   0x0a20  /* Primary adapter's starting MMIO area */
+-#define MMIOStartLocA   0x0a24  /* Alternate adapter's starting MMIO area */
+-
+-#define GLOBAL_INT_ENABLE 0x02f0
+-
+-/* MMIO bits 0-4 select register */
+-#define RRR_EVEN        0x00    /* Shared RAM relocation registers - even and odd */
+-/* Used to set the starting address of shared RAM  */
+-/* Bits 1 through 7 of this register map to bits 13 through 19 of the shared RAM address.*/
+-/* ie: 0x02 sets RAM address to ...ato!  issy su wazzoo !! GODZILLA!!! */
+-#define RRR_ODD         0x01
+-/* Bits 2 and 3 of this register can be read to determine shared RAM size */
+-/* 00 for 8k, 01 for 16k, 10 for 32k, 11 for 64k  */
+-#define WRBR_EVEN       0x02    /* Write region base registers - even and odd */
+-#define WRBR_ODD        0x03
+-#define WWOR_EVEN       0x04    /* Write window open registers - even and odd */
+-#define WWOR_ODD        0x05
+-#define WWCR_EVEN       0x06    /* Write window close registers - even and odd */
+-#define WWCR_ODD        0x07
+-
+-/* Interrupt status registers - PC system  - even and odd */
+-#define ISRP_EVEN       0x08
+-
+-#define TCR_INT 0x10    /* Bit 4 - Timer interrupt.  The TVR_EVEN timer has
+-                                                                   expired. */
+-#define ERR_INT 0x08    /* Bit 3 - Error interrupt.  The adapter has had an
+-                                                                   internal error. */
+-#define ACCESS_INT 0x04    /* Bit 2 - Access interrupt.  You have attempted to
+-                                                           write to an invalid area of shared RAM or an invalid
+-                                                                   register within the MMIO. */
+-/*      In addition, the following bits within ISRP_EVEN can be turned on or off by you */
+-/*      to control the interrupt processing:   */
+-#define INT_IRQ 0x80    /* Bit 7 - If 0 the adapter will issue a CHCK, if 1 and
+-                                                              IRQ.  This should normally be set (by you) to 1.  */
+-#define INT_ENABLE 0x40 /* Bit 6 - Interrupt enable.  If 0, no interrupts will
+-                                                                   occur.  If 1, interrupts will occur normally.
+-                                                                   Normally set to 1.  */
+-/* Bit 0 - Primary or alternate adapter.  Set to zero if this adapter is the primary adapter,*/
+-/*         1 if this adapter is the alternate adapter. */
+-
+-
+-#define ISRP_ODD        0x09
+-
+-#define ADAP_CHK_INT 0x40 /* Bit 6 - Adapter check.  the adapter has
+-                             encountered a serious problem and has closed
+-                             itself.  Whoa.  */
+-#define SRB_RESP_INT 0x20 /* Bit 5 - SRB response.  The adapter has accepted
+-                             an SRB request and set the return code within
+-                             the SRB. */
+-#define ASB_FREE_INT 0x10 /* Bit 4 - ASB free.  The adapter has read the ASB
+-                                                                          and this area can be safely reused. This interrupt
+-                                                                          is only used if your application has set the ASB
+-                                                                          free request bit in ISRA_ODD or if an error was
+-                                                                detected in your response. */
+-#define ARB_CMD_INT  0x08 /* Bit 3 - ARB command.  The adapter has given you a
+-                                                                          command for action.  The command is located in the
+-                                                                          ARB area of shared memory. */
+-#define SSB_RESP_INT 0x04 /* Bit 2 - SSB response.  The adapter has posted a
+-                                                                          response to your SRB (the response is located in
+-                                                                          the SSB area of shared memory). */
+-/* Bit 1 - Bridge frame forward complete. */
+-
+-
+-
+-#define ISRA_EVEN       0x0A    /* Interrupt status registers - adapter  - even and odd */
+-/* Bit 7 - Internal parity error (on adapter's internal bus) */
+-/* Bit 6 - Timer interrupt pending */
+-/* Bit 5 - Access interrupt (attempt by adapter to access illegal address) */
+-/* Bit 4 - Adapter microcode problem (microcode dead-man timer expired) */
+-/* Bit 3 - Adapter processor check status */
+-/* Bit 2 - Reserved */
+-/* Bit 1 - Adapter hardware interrupt mask (prevents internal interrupts) */
+-/* Bit 0 - Adapter software interrupt mask (prevents internal software interrupts) */
+-
+-#define ISRA_ODD        0x0B
+-#define CMD_IN_SRB 0x20 /* Bit 5  - Indicates that you have placed a new
+-                           command in the SRB and are ready for the adapter to
+-                           process the command. */
+-#define RESP_IN_ASB 0x10 /* Bit 4 - Indicates that you have placed a response
+-                                                                    (an ASB) in the shared RAM which is available for
+-                                                                         the adapter's use. */
+-/* Bit 3 - Indicates that you are ready to put an SRB in the shared RAM, but that a previous */
+-/*         command is still pending.  The adapter will then interrupt you when the previous */
+-/*         command is completed */
+-/* Bit 2 - Indicates that you are ready to put an ASB in the shared RAM, but that a previous */
+-/*         ASB is still pending.  The adapter will then interrupt you when the previous ASB */
+-/*         is copied.  */
+-#define ARB_FREE 0x2
+-#define SSB_FREE 0x1
+-
+-#define TCR_EVEN        0x0C    /* Timer control registers - even and odd */
+-#define TCR_ODD         0x0D
+-#define TVR_EVEN        0x0E    /* Timer value registers - even and odd */
+-#define TVR_ODD         0x0F
+-#define SRPR_EVEN       0x18    /* Shared RAM paging registers - even and odd */
+-#define SRPR_ENABLE_PAGING 0xc0
+-#define SRPR_ODD        0x19 /* Not used. */
+-#define TOKREAD         0x60
+-#define TOKOR           0x40
+-#define TOKAND          0x20
+-#define TOKWRITE        0x00
+-
+-/* MMIO bits 5-6 select operation */
+-/* 00 is used to write to a register */
+-/* 01 is used to bitwise AND a byte with a register */
+-/* 10 is used to bitwise OR a byte with a register  */
+-/* 11 is used to read from a register */
+-
+-/* MMIO bits 7-8 select area of interest.. see below */
+-/* 00 selects attachment control area. */
+-/* 01 is reserved. */
+-/* 10 selects adapter identification area A containing the adapter encoded address. */
+-/* 11 selects the adapter identification area B containing test patterns. */
+-
+-#define PCCHANNELID 5049434F3631313039393020
+-#define MCCHANNELID 4D4152533633583435313820
+-
+-#define ACA_OFFSET 0x1e00
+-#define ACA_SET 0x40
+-#define ACA_RESET 0x20
+-#define ACA_RW 0x00
+-
+-#ifdef ENABLE_PAGING
+-#define SET_PAGE(x) (isa_writeb((x), \
+-  ti->mmio + ACA_OFFSET + ACA_RW + SRPR_EVEN))
+-#else
+-#define SET_PAGE(x)
+-#endif
+-
+-typedef enum { IN_PROGRESS, SUCCESS, FAILURE, CLOSED } open_state;
+-
+-/* do_tok_int possible values */
+-#define FIRST_INT 1
+-#define NOT_FIRST 2
+-
+-struct tok_info {
+-	unsigned char irq;
+-	__u32 mmio;
+-	unsigned char hw_address[32];
+-	unsigned char adapter_type;
+-	unsigned char data_rate;
+-	unsigned char token_release;
+-	unsigned char avail_shared_ram;
+-	unsigned char shared_ram_paging;
+-	unsigned short dhb_size4mb;
+-	unsigned short rbuf_len4;
+-	unsigned short rbuf_cnt4;
+-	unsigned short maxmtu4;
+-	unsigned short dhb_size16mb;
+-	unsigned short rbuf_len16;
+-	unsigned short rbuf_cnt16;
+-	unsigned short maxmtu16;
+-	/* Additions by David Morris       */
+-	unsigned char do_tok_int;
+-	wait_queue_head_t wait_for_tok_int;
+-	wait_queue_head_t wait_for_reset;
+-	unsigned char sram_base;
+-	/* Additions by Peter De Schrijver */
+-	unsigned char page_mask;          /* mask to select RAM page to Map*/
+-	unsigned char mapped_ram_size;    /* size of RAM page */
+-	__u32 sram;                       /* Shared memory base address */
+-	__u32 init_srb;                   /* Initial System Request Block address */
+-	__u32 srb;                        /* System Request Block address */
+-	__u32 ssb;                        /* System Status Block address */
+-	__u32 arb;                        /* Adapter Request Block address */
+-	__u32 asb;                        /* Adapter Status Block address */
+-        __u8  init_srb_page;
+-        __u8  srb_page;
+-        __u8  ssb_page;
+-        __u8  arb_page;
+-        __u8  asb_page;
+-	unsigned short exsap_station_id;
+-	unsigned short global_int_enable;
+-	struct sk_buff *current_skb;
+-	struct net_device_stats tr_stats;
+-	unsigned char auto_ringspeedsave;
+-	open_state open_status;
+-	unsigned char readlog_pending;
+-	unsigned short adapter_int_enable; /* Adapter-specific int enable */
+-        struct timer_list tr_timer;
+-	unsigned char ring_speed;
+-	__u32 func_addr;
+-	unsigned int retry_count;
+-	spinlock_t lock;		/* SMP protection */
+-};
+-
+-/* token ring adapter commands */
+-#define DIR_INTERRUPT 		0x00 /* struct srb_interrupt */
+-#define DIR_MOD_OPEN_PARAMS 	0x01
+-#define DIR_OPEN_ADAPTER 	0x03 /* struct dir_open_adapter */
+-#define DIR_CLOSE_ADAPTER   	0x04
+-#define DIR_SET_GRP_ADDR    	0x06
+-#define DIR_SET_FUNC_ADDR   	0x07 /* struct srb_set_funct_addr */
+-#define DIR_READ_LOG 		0x08 /* struct srb_read_log */
+-#define DLC_OPEN_SAP 		0x15 /* struct dlc_open_sap */
+-#define DLC_CLOSE_SAP       	0x16
+-#define DATA_LOST 		0x20 /* struct asb_rec */
+-#define REC_DATA 		0x81 /* struct arb_rec_req */
+-#define XMIT_DATA_REQ 		0x82 /* struct arb_xmit_req */
+-#define DLC_STATUS 		0x83 /* struct arb_dlc_status */
+-#define RING_STAT_CHANGE    	0x84 /* struct dlc_open_sap ??? */
+-
+-/* DIR_OPEN_ADAPTER options */
+-#define OPEN_PASS_BCON_MAC 0x0100
+-#define NUM_RCV_BUF 2
+-#define RCV_BUF_LEN 1024
+-#define DHB_LENGTH 2048
+-#define NUM_DHB 2
+-#define DLC_MAX_SAP 2
+-#define DLC_MAX_STA 1
+-
+-/* DLC_OPEN_SAP options */
+-#define MAX_I_FIELD 0x0088
+-#define SAP_OPEN_IND_SAP 0x04
+-#define SAP_OPEN_PRIORITY 0x20
+-#define SAP_OPEN_STATION_CNT 0x1
+-#define XMIT_DIR_FRAME 0x0A
+-#define XMIT_UI_FRAME  0x0d
+-#define XMIT_XID_CMD   0x0e
+-#define XMIT_TEST_CMD  0x11
+-
+-/* srb close return code */
+-#define SIGNAL_LOSS  0x8000
+-#define HARD_ERROR   0x4000
+-#define XMIT_BEACON  0x1000
+-#define LOBE_FAULT   0x0800
+-#define AUTO_REMOVAL 0x0400
+-#define REMOVE_RECV  0x0100
+-#define LOG_OVERFLOW 0x0080
+-#define RING_RECOVER 0x0020
+-
+-struct srb_init_response {
+-	unsigned char command;
+-	unsigned char init_status;
+-	unsigned char init_status_2;
+-	unsigned char reserved[3];
+-	__u16 bring_up_code;
+-	__u16 encoded_address;
+-	__u16 level_address;
+-	__u16 adapter_address;
+-	__u16 parms_address;
+-	__u16 mac_address;
+-};
+-
+-struct dir_open_adapter {
+-	unsigned char command;
+-	char reserved[7];
+-	__u16 open_options;
+-	unsigned char node_address[6];
+-	unsigned char group_address[4];
+-	unsigned char funct_address[4];
+-	__u16 num_rcv_buf;
+-	__u16 rcv_buf_len;
+-	__u16 dhb_length;
+-	unsigned char num_dhb;
+-	char reserved2;
+-	unsigned char dlc_max_sap;
+-	unsigned char dlc_max_sta;
+-	unsigned char dlc_max_gsap;
+-	unsigned char dlc_max_gmem;
+-	unsigned char dlc_t1_tick_1;
+-	unsigned char dlc_t2_tick_1;
+-	unsigned char dlc_ti_tick_1;
+-	unsigned char dlc_t1_tick_2;
+-	unsigned char dlc_t2_tick_2;
+-	unsigned char dlc_ti_tick_2;
+-	unsigned char product_id[18];
+-};
+-
+-struct srb_open_response {
+-	unsigned char command;
+-	unsigned char reserved1;
+-	unsigned char ret_code;
+-	unsigned char reserved2[3];
+-	__u16 error_code;
+-	__u16 asb_addr;
+-	__u16 srb_addr;
+-	__u16 arb_addr;
+-	__u16 ssb_addr;
+-};
+-
+-struct dlc_open_sap {
+-	unsigned char command;
+-	unsigned char reserved1;
+-	unsigned char ret_code;
+-	unsigned char reserved2;
+-	__u16 station_id;
+-	unsigned char timer_t1;
+-	unsigned char timer_t2;
+-	unsigned char timer_ti;
+-	unsigned char maxout;
+-	unsigned char maxin;
+-	unsigned char maxout_incr;
+-	unsigned char max_retry_count;
+-	unsigned char gsap_max_mem;
+-	__u16 max_i_field;
+-	unsigned char sap_value;
+-	unsigned char sap_options;
+-	unsigned char station_count;
+-	unsigned char sap_gsap_mem;
+-	unsigned char gsap[0];
+-};
+-
+-struct srb_xmit {
+-	unsigned char command;
+-	unsigned char cmd_corr;
+-	unsigned char ret_code;
+-	unsigned char reserved1;
+-	__u16 station_id;
+-};
+-
+-struct srb_interrupt {
+-	unsigned char command;
+-	unsigned char cmd_corr;
+-	unsigned char ret_code;
+-};
+-
+-struct srb_read_log {
+-	unsigned char command;
+-	unsigned char reserved1;
+-	unsigned char ret_code;
+-	unsigned char reserved2;
+-	unsigned char line_errors;
+-	unsigned char internal_errors;
+-	unsigned char burst_errors;
+-	unsigned char A_C_errors;
+-	unsigned char abort_delimiters;
+-	unsigned char reserved3;
+-	unsigned char lost_frames;
+-	unsigned char recv_congest_count;
+-	unsigned char frame_copied_errors;
+-	unsigned char frequency_errors;
+-	unsigned char token_errors;
+-};
+-
+-struct asb_xmit_resp {
+-	unsigned char command;
+-	unsigned char cmd_corr;
+-	unsigned char ret_code;
+-	unsigned char reserved;
+-	__u16 station_id;
+-	__u16 frame_length;
+-	unsigned char hdr_length;
+-	unsigned char rsap_value;
+-};
+-
+-struct arb_xmit_req {
+-	unsigned char command;
+-	unsigned char cmd_corr;
+-	unsigned char reserved1[2];
+-	__u16 station_id;
+-	__u16 dhb_address;
+-};
+-
+-struct arb_rec_req {
+-	unsigned char command;
+-	unsigned char reserved1[3];
+-	__u16 station_id;
+-	__u16 rec_buf_addr;
+-	unsigned char lan_hdr_len;
+-	unsigned char dlc_hdr_len;
+-	__u16 frame_len;
+-	unsigned char msg_type;
+-};
+-
+-struct asb_rec {
+-	unsigned char command;
+-	unsigned char reserved1;
+-	unsigned char ret_code;
+-	unsigned char reserved2;
+-	__u16 station_id;
+-	__u16 rec_buf_addr;
+-};
+-
+-struct rec_buf {
+-  /*	unsigned char reserved1[2]; */
+-	__u16 buf_ptr;
+-	unsigned char reserved2;
+-	__u16 buf_len;
+-	unsigned char data[0];
+-};
+-
+-struct arb_dlc_status {
+-	unsigned char command;
+-	unsigned char reserved1[3];
+-	__u16 station_id;
+-	__u16 status;
+-	unsigned char frmr_data[5];
+-	unsigned char access_prio;
+-	unsigned char rem_addr[TR_ALEN];
+-	unsigned char rsap_value;
+-};
+-
+-struct arb_ring_stat_change {
+-	unsigned char command;
+-	unsigned char reserved1[5];
+-	__u16 ring_status;
+-};
+-
+-struct srb_close_adapter {
+-	unsigned char command;
+-	unsigned char reserved1;
+-	unsigned char ret_code;
+-};
+-
+-struct srb_set_funct_addr {
+-	unsigned char command;
+-	unsigned char reserved1;
+-	unsigned char ret_code;
+-	unsigned char reserved2[3];
+-	unsigned char funct_address[4];
+-};
+-

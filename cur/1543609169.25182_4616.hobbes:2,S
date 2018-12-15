@@ -1,0 +1,204 @@
+Date: Thu, 8 Nov 2001 15:30:11 +0100 (CET)
+From: Ingo Molnar <>
+Subject: [patch] scheduler cache affinity improvement for 2.4 kernels
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2001/11/8/256
+
+i've attached a patch that fixes a long-time performance problem in the
+Linux scheduler.
+it's a fix for a UP and SMP scheduler problem Alan described to me
+recently, the 'CPU intensive process scheduling' problem. The essence of
+the problem: if there are multiple, CPU-intensive processes running,
+intermixed with other scheduling activities such as interactive work or
+network-intensive applications, then the Linux scheduler does a poor job
+of affinizing processes to processor caches. Such scheduler workload is
+common for a large percentage of important application workloads: database
+server workloads, webserver workloads and math-intensive clustered jobs,
+and other applications.
+If there are CPU-intensive processes A B and C, and a scheduling-intensive
+X task, then in the stock 2.4 kernels we end up scheduling in the
+following way:
+    A X A X A ... [timer tick]
+    B X B X B ... [timer tick]
+    C X C X C ... [timer tick]
+ie. we switch between CPU-intensive (and possibly cache-intensive)
+processes every timer tick. The timer tick can be 10 msec or shorter,
+depending on the HZ value.
+the intended length of the timeslice of such processes is supposed to be
+dependent on their priority - for typical CPU-intensive processes it's 100
+msecs. But in the above case, the effective timeslice of the
+CPU/cache-intensive process is 10 msec or lower, causing potential cache
+trashing if the working set of A, B and C are larger than the cache size
+of the CPU but the invidivual process' workload fits into cache.
+Repopulating a large processor cache can take many milliseconds (on a 2MB
+on-die cache Xeon CPU it takes more than 10 msecs to repopulate a typical
+cache), so the effect can be significant.
+The correct behavior would be:
+    A X A X A ... [10 timer ticks]
+    B X B X B ... [10 timer ticks]
+    C X C X C ... [10 timer ticks]
+this is in fact what happens if the scheduling acitivity of process 'X'
+does not happen.
+solution: i've introduced a new current->timer_ticks field (which is not
+in the scheduler 'hot cacheline', nor does it cause any scheduling
+overhead), which counts the number of timer ticks registered by any
+particular process. If the number of timer ticks reaches the number of
+available timeslices then the timer interrupt marks the process for
+reschedule, clears ->counter and ->timer_ticks. These 'timer ticks' have
+to be correctly administered across fork() and exit(), and some places
+that touch ->counter need to deal with timer_ticks too, but otherwise the
+patch has low impact.
+scheduling semantics impact: this causes CPU hogs to be more affine to the
+CPU they were running on, and will 'batch' them more agressively - without
+giving them more CPU time than under the stock scheduler. The change does
+not impact interactive tasks since they grow their ->counter above that of
+CPU hogs anyway. It might cause less 'interactivity' in CPU hogs - but
+this is the intended effect.
+performance impact: this field is never used in the scheduler hotpath.
+It's only used by the low frequency timer interrupt, and by the
+fork()/exit() path, which can take an extra variable without any visible
+impact. Also some fringe cases that touch ->counter needed updating too:
+the OOM code and RR RT tasks.
+performance results: The cases i've tested appear to work just fine, and
+the change has the cache-affinity effect we are looking for. I've measured
+'make -j bzImage' execution times on an 8-way, 700 MHz, 2MB cache Xeon
+box. (certainly not a box whose caches are easy to trash.) Here are 6
+successive make -j execution times with and without the patch applied. (To
+avoid pagecache layout and other effects, the box is running a modified
+but functionally equivalent version of the patch which allows runtime
+switching between the old and new scheduler behavior.)
+stock scheduler:
+  real    1m1.817s
+  real    1m1.871s
+  real    1m1.993s
+  real    1m2.015s
+  real    1m2.049s
+  real    1m2.077s
+with the patch applied:
+  real    1m0.177s
+  real    1m0.313s
+  real    1m0.331s
+  real    1m0.349s
+  real    1m0.462s
+  real    1m0.792s
+ie. stock scheduler is doing it in 62.0 seconds, new scheduler is doing it
+in 60.3 seconds, a ~3% improvement - not bad, considering that compilation
+is exeucting 99% in user-space, and that there was no 'interactive'
+activity during the compilation job.
+- to further measure the effects of the patch i've changed HZ to 1024 on a
+single-CPU, 700 MHz, 2MB cache Xeon box, which improved 'make -j' kernel
+compilation times by 4%.
+- Compiling just drivers/block/floppy.c (which is a cache-intensive
+operation) in parallel, with a constant single-process Apache network load
+in the background shows a 7% improvement.
+This shows the results we expected: with smaller timeslices, the effect of
+cache trashing shows up more visibly.
+(NOTE: i used 'make -j' only to create a well-known workload that has a
+high cache footprint. It's not to suggest that 'make -j' makes much sense
+on a single-CPU box.)
+(it would be nice if those people who suspect scalability problems in
+their workloads, could further test/verify the effects this patch.)
+the patch is against 2.4.15-pre1 and boots/works just fine on both UP and
+SMP systems.
+please apply,
+	Ingo
+--- linux/kernel/sched.c.orig	Thu Nov  8 11:06:31 2001
++++ linux/kernel/sched.c	Thu Nov  8 11:07:22 2001
+@@ -703,6 +703,7 @@
+ move_rr_last:
+ 	if (!prev->counter) {
+ 		prev->counter = NICE_TO_TICKS(prev->nice);
++		prev->timer_ticks = 0;
+ 		move_last_runqueue(prev);
+ 	}
+ 	goto move_rr_back;
+--- linux/kernel/timer.c.orig	Thu Nov  8 11:06:29 2001
++++ linux/kernel/timer.c	Thu Nov  8 11:07:22 2001
+@@ -583,8 +583,9 @@
+ 
+ 	update_one_process(p, user_tick, system, cpu);
+ 	if (p->pid) {
+-		if (--p->counter <= 0) {
++		if (++p->timer_ticks >= p->counter) {
+ 			p->counter = 0;
++			p->timer_ticks = 0;
+ 			p->need_resched = 1;
+ 		}
+ 		if (p->nice > 0)
+--- linux/kernel/fork.c.orig	Thu Nov  8 11:06:26 2001
++++ linux/kernel/fork.c	Thu Nov  8 11:07:22 2001
+@@ -681,11 +681,17 @@
+ 	 * total amount of dynamic priorities in the system doesnt change,
+ 	 * more scheduling fairness. This is only important in the first
+ 	 * timeslice, on the long run the scheduling behaviour is unchanged.
++	 *
++	 * also share the timer tick counter.
+ 	 */
+ 	p->counter = (current->counter + 1) >> 1;
+ 	current->counter >>= 1;
+-	if (!current->counter)
++	p->timer_ticks = (current->timer_ticks + 1) >> 1;
++	current->timer_ticks >>= 1;
++	if (!current->counter) {
+ 		current->need_resched = 1;
++		current->timer_ticks = 0;
++	}
+ 
+ 	/*
+ 	 * Ok, add it to the run-queues and make it
+--- linux/kernel/exit.c.orig	Thu Nov  8 11:06:31 2001
++++ linux/kernel/exit.c	Thu Nov  8 11:07:22 2001
+@@ -60,10 +60,19 @@
+ 		 * (this cannot be used to artificially 'generate'
+ 		 * timeslices, because any timeslice recovered here
+ 		 * was given away by the parent in the first place.)
++		 *
++		 * Also retrieve timeslice ticks.
+ 		 */
+ 		current->counter += p->counter;
+-		if (current->counter >= MAX_COUNTER)
++		current->timer_ticks += p->timer_ticks;
++		if (current->counter >= MAX_COUNTER) {
+ 			current->counter = MAX_COUNTER;
++			if (current->timer_ticks >= current->counter) {
++				current->counter = 0;
++				current->timer_ticks = 0;
++				current->need_resched = 1;
++			}
++		}
+ 		p->pid = 0;
+ 		free_task_struct(p);
+ 	} else {
+--- linux/mm/oom_kill.c.orig	Thu Nov  8 11:06:33 2001
++++ linux/mm/oom_kill.c	Thu Nov  8 11:07:48 2001
+@@ -150,6 +150,7 @@
+ 	 * exit() and clear out its resources quickly...
+ 	 */
+ 	p->counter = 5 * HZ;
++	p->timer_ticks = 0;
+ 	p->flags |= PF_MEMALLOC | PF_MEMDIE;
+ 
+ 	/* This process has hardware access, be more careful. */
+--- linux/include/linux/sched.h.orig	Thu Nov  8 11:06:33 2001
++++ linux/include/linux/sched.h	Thu Nov  8 12:17:54 2001
+@@ -312,6 +312,7 @@
+ 	 */
+ 	struct list_head run_list;
+ 	unsigned long sleep_time;
++	long timer_ticks;
+ 
+ 	struct task_struct *next_task, *prev_task;
+ 	struct mm_struct *active_mm;
+--- linux/drivers/net/slip.c.orig	Thu Nov  8 12:18:52 2001
++++ linux/drivers/net/slip.c	Thu Nov  8 12:19:16 2001
+@@ -1395,6 +1395,7 @@
+ 		do {
+ 			if (busy) {
+ 				current->counter = 0;
++				current->timer_ticks = 0;
+ 				schedule();
+ 			}
+ 

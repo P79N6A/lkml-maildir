@@ -1,0 +1,231 @@
+Date: Sun, 12 Sep 1999 00:27:17 +0200 (CEST)
+From: Andrea Arcangeli <>
+Subject: [patch] 2.3.18-ac1 ramdisk fixes
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/9/11/123
+
+Actually the ramdisk doesn't work because after uploading a ramdisk via
+the buffer layer, we can't reach the data from the page-cache because the
+data is in the buffer layer. So basically the ramdisk must search the
+buffer cache to work. To use the ramdisk to generate disk images, the
+page-cache must also be converted back to buffer cache in order to allow
+`cp /dev/ramdisk image` to see the file-data.
+This patch should fix the ramdisk device. It's against 2.3.18-ac1.
+diff -urN 2.3.18-ac1/fs/buffer.c 2.3.18-ac1-ramdisk/fs/buffer.c
+--- 2.3.18-ac1/fs/buffer.c	Sat Sep 11 16:33:32 1999
++++ 2.3.18-ac1-ramdisk/fs/buffer.c	Sun Sep 12 00:15:16 1999
+@@ -1200,6 +1200,59 @@
+ 	return 0;
+ }
+ 
++static void hash_ramdisk_buffers(struct page * page)
++{
++	struct buffer_head * bh = page->buffers, * first = bh, ** head;
++
++	do {
++		if (MAJOR(bh->b_dev) != RAMDISK_MAJOR)
++			BUG();
++		if (buffer_mapped(bh) && buffer_uptodate(bh))
++		{
++			struct buffer_head * oldbh;
++
++			/* the buffer hash doesn't like duplicates */
++			oldbh = get_hash_table(bh->b_dev, bh->b_blocknr,
++					       bh->b_size);
++			if (oldbh)
++			{
++				mark_buffer_clean(oldbh);
++				wait_on_buffer(oldbh);
++				clear_bit(BH_Protected, &oldbh->b_state);
++
++				/* an anonymous buffer is not update */
++				clear_bit(BH_Uptodate, &oldbh->b_state);
++
++				/* make sure the old buffer will be anonymous,
++				   bforget may fail to forget the buffer
++				   if there's some other user */
++				write_lock(&hash_table_lock);
++				if (oldbh->b_pprev)
++					__hash_unlink(oldbh);
++				write_unlock(&hash_table_lock);
++
++				bforget(oldbh);
++			}
++
++			/* stop the I/O before changing the end-io
++			   completation callback */
++			if (buffer_dirty(bh) || buffer_locked(bh))
++			{
++				mark_buffer_clean(bh);
++				wait_on_buffer(bh);
++			}
++			/* need a mb() here?? It seems no. */
++			bh->b_end_io = end_buffer_io_sync;
++
++			head = &hash(bh->b_dev, bh->b_blocknr);
++			write_lock(&hash_table_lock);
++			__hash_link(bh, head);
++			write_unlock(&hash_table_lock);
++		}
++		bh = bh->b_this_page;
++	} while (bh != first);
++}
++
+ /*
+  * We don't have to release all buffers here, but
+  * we have to be sure that no dirty buffer is left
+@@ -1227,13 +1280,13 @@
+ 		 * is this block fully flushed?
+ 		 */
+ 		if (offset <= curr_off) {
+-			if (buffer_mapped(bh)) {
++			if (buffer_mapped(bh) &&
++			    MAJOR(bh->b_dev) != RAMDISK_MAJOR)
++			{
+ 				mark_buffer_clean(bh);
+ 				wait_on_buffer(bh);
+ 				clear_bit(BH_Uptodate, &bh->b_state);
+-				clear_bit(BH_Mapped, &bh->b_state);
+ 				clear_bit(BH_Req, &bh->b_state);
+-				bh->b_blocknr = 0;
+ 			}
+ 		}
+ 		curr_off = next_off;
+@@ -1253,6 +1306,8 @@
+ 	if (!offset) {
+ 		if (!try_to_free_buffers(page)) {
+ 			atomic_add(PAGE_CACHE_SIZE, &buffermem);
++			if (MAJOR(inode->i_dev) == RAMDISK_MAJOR)
++				hash_ramdisk_buffers(page);
+ 			return 0;
+ 		}
+ 	}
+@@ -1421,11 +1476,37 @@
+ 			if (buffer_new(bh)) {
+ 				memset(bh->b_data, 0, bh->b_size);
+ 			} else {
+-				ll_rw_block(READ, 1, &bh);
+-				wait_on_buffer(bh);
+-				err = -EIO;
+-				if (!buffer_uptodate(bh))
+-					goto out;
++				if (MAJOR(bh->b_dev) != RAMDISK_MAJOR)
++				{
++				do_IO:
++					ll_rw_block(READ, 1, &bh);
++					wait_on_buffer(bh);
++					err = -EIO;
++					if (!buffer_uptodate(bh))
++						goto out;
++				} else {
++					struct buffer_head * oldbh;
++
++					oldbh = get_hash_table(bh->b_dev,
++							       bh->b_blocknr,
++							       bh->b_size);
++					if (!oldbh)
++						goto do_IO;
++					mark_buffer_clean(oldbh);
++					wait_on_buffer(oldbh);
++					clear_bit(BH_Protected,
++						  &oldbh->b_state);
++					if (!buffer_uptodate(oldbh))
++					{
++						bforget(oldbh);
++						goto do_IO;
++					}
++
++					memcpy(bh->b_data, oldbh->b_data,
++					       bh->b_size);
++					set_bit(BH_Protected, &bh->b_state);
++					bforget(oldbh);
++				}
+ 			}
+ 		}
+ 
+@@ -1583,11 +1664,37 @@
+ 			if (buffer_new(bh)) {
+ 				memset(bh->b_data, 0, bh->b_size);
+ 			} else {
+-				ll_rw_block(READ, 1, &bh);
+-				wait_on_buffer(bh);
+-				err = -EIO;
+-				if (!buffer_uptodate(bh))
+-					goto out;
++				if (MAJOR(bh->b_dev) != RAMDISK_MAJOR)
++				{
++				do_IO:
++					ll_rw_block(READ, 1, &bh);
++					wait_on_buffer(bh);
++					err = -EIO;
++					if (!buffer_uptodate(bh))
++						goto out;
++				} else {
++					struct buffer_head * oldbh;
++
++					oldbh = get_hash_table(bh->b_dev,
++							       bh->b_blocknr,
++							       bh->b_size);
++					if (!oldbh)
++						goto do_IO;
++					mark_buffer_clean(oldbh);
++					wait_on_buffer(oldbh);
++					clear_bit(BH_Protected,
++						  &oldbh->b_state);
++					if (!buffer_uptodate(oldbh))
++					{
++						bforget(oldbh);
++						goto do_IO;
++					}
++
++					memcpy(bh->b_data, oldbh->b_data,
++					       bh->b_size);
++					set_bit(BH_Protected, &bh->b_state);
++					bforget(oldbh);
++				}
+ 			}
+ 		}
+ 
+@@ -2000,8 +2107,33 @@
+ 				set_bit(BH_Uptodate, &bh->b_state);
+ 				continue;
+ 			}
++			else if (MAJOR(bh->b_dev) == RAMDISK_MAJOR)
++			{
++				struct buffer_head * oldbh;
++
++				oldbh = get_hash_table(bh->b_dev,
++						       bh->b_blocknr,
++						       bh->b_size);
++				if (!oldbh)
++					goto do_IO;
++				mark_buffer_clean(oldbh);
++				wait_on_buffer(oldbh);
++				clear_bit(BH_Protected, &oldbh->b_state);
++				if (!buffer_uptodate(oldbh))
++				{
++					bforget(oldbh);
++					goto do_IO;
++				}
++
++				memcpy(bh->b_data, oldbh->b_data, bh->b_size);
++				set_bit(BH_Uptodate, &bh->b_state);
++				set_bit(BH_Protected, &bh->b_state);
++				bforget(oldbh);
++				continue;
++			}				
+ 		}
+ 
++	do_IO:
+ 		init_buffer(bh, end_buffer_io_async, NULL);
+ 		atomic_inc(&bh->b_count);
+ 		arr[nr] = bh;
+Andrea
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

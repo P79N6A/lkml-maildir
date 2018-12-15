@@ -1,0 +1,344 @@
+Date: Wed, 8 Mar 2000 23:45:25 +0100
+From: Pavel Machek <>
+Subject: Re: HELP!!! Passing File descriptors
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/3/9/25
+
+Hi!
+> 	I want to pass file descriptors between two processes.I read 
+> man cmsg where the code for sending fds is given.But how do I receive
+> them.I have tried the following one, but not working.Can anybody please
+> help me.
+> 
+> ----- CODE start ---
+> 
+>               struct msghdr msg = {0};
+>               struct cmsghdr *cmsg;
+>               int myfds[NUM_FD];/* Contains the file descriptors to rcv.*/
+>               char buf[CMSG_SPACE(sizeof myfds)];/* ancillary data buffer*/
+>               int *fdptr;
+> 
+>               msg.msg_control = buf;
+>               msg.msg_controllen = sizeof buf;
+>               cmsg = CMSG_FIRSTHDR(&msg);
+>               cmsg->cmsg_level = SOL_SOCKET;
+>               cmsg->cmsg_type = SCM_RIGHTS;
+>               cmsg->cmsg_len = CMSG_LEN(sizeof(int) * NUM_FD);
+> 
+> 	      if( recvmsg( socket, &msg, 0 ) < 0 )
+> 		    return -1; 	
+> 
+>               fdptr = (int *)CMSG_DATA(cmsg);
+>               memcpy(myfds, fdptr, NUM_FD * sizeof(int));
+> ----- CODE ends  ----------
+This works for me:
+#define open open_sorry_hack
+#include "rserv.h"
+#include <dlfcn.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#undef open
+static struct cmsghdr *cmptr;
+#define CONTROLLEN  sizeof (struct cmsghdr) + sizeof (int)
+static int
+receive_fd (int helper_fd)
+{
+        struct iovec iov [1];
+        struct msghdr msg;
+        char buf [32];
+	cmptr = malloc(CONTROLLEN);
+        iov [0].iov_base = buf;
+        iov [0].iov_len  = sizeof (buf);
+        msg.msg_iov      = iov;
+        msg.msg_iovlen   = 1;
+        msg.msg_name     = NULL;
+        msg.msg_namelen  = 0;
+        msg.msg_control = cmptr;
+        msg.msg_controllen = CONTROLLEN;
+        if (recvmsg (helper_fd, &msg, 0) <= 0)
+                return -1;
+        return *(int *) CMSG_DATA (cmptr);
+}
+#define MSG(a)
+static int
+open_socket(int uid)
+{
+  int comm;
+  struct sockaddr_un un;
+  struct msghdr msg;
+  char buf[10240];
+  comm = socket(AF_UNIX, SOCK_STREAM, 0);
+  un.sun_family = AF_UNIX;
+  sprintf(buf, "/tmp/acls.%d", uid);
+  strcpy(un.sun_path, buf);
+  if (connect(comm, &un, sizeof(un))<0) {
+    strcpy(un.sun_path, "/tmp/acls.master");
+    if (connect(comm, &un, sizeof(un))<0) {
+      printf( "Connect failed: %m\n" );
+    }
+  }
+  return comm;
+}
+static int (*old_open)(const char *name, int mode, int perm);
+static int (*old_unlink)(const char *name);
+static int (*old_link)(const char *oldpath, const char *newpath);
+static int (*old_symlink)(const char *oldpath, const char *newpath);
+/* creat, rename, access, execve (?) */
+void
+_init(void) /* used to be init_me */
+{
+  old_open    = dlsym(RTLD_NEXT, "open");
+  old_unlink  = dlsym(RTLD_NEXT, "unlink");
+  old_link    = dlsym(RTLD_NEXT, "link");
+  old_symlink = dlsym(RTLD_NEXT, "symlink");
+  /* mkdir, rmdir, creat, mknod, lchown, access, rename, truncate, [f]chown, [f]chmod */
+  if (!old_open || !old_unlink || !old_link || !old_symlink)
+    sorry_i_can_not_find_neccessary_symbols_for_liballow();
+}
+int
+open(const char *name, int mode, int perm)
+{
+  int comm, res;
+  struct request req;
+  struct stat buf;
+  res = old_open(name, mode, perm);
+  if ((res != -1) || (errno != EACCES))
+    return res;
+  if (stat(name, &buf)<0)
+    return -1;
+  if ((comm = open_socket(buf.st_uid))<0)
+    return -1;
+  req.request = R_OPEN; req.a1 = mode; req.a2 = creat; req.len = strlen(name)+1;
+  write(comm, &req, sizeof(req));
+  write(comm, name, req.len);
+  read(comm, &req, sizeof(req));
+  if (req.a1 == -1) {
+    errno = req.a2;
+    return -1;
+  } else 
+    return receive_fd(comm);
+}
+#ifdef TEST
+void
+main(void)
+{
+  int fd;
+  char buf[1024];
+  fd = remote_open("/etc/passwd", O_RDONLY);
+  if (read(fd, buf, 1024)<0)
+    printf("read failed: %m");
+  else
+    write(0, buf, 1024);
+}
+#endif
+/* 
+ * Server for LD_PRELOAD ropen hack.
+ *
+ * Notice that you must use absolute paths in .acl file, otherwise you
+ * are vulnerable to sym/hard-link attacks. You must never allow
+ * access to files in publicly writable directory: someone may kill
+ * original file and replace it with symlink to anything _he_ wants to
+ * read.
+ *
+ * For some strange reason, this does not work under 2.3.18. 2.3.34 is ok.
+ *
+ * This is not too easy: if user does fchown(), he only has
+ * filehandle, and we do not have our protection tables based on
+ * filehandles :-(. Well, we _could_ get the path from
+ * /proc/ourpid/fd/... ...
+ *
+ * */
+#include "rserv.h"
+#define CONTROLLEN (sizeof (struct cmsghdr)  + sizeof (int))
+static int
+pass_fd (int client_fd, int fd)
+{
+        struct iovec  iov[1];
+        struct msghdr msg;
+        char          buf [1];
+	struct cmsghdr *cmptr;
+	cmptr = malloc(CONTROLLEN);
+        iov [0].iov_base = buf;
+        iov [0].iov_len  = 1;
+        msg.msg_iov        = iov;
+        msg.msg_iovlen     = 1;
+        msg.msg_name       = NULL;
+        msg.msg_namelen    = 0;
+        msg.msg_control    = cmptr;
+        msg.msg_controllen = CONTROLLEN;
+        cmptr->cmsg_level = SOL_SOCKET;
+        cmptr->cmsg_type  = SCM_RIGHTS;
+        cmptr->cmsg_len   = CONTROLLEN;
+        *(int *)CMSG_DATA (cmptr) = fd;
+        if (sendmsg (client_fd, &msg, 0) != 1)
+                return -1;
+        return 0;
+}
+struct sockaddr_un un;
+int len;
+int mainfd, fd = -1;
+int
+create(void)
+{
+  int comm;
+  int res;
+  char buf[1024];
+  comm = socket(AF_UNIX, SOCK_STREAM, 0);
+  un.sun_family = AF_UNIX;
+  sprintf(un.sun_path, PATH_FORM, getuid());
+  unlink(un.sun_path);
+  if (bind(comm, &un, sizeof(un))<0)
+    printf( "bind failed: %m\n" );
+  chmod(un.sun_path, 0666);
+  listen(comm, 5);
+  len = sizeof(un);
+  return comm;
+}
+void
+deny(void)
+{
+  struct request req;
+  req.request = R_REPLY;
+  req.len = 0;
+  req.a1 = -1;
+  req.a2 = EL3HLT;
+  printf( " deny\n" );
+  if (write(fd, &req, sizeof(req))!= sizeof(req))
+    printf( "Write reply failed: %m\n" );
+}
+int
+access_allow(char *path, char *mode)
+{
+  FILE *acl;
+  char buf[10240];
+  char name[10240];
+  if (*path != '/') {
+    printf( " path not absolute" );
+    goto deny;
+  }
+  if (strstr(path, "..")) {
+    printf( " path contains .." );
+    goto deny;
+  }
+  if (strlen(path)>10200) {
+    printf( " path too long" );
+    goto deny;
+  }
+  strcpy(name, path);
+#if 0
+  slash = strrchr(path, '/');
+  *slash++ = 0;	/* Slash now contains last part of filename */
+  if (chdir(path)) {
+    printf( " chdir %s failed %m", path );
+    goto deny;
+  }
+#endif
+  sprintf(buf, "./.acls.%d", getuid());
+  {
+    acl = fopen(buf, "r");
+    if (!acl) {
+      printf( " acl file not there" );
+      goto deny;
+    }
+    // fstat(fileno(acl)) -- to check it is setuid
+    fgets(buf, 10200, acl);
+    if (strcmp(buf, "#!acl_config")) {
+      printf( " acl file not reliable");
+      goto deny2;
+    }
+    while (fgets(buf, 10200, acl)) {
+      char permitted[10240];
+      int uid;
+      char *fname;
+      if (*buf == '#')
+	continue;
+      fname = strchr(buf, ':');
+      if (!fname) {
+	printf( " acl file invalid");
+	goto deny2;
+      }
+      *fname++ = 0;
+      if (strcmp(fname, path))
+	continue;
+      printf( " file found" );
+      sscanf(buf, "%s %d", permitted, &uid);
+      while (*mode)
+	if (!strchr(permitted, *mode++)) {
+	  printf( " mode %c not permitted", *--mode );
+	  goto deny2;
+	}
+      goto allow;
+    }
+  }
+  
+  printf( " not in acl file" );
+  goto deny;
+ allow:
+  return path;
+ deny2:
+  fclose(acl);
+ deny:
+  deny();
+  return NULL;
+}
+void
+main(void)
+{
+  struct msghdr msg;
+  char *newname;
+  setvbuf(stdout, NULL, _IONBF, 0);
+  mainfd = create();
+  printf("Connected\n");
+  while(1) {
+    struct request req;
+    char buf[1024];
+    int res;
+    close(fd);
+    if ((fd = accept(mainfd, &un, &len))<0)
+      printf( "accept failed: %m\n" );
+    res = read(fd, &req, sizeof(req));
+    if (res != sizeof(req)) {
+      printf( "Read/first: %d (%m)\n", res);
+      continue;
+    }
+    res = read(fd, buf, req.len);
+    if (res != req.len) {
+      printf( "Read/second: %d (%m)\n", res);
+      continue;
+    }
+    switch (req.request) {
+    case R_OPEN:
+      printf( "Open(%s, %d, %d)", buf, req.a1, req.a2);
+      if (!(newname = access_allow(buf, "r")))
+	continue;
+      {
+	int i = open(newname, req.a1, req.a2);
+	req.request = R_REPLY;
+	req.len = 0;
+	req.a1 = i;
+	req.a2 = errno;
+	printf( " rep" );
+	if (write(fd, &req, sizeof(req))!= sizeof(req))
+	  printf( "Write reply failed: %m\n" );
+	printf( " fd" );
+	pass_fd(fd, i);
+	close(i);
+	printf( "\n" );
+      }
+      break;
+    default:
+      printf( "Unknown request #%d\n", req.request );
+    }
+  }
+}
+-- 
+I'm pavel@ucw.cz. "In my country we have almost anarchy and I don't care."
+Panos Katsaloulis describing me w.r.t. patents me at discuss@linmodems.org
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

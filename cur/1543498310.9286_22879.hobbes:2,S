@@ -1,0 +1,1537 @@
+Date: Tue, 8 Jun 1999 16:55:05 -0700
+From: "David S. Miller" <>
+Subject: [RFC-PATCH] nfs client enhancements
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/6/8/229
+
+This is against 2.3.5 but should apply cleanly to the latest
+pre-patch.
+1) readdir gets cached directly in the page cache.  Besides the
+   inherent complexity of NFS itself, this change cleaned up
+   several aspects of the NFS readdir operation.  Mainly, inode
+   page cache invalidation implicitly clears up most of the necessary
+   cached state.
+   The main NFS complexity is knowing what to request for larger than
+   PAGE_CACHE_SIZE readdir blocks.  The "cookies" used to ask for a
+   startpoint are opaque.  So I just keep a simple list of page offset
+   to NFS cookie translations hung off of the NFS inode.  And actually
+   most readdir blocks are smaller than a page, and for this case no
+   cookies are ever allocated or needed since only the implicit start
+   cookie, which is zero, is needed to fire off a request.
+   There are no longer any special unmount directory cache flushes to
+   do for the superblock, nor at module unload time either.  Inode
+   invalidation takes care of everything.
+   The XDR readdir reply handling code translates the readdir result
+   blocks into host byte order, so the readdir hot path on a page
+   cache hit need not do any of it.  There is no special "in core"
+   format used by the kernel, the NFS format is used raw and it works
+   quite well this way.
+   Please note some subtle issues wrt. actually fetching the block on
+   a cache miss.  It is crucial to place the sleep points in the
+   correct order, and then recheck the page cache before invoking the
+   readdir request.  Also the cookie check must be the next to last
+   thing looked at.  Finally, when refetching is necessary to relearn
+   the cookie needed, one must be careful about recursion.  My desire
+   to get this all correct precluded adding a read-ahead mechanism,
+   but it can be quite easily added.
+   One issue I have with this scheme is that PAGE_CACHE_SIZE is quite
+   large for a single readdir block.  We seem to waste a lot of space
+   in most of the normal cases.  However, on the other hand the fact
+   that so many other things got cleaned up, and the kernel can reap
+   inode pages quite efficiently when memory is tight, make me believe
+   that things are not so bad here.  Also, the old code ate an entire
+   page for each nfs_dirent entry chunk, so we are no worse off :-)
+2) Delay UDP checksums to the SunRPC callback handling.  This removes
+   one spurious pass over the data.  Previously we'd checksum in UDP
+   receive, then copy it over to the RPC iovec.  Now we do it in
+   parallel, in one go.
+   One spurious copy on receive remains, due to IP fragmentation.  But
+   fear not, I'm working on a clean way to allow SKB lists to make
+   their way into UDP without the spurious copy, then we'll truly only
+   ever make one pass over the network data for NFS reads for example.
+   But this is forthcoming and not done yet.
+   Note currently that normal socket users cannot enable the explicit
+   delayed UDP checksum facility, only SunRPC can directly fiddle the
+   socket setting in this way.  This may be changed in the future, at
+   which point UDP recvmsg will need to know how to handle it, which
+   is not that much work actually.
+I believe I tested this quite well, but I wish to provide the standard
+"please be cafeful" warning along with these changes.
+Please tell me what you think.
+--- ./fs/nfs/dir.c.~1~	Wed Jun  2 11:37:33 1999
++++ ./fs/nfs/dir.c	Tue Jun  8 03:42:46 1999
+@@ -14,8 +14,10 @@
+  *              Following Linus comments on my original hack, this version
+  *              depends only on the dcache stuff and doesn't touch the inode
+  *              layer (iput() and friends).
++ *  6 Jun 1999	Cache readdir lookups in the page cache. -DaveM
+  */
+ 
++#define NFS_NEED_XDR_TYPES
+ #include <linux/sched.h>
+ #include <linux/errno.h>
+ #include <linux/stat.h>
+@@ -24,31 +26,16 @@
+ #include <linux/kernel.h>
+ #include <linux/malloc.h>
+ #include <linux/mm.h>
+-#include <linux/sunrpc/types.h>
++#include <linux/sunrpc/clnt.h>
+ #include <linux/nfs_fs.h>
++#include <linux/nfs.h>
++#include <linux/pagemap.h>
+ 
+ #include <asm/segment.h>	/* for fs functions */
+ 
+ #define NFS_PARANOIA 1
+ /* #define NFS_DEBUG_VERBOSE 1 */
+ 
+-/*
+- * Head for a dircache entry. Currently still very simple; when
+- * the cache grows larger, we will need a LRU list.
+- */
+-struct nfs_dirent {
+-	dev_t			dev;		/* device number */
+-	ino_t			ino;		/* inode number */
+-	u32			cookie;		/* cookie of first entry */
+-	unsigned short		valid  : 1,	/* data is valid */
+-				locked : 1;	/* entry locked */
+-	unsigned int		size;		/* # of entries */
+-	unsigned long		age;		/* last used */
+-	unsigned long		mtime;		/* last attr stamp */
+-	wait_queue_head_t	wait;
+-	__u32 *			entry;		/* three __u32's per entry */
+-};
+-
+ static int nfs_safe_remove(struct dentry *);
+ 
+ static ssize_t nfs_dir_read(struct file *, char *, size_t, loff_t *);
+@@ -107,253 +94,326 @@
+ 	return -EISDIR;
+ }
+ 
+-static struct nfs_dirent	dircache[NFS_MAX_DIRCACHE];
++/* Each readdir response is composed of entries which look
++ * like the following, as per the NFSv2 RFC:
++ *
++ *	__u32	not_end			zero if end of response
++ *	__u32	file ID			opaque ino_t
++ *	__u32	namelen			size of name string
++ *	VAR	name string		the string, padded to modulo 4 bytes
++ *	__u32	cookie			opaque ID of next entry
++ *
++ * When you hit not_end being zero, the next __u32 is non-zero if
++ * this is the end of the complete set of readdir entires for this
++ * directory.  This can be used, for example, to initiate pre-fetch.
++ *
++ * In order to know what to ask the server for, we only need to know
++ * the final cookie of the previous page, and offset zero has cookie
++ * zero, so we cache cookie to page offset translations in chunks.
++ */
++#define COOKIES_PER_CHUNK (8 - ((sizeof(void *) / sizeof(__u32))))
++struct nfs_cookie_table {
++	struct nfs_cookie_table *next;
++	__u32	cookies[COOKIES_PER_CHUNK];
++};
++static kmem_cache_t *nfs_cookie_cachep;
+ 
+-/*
+- * We need to do caching of directory entries to prevent an
+- * incredible amount of RPC traffic.  Only the most recent open
+- * directory is cached.  This seems sufficient for most purposes.
+- * Technically, we ought to flush the cache on close but this is
+- * not a problem in practice.
++/* Since a cookie of zero is declared special by the NFS
++ * protocol, we easily can tell if a cookie in an existing
++ * table chunk is valid or not.
+  *
+- * XXX: Do proper directory caching by stuffing data into the
+- * page cache (may require some fiddling for rsize < PAGE_SIZE).
++ * NOTE: The cookies are indexed off-by-one because zero
++ *       need not an entry.
+  */
++static __inline__ __u32 *find_cookie(struct inode *inode, unsigned long off)
++{
++	static __u32 cookie_zero = 0;
++	struct nfs_cookie_table *p;
++	__u32 *ret;
++
++	if (!off)
++		return &cookie_zero;
++	off -= 1;
++	p = NFS_COOKIES(inode);
++	while(off >= COOKIES_PER_CHUNK && p) {
++		off -= COOKIES_PER_CHUNK;
++		p = p->next;
++	}
++	ret = NULL;
++	if (p) {
++		ret = &p->cookies[off];
++		if (!*ret)
++			ret = NULL;
++	}
++	return ret;
++}
+ 
+-static int nfs_readdir(struct file *filp, void *dirent, filldir_t filldir)
++/* Now we cache directories properly, by stuffing the dirent
++ * data directly in the page cache.
++ *
++ * Inode invalidation due to refresh etc. takes care of
++ * _everything_, no sloppy entry flushing logic, no extraneous
++ * copying, network direct to page cache, the way it was meant
++ * to be.
++ *
++ * NOTE: Dirent information verification is done always by the
++ *	 page-in of the RPC reply, nowhere else, this simplies
++ *	 things substantially.
++ */
++#define NFS_NAMELEN_ALIGN(__len) ((((__len)+3)>>2)<<2)
++static u32 find_midpoint(__u32 *p, u32 doff)
+ {
+-	struct dentry 		*dentry = filp->f_dentry;
+-	struct inode 		*inode = dentry->d_inode;
+-	static DECLARE_WAIT_QUEUE_HEAD(readdir_wait);
+-	wait_queue_head_t	*waitp = NULL;
+-	struct nfs_dirent	*cache, *free;
+-	unsigned long		age, dead;
+-	u32			cookie;
+-	int			ismydir, result;
+-	int			i, j, index = 0;
+-	__u32			*entry;
+-	char			*name, *start;
++	u32 walk = doff & PAGE_MASK;
+ 
+-	dfprintk(VFS, "NFS: nfs_readdir(%s/%s)\n",
+-		dentry->d_parent->d_name.name, dentry->d_name.name);
++	while(*p++ != 0) {
++		__u32 skip;
+ 
+-	result = nfs_revalidate_inode(NFS_DSERVER(dentry), dentry);
+-	if (result < 0)
+-		goto out;
++		p++; /* skip fileid */
+ 
+-	/*
+-	 * Try to find the entry in the cache
+-	 */
+-again:
+-	if (waitp) {
+-		interruptible_sleep_on(waitp);
+-		if (signal_pending(current))
+-			return -ERESTARTSYS;
+-		waitp = NULL;
++		/* Skip len, name, and cookie. */
++		skip = NFS_NAMELEN_ALIGN(*p++);
++		p += (skip >> 2) + 1;
++		walk += skip + (4 * sizeof(__u32));
++		if (walk >= doff)
++			break;
+ 	}
++	return walk;
++}
+ 
+-	cookie = filp->f_pos;
+-	entry  = NULL;
+-	free   = NULL;
+-	age    = ~(unsigned long) 0;
+-	dead   = jiffies - NFS_ATTRTIMEO(inode);
++static int create_cookie(__u32 cookie, unsigned long off, struct inode *inode)
++{
++	struct nfs_cookie_table **cpp;
+ 
+-	for (i = 0, cache = dircache; i < NFS_MAX_DIRCACHE; i++, cache++) {
+-		/*
+-		dprintk("NFS: dircache[%d] valid %d locked %d\n",
+-					i, cache->valid, cache->locked);
+-		 */
+-		ismydir = (cache->dev == inode->i_dev
+-				&& cache->ino == inode->i_ino);
+-		if (cache->locked) {
+-			if (!ismydir || cache->cookie != cookie)
+-				continue;
+-			dfprintk(DIRCACHE, "NFS: waiting on dircache entry\n");
+-			waitp = &cache->wait;
+-			goto again;
++	cpp = (struct nfs_cookie_table **) &NFS_COOKIES(inode);
++	while (off >= COOKIES_PER_CHUNK && *cpp) {
++		off -= COOKIES_PER_CHUNK;
++		cpp = &(*cpp)->next;
++	}
++	if (*cpp) {
++		(*cpp)->cookies[off] = cookie;
++	} else {
++		struct nfs_cookie_table *new;
++		int i;
++
++		new = kmem_cache_alloc(nfs_cookie_cachep, SLAB_ATOMIC);
++		if(!new)
++			return -1;
++		*cpp = new;
++		new->next = NULL;
++		for(i = 0; i < COOKIES_PER_CHUNK; i++) {
++			if (i == off) {
++				new->cookies[i] = cookie;
++			} else {
++				new->cookies[i] = 0;
++			}
+ 		}
++	}
++	return 0;
++}
+ 
+-		if (ismydir && cache->mtime != inode->i_mtime)
+-			cache->valid = 0;
+-
+-		if (!cache->valid || cache->age < dead) {
+-			free = cache;
+-			age  = 0;
+-		} else if (cache->age < age) {
+-			free = cache;
+-			age  = cache->age;
+-		}
++static struct page *try_to_get_dirent_page(struct file *, unsigned long, int);
+ 
+-		if (!ismydir || !cache->valid)
+-			continue;
++/* Recover from a revalidation flush.  The case here is that
++ * the inode for the directory got invalidated somehow, and
++ * all of our cached information is lost.  In order to get
++ * a correct cookie for the current readdir request from the
++ * user, we must (re-)fetch older readdir page cache entries.
++ */
++static int refetch_to_readdir_off(struct file *file, struct inode *inode, u32 off)
++{
++	u32 cur_off, goal_off = off & PAGE_MASK;
+ 
+-		if (cache->cookie == cookie && cache->size > 0) {
+-			entry = cache->entry + (index = 0);
+-			cache->locked = 1;
+-			break;
+-		}
+-		for (j = 0; j < cache->size; j++) {
+-			__u32 *this_ent = cache->entry + j*3;
++again:
++	cur_off = 0;
++	while (cur_off < goal_off) {
++		struct page *page;
++
++		page = find_page(inode, cur_off);
++		if (page) {
++			if (PageLocked(page))
++				__wait_on_page(page);
++			if (!PageUptodate(page))
++				return -1;
++		} else {
++			page = try_to_get_dirent_page(file, cur_off, 0);
++			if (!page) {
++				if (!cur_off)
++					return -1;
+ 
+-			if (*(this_ent+1) != cookie)
+-				continue;
+-			if (j < cache->size - 1) {
+-				index = j + 1;
+-				entry = this_ent + 3;
+-			} else if (*(this_ent+2) & (1 << 15)) {
+-				/* eof */
+-				return 0;
++				/* Someone touched the dir on us. */
++				goto again;
+ 			}
+-			break;
+-		}
+-		if (entry) {
+-			dfprintk(DIRCACHE, "NFS: found dircache entry %d\n",
+-						(int)(cache - dircache));
+-			cache->locked = 1;
+-			break;
+-		}
+-	}
+-
+-	/*
+-	 * Okay, entry not present in cache, or locked and inaccessible.
+-	 * Set up the cache entry and attempt a READDIR call.
+-	 */
+-	if (entry == NULL) {
+-		if ((cache = free) == NULL) {
+-			dfprintk(DIRCACHE, "NFS: dircache contention\n");
+-			waitp = &readdir_wait;
+-			goto again;
+-		}
+-		dfprintk(DIRCACHE, "NFS: using free dircache entry %d\n",
+-				(int)(free - dircache));
+-		cache->cookie = cookie;
+-		cache->locked = 1;
+-		cache->valid  = 0;
+-		cache->dev    = inode->i_dev;
+-		cache->ino    = inode->i_ino;
+-		init_waitqueue_head(&cache->wait);
+-		if (!cache->entry) {
+-			result = -ENOMEM;
+-			cache->entry = (__u32 *) get_free_page(GFP_KERNEL);
+-			if (!cache->entry)
+-				goto done;
++			page_cache_release(page);
+ 		}
+ 
+-		result = nfs_proc_readdir(NFS_SERVER(inode), NFS_FH(dentry),
+-					cookie, PAGE_SIZE, cache->entry);
+-		if (result <= 0)
+-			goto done;
+-		cache->size  = result;
+-		cache->valid = 1;
+-		entry = cache->entry + (index = 0);
++		cur_off += PAGE_SIZE;
+ 	}
+-	cache->mtime = inode->i_mtime;
+-	cache->age = jiffies;
+ 
+-	/*
+-	 * Yowza! We have a cache entry...
+-	 */
+-	start = (char *) cache->entry;
+-	while (index < cache->size) {
+-		__u32	fileid  = *entry++;
+-		__u32	nextpos = *entry++; /* cookie */
+-		__u32	length  = *entry++;
++	return 0;
++}
+ 
+-		/*
+-		 * Unpack the eof flag, offset, and length
+-		 */
+-		result = length & (1 << 15); /* eof flag */
+-		name = start + ((length >> 16) & 0xFFFF);
+-		length &= 0x7FFF;
+-		/*
+-		dprintk("NFS: filldir(%p, %.*s, %d, %d, %x, eof %x)\n", entry,
+-				(int) length, name, length,
+-				(unsigned int) filp->f_pos,
+-				fileid, result);
+-		 */
++static struct page *try_to_get_dirent_page(struct file *file, unsigned long offset, int refetch_ok)
++{
++	struct nfs_readdirargs rd_args;
++	struct nfs_readdirres rd_res;
++	struct dentry *dentry = file->f_dentry;
++	struct inode *inode = dentry->d_inode;
++	struct page *page, **hash;
++	unsigned long page_cache;
++	__u32 *cookiep;
++
++	page = NULL;
++	page_cache = page_cache_alloc();
++	if (!page_cache)
++		goto out;
+ 
+-		if (filldir(dirent, name, length, cookie, fileid) < 0)
+-			break;
+-		cookie = nextpos;
+-		index++;
++	while ((cookiep = find_cookie(inode, offset)) == NULL) {
++		if (!refetch_ok ||
++		    refetch_to_readdir_off(file, inode, file->f_pos))
++			goto out;
+ 	}
+-	filp->f_pos = cookie;
+-	result = 0;
+-
+-	/* XXX: May want to kick async readdir-ahead here. Not too hard
+-	 * to do. */
+ 
+-done:
+-	dfprintk(DIRCACHE, "NFS: nfs_readdir complete\n");
+-	cache->locked = 0;
+-	wake_up(&cache->wait);
+-	wake_up(&readdir_wait);
++	hash = page_hash(inode, offset);
++	page = __find_page(inode, offset, *hash);
++	if (page) {
++		page_cache_free(page_cache);
++		goto out;
++	}
+ 
++	page = page_cache_entry(page_cache);
++	atomic_inc(&page->count);
++	page->flags = ((page->flags &
++			~((1 << PG_uptodate) | (1 << PG_error))) |
++		       ((1 << PG_referenced) | (1 << PG_locked)));
++	page->offset = offset;
++	add_page_to_inode_queue(inode, page);
++	__add_page_to_hash_queue(page, hash);
++
++	rd_args.fh = NFS_FH(dentry);
++	rd_res.buffer = (char *)page_cache;
++	rd_res.bufsiz = PAGE_CACHE_SIZE;
++	rd_res.cookie = *cookiep;
++	do {
++		rd_args.buffer = rd_res.buffer;
++		rd_args.bufsiz = rd_res.bufsiz;
++		rd_args.cookie = rd_res.cookie;
++		if (rpc_call(NFS_CLIENT(inode),
++			     NFSPROC_READDIR, &rd_args, &rd_res, 0) < 0)
++			goto error;
++	} while(rd_res.bufsiz > 0);
++
++	if (rd_res.bufsiz < 0)
++		NFS_DIREOF(inode) =
++			(offset << PAGE_CACHE_SHIFT) + -(rd_res.bufsiz);
++	else if (create_cookie(rd_res.cookie, offset, inode))
++		goto error;
++
++	set_bit(PG_uptodate, &page->flags);
++unlock_out:
++	clear_bit(PG_locked, &page->flags);
++	wake_up(&page->wait);
+ out:
+-	return result;
++	return page;
++
++error:
++	set_bit(PG_error, &page->flags);
++	goto unlock_out;
+ }
+ 
+-/*
+- * Invalidate dircache entries for an inode.
+- */
+-void
+-nfs_invalidate_dircache(struct inode *inode)
++static __inline__ u32 nfs_do_filldir(__u32 *p, u32 doff,
++				     void *dirent, filldir_t filldir)
+ {
+-	struct nfs_dirent *cache = dircache;
+-	dev_t		dev = inode->i_dev;
+-	ino_t		ino = inode->i_ino;
+-	int		i;
+-
+-	dfprintk(DIRCACHE, "NFS: invalidate dircache for %x/%ld\n", dev, (long)ino);
+-	for (i = NFS_MAX_DIRCACHE; i--; cache++) {
+-		if (cache->ino != ino)
+-			continue;
+-		if (cache->dev != dev)
+-			continue;
+-		if (cache->locked) {
+-			printk("NFS: cache locked for %s/%ld\n",
+-				kdevname(dev), (long) ino);
+-			continue;
+-		}
+-		cache->valid = 0;	/* brute force */
++	u32 end;
++
++	if (doff & ~PAGE_CACHE_MASK) {
++		doff = find_midpoint(p, doff);
++		p += (doff & ~PAGE_CACHE_MASK) >> 2;
++	}
++	while((end = *p++) != 0) {
++		__u32 fileid = *p++;
++		__u32 len = *p++;
++		__u32 skip = NFS_NAMELEN_ALIGN(len);
++		char *name = (char *) p;
++
++		/* Skip the cookie. */
++		p = ((__u32 *) (name + skip)) + 1;
++		if (filldir(dirent, name, len, doff, fileid) < 0)
++			goto out;
++		doff += (skip + (4 * sizeof(__u32)));
+ 	}
++	if (!*p)
++		doff = PAGE_CACHE_ALIGN(doff);
++out:
++	return doff;
+ }
+ 
+-/*
+- * Invalidate the dircache for a super block (or all caches),
+- * and release the cache memory.
++/* The file offset position is represented in pure bytes, to
++ * make the page cache interface straight forward.
++ *
++ * However, some way is needed to make the connection between the
++ * opaque NFS directory entry cookies and our offsets, so a per-inode
++ * cookie cache table is used.
+  */
+-void
+-nfs_invalidate_dircache_sb(struct super_block *sb)
++static int nfs_readdir(struct file *filp, void *dirent, filldir_t filldir)
+ {
+-	struct nfs_dirent *cache = dircache;
+-	int		i;
++	struct dentry *dentry = filp->f_dentry;
++	struct inode *inode = dentry->d_inode;
++	struct page *page, **hash;
++	unsigned long offset;
++	int res;
++
++	res = nfs_revalidate_inode(NFS_DSERVER(dentry), dentry);
++	if (res < 0)
++		return res;
++
++	if (NFS_DIREOF(inode) && filp->f_pos >= NFS_DIREOF(inode))
++		return 0;
++
++	offset = filp->f_pos >> PAGE_CACHE_SHIFT;
++	hash = page_hash(inode, offset);
++	page = __find_page(inode, offset, *hash);
++	if (!page)
++		goto no_dirent_page;
++	if (PageLocked(page))
++		goto dirent_locked_wait;
++	if (!PageUptodate(page))
++		goto dirent_read_error;
++success:
++	filp->f_pos = nfs_do_filldir((__u32 *) page_address(page),
++				     filp->f_pos, dirent, filldir);
++	page_cache_release(page);
++	return 0;
+ 
+-	for (i = NFS_MAX_DIRCACHE; i--; cache++) {
+-		if (sb && sb->s_dev != cache->dev)
+-			continue;
+-		if (cache->locked) {
+-			printk("NFS: cache locked at umount %s\n",
+-				(cache->entry ? "(lost a page!)" : ""));
+-			continue;
+-		}
+-		cache->valid = 0;	/* brute force */
+-		if (cache->entry) {
+-			free_page((unsigned long) cache->entry);
+-			cache->entry = NULL;
+-		}
+-	}
++no_dirent_page:
++	page = try_to_get_dirent_page(filp, offset, 1);
++	if (!page)
++		goto no_page;
++
++dirent_locked_wait:
++	wait_on_page(page);
++	if (PageUptodate(page))
++		goto success;
++dirent_read_error:
++	page_cache_release(page);
++no_page:
++	return -EIO;
+ }
+ 
+-/*
+- * Free directory cache memory
+- * Called from cleanup_module
++/* Invalidate directory cookie caches and EOF marker
++ * for an inode.
+  */
+-void
+-nfs_free_dircache(void)
++__inline__ void nfs_invalidate_dircache(struct inode *inode)
+ {
+-	dfprintk(DIRCACHE, "NFS: freeing dircache\n");
+-	nfs_invalidate_dircache_sb(NULL);
++	struct nfs_cookie_table *p = NFS_COOKIES(inode);
++
++	if (p != NULL) {
++		NFS_COOKIES(inode) = NULL;
++		do {	struct nfs_cookie_table *next = p->next;
++			kmem_cache_free(nfs_cookie_cachep, p);
++			p = next;
++		} while (p != NULL);
++	}
++	NFS_DIREOF(inode) = 0;
+ }
+ 
+ /*
+@@ -475,10 +535,15 @@
+ out_valid:
+ 	return 1;
+ out_bad:
+-	if (dentry->d_parent->d_inode)
++	/* Purge readdir caches. */
++	if (dentry->d_parent->d_inode) {
++		invalidate_inode_pages(dentry->d_parent->d_inode);
+ 		nfs_invalidate_dircache(dentry->d_parent->d_inode);
+-	if (inode && S_ISDIR(inode->i_mode))
++	}
++	if (inode && S_ISDIR(inode->i_mode)) {
++		invalidate_inode_pages(inode);
+ 		nfs_invalidate_dircache(inode);
++	}
+ 	return 0;
+ }
+ 
+@@ -522,13 +587,25 @@
+ #endif
+ }
+ 
++static kmem_cache_t *nfs_fh_cachep;
++
++__inline__ struct nfs_fh *nfs_fh_alloc(void)
++{
++	return kmem_cache_alloc(nfs_fh_cachep, SLAB_KERNEL);
++}
++
++__inline__ void nfs_fh_free(struct nfs_fh *p)
++{
++	kmem_cache_free(nfs_fh_cachep, p);
++}
++
+ /*
+  * Called when the dentry is being freed to release private memory.
+  */
+ static void nfs_dentry_release(struct dentry *dentry)
+ {
+ 	if (dentry->d_fsdata)
+-		kfree(dentry->d_fsdata);
++		nfs_fh_free(dentry->d_fsdata);
+ }
+ 
+ struct dentry_operations nfs_dentry_operations = {
+@@ -579,7 +656,7 @@
+ 
+ 	error = -ENOMEM;
+ 	if (!dentry->d_fsdata) {
+-		dentry->d_fsdata = kmalloc(sizeof(struct nfs_fh), GFP_KERNEL);
++		dentry->d_fsdata = nfs_fh_alloc();
+ 		if (!dentry->d_fsdata)
+ 			goto out;
+ 	}
+@@ -661,6 +738,7 @@
+ 	/*
+ 	 * Invalidate the dir cache before the operation to avoid a race.
+ 	 */
++	invalidate_inode_pages(dir);
+ 	nfs_invalidate_dircache(dir);
+ 	error = nfs_proc_create(NFS_SERVER(dir), NFS_FH(dentry->d_parent),
+ 			dentry->d_name.name, &sattr, &fhandle, &fattr);
+@@ -690,6 +768,7 @@
+ 		sattr.size = rdev; /* get out your barf bag */
+ 	sattr.atime.seconds = sattr.mtime.seconds = (unsigned) -1;
+ 
++	invalidate_inode_pages(dir);
+ 	nfs_invalidate_dircache(dir);
+ 	error = nfs_proc_create(NFS_SERVER(dir), NFS_FH(dentry->d_parent),
+ 				dentry->d_name.name, &sattr, &fhandle, &fattr);
+@@ -724,6 +803,7 @@
+ 	 * depending on potentially bogus information.
+ 	 */
+ 	d_drop(dentry);
++	invalidate_inode_pages(dir);
+ 	nfs_invalidate_dircache(dir);
+ 	error = nfs_proc_mkdir(NFS_DSERVER(dentry), NFS_FH(dentry->d_parent),
+ 				dentry->d_name.name, &sattr, &fhandle, &fattr);
+@@ -744,6 +824,7 @@
+ dentry->d_inode->i_count, dentry->d_inode->i_nlink);
+ #endif
+ 
++	invalidate_inode_pages(dir);
+ 	nfs_invalidate_dircache(dir);
+ 	error = nfs_proc_rmdir(NFS_SERVER(dir), NFS_FH(dentry->d_parent),
+ 				dentry->d_name.name);
+@@ -871,6 +952,7 @@
+ 			goto out;
+ 	} while(sdentry->d_inode != NULL); /* need negative lookup */
+ 
++	invalidate_inode_pages(dir);
+ 	nfs_invalidate_dircache(dir);
+ 	error = nfs_proc_rename(NFS_SERVER(dir),
+ 				NFS_FH(dentry->d_parent), dentry->d_name.name,
+@@ -940,6 +1022,7 @@
+ 			inode->i_nlink --;
+ 		d_delete(dentry);
+ 	}
++	invalidate_inode_pages(dir);
+ 	nfs_invalidate_dircache(dir);
+ 	error = nfs_proc_remove(NFS_SERVER(dir), NFS_FH(dentry->d_parent),
+ 				dentry->d_name.name);
+@@ -1006,6 +1089,7 @@
+ 	 * can't instantiate the new inode.
+ 	 */
+ 	d_drop(dentry);
++	invalidate_inode_pages(dir);
+ 	nfs_invalidate_dircache(dir);
+ 	error = nfs_proc_symlink(NFS_SERVER(dir), NFS_FH(dentry->d_parent),
+ 				dentry->d_name.name, symname, &sattr);
+@@ -1036,6 +1120,7 @@
+ 	 * we can't use the existing dentry.
+ 	 */
+ 	d_drop(dentry);
++	invalidate_inode_pages(dir);
+ 	nfs_invalidate_dircache(dir);
+ 	error = nfs_proc_link(NFS_DSERVER(old_dentry), NFS_FH(old_dentry),
+ 				NFS_FH(dentry->d_parent), dentry->d_name.name);
+@@ -1181,7 +1266,9 @@
+ 		d_delete(new_dentry);
+ 	}
+ 
++	invalidate_inode_pages(new_dir);
+ 	nfs_invalidate_dircache(new_dir);
++	invalidate_inode_pages(old_dir);
+ 	nfs_invalidate_dircache(old_dir);
+ 	error = nfs_proc_rename(NFS_DSERVER(old_dentry),
+ 			NFS_FH(old_dentry->d_parent), old_dentry->d_name.name,
+@@ -1199,6 +1286,25 @@
+ 	if (dentry)
+ 		dput(dentry);
+ 	return error;
++}
++
++int nfs_init_fhcache(void)
++{
++	nfs_fh_cachep = kmem_cache_create("nfs_fh",
++					  sizeof(struct nfs_fh),
++					  0, SLAB_HWCACHE_ALIGN,
++					  NULL, NULL);
++	if (nfs_fh_cachep == NULL)
++		return -ENOMEM;
++
++	nfs_cookie_cachep = kmem_cache_create("nfs_dcookie",
++					      sizeof(struct nfs_cookie_table),
++					      0, SLAB_HWCACHE_ALIGN,
++					      NULL, NULL);
++	if (nfs_cookie_cachep == NULL)
++		return -ENOMEM;
++
++	return 0;
+ }
+ 
+ /*
+--- ./fs/nfs/inode.c.~1~	Wed Jun  2 11:37:37 1999
++++ ./fs/nfs/inode.c	Mon Jun  7 23:05:45 1999
+@@ -137,10 +137,6 @@
+ 	if (!(server->flags & NFS_MOUNT_NONLM))
+ 		lockd_down();	/* release rpc.lockd */
+ 	rpciod_down();		/* release rpciod */
+-	/*
+-	 * Invalidate the dircache for this superblock.
+-	 */
+-	nfs_invalidate_dircache_sb(sb);
+ 
+ 	kfree(server->hostname);
+ 
+@@ -185,6 +181,9 @@
+ 	return bsize;
+ }
+ 
++extern struct nfs_fh *nfs_fh_alloc(void);
++extern void nfs_fh_free(struct nfs_fh *p);
++
+ /*
+  * The way this works is that the mount process passes a structure
+  * in the data argument which contains the server's IP address
+@@ -291,7 +290,7 @@
+ 	 * Keep the super block locked while we try to get 
+ 	 * the root fh attributes.
+ 	 */
+-	root_fh = kmalloc(sizeof(struct nfs_fh), GFP_KERNEL);
++	root_fh = nfs_fh_alloc();
+ 	if (!root_fh)
+ 		goto out_no_fh;
+ 	*root_fh = data->root;
+@@ -325,7 +324,7 @@
+ out_no_fattr:
+ 	printk("nfs_read_super: get root fattr failed\n");
+ out_free_fh:
+-	kfree(root_fh);
++	nfs_fh_free(root_fh);
+ out_no_fh:
+ 	rpciod_down();
+ 	goto out_shutdown;
+@@ -432,10 +431,9 @@
+ 	NFS_ATTRTIMEO(inode) = NFS_MINATTRTIMEO(inode);
+ 	NFS_CACHEINV(inode);
+ 
++	invalidate_inode_pages(inode);
+ 	if (S_ISDIR(inode->i_mode))
+ 		nfs_invalidate_dircache(inode);
+-	else
+-		invalidate_inode_pages(inode);
+ }
+ 
+ /*
+@@ -479,6 +477,8 @@
+ 		inode->i_size  = fattr->size;
+ 		inode->i_mtime = fattr->mtime.seconds;
+ 		NFS_OLDMTIME(inode) = fattr->mtime.seconds;
++		NFS_COOKIES(inode) = NULL;
++		NFS_WRITEBACK(inode) = NULL;
+ 	}
+ 	nfs_refresh_inode(inode, fattr);
+ }
+@@ -881,12 +881,25 @@
+ 	NULL
+ };
+ 
++extern int nfs_init_fhcache(void);
++extern int nfs_init_wreqcache(void);
++
+ /*
+  * Initialize NFS
+  */
+ int
+ init_nfs_fs(void)
+ {
++	int err;
++
++	err = nfs_init_fhcache();
++	if (err)
++		return err;
++
++	err = nfs_init_wreqcache();
++	if (err)
++		return err;
++
+ #ifdef CONFIG_PROC_FS
+ 	rpc_register_sysctl();
+ 	rpc_proc_init();
+@@ -917,6 +930,5 @@
+ 	rpc_proc_unregister("nfs");
+ #endif
+ 	unregister_filesystem(&nfs_fs_type);
+-	nfs_free_dircache();
+ }
+ #endif
+--- ./fs/nfs/write.c.~1~	Fri Jun  4 14:45:55 1999
++++ ./fs/nfs/write.c	Sat Jun  5 15:03:21 1999
+@@ -250,11 +250,24 @@
+ 	return 1;
+ }
+ 
++static kmem_cache_t *nfs_wreq_cachep;
++
++int nfs_init_wreqcache(void)
++{
++	nfs_wreq_cachep = kmem_cache_create("nfs_wreq",
++					    sizeof(struct nfs_wreq),
++					    0, SLAB_HWCACHE_ALIGN,
++					    NULL, NULL);
++	if (nfs_wreq_cachep == NULL)
++		return -ENOMEM;
++	return 0;
++}
++
+ static inline void
+ free_write_request(struct nfs_wreq * req)
+ {
+ 	if (!--req->wb_count)
+-		kfree(req);
++		kmem_cache_free(nfs_wreq_cachep, req);
+ }
+ 
+ /*
+@@ -274,7 +287,7 @@
+ 		page->offset + offset, bytes);
+ 
+ 	/* FIXME: Enforce hard limit on number of concurrent writes? */
+-	wreq = (struct nfs_wreq *) kmalloc(sizeof(*wreq), GFP_KERNEL);
++	wreq = kmem_cache_alloc(nfs_wreq_cachep, SLAB_KERNEL);
+ 	if (!wreq)
+ 		goto out_fail;
+ 	memset(wreq, 0, sizeof(*wreq));
+@@ -306,7 +319,7 @@
+ 
+ out_req:
+ 	rpc_release_task(task);
+-	kfree(wreq);
++	kmem_cache_free(nfs_wreq_cachep, wreq);
+ out_fail:
+ 	return NULL;
+ }
+--- ./fs/nfs/nfs2xdr.c.~1~	Tue May  4 01:30:14 1999
++++ ./fs/nfs/nfs2xdr.c	Tue Jun  8 03:41:59 1999
+@@ -359,133 +359,106 @@
+ {
+ 	struct rpc_task	*task = req->rq_task;
+ 	struct rpc_auth	*auth = task->tk_auth;
+-	u32		bufsiz = args->bufsiz;
++	int		bufsiz = args->bufsiz;
+ 	int		replen;
+ 
+-	/*
+-	 * Some servers (e.g. HP OS 9.5) seem to expect the buffer size
++	p = xdr_encode_fhandle(p, args->fh);
++	*p++ = htonl(args->cookie);
++
++	/* Some servers (e.g. HP OS 9.5) seem to expect the buffer size
+ 	 * to be in longwords ... check whether to convert the size.
+ 	 */
+ 	if (task->tk_client->cl_flags & NFS_CLNTF_BUFSIZE)
+-		bufsiz = bufsiz >> 2;
++		*p++ = htonl(bufsiz >> 2);
++	else
++		*p++ = htonl(bufsiz);
+ 
+-	p = xdr_encode_fhandle(p, args->fh);
+-	*p++ = htonl(args->cookie);
+-	*p++ = htonl(bufsiz); /* see above */
+ 	req->rq_slen = xdr_adjust_iovec(req->rq_svec, p);
+ 
+ 	/* set up reply iovec */
+ 	replen = (RPC_REPHDRSIZE + auth->au_rslack + NFS_readdirres_sz) << 2;
+-	/*
+-	dprintk("RPC: readdirargs: slack is 4 * (%d + %d + %d) = %d\n",
+-		RPC_REPHDRSIZE, auth->au_rslack, NFS_readdirres_sz, replen);
+-	 */
+ 	req->rq_rvec[0].iov_len  = replen;
+ 	req->rq_rvec[1].iov_base = args->buffer;
+-	req->rq_rvec[1].iov_len  = args->bufsiz;
+-	req->rq_rlen = replen + args->bufsiz;
++	req->rq_rvec[1].iov_len  = bufsiz;
++	req->rq_rlen = replen + bufsiz;
+ 	req->rq_rnr = 2;
+ 
+-	/*
+-	dprintk("RPC:      readdirargs set up reply vec:\n");
+-	dprintk("          rvec[0] = %p/%d\n",
+-			req->rq_rvec[0].iov_base,
+-			req->rq_rvec[0].iov_len);
+-	dprintk("          rvec[1] = %p/%d\n",
+-			req->rq_rvec[1].iov_base,
+-			req->rq_rvec[1].iov_len);
+-	 */
+-
+ 	return 0;
+ }
+ 
+ /*
+- * Decode the result of a readdir call. We decode the result in place
+- * to avoid a malloc of NFS_MAXNAMLEN+1 for each file name.
+- * After decoding, the layout in memory looks like this:
+- *	entry1 entry2 ... entryN <space> stringN ... string2 string1
+- * Each entry consists of three __u32 values, the same space as NFS uses.
+- * Note that the strings are not null-terminated so that the entire number
+- * of entries returned by the server should fit into the buffer.
++ * Decode the result of a readdir call.
+  */
++#define NFS_DIRENT_MAXLEN	(5 * sizeof(u32) + (NFS_MAXNAMLEN + 1))
+ static int
+ nfs_xdr_readdirres(struct rpc_rqst *req, u32 *p, struct nfs_readdirres *res)
+ {
+ 	struct iovec		*iov = req->rq_rvec;
+ 	int			 status, nr;
+-	char			*string, *start;
+-	u32			*end, *entry, len, fileid, cookie;
++	u32			*end;
++	u32			last_cookie = res->cookie;
+ 
+-	if ((status = ntohl(*p++)))
+-		return -nfs_stat_to_errno(status);
++	status = ntohl(*p++);
++	if (status) {
++		nr = -nfs_stat_to_errno(status);
++		goto error;
++	}
+ 	if ((void *) p != ((u8 *) iov->iov_base+iov->iov_len)) {
+ 		/* Unexpected reply header size. Punt. */
+ 		printk("NFS: Odd RPC header size in readdirres reply\n");
+-		return -errno_NFSERR_IO;
++		nr = -errno_NFSERR_IO;
++		goto error;
+ 	}
+ 
+-	/* Get start and end address of XDR data */
++	/* Get start and end address of XDR readdir response. */
+ 	p   = (u32 *) iov[1].iov_base;
+ 	end = (u32 *) ((u8 *) p + iov[1].iov_len);
+-
+-	/* Get start and end of dirent buffer */
+-	entry  = (u32 *) res->buffer;
+-	start  = (char *) res->buffer;
+-	string = (char *) res->buffer + res->bufsiz;
+ 	for (nr = 0; *p++; nr++) {
+-		fileid = ntohl(*p++);
++		__u32 len;
++
++		/* Convert fileid. */
++		*p = ntohl(*p);
++		p++;
++
++		/* Convert and capture len */
++		len = *p = ntohl(*p);
++		p++;
+ 
+-		len = ntohl(*p++);
+-		/*
+-		 * Check whether the server has exceeded our reply buffer,
+-		 * and set a flag to convert the size to longwords.
+-		 */
+ 		if ((p + QUADLEN(len) + 3) > end) {
+ 			struct rpc_clnt *clnt = req->rq_task->tk_client;
+-			printk(KERN_WARNING
+-				"NFS: server %s, readdir reply truncated\n",
+-				clnt->cl_server);
+-			printk(KERN_WARNING "NFS: nr=%d, slots=%d, len=%d\n",
+-				nr, (end - p), len);
++
+ 			clnt->cl_flags |= NFS_CLNTF_BUFSIZE;
++			p -= 2;
++			p[-1] = 0;
++			p[0] = 0;
+ 			break;
+ 		}
+ 		if (len > NFS_MAXNAMLEN) {
+-			printk("NFS: giant filename in readdir (len %x)!\n",
+-						len);
+-			return -errno_NFSERR_IO;
+-		}
+-		string -= len;
+-		if ((void *) (entry+3) > (void *) string) {
+-			/* 
+-			 * This error is impossible as long as the temp
+-			 * buffer is no larger than the user buffer. The 
+-			 * current packing algorithm uses the same amount
+-			 * of space in the user buffer as in the XDR data,
+-			 * so it's guaranteed to fit.
+-			 */
+-			printk("NFS: incorrect buffer size in %s!\n",
+-				__FUNCTION__);
+-			break;
++			nr = -errno_NFSERR_IO;
++			goto error;
+ 		}
+-
+-		memmove(string, p, len);
+ 		p += QUADLEN(len);
+-		cookie = ntohl(*p++);
+-		/*
+-		 * To make everything fit, we encode the length, offset,
+-		 * and eof flag into 32 bits. This works for filenames
+-		 * up to 32K and PAGE_SIZE up to 64K.
+-		 */
+-		status = !p[0] && p[1] ? (1 << 15) : 0; /* eof flag */
+-		*entry++ = fileid;
+-		*entry++ = cookie;
+-		*entry++ = ((string - start) << 16) | status | (len & 0x7FFF);
++
++		/* Convert and capture cookie. */
++		last_cookie = *p = ntohl(*p);
++		p++;
+ 	}
+-#ifdef NFS_PARANOIA
+-printk("nfs_xdr_readdirres: %d entries, ent sp=%d, str sp=%d\n",
+-nr, ((char *) entry - start), (start + res->bufsiz - string));
+-#endif
++	p -= 1;
++	status = ((end - p) << 2);
++	if (!p[1] && (status >= NFS_DIRENT_MAXLEN)) {
++		res->buffer += status;
++		res->bufsiz -= status;
++	} else if (p[1]) {
++		status = (int)((long)p & ~PAGE_CACHE_MASK);
++		res->bufsiz = -status;
++	} else {
++		res->bufsiz = 0;
++	}
++	res->cookie = last_cookie;
++	return nr;
++
++error:
++	res->bufsiz = 0;
+ 	return nr;
+ }
+ 
+--- ./fs/nfs/proc.c.~1~	Tue May  4 01:30:17 1999
++++ ./fs/nfs/proc.c	Mon Jun  7 23:25:30 1999
+@@ -234,61 +234,6 @@
+ 	return status;
+ }
+ 
+-/*
+- * The READDIR implementation is somewhat hackish - we pass a temporary
+- * buffer to the encode function, which installs it in the receive
+- * iovec. The dirent buffer itself is passed in the result struct.
+- */
+-int
+-nfs_proc_readdir(struct nfs_server *server, struct nfs_fh *fhandle,
+-			u32 cookie, unsigned int size, __u32 *entry)
+-{
+-	struct nfs_readdirargs	arg;
+-	struct nfs_readdirres	res;
+-	void *			buffer;
+-	unsigned int		buf_size = PAGE_SIZE;
+-	int			status;
+-
+-	/* First get a temp buffer for the readdir reply */
+-	/* N.B. does this really need to be cleared? */
+-	status = -ENOMEM;
+-	buffer = (void *) get_free_page(GFP_KERNEL);
+-	if (!buffer)
+-		goto out;
+-
+-	/*
+-	 * Calculate the effective size the buffer.  To make sure
+-	 * that the returned data will fit into the user's buffer,
+-	 * we decrease the buffer size as necessary.
+-	 *
+-	 * Note: NFS returns three __u32 values for each entry,
+-	 * and we assume that the data is packed into the user
+-	 * buffer with the same efficiency. 
+-	 */
+-	if (size < buf_size)
+-		buf_size = size;
+-	if (server->rsize < buf_size)
+-		buf_size = server->rsize;
+-#if 0
+-printk("nfs_proc_readdir: user size=%d, rsize=%d, buf_size=%d\n",
+-size, server->rsize, buf_size);
+-#endif
+-
+-	arg.fh = fhandle;
+-	arg.cookie = cookie;
+-	arg.buffer = buffer;
+-	arg.bufsiz = buf_size;
+-	res.buffer = entry;
+-	res.bufsiz = size;
+-
+-	dprintk("NFS call  readdir %d\n", cookie);
+-	status = rpc_call(server->client, NFSPROC_READDIR, &arg, &res, 0);
+-	dprintk("NFS reply readdir: %d\n", status);
+-	free_page((unsigned long) buffer);
+-out:
+-	return status;
+-}
+-
+ int
+ nfs_proc_statfs(struct nfs_server *server, struct nfs_fh *fhandle,
+ 			struct nfs_fsinfo *info)
+--- ./include/linux/nfs_fs_i.h.~1~	Wed Jun  2 12:03:29 1999
++++ ./include/linux/nfs_fs_i.h	Tue Jun  8 00:13:34 1999
+@@ -47,6 +47,10 @@
+ 	 * pages.
+ 	 */
+ 	struct nfs_wreq *	writeback;
++
++	/* Readdir caching information. */
++	void *cookies;
++	u32 direof;
+ };
+ 
+ /*
+--- ./include/linux/nfs_fs.h.~1~	Fri Jun  4 14:52:59 1999
++++ ./include/linux/nfs_fs.h	Tue Jun  8 00:13:59 1999
+@@ -79,6 +79,8 @@
+ #define NFS_FLAGS(inode)		((inode)->u.nfs_i.flags)
+ #define NFS_REVALIDATING(inode)		(NFS_FLAGS(inode) & NFS_INO_REVALIDATE)
+ #define NFS_WRITEBACK(inode)		((inode)->u.nfs_i.writeback)
++#define NFS_COOKIES(inode)		((inode)->u.nfs_i.cookies)
++#define NFS_DIREOF(inode)		((inode)->u.nfs_i.direof)
+ 
+ /*
+  * These are the default flags for swap requests
+@@ -195,9 +197,7 @@
+  */
+ extern struct inode_operations nfs_dir_inode_operations;
+ extern struct dentry_operations nfs_dentry_operations;
+-extern void nfs_free_dircache(void);
+ extern void nfs_invalidate_dircache(struct inode *);
+-extern void nfs_invalidate_dircache_sb(struct super_block *);
+ 
+ /*
+  * linux/fs/nfs/symlink.c
+--- ./include/linux/nfs.h.~1~	Tue May  4 02:17:40 1999
++++ ./include/linux/nfs.h	Tue Jun  8 00:05:23 1999
+@@ -195,7 +195,7 @@
+ 	struct nfs_fh *		fh;
+ 	__u32			cookie;
+ 	void *			buffer;
+-	unsigned int		bufsiz;
++	int			bufsiz;
+ };
+ 
+ struct nfs_diropok {
+@@ -217,7 +217,8 @@
+ 
+ struct nfs_readdirres {
+ 	void *			buffer;
+-	unsigned int		bufsiz;
++	int			bufsiz;
++	u32			cookie;
+ };
+ 
+ #endif /* NFS_NEED_XDR_TYPES */
+--- ./include/linux/pagemap.h.~1~	Tue Jun  8 00:13:36 1999
++++ ./include/linux/pagemap.h	Tue Jun  8 01:23:58 1999
+@@ -28,6 +28,7 @@
+ #define PAGE_CACHE_SHIFT	PAGE_SHIFT
+ #define PAGE_CACHE_SIZE		PAGE_SIZE
+ #define PAGE_CACHE_MASK		PAGE_MASK
++#define PAGE_CACHE_ALIGN(addr)	(((addr)+PAGE_CACHE_SIZE-1)&PAGE_CACHE_MASK)
+ 
+ #define page_cache_alloc()	__get_free_page(GFP_USER)
+ #define page_cache_free(x)	free_page(x)
+--- ./include/net/udp.h.~1~	Tue May  4 02:01:20 1999
++++ ./include/net/udp.h	Sat Jun  5 20:36:42 1999
+@@ -34,8 +34,14 @@
+ 
+ extern unsigned short udp_good_socknum(void);
+ 
+-#define UDP_NO_CHECK	0
++/* Note: this must match 'valbool' in sock_setsockopt */
++#define UDP_CSUM_NOXMIT		1
+ 
++/* Used by SunRPC/xprt layer. */
++#define UDP_CSUM_NORCV		2
++
++/* Default, as per the RFC, is to always do csums. */
++#define UDP_CSUM_DEFAULT	0
+ 
+ extern struct proto udp_prot;
+ 
+--- ./net/ipv4/af_inet.c.~1~	Wed Jun  2 11:52:46 1999
++++ ./net/ipv4/af_inet.c	Sat Jun  5 20:23:14 1999
+@@ -371,7 +371,7 @@
+ 		if (protocol && protocol != IPPROTO_UDP)
+ 			goto free_and_noproto;
+ 		protocol = IPPROTO_UDP;
+-		sk->no_check = UDP_NO_CHECK;
++		sk->no_check = UDP_CSUM_DEFAULT;
+ 		sk->ip_pmtudisc = IP_PMTUDISC_DONT;
+ 		prot=&udp_prot;
+ 		sock->ops = &inet_dgram_ops;
+--- ./net/ipv4/udp.c.~1~	Wed Jun  2 11:53:33 1999
++++ ./net/ipv4/udp.c	Sat Jun  5 21:37:39 1999
+@@ -763,7 +763,10 @@
+ 	/* 4.1.3.4. It's configurable by the application via setsockopt() */
+ 	/* (MAY) and it defaults to on (MUST). */
+ 
+-	err = ip_build_xmit(sk,sk->no_check ? udp_getfrag_nosum : udp_getfrag,
++	err = ip_build_xmit(sk,
++			    (sk->no_check == UDP_CSUM_NOXMIT ?
++			     udp_getfrag_nosum :
++			     udp_getfrag),
+ 			    &ufh, ulen, &ipc, rt, msg->msg_flags);
+ 
+ out:
+@@ -1093,6 +1096,33 @@
+ }
+ #endif
+ 
++static int udp_checksum_verify(struct sk_buff *skb, struct udphdr *uh,
++			       unsigned short ulen, u32 saddr, u32 daddr,
++			       int full_csum_deferred)
++{
++	if (!full_csum_deferred) {
++		if (uh->check) {
++			if (skb->ip_summed == CHECKSUM_HW &&
++			    udp_check(uh, ulen, saddr, daddr, skb->csum))
++				return -1;
++			if (skb->ip_summed == CHECKSUM_NONE &&
++			    udp_check(uh, ulen, saddr, daddr,
++				      csum_partial((char *)uh, ulen, 0)))
++				return -1;
++		}
++	} else {
++		if (uh->check == 0)
++			skb->ip_summed = CHECKSUM_UNNECESSARY;
++		else if (skb->ip_summed == CHECKSUM_HW) {
++			if (udp_check(uh, ulen, saddr, daddr, skb->csum))
++				return -1;
++			skb->ip_summed = CHECKSUM_UNNECESSARY;
++		} else if (skb->ip_summed != CHECKSUM_UNNECESSARY)
++			skb->csum = csum_tcpudp_nofold(saddr, daddr, ulen, IPPROTO_UDP, 0);
++	}
++	return 0;
++}
++
+ /*
+  *	All we need to do is get the socket, and then do a checksum. 
+  */
+@@ -1134,25 +1164,18 @@
+ 	}
+ 	skb_trim(skb, ulen);
+ 
+-#ifndef CONFIG_UDP_DELAY_CSUM
+-	if (uh->check &&
+-	    (((skb->ip_summed==CHECKSUM_HW)&&udp_check(uh,ulen,saddr,daddr,skb->csum)) ||
+-	     ((skb->ip_summed==CHECKSUM_NONE) &&
+-	      (udp_check(uh,ulen,saddr,daddr, csum_partial((char*)uh, ulen, 0)))))) 
+-		goto csum_error;
++	if(rt->rt_flags & (RTCF_BROADCAST|RTCF_MULTICAST)) {
++		int defer;
++
++#ifdef CONFIG_UDP_DELAY_CSUM
++		defer = 1;
+ #else
+-	if (uh->check==0)
+-		skb->ip_summed = CHECKSUM_UNNECESSARY;
+-	else if (skb->ip_summed==CHECKSUM_HW) {
+-		if (udp_check(uh,ulen,saddr,daddr,skb->csum)) 
+-			goto csum_error;
+-		skb->ip_summed = CHECKSUM_UNNECESSARY;
+-	} else if (skb->ip_summed != CHECKSUM_UNNECESSARY)
+-		skb->csum = csum_tcpudp_nofold(saddr, daddr, ulen, IPPROTO_UDP, 0);
++		defer = 0;
+ #endif
+-
+-	if(rt->rt_flags & (RTCF_BROADCAST|RTCF_MULTICAST))
++		if (udp_checksum_verify(skb, uh, ulen, saddr, daddr, defer))
++			goto csum_error;
+ 		return udp_v4_mcast_deliver(skb, uh, saddr, daddr);
++	}
+ 
+ #ifdef CONFIG_IP_TRANSPARENT_PROXY
+ 	if (IPCB(skb)->redirport)
+@@ -1179,6 +1202,15 @@
+ 		kfree_skb(skb);
+ 		return(0);
+   	}
++	if (udp_checksum_verify(skb, uh, ulen, saddr, daddr,
++#ifdef CONFIG_UDP_DELAY_CSUM
++				1
++#else
++				(sk->no_check & UDP_CSUM_NORCV) != 0
++#endif
++		))
++		goto csum_error;
++
+ 	udp_deliver(sk, skb);
+ 	return 0;
+ 
+--- ./net/sunrpc/xprt.c.~1~	Wed Jun  2 11:55:15 1999
++++ ./net/sunrpc/xprt.c	Sun Jun  6 18:36:53 1999
+@@ -42,6 +42,7 @@
+ #define __KERNEL_SYSCALLS__
+ 
+ #include <linux/version.h>
++#include <linux/config.h>
+ #include <linux/types.h>
+ #include <linux/malloc.h>
+ #include <linux/sched.h>
+@@ -56,6 +57,8 @@
+ #include <linux/file.h>
+ 
+ #include <net/sock.h>
++#include <net/checksum.h>
++#include <net/udp.h>
+ 
+ #include <asm/uaccess.h>
+ 
+@@ -356,6 +359,7 @@
+ 	sk->user_data    = NULL;
+ #endif
+ 	sk->data_ready   = xprt->old_data_ready;
++	sk->no_check 	 = 0;
+ 	sk->state_change = xprt->old_state_change;
+ 	sk->write_space  = xprt->old_write_space;
+ 
+@@ -563,18 +567,61 @@
+ 	return;
+ }
+ 
+-/*
+- * Input handler for RPC replies. Called from a bottom half and hence
++/* We have set things up such that we perform the checksum of the UDP
++ * packet in parallel with the copies into the RPC client iovec.  -DaveM
++ */
++static int csum_partial_copy_to_page_cache(struct iovec *iov,
++					   struct sk_buff *skb,
++					   int copied)
++{
++	__u8 *pkt_data = skb->data + sizeof(struct udphdr);
++	__u8 *cur_ptr = iov->iov_base;
++	__kernel_size_t cur_len = iov->iov_len;
++	unsigned int csum = skb->csum;
++	int need_csum = (skb->ip_summed != CHECKSUM_UNNECESSARY);
++	int slack = skb->len - copied - sizeof(struct udphdr);
++
++	if (need_csum)
++		csum = csum_partial(skb->h.raw, sizeof(struct udphdr), csum);
++	while (copied > 0) {
++		if (cur_len) {
++			int to_move = cur_len;
++			if (to_move > copied)
++				to_move = copied;
++			if (need_csum)
++				csum = csum_partial_copy_nocheck(pkt_data, cur_ptr,
++								 to_move, csum);
++			else
++				memcpy(cur_ptr, pkt_data, to_move);
++			pkt_data += to_move;
++			copied -= to_move;
++			cur_ptr += to_move;
++			cur_len -= to_move;
++		}
++		if (cur_len <= 0) {
++			iov++;
++			cur_len = iov->iov_len;
++			cur_ptr = iov->iov_base;
++		}
++	}
++	if (need_csum) {
++		if (slack > 0)
++			csum = csum_partial(pkt_data, slack, csum);
++		if ((unsigned short)csum_fold(csum))
++			return -1;
++	}
++	return 0;
++}
++
++/* Input handler for RPC replies. Called from a bottom half and hence
+  * atomic.
+  */
+ static inline void
+ udp_data_ready(struct sock *sk, int len)
+ {
+-	struct rpc_task	*task;
+ 	struct rpc_xprt	*xprt;
+ 	struct rpc_rqst *rovr;
+ 	struct sk_buff	*skb;
+-	struct iovec	iov[MAX_IOVEC];
+ 	int		err, repsize, copied;
+ 
+ 	dprintk("RPC:      udp_data_ready...\n");
+@@ -584,28 +631,31 @@
+ 
+ 	if ((skb = skb_recv_datagram(sk, 0, 1, &err)) == NULL)
+ 		return;
+-	repsize = skb->len - 8;	/* don't account for UDP header */
+ 
++	repsize = skb->len - sizeof(struct udphdr);
+ 	if (repsize < 4) {
+ 		printk("RPC: impossible RPC reply size %d!\n", repsize);
+ 		goto dropit;
+ 	}
+ 
+ 	/* Look up the request corresponding to the given XID */
+-	if (!(rovr = xprt_lookup_rqst(xprt, *(u32 *) (skb->h.raw + 8))))
++	if (!(rovr = xprt_lookup_rqst(xprt,
++				      *(u32 *) (skb->h.raw + sizeof(struct udphdr)))))
+ 		goto dropit;
+-	task = rovr->rq_task;
+ 
+-	dprintk("RPC: %4d received reply\n", task->tk_pid);
+-	xprt_pktdump("packet data:", (u32 *) (skb->h.raw+8), repsize);
++	dprintk("RPC: %4d received reply\n", rovr->rq_task->tk_pid);
++	xprt_pktdump("packet data:",
++		     (u32 *) (skb->h.raw + sizeof(struct udphdr)), repsize);
+ 
+ 	if ((copied = rovr->rq_rlen) > repsize)
+ 		copied = repsize;
+ 
+-	/* Okay, we have it. Copy datagram... */
+-	memcpy(iov, rovr->rq_rvec, rovr->rq_rnr * sizeof(iov[0]));
+-	/* This needs to stay tied with the usermode skb_copy_dagram... */
+-	memcpy_tokerneliovec(iov, skb->data+8, copied);
++	/* Suck it into the iovec, verify checksum if not done by hw. */
++	if (csum_partial_copy_to_page_cache(rovr->rq_rvec, skb, copied))
++		goto dropit;
++
++	/* Something worked... */
++	dst_confirm(skb->dst);
+ 
+ 	xprt_complete_rqst(xprt, rovr, copied);
+ 
+@@ -1341,6 +1391,7 @@
+ 	xprt->old_write_space = inet->write_space;
+ 	if (proto == IPPROTO_UDP) {
+ 		inet->data_ready = udp_data_ready;
++		inet->no_check = UDP_CSUM_NORCV;
+ 	} else {
+ 		inet->data_ready = tcp_data_ready;
+ 		inet->state_change = tcp_state_change;
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

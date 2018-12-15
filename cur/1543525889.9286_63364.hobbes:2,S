@@ -1,0 +1,269 @@
+Date: Tue, 15 Feb 2000 15:20:46 +0100
+From: Jakub Jelinek <>
+Subject: Dynamic DMA for pci2000.c
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/2/15/57
+
+Hi!
+This patch provides dynamic DMA support and fixes endianity in the PCI2000
+SCSI driver. Anyone with that card to test it?
+--- linux/drivers/scsi/pci2000.c.jj	Wed Dec 15 17:34:35 1999
++++ linux/drivers/scsi/pci2000.c	Tue Feb 15 15:00:05 2000
+@@ -67,14 +67,17 @@
+ 
+ typedef struct
+ 	{
+-	ULONG		address;
+-	ULONG		length;
++	unsigned int	address;
++	unsigned int	length;
+ 	}	SCATGATH, *PSCATGATH;
+ 
+ typedef struct
+ 	{
+ 	Scsi_Cmnd	*SCpnt;
+-	SCATGATH	 scatGath[16];
++	PSCATGATH	 scatGath;
++	dma_addr_t	 scatGathDma;
++	UCHAR		*cdb;
++	dma_addr_t	 cdbDma;
+ 	UCHAR		 tag;
+ 	}	DEV2000, *PDEV2000;
+ 
+@@ -89,6 +92,7 @@ typedef struct
+ 	USHORT		 cmd;
+ 	USHORT		 tag;
+ 	ULONG		 irqOwned;
++	struct pci_dev	*pdev;
+ 	DEV2000	 	 dev[MAX_BUS][MAX_UNITS];
+ 	}	ADAPTER2000, *PADAPTER2000;
+ 
+@@ -171,20 +175,30 @@ static UCHAR Command (PADAPTER2000 padap
+  ****************************************************************/
+ static int BuildSgList (Scsi_Cmnd *SCpnt, PADAPTER2000 padapter, PDEV2000 pdev)
+ 	{
+-	int	z;
++	int	z, n;
++	struct scatterlist *sg;
+ 
+ 	if ( SCpnt->use_sg )
+ 		{
+-		for ( z = 0;  z < SCpnt->use_sg;  z++ )
++		sg = (struct scatterlist *)SCpnt->request_buffer;
++		n = pci_map_sg (padapter->pdev, sg, SCpnt->use_sg);
++		for ( z = 0;  z < n;  z++ )
+ 			{
+-			pdev->scatGath[z].address = virt_to_bus (((struct scatterlist *)SCpnt->request_buffer)[z].address);
+-			pdev->scatGath[z].length = ((struct scatterlist *)SCpnt->request_buffer)[z].length;
++			pdev->scatGath[z].address = cpu_to_le32(sg_dma_address (sg));
++			pdev->scatGath[z].length = cpu_to_le32(sg_dma_len (sg++));
+ 			}
+-		outl (virt_to_bus (pdev->scatGath), padapter->mb2);
+-		outl ((SCpnt->use_sg << 24) | SCpnt->request_bufflen, padapter->mb3);
++		outl (pdev->scatGathDma, padapter->mb2);
++		outl ((n << 24) | SCpnt->request_bufflen, padapter->mb3);
+ 		return FALSE;
+ 		}
+-	outl (virt_to_bus (SCpnt->request_buffer), padapter->mb2);
++	if ( !SCpnt->request_bufflen)
++		{
++		outl (0, padapter->mb2);
++		outl (0, padapter->mb3);
++		return TRUE;
++		}
++	SCpnt->SCp.have_data_in = pci_map_single (padapter->pdev, SCpnt->request_buffer, SCpnt->request_bufflen);
++	outl (SCpnt->SCp.have_data_in, padapter->mb2);
+ 	outl (SCpnt->request_bufflen, padapter->mb3);
+ 	return TRUE;
+ 	}
+@@ -274,7 +288,7 @@ static void Irq_Handler (int irq, void *
+ 				{
+ 				pdev->tag = 0;
+ 				SCpnt = pdev->SCpnt;
+-				goto irqProceed;
++				goto unmapProceed;
+     			}
+ 			}
+     	}
+@@ -283,6 +297,25 @@ static void Irq_Handler (int irq, void *
+ 	outb_p (CMD_DONE, padapter->cmd);											// complete the op
+ 	goto irq_return;;																		// done, but, with what?
+ 
++unmapProceed:;
++	if ( !bus )
++		switch ( SCpnt->cmnd[0] )
++			{
++			case SCSIOP_TEST_UNIT_READY:
++				pci_unmap_single (padapter->pdev, SCpnt->SCp.have_data_in, sizeof (SCpnt->sense_buffer));
++				goto irqProceed;
++			case SCSIOP_READ_CAPACITY:
++				pci_unmap_single (padapter->pdev, SCpnt->SCp.have_data_in, 8);
++				goto irqProceed;
++			case SCSIOP_VERIFY:
++			case SCSIOP_START_STOP_UNIT:
++			case SCSIOP_MEDIUM_REMOVAL:
++				goto irqProceed;
++			}
++	if ( SCpnt->SCp.have_data_in )
++		pci_unmap_single (padapter->pdev, SCpnt->SCp.have_data_in, SCpnt->request_bufflen);
++	else if ( SCpnt->use_sg )
++		pci_unmap_sg (padapter->pdev, (struct scatterlist *)SCpnt->request_buffer, SCpnt->use_sg);
+ irqProceed:;
+ 	if ( tag & ERR08_TAGGED )												// is there an error here?
+ 		{
+@@ -363,6 +396,7 @@ int Pci2000_QueueCommand (Scsi_Cmnd *SCp
+ 		}
+ 
+ 	SCpnt->scsi_done = done;
++	SCpnt->SCp.have_data_in = 0;
+ 	pdev->SCpnt = SCpnt;  									// Save this command data
+ 
+ 	if ( WaitReady (padapter) )
+@@ -388,7 +422,8 @@ int Pci2000_QueueCommand (Scsi_Cmnd *SCp
+ 
+ 		outw_p (pun | (lun << 8), padapter->mb0);
+ 		outw_p (SCpnt->cmd_len << 8, padapter->mb0 + 2);
+-		outl (virt_to_bus (cdb), padapter->mb1);
++		memcpy (pdev->cdb, cdb, MAX_COMMAND_SIZE);
++		outl (pdev->cdbDma, padapter->mb1);
+ 		if ( BuildSgList (SCpnt, padapter, pdev) )
+ 			cmd = CMD_SCSI_THRU;
+ 		else
+@@ -428,8 +463,11 @@ int Pci2000_QueueCommand (Scsi_Cmnd *SCp
+ 							rc = DID_ERROR;
+ 							goto finished;
+ 							}
+-						else
+-							outl (virt_to_bus (SCpnt->request_buffer), padapter->mb2);
++						else {
++							SCpnt->SCp.have_data_in = pci_map_single (padapter->pdev, SCpnt->request_buffer,
++												  SCpnt->request_bufflen);
++							outl (SCpnt->SCp.have_data_in, padapter->mb2);
++						}
+ 						outl (cdb[5], padapter->mb0);
+ 						outl (cdb[3], padapter->mb3);
+ 						cmd = CMD_DASD_RAID_RQ;
+@@ -439,32 +477,26 @@ int Pci2000_QueueCommand (Scsi_Cmnd *SCp
+ 				}
+ 			
+ 			if ( SCpnt->use_sg )
+-				{
+-				outl (virt_to_bus (((struct scatterlist *)(SCpnt->request_buffer))->address), padapter->mb2);
+-				}
++				SCpnt->SCp.have_data_in = pci_map_single (padapter->pdev, ((struct scatterlist *)SCpnt->request_buffer)->address, SCpnt->request_bufflen);
+ 			else
+-				{
+-				outl (virt_to_bus (SCpnt->request_buffer), padapter->mb2);
+-				}
++				SCpnt->SCp.have_data_in = pci_map_single (padapter->pdev, SCpnt->request_buffer, SCpnt->request_bufflen);
++			outl (SCpnt->SCp.have_data_in, padapter->mb2);
+ 			outl (SCpnt->request_bufflen, padapter->mb3);
+ 			cmd = CMD_DASD_SCSI_INQ;
+ 			break;
+ 
+ 		case SCSIOP_TEST_UNIT_READY:			// test unit ready CDB
+-			outl (virt_to_bus (SCpnt->sense_buffer), padapter->mb2);
++			SCpnt->SCp.have_data_in = pci_map_single (padapter->pdev, SCpnt->sense_buffer, sizeof (SCpnt->sense_buffer));
++			outl (SCpnt->SCp.have_data_in, padapter->mb2);
+ 			outl (sizeof (SCpnt->sense_buffer), padapter->mb3);
+ 			cmd = CMD_TEST_READY;
+ 			break;
+ 
+-		case SCSIOP_READ_CAPACITY:			  	// read capctiy CDB
++		case SCSIOP_READ_CAPACITY:			  	// read capacity CDB
+ 			if ( SCpnt->use_sg )
+-				{
+-				outl (virt_to_bus (((struct scatterlist *)(SCpnt->request_buffer))->address), padapter->mb2);
+-				}
++				SCpnt->SCp.have_data_in = pci_map_single (padapter->pdev, ((struct scatterlist *)SCpnt->request_buffer)->address, 8);
+ 			else
+-				{
+-				outl (virt_to_bus (SCpnt->request_buffer), padapter->mb2);
+-				}
++				SCpnt->SCp.have_data_in = pci_map_single (padapter->pdev, SCpnt->request_buffer, 8);
+ 			outl (8, padapter->mb3);
+ 			cmd = CMD_DASD_CAP;
+ 			break;
+@@ -590,6 +622,9 @@ int Pci2000_Detect (Scsi_Host_Template *
+ 	int					z, zz;
+ 	int					setirq;
+ 	struct pci_dev	   *pdev = NULL;
++	UCHAR		   *consistent;
++	dma_addr_t	    consistentDma;
++#define consistentLen (MAX_BUS * MAX_UNITS * (16 * sizeof (SCATGATH) + MAX_COMMAND_SIZE))
+ 
+ 	if ( !pci_present () )
+ 		{
+@@ -612,6 +647,7 @@ int Pci2000_Detect (Scsi_Host_Template *
+ 		padapter->mb4	= padapter->basePort + RTR_MAILBOX + 16;
+ 		padapter->cmd	= padapter->basePort + RTR_LOCAL_DOORBELL;			// command register
+ 		padapter->tag	= padapter->basePort + RTR_PCI_DOORBELL;			// tag/response register
++		padapter->pdev	= pdev;
+ 
+ 		if ( WaitReady (padapter) )
+ 			goto unregister;
+@@ -620,6 +656,13 @@ int Pci2000_Detect (Scsi_Host_Template *
+ 		if ( WaitReady (padapter) )
+ 			goto unregister;
+ 
++		consistent = pci_alloc_consistent (pdev, consistentLen, &consistentDma);
++		if ( !consistent )
++			{
++			printk ("Unable to allocate DMA memory for PCI-2000 controller.\n");
++			goto unregister;
++			}
++
+ 		pshost->irq = pdev->irq;
+ 		setirq = 1;
+ 		padapter->irqOwned = 0;
+@@ -635,6 +678,7 @@ int Pci2000_Detect (Scsi_Host_Template *
+ 				if ( request_irq (pshost->irq, Irq_Handler, SA_INTERRUPT | SA_SHIRQ, "pci2000", padapter) < 0 )
+ 					{
+ 					printk ("Unable to allocate IRQ for PCI-2000 controller.\n");
++					pci_free_consistent (pdev, consistentLen, consistent, consistentDma);
+ 					goto unregister;
+ 					}
+ 				}
+@@ -650,7 +694,17 @@ int Pci2000_Detect (Scsi_Host_Template *
+ 
+ 		for ( zz = 0;  zz < MAX_BUS;  zz++ )
+ 			for ( z = 0; z < MAX_UNITS;  z++ )
++				{
+ 				padapter->dev[zz][z].tag = 0;
++				padapter->dev[zz][z].scatGath = (PSCATGATH) consistent;
++				padapter->dev[zz][z].scatGathDma = consistentDma;
++				consistent += 16 * sizeof (SCATGATH);
++				consistentDma += 16 * sizeof (SCATGATH);
++				padapter->dev[zz][z].cdb = (UCHAR *) consistent;
++				padapter->dev[zz][z].cdbDma = consistentDma;
++				consistent += MAX_COMMAND_SIZE;
++				consistentDma += MAX_COMMAND_SIZE;
++				}
+ 			
+ 		printk("\nPSI-2000 Intelligent Storage SCSI CONTROLLER: at I/O = %X  IRQ = %d\n", padapter->basePort, pshost->irq);
+ 		printk("Version %s, Compiled %s %s\n\n", PCI2000_VERSION,  __DATE__, __TIME__);
+@@ -715,6 +769,9 @@ int Pci2000_Release (struct Scsi_Host *p
+ 
+ 	if ( padapter->irqOwned )
+ 		free_irq (pshost->irq, padapter);
++    pci_free_consistent (padapter->pdev, consistentLen,
++			 padapter->dev[0][0].scatGath,
++			 padapter->dev[0][0].scatGathDma);
+     release_region (pshost->io_port, pshost->n_io_port);
+     scsi_unregister(pshost);
+     return 0;
+Cheers,
+    Jakub
+___________________________________________________________________
+Jakub Jelinek | jakub@redhat.com | 
+http://sunsite.mff.cuni.cz/~jj
+Linux version 2.3.45 on a sparc64 machine (1343.49 BogoMips)
+___________________________________________________________________
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

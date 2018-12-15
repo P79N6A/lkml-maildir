@@ -1,0 +1,161 @@
+Date: Wed, 3 Nov 1999 17:20:42 +0100
+From: Jamie Lokier <>
+Subject: Re: structure dentry help...
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/11/3/120
+
+Theodore Y. Ts'o wrote:
+>    For "find" style operations where you simply want a list of names (plus
+>    `-type d' tests), a speedup is possible without any kernel/user API
+>    change.  Do you remember the patch to speed up `open (fn, O_DIRECTORY)'
+>    by avoiding inode reads for non-directories?  Your tune2fs feature is
+>    the step that makes that patch effective.  I will try it on a real
+>    filesystem soon, and see how much faster treescan runs.
+> 
+> P.S.  It would be good to make the user code check the de_type field
+> returned from readdir(), and not try the open(fn, O_DIRECTORY) call if
+> de_type is set.
+Fwiw, The O_DIRECTORY hack is still worthwhile even with d_type in some
+cases.  Potentially, a filesystem can know that an entry is not a
+directory but that cannot be reported in d_type.
+I have updated the O_DIRECTORY patch for 2.3.25.  It is a big
+improvement :-)  Now I can scan all ~70,000 files starting from / in 50
+seconds (I think it was about 2 minutes before).  Much more noticable: I
+can scan from / again in 1.3 seconds.
+Yes, the kernel manages to cache all that's required for scanning the
+names of about 70,000 files over 3 filesystems, totalling 2.5GB.  It
+needs 8MB of buffers to do it.  I don't know how much memory goes on
+inodes and dentries (slabinfo shows 4788 inode_cache and 6748
+dentry_cache).  It couldn't do that before: a repeated scan meant lots
+of disk access, just like a fresh scan.
+I don't know how much that is due to the dynamic inode table changes
+between 2.3.18 and 2.3.25 (I just switched kernel version too), and how
+much is due to reading fewer inodes.  There is still quite a lot of
+async activity afterwards: that will be writing back the updated atimes.
+I would like to avoid updating the atimes for searches like this, and I
+have an O_NOATIME patch for that very purpose.  Anyone interested?
+Anyway, here is the O_DIRECTORY fast lookup patch.  Only works with
+ext2.  The rest don't implement the optimisation, but it could be added
+in most cases.
+diff -u linux-2.3/fs/ext2/namei.c.diropt linux-2.3/fs/ext2/namei.c
+--- linux-2.3/fs/ext2/namei.c.diropt	Wed Nov  3 16:49:06 1999
++++ linux-2.3/fs/ext2/namei.c	Wed Nov  3 16:49:25 1999
+@@ -162,6 +162,7 @@
+ 
+ struct dentry *ext2_lookup(struct inode * dir, struct dentry *dentry)
+ {
++	unsigned long ino;
+ 	struct inode * inode;
+ 	struct ext2_dir_entry_2 * de;
+ 	struct buffer_head * bh;
+@@ -172,10 +173,19 @@
+ 	bh = ext2_find_entry (dir, dentry->d_name.name, dentry->d_name.len, &de);
+ 	inode = NULL;
+ 	if (bh) {
+-		unsigned long ino = le32_to_cpu(de->inode);
++		/* Optimise away iget() when we want a directory. */
++		if ((dentry->d_flags & DCACHE_LOOKUP_DIR)
++		    && de->file_type != EXT2_FT_DIR
++		    && de->file_type != EXT2_FT_UNKNOWN
++		    && (de->file_type != EXT2_FT_SYMLINK
++			|| !(dentry->d_flags & DCACHE_LOOKUP_SYMLINK))) {
++			brelse (bh);
++			return ERR_PTR(-ENOTDIR);
++		}
++
++		ino = le32_to_cpu(de->inode);
+ 		brelse (bh);
+ 		inode = iget(dir->i_sb, ino);
+-
+ 		if (!inode)
+ 			return ERR_PTR(-EACCES);
+ 	}
+diff -u linux-2.3/fs/namei.c.diropt linux-2.3/fs/namei.c
+--- linux-2.3/fs/namei.c.diropt	Wed Nov  3 16:49:06 1999
++++ linux-2.3/fs/namei.c	Wed Nov  3 16:49:25 1999
+@@ -255,6 +255,20 @@
+ 		struct dentry * dentry = d_alloc(parent, name);
+ 		result = ERR_PTR(-ENOMEM);
+ 		if (dentry) {
++			/*
++			 * Try not to read non-directory inodes for the final
++			 * component of an explicit O_DIRECTORY lookup.  Don't
++			 * do this optimisation for intermediate components --
++			 * those lookups tend to repeat so it's faster to cache
++			 * the result than repeatedly call lookup().
++			 */
++			if ((flags & (LOOKUP_O_DIRECTORY | LOOKUP_CONTINUE))
++			    == LOOKUP_O_DIRECTORY) {
++				dentry->d_flags |= DCACHE_LOOKUP_DIR;
++				if (flags & LOOKUP_FOLLOW)
++					dentry->d_flags |= DCACHE_LOOKUP_SYMLINK;
++			}
++
+ 			result = dir->i_op->lookup(dir, dentry);
+ 			if (result)
+ 				dput(dentry);
+@@ -339,7 +353,8 @@
+ 		goto return_base;
+ 
+ 	inode = base->d_inode;
+-	lookup_flags &= LOOKUP_FOLLOW | LOOKUP_DIRECTORY | LOOKUP_SLASHOK;
++	lookup_flags &= (LOOKUP_FOLLOW | LOOKUP_DIRECTORY | LOOKUP_SLASHOK
++			 | LOOKUP_O_DIRECTORY);
+ 
+ 	/* At this point we know we have a real path component. */
+ 	for(;;) {
+@@ -643,7 +658,7 @@
+ 		retval &= ~LOOKUP_FOLLOW;
+ 	
+ 	if (f & O_DIRECTORY)
+-		retval |= LOOKUP_DIRECTORY;
++		retval |= LOOKUP_DIRECTORY | LOOKUP_O_DIRECTORY;
+ 	
+ 	return retval;
+ }
+diff -u linux-2.3/include/linux/dcache.h.diropt linux-2.3/include/linux/dcache.h
+--- linux-2.3/include/linux/dcache.h.diropt	Wed Nov  3 16:49:06 1999
++++ linux-2.3/include/linux/dcache.h	Wed Nov  3 16:49:25 1999
+@@ -98,6 +98,15 @@
+ 					 * renamed" and has to be
+ 					 * deleted on the last dput()
+ 					 */
++#define DCACHE_LOOKUP_DIR     0x0004	/* during fs lookup(): "if you find a
++					 * non-directory, you may return
++					 * -ENOTDIR instead of reading the
++					 * inode" (ignored at other times)
++					 */
++#define DCACHE_LOOKUP_SYMLINK 0x0008	/* modifies above: "if you find a
++					 * non-directory that is also not a
++					 * symbolic link..."
++					 */
+ 
+ /*
+  * d_drop() unhashes the entry from the parent
+diff -u linux-2.3/include/linux/fs.h.diropt linux-2.3/include/linux/fs.h
+--- linux-2.3/include/linux/fs.h.diropt	Wed Nov  3 16:49:06 1999
++++ linux-2.3/include/linux/fs.h	Wed Nov  3 16:49:25 1999
+@@ -862,12 +862,14 @@
+  *  - follow links at the end
+  *  - require a directory
+  *  - ending slashes ok even for nonexistent files
+- *  - internal "there are more path compnents" flag
++ *  - internal "there are more path components" flag
++ *  - internal "use different cache strategy for explicit O_DIRECTORY" flag
+  */
+ #define LOOKUP_FOLLOW		(1)
+ #define LOOKUP_DIRECTORY	(2)
+ #define LOOKUP_SLASHOK		(4)
+ #define LOOKUP_CONTINUE		(8)
++#define LOOKUP_O_DIRECTORY	(16)
+ 
+ /*
+  * "descriptor" for what we're up to with a read for sendfile().
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

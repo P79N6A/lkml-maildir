@@ -1,0 +1,3126 @@
+Date: Tue, 20 Dec 2005 22:15:47 +0200
+From: Pekka Enberg <>
+Subject: Re: [PATCH RT 00/02] SLOB optimizations
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2005/12/20/197
+
+Hi Steve and Matt,
+On 12/20/05, Steven Rostedt <rostedt@goodmis.org> wrote:
+> That looks like quite an undertaking, but may be well worth it.  I think
+> Linux's memory management is starting to show it's age.  It's been
+> through a few transformations, and maybe it's time to go through
+> another.  The work being done by the NUMA folks, should be taking into
+> account, and maybe we can come up with a way that can make things easier
+> and less complex without losing performance.
+The slab allocator is indeed complex, messy, and hard to understand.
+In case you're interested, I have included a replacement I started out
+a while a go. It follows the design of a magazine allocator described
+by Bonwick. It's not a complete replacement but should boot (well, did
+anyway at some point). I have also included a user space test harness
+I am using to smoke it.
+If there's enough interest, I would be more than glad to help write a
+replacement for mm/slab.c :-)
+                                        Pekka
+Index: 2.6/mm/kmalloc.c
+===================================================================
+--- /dev/null
++++ 2.6/mm/kmalloc.c
+@@ -0,0 +1,170 @@
++/*
++ * mm/kmalloc.c - A general purpose memory allocator.
++ *
++ * Copyright (C) 1996, 1997 Mark Hemment
++ * Copyright (C) 1999 Andrea Arcangeli
++ * Copyright (C) 2000, 2002 Manfred Spraul
++ * Copyright (C) 2005 Shai Fultheim
++ * Copyright (C) 2005 Shobhit Dayal
++ * Copyright (C) 2005 Alok N Kataria
++ * Copyright (C) 2005 Christoph Lameter
++ * Copyright (C) 2005 Pekka Enberg
++ *
++ * This file is released under the GPLv2.
++ */
++
++#include <linux/kernel.h>
++#include <linux/kmem.h>
++#include <linux/mm.h>
++#include <linux/module.h>
++#include <linux/string.h>
++
++struct cache_sizes malloc_sizes[] = {
++#define CACHE(x) { .cs_size = (x) },
++#include <linux/kmalloc_sizes.h>
++	{ .cs_size = ULONG_MAX }
++#undef CACHE
++};
++EXPORT_SYMBOL(malloc_sizes);
++
++struct cache_names {
++	char *name;
++	char *name_dma;
++};
++
++static struct cache_names cache_names[] = {
++#define CACHE(x) { .name = "size-" #x, .name_dma = "size-" #x "(DMA" },
++#include <linux/kmalloc_sizes.h>
++	{ NULL, }
++#undef CACHE
++};
++
++void kmalloc_init(void)
++{
++	struct cache_sizes *sizes = malloc_sizes;
++	struct cache_names *names = cache_names;
++
++	while (sizes->cs_size != ULONG_MAX) {
++		sizes->cs_cache = kmem_cache_create(names->name,
++						    sizes->cs_size, 0, 0,
++						    NULL, NULL);
++		sizes->cs_dma_cache = kmem_cache_create(names->name_dma,
++							sizes->cs_size, 0, 0,
++							NULL, NULL);
++		sizes++;
++		names++;
++	}
++}
++
++static struct kmem_cache *find_general_cache(size_t size, gfp_t flags)
++{
++	struct cache_sizes *sizes = malloc_sizes;
++
++	while (size > sizes->cs_size)
++		sizes++;
++
++	if (unlikely(flags & GFP_DMA))
++		return sizes->cs_dma_cache;
++	return sizes->cs_cache;
++}
++
++/**
++ * kmalloc - allocate memory
++ * @size: how many bytes of memory are required.
++ * @flags: the type of memory to allocate.
++ *
++ * kmalloc is the normal method of allocating memory
++ * in the kernel.
++ *
++ * The @flags argument may be one of:
++ *
++ * %GFP_USER - Allocate memory on behalf of user.  May sleep.
++ *
++ * %GFP_KERNEL - Allocate normal kernel ram.  May sleep.
++ *
++ * %GFP_ATOMIC - Allocation will not sleep.  Use inside interrupt handlers.
++ *
++ * Additionally, the %GFP_DMA flag may be set to indicate the memory
++ * must be suitable for DMA.  This can mean different things on different
++ * platforms.  For example, on i386, it means that the memory must come
++ * from the first 16MB.
++ */
++void *__kmalloc(size_t size, gfp_t flags)
++{
++	struct kmem_cache *cache = find_general_cache(size, flags);
++	if (unlikely(cache == NULL))
++		return NULL;
++	return kmem_cache_alloc(cache, flags);
++}
++EXPORT_SYMBOL(__kmalloc);
++
++void *kmalloc_node(size_t size, unsigned int __nocast flags, int node)
++{
++	return __kmalloc(size, flags);
++}
++EXPORT_SYMBOL(kmalloc_node);
++
++/**
++ * kzalloc - allocate memory. The memory is set to zero.
++ * @size: how many bytes of memory are required.
++ * @flags: the type of memory to allocate.
++ */
++void *kzalloc(size_t size, gfp_t flags)
++{
++        void *ret = kmalloc(size, flags);
++        if (ret)
++                memset(ret, 0, size);
++        return ret;
++}
++EXPORT_SYMBOL(kzalloc);
++
++/*
++ * kstrdup - allocate space for and copy an existing string
++ *
++ * @s: the string to duplicate
++ * @gfp: the GFP mask used in the kmalloc() call when allocating memory
++ */
++char *kstrdup(const char *s, gfp_t gfp)
++{
++	size_t len;
++	char *buf;
++
++	if (!s)
++		return NULL;
++
++	len = strlen(s) + 1;
++	buf = kmalloc(len, gfp);
++	if (buf)
++		memcpy(buf, s, len);
++	return buf;
++}
++EXPORT_SYMBOL(kstrdup);
++
++// FÌXME: duplicate!
++static struct kmem_cache *page_get_cache(struct page *page)
++{
++	return (struct kmem_cache *)page->lru.next;
++}
++
++/**
++ * kfree - free previously allocated memory
++ * @objp: pointer returned by kmalloc.
++ *
++ * If @objp is NULL, no operation is performed.
++ *
++ * Don't free memory not originally allocated by kmalloc()
++ * or you will run into trouble.
++ */
++void kfree(const void *obj)
++{
++	struct page *page;
++	struct kmem_cache *cache;
++
++	if (unlikely(!obj))
++		return;
++
++	page = virt_to_page(obj);
++	cache = page_get_cache(page);
++	kmem_cache_free(cache, (void *)obj);
++}
++EXPORT_SYMBOL(kfree);
+Index: 2.6/mm/kmem.c
+===================================================================
+--- /dev/null
++++ 2.6/mm/kmem.c
+@@ -0,0 +1,1203 @@
++/*
++ * mm/kmem.c - An object-caching memory allocator.
++ *
++ * Copyright (C) 1996, 1997 Mark Hemment
++ * Copyright (C) 1999 Andrea Arcangeli
++ * Copyright (C) 2000, 2002 Manfred Spraul
++ * Copyright (C) 2005 Shai Fultheim
++ * Copyright (C) 2005 Shobhit Dayal
++ * Copyright (C) 2005 Alok N Kataria
++ * Copyright (C) 2005 Christoph Lameter
++ * Copyright (C) 2005 Pekka Enberg
++ *
++ * This file is released under the GPLv2.
++ *
++ * The design of this allocator is based on the following papers:
++ *
++ * Jeff Bonwick.  The Slab Allocator: An Object-Caching Kernel Memory
++ * 	Allocator. 1994.
++ *
++ * Jeff Bonwick, Jonathan Adams.  Magazines and Vmem: Extending the Slab
++ * 	Allocator to Many CPUs and Arbitrary Resources. 2001.
++ *
++ * TODO:
++ *
++ *   - Shrinking
++ *   - Alignment
++ *   - Coloring
++ *   - Per node slab lists and depots
++ *   - Compatible procfs
++ *   - Red zoning
++ *   - Poisoning
++ *   - Use after free
++ *   - Adaptive magazine size?
++ *   - Batching for freeing of wrong-node objects?
++ *   - Lock-less magazines?
++ *   - Disable magazine layer for UP?
++ *   - sysfs?
++ */
++
++#include <linux/kmem.h>
++#include <linux/mm.h>
++#include <linux/module.h>
++#include <linux/seq_file.h>
++#include <linux/string.h>
++#include <linux/percpu.h>
++#include <linux/workqueue.h>
++
++#include <asm/semaphore.h>
++#include <asm/uaccess.h>
++
++
++/* Guard access to the cache-chain. */
++static struct semaphore	cache_chain_sem;
++static struct list_head cache_chain;
++
++atomic_t slab_reclaim_pages;
++
++static DEFINE_PER_CPU(struct work_struct, reap_work);
++
++#define REAP_TIMEOUT_CPU_CACHES (2*HZ)
++
++
++/*
++ *	Internal Caches
++ */
++
++static void kmem_cache_ctor(void *, struct kmem_cache *, unsigned long);
++static void kmem_magazine_ctor(void *, struct kmem_cache *, unsigned long);
++
++static struct kmem_cache cache_cache = {
++	.name = "cache-cache",
++	.objsize = sizeof(struct kmem_cache),
++	.ctor = kmem_cache_ctor
++};
++
++static struct kmem_cache slab_cache = {
++	.name = "slab-cache",
++	.objsize = sizeof(struct kmem_slab)
++};
++
++static struct kmem_cache magazine_cache = {
++	.name = "magazine-cache",
++	.objsize = sizeof(struct kmem_magazine),
++	.ctor = kmem_magazine_ctor
++};
++
++
++/*
++ *	The following functions are used to find the cache and slab an object
++ *	belongs to. They are used when we want to free an object.
++ */
++
++static void page_set_cache(struct page *page, struct kmem_cache *cache)
++{
++	page->lru.next = (struct list_head *)cache;
++}
++
++static struct kmem_cache *page_get_cache(struct page *page)
++{
++	return (struct kmem_cache *)page->lru.next;
++}
++
++static void page_set_slab(struct page *page, struct kmem_slab *slab)
++{
++	page->lru.prev = (struct list_head *)slab;
++}
++
++static struct kmem_slab *page_get_slab(struct page *page)
++{
++	return (struct kmem_slab *)page->lru.prev;
++}
++
++
++/*
++ *	Cache Statistics
++ */
++
++static inline void stats_inc_grown(struct kmem_cache *cache)
++{
++	cache->stats.grown++;
++}
++
++static inline void stats_inc_reaped(struct kmem_cache *cache)
++{
++	cache->stats.reaped++;
++}
++
++
++/*
++ *	Magazines, CPU Caches, and Depots
++ */
++
++static void init_magazine(struct kmem_magazine *mag)
++{
++	memset(mag, 0, sizeof(*mag));
++	INIT_LIST_HEAD(&mag->list);
++}
++
++static void kmem_magazine_ctor(void *obj, struct kmem_cache *cache,
++			       unsigned long flags)
++{
++	struct kmem_magazine *mag = obj;
++	if (cache != &magazine_cache)
++		BUG();
++	init_magazine(mag);
++}
++
++static int magazine_is_empty(struct kmem_magazine *mag)
++{
++	return mag->rounds == 0;
++}
++
++static int magazine_is_full(struct kmem_magazine *mag)
++{
++	return mag->rounds == MAX_ROUNDS;
++}
++
++static void *magazine_get(struct kmem_magazine *mag)
++{
++	BUG_ON(magazine_is_empty(mag));
++	return mag->objs[--mag->rounds];
++}
++
++static void magazine_put(struct kmem_magazine *mag, void *obj)
++{
++	BUG_ON(magazine_is_full(mag));
++	mag->objs[mag->rounds++] = obj;
++}
++
++static struct kmem_cpu_cache *__cpu_cache_get(struct kmem_cache *cache,
++					      unsigned long cpu)
++{
++	return &cache->cpu_cache[cpu];
++}
++
++static struct kmem_cpu_cache *cpu_cache_get(struct kmem_cache *cache)
++{
++	return __cpu_cache_get(cache, smp_processor_id());
++}
++
++static void depot_put_full(struct kmem_cache *cache,
++			   struct kmem_magazine *magazine)
++{
++	BUG_ON(!magazine_is_full(magazine));
++	list_add(&magazine->list, &cache->full_magazines);
++}
++
++static struct kmem_magazine *depot_get_full(struct kmem_cache *cache)
++{
++	struct kmem_magazine *ret = list_entry(cache->full_magazines.next,
++					       struct kmem_magazine, list);
++	list_del(&ret->list);
++	BUG_ON(!magazine_is_full(ret));
++	return ret;
++}
++
++static void depot_put_empty(struct kmem_cache *cache,
++			    struct kmem_magazine *magazine)
++{
++	BUG_ON(!magazine_is_empty(magazine));
++	list_add(&magazine->list, &cache->empty_magazines);
++}
++
++static struct kmem_magazine *depot_get_empty(struct kmem_cache *cache)
++{
++	struct kmem_magazine *ret = list_entry(cache->empty_magazines.next,
++					       struct kmem_magazine, list);
++	list_del(&ret->list);
++	BUG_ON(!magazine_is_empty(ret));
++	return ret;
++}
++
++
++/*
++ *	Object Caches and Slabs
++ */
++
++const char *kmem_cache_name(struct kmem_cache *cache)
++{
++	return cache->name;
++}
++EXPORT_SYMBOL_GPL(kmem_cache_name);
++
++static inline struct kmem_bufctl *obj_to_bufctl(struct kmem_cache *cache,
++						struct kmem_slab *slab,
++						void *ptr)
++{
++	return ptr + (cache->objsize) - sizeof(struct kmem_bufctl);
++}
++
++static void init_cache(struct kmem_cache *cache)
++{
++	spin_lock_init(&cache->lists_lock);
++	INIT_LIST_HEAD(&cache->full_slabs);
++	INIT_LIST_HEAD(&cache->partial_slabs);
++	INIT_LIST_HEAD(&cache->empty_slabs);
++	INIT_LIST_HEAD(&cache->full_magazines);
++	INIT_LIST_HEAD(&cache->empty_magazines);
++}
++
++static void kmem_cache_ctor(void *obj, struct kmem_cache *cache,
++			    unsigned long flags)
++{
++	struct kmem_cache *cachep = obj;
++	if (cache != &cache_cache)
++		BUG();
++	init_cache(cachep);
++}
++
++#define MAX_WASTAGE (PAGE_SIZE/8)
++
++static inline int mgmt_in_slab(struct kmem_cache *cache)
++{
++	return cache->objsize < MAX_WASTAGE;
++}
++
++static inline size_t order_to_size(unsigned int order)
++{
++	return (1UL << order) * PAGE_SIZE;
++}
++
++static inline size_t slab_size(struct kmem_cache *cache)
++{
++	return order_to_size(cache->cache_order);
++}
++
++static inline unsigned int slab_capacity(struct kmem_cache *cache)
++{
++	unsigned long mgmt_size = 0;
++	if (mgmt_in_slab(cache))
++		mgmt_size = sizeof(struct kmem_slab);
++
++	return (slab_size(cache) - mgmt_size) / cache->objsize;
++}
++
++static void *obj_at(struct kmem_cache *cache, struct kmem_slab *slab,
++		    unsigned long idx)
++{
++	return slab->mem + idx * cache->objsize;
++}
++
++static void init_slab_bufctl(struct kmem_cache *cache, struct kmem_slab *slab)
++{
++	unsigned long i;
++	struct kmem_bufctl *bufctl;
++	void *obj;
++
++	for (i = 0; i < cache->slab_capacity-1; i++) {
++		obj = obj_at(cache, slab, i);
++		bufctl = obj_to_bufctl(cache, slab, obj);
++		bufctl->addr = obj;
++		bufctl->next = obj_to_bufctl(cache, slab, obj+cache->objsize);
++	}
++	obj = obj_at(cache, slab, cache->slab_capacity-1);
++	bufctl = obj_to_bufctl(cache, slab, obj);
++	bufctl->addr = obj;
++	bufctl->next = NULL;
++
++	slab->free = obj_to_bufctl(cache, slab, slab->mem);
++}
++
++static struct kmem_slab *create_slab(struct kmem_cache *cache, gfp_t gfp_flags)
++{
++	struct page *page;
++	void *addr;
++	struct kmem_slab *slab;
++	int nr_pages;
++
++	page = alloc_pages(cache->gfp_flags, cache->cache_order);
++	if (!page)
++		return NULL;
++
++	addr = page_address(page);
++
++	if (mgmt_in_slab(cache))
++		slab = addr + slab_size(cache) - sizeof(*slab);
++	else {
++		slab = kmem_cache_alloc(&slab_cache, gfp_flags);
++		if (!slab)
++			goto failed;
++	}
++
++	INIT_LIST_HEAD(&slab->list);
++	slab->nr_available = cache->slab_capacity;
++	slab->mem = addr;
++	init_slab_bufctl(cache, slab);
++
++	nr_pages = 1 << cache->cache_order;
++	add_page_state(nr_slab, nr_pages);
++
++	while (nr_pages--) {
++		SetPageSlab(page);
++		page_set_cache(page, cache);
++		page_set_slab(page, slab);
++		page++;
++	}
++
++	cache->free_objects += cache->slab_capacity;
++
++	return slab;
++
++  failed:
++	free_pages((unsigned long)addr, cache->cache_order);
++	return NULL;
++}
++
++static void construct_object(void *obj, struct kmem_cache *cache,
++			     gfp_t gfp_flags)
++{
++	unsigned long ctor_flags = SLAB_CTOR_CONSTRUCTOR;
++
++	if (!cache->ctor)
++		return;
++
++	if (!(gfp_flags & __GFP_WAIT))
++		ctor_flags |= SLAB_CTOR_ATOMIC;
++
++	cache->ctor(obj, cache, ctor_flags);
++}
++
++static inline void destruct_object(void *obj, struct kmem_cache *cache)
++{
++	if (unlikely(cache->dtor))
++		cache->dtor(obj, cache, 0);
++}
++
++static void destroy_slab(struct kmem_cache *cache, struct kmem_slab *slab)
++{
++	unsigned long addr = (unsigned long)slab->mem;
++	struct page *page = virt_to_page(addr);
++	unsigned long nr_pages;
++
++	BUG_ON(slab->nr_available != cache->slab_capacity);
++
++	if (!mgmt_in_slab(cache))
++		kmem_cache_free(&slab_cache, slab);
++
++	nr_pages = 1 << cache->cache_order;
++
++	sub_page_state(nr_slab, nr_pages);
++
++	while (nr_pages--) {
++		if (!TestClearPageSlab(page))
++			BUG();
++		page++;
++	}
++	free_pages(addr, cache->cache_order);
++	cache->free_objects -= cache->slab_capacity;
++
++	stats_inc_reaped(cache);
++}
++
++static struct kmem_slab *expand_cache(struct kmem_cache *cache, gfp_t gfp_flags)
++{
++	struct kmem_slab *slab = create_slab(cache, gfp_flags);
++	if (!slab)
++		return NULL;
++
++	list_add_tail(&slab->list, &cache->full_slabs);
++	stats_inc_grown(cache);
++
++	return slab;
++}
++
++static struct kmem_slab *find_slab(struct kmem_cache *cache)
++{
++	struct kmem_slab *slab;
++	struct list_head *list = NULL;
++	
++	if (!list_empty(&cache->partial_slabs))
++		list = &cache->partial_slabs;
++	else if (!list_empty(&cache->full_slabs))
++		list = &cache->full_slabs;
++	else
++		BUG();
++
++	slab = list_entry(list->next, struct kmem_slab, list);
++	BUG_ON(!slab->nr_available);
++	return slab;
++}
++
++static void *alloc_obj(struct kmem_cache *cache, struct kmem_slab *slab)
++{
++	void *obj = slab->free->addr;
++	slab->free = slab->free->next;
++	slab->nr_available--;
++	cache->free_objects--;
++	return obj;
++}
++
++/* The caller must hold cache->lists_lock.  */
++static void *slab_alloc(struct kmem_cache *cache, gfp_t gfp_flags)
++{
++	struct kmem_slab *slab;
++	void *ret;
++
++	if (list_empty(&cache->partial_slabs) &&
++	    list_empty(&cache->full_slabs) &&
++	    !expand_cache(cache, gfp_flags))
++		return NULL;
++
++	slab = find_slab(cache);
++	if (slab->nr_available == cache->slab_capacity)
++		list_move(&slab->list, &cache->partial_slabs);
++
++	ret = alloc_obj(cache, slab);
++	if (!slab->nr_available)
++		list_move(&slab->list, &cache->empty_slabs);
++
++	return ret;
++}
++
++static void swap_magazines(struct kmem_cpu_cache *cpu_cache)
++{
++	struct kmem_magazine *tmp = cpu_cache->loaded;
++	cpu_cache->loaded = cpu_cache->prev;
++	cpu_cache->prev = tmp;
++}
++
++/**
++ * kmem_ptr_validate - check if an untrusted pointer might
++ *	be a slab entry.
++ * @cachep: the cache we're checking against
++ * @ptr: pointer to validate
++ *
++ * This verifies that the untrusted pointer looks sane: it is _not_ a
++ * guarantee that the pointer is actually part of the slab cache in
++ * question, but it at least validates that the pointer can be
++ * dereferenced and looks half-way sane.
++ *
++ * Currently only used for dentry validation.
++ */
++int fastcall kmem_ptr_validate(struct kmem_cache *cache, void *ptr)
++{
++	unsigned long addr = (unsigned long) ptr;
++	unsigned long min_addr = PAGE_OFFSET;
++	unsigned long size = cache->objsize;
++	struct page *page;
++
++	if (unlikely(addr < min_addr))
++		goto out;
++	if (unlikely(addr > (unsigned long)high_memory - size))
++		goto out;
++	if (unlikely(!kern_addr_valid(addr)))
++		goto out;
++	if (unlikely(!kern_addr_valid(addr + size - 1)))
++		goto out;
++	page = virt_to_page(ptr);
++	if (unlikely(!PageSlab(page)))
++		goto out;
++	if (unlikely(page_get_cache(page) != cache))
++		goto out;
++	return 1;
++  out:
++	return 0;
++}
++
++/**
++ * kmem_cache_alloc - Allocate an object
++ * @cachep: The cache to allocate from.
++ * @flags: See kmalloc().
++ *
++ * This function can be called from interrupt and process contexts.
++ *
++ * Allocate an object from this cache.  The flags are only relevant
++ * if the cache has no available objects.
++ */
++void *kmem_cache_alloc(struct kmem_cache *cache, gfp_t gfp_flags)
++{
++	void *ret = NULL;
++	unsigned long flags;
++	struct kmem_cpu_cache *cpu_cache = cpu_cache_get(cache);
++
++	spin_lock_irqsave(&cpu_cache->lock, flags);
++
++	while (1) {
++		if (likely(!magazine_is_empty(cpu_cache->loaded))) {
++			ret = magazine_get(cpu_cache->loaded);
++			break;
++		} else if (magazine_is_full(cpu_cache->prev)) {
++			swap_magazines(cpu_cache);
++			continue;
++		}
++
++		spin_lock(&cache->lists_lock);
++
++		if (list_empty(&cache->full_magazines)) {
++			ret = slab_alloc(cache, gfp_flags);
++			spin_unlock(&cache->lists_lock);
++			if (ret)
++				construct_object(ret, cache, gfp_flags);
++			break;
++		}
++		depot_put_empty(cache, cpu_cache->prev);
++		cpu_cache->prev = cpu_cache->loaded;
++		cpu_cache->loaded = depot_get_full(cache);
++
++		spin_unlock(&cache->lists_lock);
++	}
++
++	spin_unlock_irqrestore(&cpu_cache->lock, flags);
++	return ret;
++}
++EXPORT_SYMBOL(kmem_cache_alloc);
++
++void *kmem_cache_alloc_node(struct kmem_cache *cache, unsigned int __nocast flags, int nodeid)
++{
++	return kmem_cache_alloc(cache, flags);
++}
++EXPORT_SYMBOL(kmem_cache_alloc_node);
++
++static void free_obj(struct kmem_cache *cache, struct kmem_slab *slab,
++		     void *obj)
++{
++	struct kmem_bufctl *bufctl;
++
++	bufctl = obj_to_bufctl(cache, slab, obj);
++	bufctl->next = slab->free;
++	bufctl->addr = obj;
++
++	slab->free = bufctl;
++	slab->nr_available++;
++	cache->free_objects++;
++}
++
++static void slab_free(struct kmem_cache *cache, void *obj)
++{
++	struct page *page = virt_to_page(obj);
++	struct kmem_slab *slab = page_get_slab(page);
++
++	if (page_get_cache(page) != cache)
++		BUG();
++
++	if (slab->nr_available == 0)
++		list_move(&slab->list, &cache->partial_slabs);
++
++	free_obj(cache, slab, obj);
++
++	if (slab->nr_available == cache->slab_capacity)
++		list_move(&slab->list, &cache->full_slabs);
++}
++
++/**
++ * kmem_cache_free - Deallocate an object
++ * @cachep: The cache the allocation was from.
++ * @objp: The previously allocated object.
++ *
++ * This function can be called from interrupt and process contexts.
++ *
++ * Free an object which was previously allocated from this
++ * cache.
++ */
++void kmem_cache_free(struct kmem_cache *cache, void *obj)
++{
++	unsigned long flags;
++	struct kmem_cpu_cache *cpu_cache = cpu_cache_get(cache);
++
++	if (!obj)
++		return;
++
++	spin_lock_irqsave(&cpu_cache->lock, flags);
++
++	while (1) {
++		if (!magazine_is_full(cpu_cache->loaded)) {
++			magazine_put(cpu_cache->loaded, obj);
++			break;
++		}
++
++		if (magazine_is_empty(cpu_cache->prev)) {
++			swap_magazines(cpu_cache);
++			continue;
++		}
++	
++		spin_lock(&cache->lists_lock);
++		if (unlikely(list_empty(&cache->empty_magazines))) {
++			struct kmem_magazine *magazine;
++
++			spin_unlock(&cache->lists_lock);
++			magazine = kmem_cache_alloc(&magazine_cache,
++						    GFP_KERNEL);
++			if (magazine) {
++				depot_put_empty(cache, magazine);
++				continue;
++			}
++			destruct_object(obj, cache);
++			spin_lock(&cache->lists_lock);
++			slab_free(cache, obj);
++			spin_unlock(&cache->lists_lock);
++			break;
++		}
++		depot_put_full(cache, cpu_cache->prev);
++		cpu_cache->prev = cpu_cache->loaded;
++		cpu_cache->loaded = depot_get_empty(cache);
++		spin_unlock(&cache->lists_lock);
++	}
++
++	spin_unlock_irqrestore(&cpu_cache->lock, flags);
++}
++
++EXPORT_SYMBOL(kmem_cache_free);
++
++static void free_slab_list(struct kmem_cache *cache, struct list_head *slab_list)
++{
++	struct kmem_slab *slab, *tmp;
++
++	list_for_each_entry_safe(slab, tmp, slab_list, list) {
++		list_del(&slab->list);
++		destroy_slab(cache, slab);
++	}
++}
++
++static void free_cache_slabs(struct kmem_cache *cache)
++{
++	free_slab_list(cache, &cache->full_slabs);
++	free_slab_list(cache, &cache->partial_slabs);
++	free_slab_list(cache, &cache->empty_slabs);
++}
++
++static void purge_magazine(struct kmem_cache *cache,
++			   struct kmem_magazine *mag)
++{
++	while (!magazine_is_empty(mag)) {
++		void *obj = magazine_get(mag);
++		destruct_object(obj, cache);
++		spin_lock(&cache->lists_lock);
++		slab_free(cache, obj);
++		spin_unlock(&cache->lists_lock);
++	}
++}
++
++static void destroy_magazine(struct kmem_cache *cache,
++			     struct kmem_magazine *mag)
++{
++	if (!mag)
++		return;
++
++	purge_magazine(cache, mag);
++	kmem_cache_free(&magazine_cache, mag);
++}
++
++static void free_cpu_caches(struct kmem_cache *cache)
++{
++	int i;
++
++	for (i = 0; i < NR_CPUS; i++) {
++		struct kmem_cpu_cache *cpu_cache = __cpu_cache_get(cache, i);
++		destroy_magazine(cache, cpu_cache->loaded);
++		destroy_magazine(cache, cpu_cache->prev);
++	}
++}
++
++static int init_cpu_cache(struct kmem_cpu_cache *cpu_cache)
++{
++	int err = 0;
++
++	spin_lock_init(&cpu_cache->lock);
++
++	cpu_cache->loaded = kmem_cache_alloc(&magazine_cache, GFP_KERNEL);
++	if (!cpu_cache->loaded)
++		goto failed;
++
++	cpu_cache->prev = kmem_cache_alloc(&magazine_cache, GFP_KERNEL);
++	if (!cpu_cache->prev)
++		goto failed;
++
++  out:
++	return err;
++
++  failed:
++	kmem_cache_free(&magazine_cache, cpu_cache->loaded);
++	err = -ENOMEM;
++	goto out;
++}
++
++static int init_cpu_caches(struct kmem_cache *cache)
++{
++	int i;
++	int ret = 0;
++
++	for (i = 0; i < NR_CPUS; i++) {
++		struct kmem_cpu_cache *cpu_cache = __cpu_cache_get(cache, i);
++		ret = init_cpu_cache(cpu_cache);
++		if (ret)
++			break;
++	}
++
++	if (ret)
++		free_cpu_caches(cache);
++
++	return ret;
++}
++
++static unsigned long wastage(struct kmem_cache *cache, unsigned long order)
++{
++	unsigned long size = order_to_size(order);
++	return size % cache->objsize;
++}
++
++static long cache_order(struct kmem_cache *cache)
++{
++	unsigned int prev, order;
++
++	prev = order = 0;
++
++	/*
++	 * First find the first order in which the objects fit.
++	 */ 
++	while (1) {
++		if (cache->objsize <= order_to_size(order))
++			break;
++		if (++order > MAX_ORDER) {
++			order = -1;
++			goto out;
++		}
++	}
++
++	/*
++	 * Then see if we can find a better one.
++	 */
++	while (order < MAX_ORDER-1) {
++		unsigned long prev_wastage, current_wastage;
++
++		prev = order;
++		prev_wastage = wastage(cache, prev);
++		current_wastage = wastage(cache, ++order);
++
++		if (prev_wastage < current_wastage ||
++		    prev_wastage-current_wastage < MAX_WASTAGE) {
++			order = prev;
++			break;
++		}
++	}
++
++  out:
++	return order;
++}
++
++/**
++ * kmem_cache_create - Create a cache.
++ * @name: A string which is used in /proc/slabinfo to identify this cache.
++ * @size: The size of objects to be created in this cache.
++ * @align: The required alignment for the objects.
++ * @flags: SLAB flags
++ * @ctor: A constructor for the objects.
++ * @dtor: A destructor for the objects.
++ *
++ * This function must not be called from interrupt context.
++ *
++ * Returns a ptr to the cache on success, NULL on failure.  Cannot be
++ * called within a int, but can be interrupted.  The @ctor is run when
++ * new pages are allocated by the cache and the @dtor is run before
++ * the pages are handed back.
++ *
++ * @name must be valid until the cache is destroyed. This implies that
++ * the module calling this has to destroy the cache before getting
++ * unloaded.
++ *
++ * The flags are
++ *
++ * %SLAB_POISON - Poison the slab with a known test pattern (a5a5a5a5)
++ * to catch references to uninitialised memory.
++ *
++ * %SLAB_RED_ZONE - Insert `Red' zones around the allocated memory to
++ * check for buffer overruns.
++ *
++ * %SLAB_NO_REAP - Don't automatically reap this cache when we're
++ * under memory pressure.
++ *
++ * %SLAB_HWCACHE_ALIGN - Align the objects in this cache to a hardware
++ * cacheline.  This can be beneficial if you're counting cycles as
++ * closely as davem.
++ */
++struct kmem_cache *kmem_cache_create(const char *name, size_t objsize,
++				     size_t align, unsigned long flags,
++				     kmem_ctor_fn ctor, kmem_dtor_fn dtor)
++{
++	struct kmem_cache *cache = kmem_cache_alloc(&cache_cache, GFP_KERNEL);
++	if (!cache)
++		return NULL;
++
++	cache->name = name;
++	cache->objsize = objsize;
++	cache->ctor = ctor;
++	cache->dtor = dtor;
++	cache->free_objects = 0;
++
++	cache->cache_order = cache_order(cache);
++	if (cache->cache_order < 0)
++		goto failed;
++
++	cache->slab_capacity = slab_capacity(cache);
++
++	memset(&cache->stats, 0, sizeof(struct kmem_cache_statistics));
++
++	if (init_cpu_caches(cache))
++		goto failed;
++
++	down(&cache_chain_sem);
++	list_add(&cache->next, &cache_chain);
++	up(&cache_chain_sem);
++
++	return cache;
++
++  failed:
++	kmem_cache_free(&cache_cache, cache);
++	return NULL;
++}
++
++EXPORT_SYMBOL(kmem_cache_create);
++
++static void free_depot_magazines(struct kmem_cache *cache)
++{
++	struct kmem_magazine *magazine, *tmp;
++
++	list_for_each_entry_safe(magazine, tmp, &cache->empty_magazines, list) {
++		list_del(&magazine->list);
++		destroy_magazine(cache, magazine);
++	}
++
++	list_for_each_entry_safe(magazine, tmp, &cache->full_magazines, list) {
++		list_del(&magazine->list);
++		destroy_magazine(cache, magazine);
++	}
++}
++
++/**
++ * kmem_cache_destroy - delete a cache
++ * @cache: the cache to destroy
++ *
++ * This function must not be called from interrupt context.
++ *
++ * Remove a kmem_cache from the slab cache.
++ *
++ * It is expected this function will be called by a module when it is
++ * unloaded.  This will remove the cache completely, and avoid a
++ * duplicate cache being allocated each time a module is loaded and
++ * unloaded, if the module doesn't have persistent in-kernel storage
++ * across loads and unloads.
++ *
++ * The cache must be empty before calling this function.
++ *
++ * The caller must guarantee that no one will allocate memory from the
++ * cache during the kmem_cache_destroy().
++ */
++int kmem_cache_destroy(struct kmem_cache *cache)
++{
++	unsigned long flags;
++
++	down(&cache_chain_sem);
++	list_del(&cache->next);
++	up(&cache_chain_sem);
++
++	spin_lock_irqsave(&cache->lists_lock, flags);
++	free_cpu_caches(cache);
++	free_depot_magazines(cache);
++	free_cache_slabs(cache);
++	kmem_cache_free(&cache_cache, cache);
++	spin_unlock_irqrestore(&cache->lists_lock, flags);
++
++	return 0;
++}
++EXPORT_SYMBOL(kmem_cache_destroy);
++
++extern int kmem_cache_shrink(struct kmem_cache *cache)
++{
++	unsigned long flags;
++	struct kmem_cpu_cache *cpu_cache = cpu_cache_get(cache);
++
++	purge_magazine(cache, cpu_cache->loaded);
++	purge_magazine(cache, cpu_cache->prev);
++
++	spin_lock_irqsave(&cache->lists_lock, flags);
++	free_depot_magazines(cache);
++	free_slab_list(cache, &cache->full_slabs);
++	spin_unlock_irqrestore(&cache->lists_lock, flags);
++	return 0;
++}
++EXPORT_SYMBOL(kmem_cache_shrink);
++
++
++/*
++ *	Cache Reaping
++ */
++
++/**
++ * cache_reap - Reclaim memory from caches.
++ * @unused: unused parameter
++ *
++ * Called from workqueue/eventd every few seconds.
++ * Purpose:
++ * - clear the per-cpu caches for this CPU.
++ * - return freeable pages to the main free memory pool.
++ *
++ * If we cannot acquire the cache chain semaphore then just give up - we'll
++ * try again on the next iteration.
++ */
++static void cache_reap(void *unused)
++{
++	struct list_head *walk;
++
++	if (down_trylock(&cache_chain_sem))
++		goto out;
++
++	list_for_each(walk, &cache_chain) {
++		struct kmem_cache *cache = list_entry(walk, struct kmem_cache,
++						      next);
++		kmem_cache_shrink(cache);
++	}
++
++	up(&cache_chain_sem);
++  out:
++	/* Setup the next iteration */
++	schedule_delayed_work(&__get_cpu_var(reap_work),
++			      REAP_TIMEOUT_CPU_CACHES);
++}
++
++/*
++ * Initiate the reap timer running on the target CPU.  We run at around 1 to 2Hz
++ * via the workqueue/eventd.
++ * Add the CPU number into the expiration time to minimize the possibility of
++ * the CPUs getting into lockstep and contending for the global cache chain
++ * lock.
++ */
++static void __devinit start_cpu_timer(int cpu)
++{
++	struct work_struct *reap_work = &per_cpu(reap_work, cpu);
++
++	/*
++	 * When this gets called from do_initcalls via cpucache_init(),
++	 * init_workqueues() has already run, so keventd will be setup
++	 * at that time.
++	 */
++	if (keventd_up() && reap_work->func == NULL) {
++		INIT_WORK(reap_work, cache_reap, NULL);
++		schedule_delayed_work_on(cpu, reap_work, HZ + 3 * cpu);
++	}
++}
++
++
++/*
++ *	Proc FS
++ */
++
++#ifdef CONFIG_PROC_FS
++
++static void *s_start(struct seq_file *m, loff_t *pos)
++{
++	loff_t n = *pos;
++	struct list_head *p;
++
++	down(&cache_chain_sem);
++	if (!n) {
++		/*
++		 * Output format version, so at least we can change it
++		 * without _too_ many complaints.
++		 */
++		seq_puts(m, "slabinfo - version: 2.1\n");
++		seq_puts(m, "# name            <active_objs> <num_objs> <objsize> <objperslab> <pagesperslab>");
++		seq_puts(m, " : tunables <limit> <batchcount> <sharedfactor>");
++		seq_puts(m, " : slabdata <active_slabs> <num_slabs> <sharedavail>");
++		seq_putc(m, '\n');
++	}
++	p = cache_chain.next;
++	while (n--) {
++		p = p->next;
++		if (p == &cache_chain)
++			return NULL;
++	}
++	return list_entry(p, struct kmem_cache, next);
++}
++
++static void *s_next(struct seq_file *m, void *p, loff_t *pos)
++{
++	struct kmem_cache *cache = p;
++	++*pos;
++	return cache->next.next == &cache_chain ? NULL
++		: list_entry(cache->next.next, struct kmem_cache, next);
++}
++
++static void s_stop(struct seq_file *m, void *p)
++{
++	up(&cache_chain_sem);
++}
++
++static int s_show(struct seq_file *m, void *p)
++{
++	struct kmem_cache *cache = p;
++	struct list_head *q;
++	struct kmem_slab *slab;
++	unsigned long active_objs;
++	unsigned long num_objs;
++	unsigned long active_slabs = 0;
++	unsigned long num_slabs, free_objects = 0, shared_avail = 0;
++	const char *name;
++	char *error = NULL;
++
++	spin_lock_irq(&cache->lists_lock);
++
++	active_objs = 0;
++	num_slabs = 0;
++
++	list_for_each(q, &cache->full_slabs) {
++		slab = list_entry(q, struct kmem_slab, list);
++		active_slabs++;
++		active_objs += cache->slab_capacity - slab->nr_available;
++	}
++
++	list_for_each(q, &cache->partial_slabs) {
++		slab = list_entry(q, struct kmem_slab, list);
++		active_slabs++;
++		active_objs += cache->slab_capacity - slab->nr_available;
++	}
++
++	list_for_each(q, &cache->empty_slabs) {
++		slab = list_entry(q, struct kmem_slab, list);
++		active_slabs++;
++		active_objs += cache->slab_capacity - slab->nr_available;
++	}
++
++	num_slabs += active_slabs;
++	num_objs = num_slabs * cache->slab_capacity;
++	free_objects = cache->free_objects;
++
++	if (num_objs - active_objs != free_objects && !error)
++		error = "free_objects accounting error";
++
++	name = cache->name;
++	if (error)
++		printk(KERN_ERR "slab: cache %s error: %s\n", name, error);
++
++	seq_printf(m, "%-17s %6lu %6lu %6u %4u %4d",
++		name, active_objs, num_objs, cache->objsize,
++		cache->slab_capacity, (1 << cache->cache_order));
++	seq_printf(m, " : slabdata %6lu %6lu %6lu",
++			active_slabs, num_slabs, shared_avail);
++	seq_putc(m, '\n');
++
++	spin_unlock_irq(&cache->lists_lock);
++	return 0;
++}
++
++/*
++ * slabinfo_op - iterator that generates /proc/slabinfo
++ *
++ * Output layout:
++ * cache-name
++ * num-active-objs
++ * total-objs
++ * object size
++ * num-active-slabs
++ * total-slabs
++ * num-pages-per-slab
++ * + further values on SMP and with statistics enabled
++ */
++
++struct seq_operations slabinfo_op = {
++	.start	= s_start,
++	.next	= s_next,
++	.stop	= s_stop,
++	.show	= s_show,
++};
++
++ssize_t slabinfo_write(struct file *file, const char __user *buffer,
++		       size_t count, loff_t *ppos)
++{
++	return -EFAULT;
++}
++#endif
++
++
++/*
++ *	Memory Allocator Initialization
++ */
++
++static int bootstrap_cpu_caches(struct kmem_cache *cache)
++{
++	int i, err = 0;
++
++	for (i = 0; i < NR_CPUS; i++) {
++		struct kmem_cpu_cache *cpu_cache = __cpu_cache_get(cache, i);
++		spin_lock_init(&cpu_cache->lock);
++
++		spin_lock(&cache->lists_lock);
++		cpu_cache->loaded = slab_alloc(cache, GFP_KERNEL);
++		spin_unlock(&cache->lists_lock);
++		if (!cpu_cache->loaded) {
++			err = -ENOMEM;
++			goto out;
++		}
++
++		init_magazine(cpu_cache->loaded);
++
++		spin_lock(&cache->lists_lock);
++		cpu_cache->prev = slab_alloc(cache, GFP_KERNEL);
++		spin_unlock(&cache->lists_lock);
++		if (!cpu_cache->prev) {
++			err = -ENOMEM;
++			goto out;
++		}
++
++		init_magazine(cpu_cache->prev);
++	}
++
++  out:
++	return err;
++}
++
++void kmem_cache_init(void)
++{
++	init_MUTEX(&cache_chain_sem);
++	INIT_LIST_HEAD(&cache_chain);
++
++	cache_cache.cache_order = cache_order(&cache_cache);
++	cache_cache.slab_capacity = slab_capacity(&cache_cache);
++	slab_cache.cache_order = cache_order(&slab_cache);
++	slab_cache.slab_capacity = slab_capacity(&slab_cache);
++	magazine_cache.cache_order = cache_order(&magazine_cache);
++	magazine_cache.slab_capacity = slab_capacity(&magazine_cache);
++
++	init_cache(&cache_cache);
++	init_cache(&slab_cache);
++	init_cache(&magazine_cache);
++
++	if (bootstrap_cpu_caches(&magazine_cache))
++		goto failed;
++
++	if (init_cpu_caches(&cache_cache))
++		goto failed;
++
++	if (init_cpu_caches(&slab_cache))
++		goto failed;
++
++	list_add(&cache_cache.next, &cache_chain);
++	list_add(&slab_cache.next, &cache_chain);
++	list_add(&magazine_cache.next, &cache_chain);
++
++	kmalloc_init();
++
++	return;
++
++  failed:
++	panic("slab allocator init failed");
++}
++
++static int __init cpucache_init(void)
++{
++	int cpu;
++
++	/* 
++	 * Register the timers that return unneeded
++	 * pages to gfp.
++	 */
++	for_each_online_cpu(cpu)
++		start_cpu_timer(cpu);
++
++	return 0;
++}
++
++__initcall(cpucache_init);
++
++void kmem_cache_release(void)
++{
++}
+Index: 2.6/test/CuTest.c
+===================================================================
+--- /dev/null
++++ 2.6/test/CuTest.c
+@@ -0,0 +1,331 @@
++#include <assert.h>
++#include <setjmp.h>
++#include <stdlib.h>
++#include <stdio.h>
++#include <string.h>
++#include <math.h>
++
++#include "CuTest.h"
++
++/*-------------------------------------------------------------------------*
++ * CuStr
++ *-------------------------------------------------------------------------*/
++
++char* CuStrAlloc(int size)
++{
++	char* newStr = (char*) malloc( sizeof(char) * (size) );
++	return newStr;
++}
++
++char* CuStrCopy(const char* old)
++{
++	int len = strlen(old);
++	char* newStr = CuStrAlloc(len + 1);
++	strcpy(newStr, old);
++	return newStr;
++}
++
++/*-------------------------------------------------------------------------*
++ * CuString
++ *-------------------------------------------------------------------------*/
++
++void CuStringInit(CuString* str)
++{
++	str->length = 0;
++	str->size = STRING_MAX;
++	str->buffer = (char*) malloc(sizeof(char) * str->size);
++	str->buffer[0] = '\0';
++}
++
++CuString* CuStringNew(void)
++{
++	CuString* str = (CuString*) malloc(sizeof(CuString));
++	str->length = 0;
++	str->size = STRING_MAX;
++	str->buffer = (char*) malloc(sizeof(char) * str->size);
++	str->buffer[0] = '\0';
++	return str;
++}
++
++void CuStringDelete(CuString* str)
++{
++	free(str->buffer);
++	free(str);
++}
++
++void CuStringResize(CuString* str, int newSize)
++{
++	str->buffer = (char*) realloc(str->buffer, sizeof(char) * newSize);
++	str->size = newSize;
++}
++
++void CuStringAppend(CuString* str, const char* text)
++{
++	int length;
++
++	if (text == NULL) {
++		text = "NULL";
++	}
++
++	length = strlen(text);
++	if (str->length + length + 1 >= str->size)
++		CuStringResize(str, str->length + length + 1 + STRING_INC);
++	str->length += length;
++	strcat(str->buffer, text);
++}
++
++void CuStringAppendChar(CuString* str, char ch)
++{
++	char text[2];
++	text[0] = ch;
++	text[1] = '\0';
++	CuStringAppend(str, text);
++}
++
++void CuStringAppendFormat(CuString* str, const char* format, ...)
++{
++	va_list argp;
++	char buf[HUGE_STRING_LEN];
++	va_start(argp, format);
++	vsprintf(buf, format, argp);
++	va_end(argp);
++	CuStringAppend(str, buf);
++}
++
++void CuStringInsert(CuString* str, const char* text, int pos)
++{
++	int length = strlen(text);
++	if (pos > str->length)
++		pos = str->length;
++	if (str->length + length + 1 >= str->size)
++		CuStringResize(str, str->length + length + 1 + STRING_INC);
++	memmove(str->buffer + pos + length, str->buffer + pos, (str->length - pos) + 1);
++	str->length += length;
++	memcpy(str->buffer + pos, text, length);
++}
++
++/*-------------------------------------------------------------------------*
++ * CuTest
++ *-------------------------------------------------------------------------*/
++
++void CuTestInit(CuTest* t, const char* name, TestFunction function)
++{
++	t->name = CuStrCopy(name);
++	t->failed = 0;
++	t->ran = 0;
++	t->message = NULL;
++	t->function = function;
++	t->jumpBuf = NULL;
++}
++
++CuTest* CuTestNew(const char* name, TestFunction function)
++{
++	CuTest* tc = malloc(sizeof(*tc));
++	CuTestInit(tc, name, function);
++	return tc;
++}
++
++void CuTestDelete(CuTest *ct)
++{
++	free((char *)ct->name);
++	free(ct);
++}
++
++void CuTestRun(CuTest* tc)
++{
++	jmp_buf buf;
++	tc->jumpBuf = &buf;
++	if (setjmp(buf) == 0)
++	{
++		tc->ran = 1;
++		(tc->function)(tc);
++	}
++	tc->jumpBuf = 0;
++}
++
++static void CuFailInternal(CuTest* tc, const char* file, int line, CuString* string)
++{
++	char buf[HUGE_STRING_LEN];
++
++	sprintf(buf, "%s:%d: ", file, line);
++	CuStringInsert(string, buf, 0);
++
++	tc->failed = 1;
++	tc->message = string->buffer;
++	if (tc->jumpBuf != 0) longjmp(*(tc->jumpBuf), 0);
++}
++
++void CuFail_Line(CuTest* tc, const char* file, int line, const char* message2, const char* message)
++{
++	CuString string;
++
++	CuStringInit(&string);
++	if (message2 != NULL)
++	{
++		CuStringAppend(&string, message2);
++		CuStringAppend(&string, ": ");
++	}
++	CuStringAppend(&string, message);
++	CuFailInternal(tc, file, line, &string);
++}
++
++void CuAssert_Line(CuTest* tc, const char* file, int line, const char* message, int condition)
++{
++	if (condition) return;
++	CuFail_Line(tc, file, line, NULL, message);
++}
++
++void CuAssertStrEquals_LineMsg(CuTest* tc, const char* file, int line, const char* message,
++	const char* expected, const char* actual)
++{
++	CuString string;
++	if ((expected == NULL && actual == NULL) ||
++	    (expected != NULL && actual != NULL &&
++	     strcmp(expected, actual) == 0))
++	{
++		return;
++	}
++
++	CuStringInit(&string);
++	if (message != NULL)
++	{
++		CuStringAppend(&string, message);
++		CuStringAppend(&string, ": ");
++	}
++	CuStringAppend(&string, "expected <");
++	CuStringAppend(&string, expected);
++	CuStringAppend(&string, "> but was <");
++	CuStringAppend(&string, actual);
++	CuStringAppend(&string, ">");
++	CuFailInternal(tc, file, line, &string);
++}
++
++void CuAssertIntEquals_LineMsg(CuTest* tc, const char* file, int line, const char* message,
++	int expected, int actual)
++{
++	char buf[STRING_MAX];
++	if (expected == actual) return;
++	sprintf(buf, "expected <%d> but was <%d>", expected, actual);
++	CuFail_Line(tc, file, line, message, buf);
++}
++
++void CuAssertDblEquals_LineMsg(CuTest* tc, const char* file, int line, const char* message,
++	double expected, double actual, double delta)
++{
++	char buf[STRING_MAX];
++	if (fabs(expected - actual) <= delta) return;
++	sprintf(buf, "expected <%lf> but was <%lf>", expected, actual);
++	CuFail_Line(tc, file, line, message, buf);
++}
++
++void CuAssertPtrEquals_LineMsg(CuTest* tc, const char* file, int line, const char* message,
++	void* expected, void* actual)
++{
++	char buf[STRING_MAX];
++	if (expected == actual) return;
++	sprintf(buf, "expected pointer <0x%p> but was <0x%p>", expected, actual);
++	CuFail_Line(tc, file, line, message, buf);
++}
++
++
++/*-------------------------------------------------------------------------*
++ * CuSuite
++ *-------------------------------------------------------------------------*/
++
++void CuSuiteInit(CuSuite* testSuite)
++{
++	testSuite->count = 0;
++	testSuite->failCount = 0;
++}
++
++CuSuite* CuSuiteNew(void)
++{
++	CuSuite* testSuite = malloc(sizeof(*testSuite));
++	CuSuiteInit(testSuite);
++	return testSuite;
++}
++
++void CuSuiteDelete(CuSuite *testSuite)
++{
++	int i;
++	for (i = 0 ; i < testSuite->count ; ++i)
++	{
++		CuTestDelete(testSuite->list[i]);
++	}
++	free(testSuite);
++}
++
++void CuSuiteAdd(CuSuite* testSuite, CuTest *testCase)
++{
++	assert(testSuite->count < MAX_TEST_CASES);
++	testSuite->list[testSuite->count] = testCase;
++	testSuite->count++;
++}
++
++void CuSuiteAddSuite(CuSuite* testSuite, CuSuite* testSuite2)
++{
++	int i;
++	for (i = 0 ; i < testSuite2->count ; ++i)
++	{
++		CuTest* testCase = testSuite2->list[i];
++		CuSuiteAdd(testSuite, testCase);
++	}
++}
++
++void CuSuiteRun(CuSuite* testSuite)
++{
++	int i;
++	for (i = 0 ; i < testSuite->count ; ++i)
++	{
++		CuTest* testCase = testSuite->list[i];
++		CuTestRun(testCase);
++		if (testCase->failed) { testSuite->failCount += 1; }
++	}
++}
++
++void CuSuiteSummary(CuSuite* testSuite, CuString* summary)
++{
++	int i;
++	for (i = 0 ; i < testSuite->count ; ++i)
++	{
++		CuTest* testCase = testSuite->list[i];
++		CuStringAppend(summary, testCase->failed ? "F" : ".");
++	}
++	CuStringAppend(summary, "\n\n");
++}
++
++void CuSuiteDetails(CuSuite* testSuite, CuString* details)
++{
++	int i;
++	int failCount = 0;
++
++	if (testSuite->failCount == 0)
++	{
++		int passCount = testSuite->count - testSuite->failCount;
++		const char* testWord = passCount == 1 ? "test" : "tests";
++		CuStringAppendFormat(details, "OK (%d %s)\n", passCount, testWord);
++	}
++	else
++	{
++		if (testSuite->failCount == 1)
++			CuStringAppend(details, "There was 1 failure:\n");
++		else
++			CuStringAppendFormat(details, "There were %d failures:\n", testSuite->failCount);
++
++		for (i = 0 ; i < testSuite->count ; ++i)
++		{
++			CuTest* testCase = testSuite->list[i];
++			if (testCase->failed)
++			{
++				failCount++;
++				CuStringAppendFormat(details, "%d) %s: %s\n",
++					failCount, testCase->name, testCase->message);
++			}
++		}
++		CuStringAppend(details, "\n!!!FAILURES!!!\n");
++
++		CuStringAppendFormat(details, "Runs: %d ",   testSuite->count);
++		CuStringAppendFormat(details, "Passes: %d ", testSuite->count - testSuite->failCount);
++		CuStringAppendFormat(details, "Fails: %d\n",  testSuite->failCount);
++	}
++}
+Index: 2.6/test/Makefile
+===================================================================
+--- /dev/null
++++ 2.6/test/Makefile
+@@ -0,0 +1,18 @@
++all: test
++
++gen:
++	sh make-tests.sh mm/*.c > test-runner.c
++
++compile:
++	gcc -O2 -g -Wall -Iinclude -I../include -D__KERNEL__=1 ../mm/kmalloc.c mm/kmalloc-test.c ../mm/kmem.c mm/kmem-test.c mm/page_alloc.c kernel/panic.c kernel/workqueue.c kernel/timer.c CuTest.c test-runner.c -o test-runner
++
++run:
++	./test-runner
++
++test: gen compile run
++
++valgrind: gen compile
++	valgrind --leak-check=full test-runner
++
++clean:
++	rm -f *.o tags test-runner test-runner.c
+Index: 2.6/test/include/CuTest.h
+===================================================================
+--- /dev/null
++++ 2.6/test/include/CuTest.h
+@@ -0,0 +1,116 @@
++#ifndef CU_TEST_H
++#define CU_TEST_H
++
++#include <setjmp.h>
++#include <stdarg.h>
++#include <stdio.h>
++#include <stdlib.h>
++
++/* CuString */
++
++char* CuStrAlloc(int size);
++char* CuStrCopy(const char* old);
++
++#define CU_ALLOC(TYPE)		((TYPE*) malloc(sizeof(TYPE)))
++
++#define HUGE_STRING_LEN	8192
++#define STRING_MAX		256
++#define STRING_INC		256
++
++typedef struct
++{
++	int length;
++	int size;
++	char* buffer;
++} CuString;
++
++void CuStringInit(CuString* str);
++CuString* CuStringNew(void);
++void CuStringDelete(CuString *str);
++void CuStringRead(CuString* str, const char* path);
++void CuStringAppend(CuString* str, const char* text);
++void CuStringAppendChar(CuString* str, char ch);
++void CuStringAppendFormat(CuString* str, const char* format, ...);
++void CuStringInsert(CuString* str, const char* text, int pos);
++void CuStringResize(CuString* str, int newSize);
++
++/* CuTest */
++
++typedef struct CuTest CuTest;
++
++typedef void (*TestFunction)(CuTest *);
++
++struct CuTest
++{
++	const char* name;
++	TestFunction function;
++	int failed;
++	int ran;
++	const char* message;
++	jmp_buf *jumpBuf;
++};
++
++void CuTestInit(CuTest* t, const char* name, TestFunction function);
++CuTest* CuTestNew(const char* name, TestFunction function);
++void CuTestDelete(CuTest *tc);
++void CuTestRun(CuTest* tc);
++
++/* Internal versions of assert functions -- use the public versions */
++void CuFail_Line(CuTest* tc, const char* file, int line, const char* message2, const char* message);
++void CuAssert_Line(CuTest* tc, const char* file, int line, const char* message, int condition);
++void CuAssertStrEquals_LineMsg(CuTest* tc,
++	const char* file, int line, const char* message,
++	const char* expected, const char* actual);
++void CuAssertIntEquals_LineMsg(CuTest* tc,
++	const char* file, int line, const char* message,
++	int expected, int actual);
++void CuAssertDblEquals_LineMsg(CuTest* tc,
++	const char* file, int line, const char* message,
++	double expected, double actual, double delta);
++void CuAssertPtrEquals_LineMsg(CuTest* tc,
++	const char* file, int line, const char* message,
++	void* expected, void* actual);
++
++/* public assert functions */
++
++#define CuFail(tc, ms)                        CuFail_Line(  (tc), __FILE__, __LINE__, NULL, (ms))
++#define CuAssert(tc, ms, cond)                CuAssert_Line((tc), __FILE__, __LINE__, (ms), (cond))
++#define CuAssertTrue(tc, cond)                CuAssert_Line((tc), __FILE__, __LINE__, "assert failed", (cond))
++
++#define CuAssertStrEquals(tc,ex,ac)           CuAssertStrEquals_LineMsg((tc),__FILE__,__LINE__,NULL,(ex),(ac))
++#define CuAssertStrEquals_Msg(tc,ms,ex,ac)    CuAssertStrEquals_LineMsg((tc),__FILE__,__LINE__,(ms),(ex),(ac))
++#define CuAssertIntEquals(tc,ex,ac)           CuAssertIntEquals_LineMsg((tc),__FILE__,__LINE__,NULL,(ex),(ac))
++#define CuAssertIntEquals_Msg(tc,ms,ex,ac)    CuAssertIntEquals_LineMsg((tc),__FILE__,__LINE__,(ms),(ex),(ac))
++#define CuAssertDblEquals(tc,ex,ac,dl)        CuAssertDblEquals_LineMsg((tc),__FILE__,__LINE__,NULL,(ex),(ac),(dl))
++#define CuAssertDblEquals_Msg(tc,ms,ex,ac,dl) CuAssertDblEquals_LineMsg((tc),__FILE__,__LINE__,(ms),(ex),(ac),(dl))
++#define CuAssertPtrEquals(tc,ex,ac)           CuAssertPtrEquals_LineMsg((tc),__FILE__,__LINE__,NULL,(ex),(ac))
++#define CuAssertPtrEquals_Msg(tc,ms,ex,ac)    CuAssertPtrEquals_LineMsg((tc),__FILE__,__LINE__,(ms),(ex),(ac))
++
++#define CuAssertPtrNotNull(tc,p)        CuAssert_Line((tc),__FILE__,__LINE__,"null pointer unexpected",(p != NULL))
++#define CuAssertPtrNotNullMsg(tc,msg,p) CuAssert_Line((tc),__FILE__,__LINE__,(msg),(p != NULL))
++
++/* CuSuite */
++
++#define MAX_TEST_CASES	1024
++
++#define SUITE_ADD_TEST(SUITE,TEST)	CuSuiteAdd(SUITE, CuTestNew(#TEST, TEST))
++
++typedef struct
++{
++	int count;
++	CuTest* list[MAX_TEST_CASES];
++	int failCount;
++
++} CuSuite;
++
++
++void CuSuiteInit(CuSuite* testSuite);
++CuSuite* CuSuiteNew(void);
++void CuSuiteDelete(CuSuite *);
++void CuSuiteAdd(CuSuite* testSuite, CuTest *testCase);
++void CuSuiteAddSuite(CuSuite* testSuite, CuSuite* testSuite2);
++void CuSuiteRun(CuSuite* testSuite);
++void CuSuiteSummary(CuSuite* testSuite, CuString* summary);
++void CuSuiteDetails(CuSuite* testSuite, CuString* details);
++
++#endif /* CU_TEST_H */
+Index: 2.6/test/make-tests.sh
+===================================================================
+--- /dev/null
++++ 2.6/test/make-tests.sh
+@@ -0,0 +1,54 @@
++#!/bin/bash
++
++# Auto generate single AllTests file for CuTest.
++# Searches through all *.c files in the current directory.
++# Prints to stdout.
++# Author: Asim Jalis
++# Date: 01/08/2003
++
++if test $# -eq 0 ; then FILES=*.c ; else FILES=$* ; fi
++
++echo '
++
++/* This is auto-generated code. Edit at your own peril. */
++
++#include "CuTest.h"
++
++'
++
++cat $FILES | grep '^void test' |
++    sed -e 's/(.*$//' \
++        -e 's/$/(CuTest*);/' \
++        -e 's/^/extern /'
++
++echo \
++'
++
++void RunAllTests(void)
++{
++    CuString *output = CuStringNew();
++    CuSuite* suite = CuSuiteNew();
++
++'
++cat $FILES | grep '^void test' |
++    sed -e 's/^void //' \
++        -e 's/(.*$//' \
++        -e 's/^/    SUITE_ADD_TEST(suite, /' \
++        -e 's/$/);/'
++
++echo \
++'
++    CuSuiteRun(suite);
++    CuSuiteSummary(suite, output);
++    CuSuiteDetails(suite, output);
++    printf("%s\n", output->buffer);
++    CuSuiteDelete(suite);
++    CuStringDelete(output);
++}
++
++int main(void)
++{
++    RunAllTests();
++    return 0;
++}
++'
+Index: 2.6/test/mm/kmalloc-test.c
+===================================================================
+--- /dev/null
++++ 2.6/test/mm/kmalloc-test.c
+@@ -0,0 +1,21 @@
++#include <CuTest.h>
++#include <linux/kmem.h>
++
++void test_kmalloc_returns_from_slab(CuTest *ct)
++{
++	kmem_cache_init();
++	void *obj1 = kmalloc(10, GFP_KERNEL);
++	void *obj2 = kmalloc(10, GFP_KERNEL);
++	CuAssertIntEquals(ct, (unsigned long)obj1+32, (unsigned long)obj2);
++	kmem_cache_release();
++}
++
++void test_kzalloc_zeros_memory(CuTest *ct)
++{
++	int i;
++	kmem_cache_init();
++	char *obj = kzalloc(10, GFP_KERNEL);
++	for (i = 0; i < 10; i++)
++		CuAssertIntEquals(ct, 0, obj[i]);
++	kmem_cache_release();
++}
+Index: 2.6/test/mm/kmem-test.c
+===================================================================
+--- /dev/null
++++ 2.6/test/mm/kmem-test.c
+@@ -0,0 +1,239 @@
++#include <CuTest.h>
++#include <linux/kmem.h>
++#include <linux/string.h>
++#include <linux/mm.h>
++
++#define DEFAULT_OBJSIZE (PAGE_SIZE/2)
++#define MAX_OBJS (100)
++
++void test_retains_cache_name(CuTest *ct)
++{
++	kmem_cache_init();
++	struct kmem_cache *cache = kmem_cache_create("object_cache", 512, 0, 0, NULL, NULL);
++	CuAssertStrEquals(ct, "object_cache", cache->name);
++	kmem_cache_destroy(cache);
++	kmem_cache_release();
++}
++
++void test_alloc_grows_cache(CuTest *ct)
++{
++	kmem_cache_init();
++	struct kmem_cache *cache = kmem_cache_create("cache", DEFAULT_OBJSIZE, 0, 0, NULL, NULL);
++	CuAssertIntEquals(ct, 0, cache->stats.grown);
++	void *obj = kmem_cache_alloc(cache, GFP_KERNEL);
++	CuAssertIntEquals(ct, 1, cache->stats.grown);
++	kmem_cache_free(cache, obj);
++	kmem_cache_destroy(cache);
++	kmem_cache_release();
++}
++
++static void alloc_objs(struct kmem_cache *cache, void *objs[], size_t nr_objs)
++{
++	int i;
++	for (i = 0; i < nr_objs; i++) {
++		objs[i] = kmem_cache_alloc(cache, GFP_KERNEL);
++	}
++}
++
++static void free_objs(struct kmem_cache *cache, void *objs[], size_t nr_objs)
++{
++	int i;
++	for (i = 0; i < nr_objs; i++) {
++		kmem_cache_free(cache, objs[i]);
++	}
++}
++
++void test_destroying_cache_reaps_slabs(CuTest *ct)
++{
++	kmem_cache_init();
++	struct kmem_cache *cache = kmem_cache_create("cache", DEFAULT_OBJSIZE, 0, 0, NULL, NULL);
++	void *objs[MAX_OBJS];
++	alloc_objs(cache, objs, MAX_OBJS);
++	free_objs(cache, objs, MAX_OBJS);
++	kmem_cache_destroy(cache);
++	CuAssertIntEquals(ct, 1, list_empty(&cache->full_slabs));
++	CuAssertIntEquals(ct, 1, list_empty(&cache->partial_slabs));
++	CuAssertIntEquals(ct, 1, list_empty(&cache->empty_slabs));
++	kmem_cache_release();
++}
++
++void test_multiple_objects_within_one_page(CuTest *ct)
++{
++	kmem_cache_init();
++	struct kmem_cache *cache = kmem_cache_create("cache", DEFAULT_OBJSIZE, 0, 0, NULL, NULL);
++	void *objs[MAX_OBJS];
++	alloc_objs(cache, objs, MAX_OBJS);
++	CuAssertIntEquals(ct, (MAX_OBJS*DEFAULT_OBJSIZE/PAGE_SIZE), cache->stats.grown);
++	free_objs(cache, objs, MAX_OBJS);
++	kmem_cache_destroy(cache);
++	kmem_cache_release();
++}
++
++void test_allocates_from_magazine_when_available(CuTest *ct)
++{
++	kmem_cache_init();
++	struct kmem_cache *cache = kmem_cache_create("cache", DEFAULT_OBJSIZE, 0, 0, NULL, NULL);
++	void *obj1 = kmem_cache_alloc(cache, GFP_KERNEL);
++	kmem_cache_free(cache, obj1);
++	void *obj2 = kmem_cache_alloc(cache, GFP_KERNEL);
++	kmem_cache_free(cache, obj2);
++	CuAssertPtrEquals(ct, obj1, obj2);
++	kmem_cache_destroy(cache);
++	kmem_cache_release();
++}
++
++void test_allocated_objects_are_from_same_slab(CuTest *ct)
++{
++	kmem_cache_init();
++	struct kmem_cache *cache = kmem_cache_create("cache", DEFAULT_OBJSIZE, 0, 0, NULL, NULL);
++	void *obj1 = kmem_cache_alloc(cache, GFP_KERNEL);
++	void *obj2 = kmem_cache_alloc(cache, GFP_KERNEL);
++	CuAssertPtrEquals(ct, obj1+(DEFAULT_OBJSIZE), obj2);
++	kmem_cache_destroy(cache);
++	kmem_cache_release();
++}
++
++static unsigned long nr_ctor_dtor_called;
++static struct kmem_cache *cache_passed_to_ctor_dtor;
++static unsigned long flags_passed_to_ctor_dtor;
++
++static void ctor_dtor(void *obj, struct kmem_cache *cache, unsigned long flags)
++{
++	nr_ctor_dtor_called++;
++	cache_passed_to_ctor_dtor = cache;
++	flags_passed_to_ctor_dtor = flags;
++}
++
++static void reset_ctor_dtor(void)
++{
++	nr_ctor_dtor_called = 0;
++	cache_passed_to_ctor_dtor = NULL;
++	flags_passed_to_ctor_dtor = 0;
++}
++
++void test_constructor_is_called_for_allocated_objects(CuTest *ct)
++{
++	kmem_cache_init();
++	struct kmem_cache *cache = kmem_cache_create("cache", DEFAULT_OBJSIZE,
++						     0, 0, ctor_dtor, NULL);
++	reset_ctor_dtor();
++	void *obj = kmem_cache_alloc(cache, GFP_KERNEL);
++	CuAssertIntEquals(ct, 1, nr_ctor_dtor_called);
++	CuAssertPtrEquals(ct, cache, cache_passed_to_ctor_dtor);
++	CuAssertIntEquals(ct, SLAB_CTOR_CONSTRUCTOR,
++			  flags_passed_to_ctor_dtor);
++	kmem_cache_free(cache, obj);
++	kmem_cache_release();
++}
++
++void test_atomic_flag_is_passed_to_constructor(CuTest *ct)
++{
++	kmem_cache_init();
++	struct kmem_cache *cache = kmem_cache_create("cache", DEFAULT_OBJSIZE,
++						     0, 0, ctor_dtor, NULL);
++	reset_ctor_dtor();
++	void *obj = kmem_cache_alloc(cache, GFP_ATOMIC);
++	CuAssertIntEquals(ct, SLAB_CTOR_CONSTRUCTOR|SLAB_CTOR_ATOMIC,
++			  flags_passed_to_ctor_dtor);
++	kmem_cache_free(cache, obj);
++	kmem_cache_destroy(cache);
++	kmem_cache_release();
++}
++
++void test_destructor_is_called_for_allocated_objects(CuTest *ct)
++{
++	kmem_cache_init();
++	struct kmem_cache *cache = kmem_cache_create("cache", DEFAULT_OBJSIZE,
++						     0, 0, NULL, ctor_dtor);
++	reset_ctor_dtor();
++	void *obj = kmem_cache_alloc(cache, GFP_KERNEL);
++	kmem_cache_free(cache, obj);
++	CuAssertIntEquals(ct, 0, nr_ctor_dtor_called);
++	kmem_cache_destroy(cache);
++	CuAssertIntEquals(ct, 1, nr_ctor_dtor_called);
++	CuAssertPtrEquals(ct, cache, cache_passed_to_ctor_dtor);
++	CuAssertIntEquals(ct, 0, flags_passed_to_ctor_dtor);
++	kmem_cache_release();
++}
++
++#define PATTERN 0x7D
++
++static void memset_ctor(void *obj, struct kmem_cache *cache, unsigned long flags)
++{
++	memset(obj, PATTERN, cache->objsize);
++}
++
++static void memcmp_dtor(void *obj, struct kmem_cache *cache, unsigned long flags)
++{
++	int i;
++	char *array = obj;
++
++	for (i = 0; i < cache->objsize; i++) {
++		if (array[i] != PATTERN)
++			BUG();
++	}
++}
++
++void test_object_is_preserved_until_destructed(CuTest *ct)
++{
++	kmem_cache_init();
++	struct kmem_cache *cache = kmem_cache_create("cache", DEFAULT_OBJSIZE,
++						     0, 0, memset_ctor,
++						     memcmp_dtor);
++	reset_ctor_dtor();
++	void *obj = kmem_cache_alloc(cache, GFP_KERNEL);
++	kmem_cache_free(cache, obj);
++	kmem_cache_destroy(cache);
++	kmem_cache_release();
++}
++
++static void assert_num_objs_and_cache_order(CuTest *ct,
++					    unsigned long expected_num_objs,
++					    unsigned int expected_order,
++					    unsigned long objsize)
++{
++	kmem_cache_init();
++	struct kmem_cache *cache = kmem_cache_create("cache", objsize,
++						     0, 0, NULL, NULL);
++	CuAssertIntEquals(ct, expected_num_objs, cache->slab_capacity);
++	CuAssertIntEquals(ct, expected_order, cache->cache_order);
++	kmem_cache_destroy(cache);
++	kmem_cache_release();
++}
++
++void test_slab_order_grows_with_object_size(CuTest *ct)
++{
++	assert_num_objs_and_cache_order(ct, 127, 0, 32);
++	assert_num_objs_and_cache_order(ct, 63, 0, 64);
++	assert_num_objs_and_cache_order(ct, 31, 0, 128);
++	assert_num_objs_and_cache_order(ct, 15, 0, 256);
++	assert_num_objs_and_cache_order(ct,  8, 0, 512);
++	assert_num_objs_and_cache_order(ct,  4, 0, 1024);
++	assert_num_objs_and_cache_order(ct,  2, 0, 2048);
++	assert_num_objs_and_cache_order(ct,  1, 0, 4096);
++	assert_num_objs_and_cache_order(ct,  1, 1, 8192);
++	assert_num_objs_and_cache_order(ct,  1, 2, 16384);
++	assert_num_objs_and_cache_order(ct,  1, 3, 32768);
++	assert_num_objs_and_cache_order(ct,  1, 11, (1<<MAX_ORDER)*PAGE_SIZE);
++}
++
++void test_find_best_order_for_worst_fitting_objects(CuTest *ct)
++{
++	assert_num_objs_and_cache_order(ct, 5, 0, 765);
++	assert_num_objs_and_cache_order(ct, 1, 1, PAGE_SIZE+1);
++	assert_num_objs_and_cache_order(ct, 7, 3, PAGE_SIZE+512);
++}
++
++void test_shrinking_cache_purges_magazines(CuTest *ct)
++{
++	kmem_cache_init();
++	struct kmem_cache *cache = kmem_cache_create("cache", PAGE_SIZE, 0, 0, NULL, NULL);
++	void *obj = kmem_cache_alloc(cache, GFP_KERNEL);
++	kmem_cache_free(cache, obj);
++	CuAssertIntEquals(ct, 0, cache->stats.reaped);
++	kmem_cache_shrink(cache);
++	CuAssertIntEquals(ct, 1, list_empty(&cache->full_slabs));
++	CuAssertIntEquals(ct, 1, cache->stats.reaped);
++	kmem_cache_destroy(cache);
++	kmem_cache_release();
++}
+Index: 2.6/test/include/linux/gfp.h
+===================================================================
+--- /dev/null
++++ 2.6/test/include/linux/gfp.h
+@@ -0,0 +1,60 @@
++#ifndef __LINUX_GFP_H
++#define __LINUX_GFP_H
++
++/*
++ * GFP bitmasks..
++ */
++/* Zone modifiers in GFP_ZONEMASK (see linux/mmzone.h - low two bits) */
++#define __GFP_DMA	((__force gfp_t)0x01u)
++#define __GFP_HIGHMEM	((__force gfp_t)0x02u)
++
++/*
++ * Action modifiers - doesn't change the zoning
++ *
++ * __GFP_REPEAT: Try hard to allocate the memory, but the allocation attempt
++ * _might_ fail.  This depends upon the particular VM implementation.
++ *
++ * __GFP_NOFAIL: The VM implementation _must_ retry infinitely: the caller
++ * cannot handle allocation failures.
++ *
++ * __GFP_NORETRY: The VM implementation must not retry indefinitely.
++ */
++#define __GFP_WAIT	((__force gfp_t)0x10u)	/* Can wait and reschedule? */
++#define __GFP_HIGH	((__force gfp_t)0x20u)	/* Should access emergency pools? */
++#define __GFP_IO	((__force gfp_t)0x40u)	/* Can start physical IO? */
++#define __GFP_FS	((__force gfp_t)0x80u)	/* Can call down to low-level FS? */
++#define __GFP_COLD	((__force gfp_t)0x100u)	/* Cache-cold page required */
++#define __GFP_NOWARN	((__force gfp_t)0x200u)	/* Suppress page allocation failure warning */
++#define __GFP_REPEAT	((__force gfp_t)0x400u)	/* Retry the allocation.  Might fail */
++#define __GFP_NOFAIL	((__force gfp_t)0x800u)	/* Retry for ever.  Cannot fail */
++#define __GFP_NORETRY	((__force gfp_t)0x1000u)/* Do not retry.  Might fail */
++#define __GFP_NO_GROW	((__force gfp_t)0x2000u)/* Slab internal usage */
++#define __GFP_COMP	((__force gfp_t)0x4000u)/* Add compound page metadata */
++#define __GFP_ZERO	((__force gfp_t)0x8000u)/* Return zeroed page on success */
++#define __GFP_NOMEMALLOC ((__force gfp_t)0x10000u) /* Don't use emergency reserves */
++#define __GFP_NORECLAIM  ((__force gfp_t)0x20000u) /* No realy zone reclaim during allocation */
++#define __GFP_HARDWALL   ((__force gfp_t)0x40000u) /* Enforce hardwall cpuset memory allocs */
++
++#define __GFP_BITS_SHIFT 20	/* Room for 20 __GFP_FOO bits */
++#define __GFP_BITS_MASK ((__force gfp_t)((1 << __GFP_BITS_SHIFT) - 1))
++
++/* if you forget to add the bitmask here kernel will crash, period */
++#define GFP_LEVEL_MASK (__GFP_WAIT|__GFP_HIGH|__GFP_IO|__GFP_FS| \
++			__GFP_COLD|__GFP_NOWARN|__GFP_REPEAT| \
++			__GFP_NOFAIL|__GFP_NORETRY|__GFP_NO_GROW|__GFP_COMP| \
++			__GFP_NOMEMALLOC|__GFP_NORECLAIM|__GFP_HARDWALL)
++
++#define GFP_ATOMIC	(__GFP_HIGH)
++#define GFP_NOIO	(__GFP_WAIT)
++#define GFP_NOFS	(__GFP_WAIT | __GFP_IO)
++#define GFP_KERNEL	(__GFP_WAIT | __GFP_IO | __GFP_FS)
++#define GFP_USER	(__GFP_WAIT | __GFP_IO | __GFP_FS | __GFP_HARDWALL)
++#define GFP_HIGHUSER	(__GFP_WAIT | __GFP_IO | __GFP_FS | __GFP_HARDWALL | \
++			 __GFP_HIGHMEM)
++
++/* Flag - indicates that the buffer will be suitable for DMA.  Ignored on some
++   platforms, used as appropriate on others */
++
++#define GFP_DMA		__GFP_DMA
++
++#endif
+Index: 2.6/test/include/asm/processor.h
+===================================================================
+--- /dev/null
++++ 2.6/test/include/asm/processor.h
+@@ -0,0 +1,4 @@
++#ifndef __LINUX_PROCESSOR_H
++#define __LINUX_PROCESSOR_H
++
++#endif
+Index: 2.6/test/include/linux/compiler-gcc3.h
+===================================================================
+--- /dev/null
++++ 2.6/test/include/linux/compiler-gcc3.h
+@@ -0,0 +1,30 @@
++/* Never include this file directly.  Include <linux/compiler.h> instead.  */
++
++/* These definitions are for GCC v3.x.  */
++#include <linux/compiler-gcc.h>
++
++#if __GNUC_MINOR__ >= 1
++# define inline		inline		__attribute__((always_inline))
++# define __inline__	__inline__	__attribute__((always_inline))
++# define __inline	__inline	__attribute__((always_inline))
++#endif
++
++#if __GNUC_MINOR__ > 0
++# define __deprecated		__attribute__((deprecated))
++#endif
++
++#if __GNUC_MINOR__ >= 3
++#else
++# define __attribute_used__	__attribute__((__unused__))
++#endif
++
++#define __attribute_const__	__attribute__((__const__))
++
++#if __GNUC_MINOR__ >= 1
++#define  noinline		__attribute__((noinline))
++#endif
++
++#if __GNUC_MINOR__ >= 4
++#define __must_check		__attribute__((warn_unused_result))
++#endif
++
+Index: 2.6/test/include/asm/system.h
+===================================================================
+--- /dev/null
++++ 2.6/test/include/asm/system.h
+@@ -0,0 +1,7 @@
++#ifndef __LINUX_SYSTEM_H
++#define __LINUX_SYSTEM_H
++
++#define smp_wmb(x) x
++#define cmpxchg(ptr,o,n)
++
++#endif
+Index: 2.6/test/include/asm/bug.h
+===================================================================
+--- /dev/null
++++ 2.6/test/include/asm/bug.h
+@@ -0,0 +1,13 @@
++#ifndef _I386_BUG_H
++#define _I386_BUG_H
++
++#include <linux/config.h>
++#include <assert.h>
++
++#define HAVE_ARCH_BUG
++#define BUG() assert(!"bug")
++#define HAVE_ARCH_BUG_ON
++#define BUG_ON(cond) assert(!cond)
++
++#include <asm-generic/bug.h>
++#endif
+Index: 2.6/test/include/linux/mm.h
+===================================================================
+--- /dev/null
++++ 2.6/test/include/linux/mm.h
+@@ -0,0 +1,41 @@
++#ifndef __MM_H
++#define __MM_H
++
++#include <linux/types.h>
++#include <linux/gfp.h>
++#include <linux/list.h>
++#include <linux/mmzone.h>
++#include <linux/errno.h>
++#include <linux/sched.h>
++#include <asm/pgtable.h>
++
++struct page {
++	unsigned long flags;
++	void *virtual;
++	struct list_head lru;
++	struct list_head memory_map;
++	unsigned int order;
++};
++
++#define high_memory (~0UL)
++
++#define PageSlab(page) (page->flags & 0x01)
++#define SetPageSlab(page) do { page->flags |= 0x01; } while (0)
++#define ClearPageSlab(page) do { page->flags &= ~0x01; } while (0)
++
++#define add_page_state(member,delta)
++#define sub_page_state(member,delta)
++
++static inline int TestClearPageSlab(struct page *page)
++{
++	int ret = page->flags;
++	ClearPageSlab(page);
++	return ret;
++}
++
++#define page_address(page) (page->virtual)
++
++extern struct page *alloc_pages(gfp_t, unsigned int);
++extern void free_pages(unsigned long, unsigned int);
++
++#endif
+Index: 2.6/include/linux/kmem.h
+===================================================================
+--- /dev/null
++++ 2.6/include/linux/kmem.h
+@@ -0,0 +1,242 @@
++/*
++ * include/linux/kmem.h - An object-caching memory allocator.
++ *
++ * Copyright (C) 2005 Pekka Enberg
++ *
++ * This file is released under the GPLv2.
++ */
++
++#ifndef __LINUX_KMEM_H
++#define __LINUX_KMEM_H
++
++#include <linux/config.h>
++#include <linux/kernel.h>
++#include <linux/gfp.h>
++#include <linux/init.h>
++#include <linux/types.h>
++#include <linux/list.h>
++#include <linux/spinlock.h>
++
++#include <asm/cache.h>
++#include <asm/page.h>
++
++/*
++ *	Object-Caching Allocator
++ */
++
++struct kmem_bufctl {
++	void *addr;
++	void *next;
++};
++
++/**
++ * struct kmem_slab - contiguous memory carved up into equal-sized chunks.
++ *
++ * @list: List head used by object cache slab lists.
++ * @mem: Pointer to the beginning of a contiguous memory block.
++ * @nr_available: Number of available objects.
++ * @free: A pointer to bufctl of next free object.
++ *
++ * A slab consist of one or more pages of contiguous memory carved up into
++ * equal-sized chunks.
++ */
++struct kmem_slab {
++	struct list_head list;
++	void *mem;
++	size_t nr_available;
++	struct kmem_bufctl *free;
++};
++
++enum { MAX_ROUNDS = 10 };
++
++/**
++ * struct kmem_magazine - a stack of objects.
++ *
++ * @rounds: Number of objects available for allocation.
++ * @objs: Objects in this magazine.
++ * @list: List head used by object cache depot magazine lists.
++ *
++ * A magazine contains a stack of objects. It is used as a per-CPU data
++ * structure that can satisfy M allocations without a need for a global
++ * lock.
++ */
++struct kmem_magazine {
++	size_t rounds;
++	void *objs[MAX_ROUNDS];
++	struct list_head list;
++};
++
++struct kmem_cpu_cache {
++	spinlock_t lock;
++	struct kmem_magazine *loaded;
++	struct kmem_magazine *prev;
++};
++
++struct kmem_cache_statistics {
++	unsigned long grown;
++	unsigned long reaped;
++};
++
++struct kmem_cache;
++
++typedef void (*kmem_ctor_fn)(void *, struct kmem_cache *, unsigned long);
++typedef void (*kmem_dtor_fn)(void *, struct kmem_cache *, unsigned long);
++
++/**
++ * An object cache for equal-sized objects. An cache consists of per-CPU
++ * magazines, a depot, and a list of slabs.
++ *
++ * @lists_lock: A lock protecting full_slabs, partia_slabs, empty_slabs,
++ * 	full_magazines, and empty_magazines lists.
++ * @slabs: List of slabs that contain free buffers.
++ * @empty_slabs: List of slabs do not contain any free buffers.
++ * @full_magazines: List of magazines that can contain objects.
++ * @empty_magazines: List of empty magazines that do not contain any objects.
++ */
++struct kmem_cache {
++	struct kmem_cpu_cache cpu_cache[NR_CPUS];
++	size_t objsize;
++	gfp_t gfp_flags;
++	unsigned int slab_capacity;
++	unsigned int cache_order;
++	spinlock_t lists_lock;
++	struct list_head full_slabs;
++	struct list_head partial_slabs;
++	struct list_head empty_slabs;
++	struct list_head full_magazines;
++	struct list_head empty_magazines;
++	struct kmem_cache_statistics stats;
++	kmem_ctor_fn ctor;
++	kmem_ctor_fn dtor;
++	const char *name;
++	struct list_head next;
++	unsigned long active_objects;
++	unsigned long free_objects;
++};
++
++typedef struct kmem_cache kmem_cache_t;
++
++extern void kmem_cache_init(void);
++extern void kmem_cache_release(void);
++extern struct kmem_cache *kmem_cache_create(const char *, size_t, size_t,
++					    unsigned long, kmem_ctor_fn,
++					    kmem_ctor_fn);
++extern int kmem_cache_destroy(struct kmem_cache *);
++extern int kmem_cache_shrink(struct kmem_cache *);
++extern const char *kmem_cache_name(struct kmem_cache *cache);
++extern void *kmem_cache_alloc(struct kmem_cache *, gfp_t);
++extern void *kmem_cache_alloc_node(kmem_cache_t *, unsigned int __nocast, int);
++extern void kmem_cache_free(struct kmem_cache *, void *);
++
++/* Flags passd to kmem_cache_alloc().  */
++#define	SLAB_NOFS	GFP_NOFS
++#define	SLAB_NOIO	GFP_NOIO
++#define	SLAB_ATOMIC	GFP_ATOMIC
++#define	SLAB_USER	GFP_USER
++#define	SLAB_KERNEL	GFP_KERNEL
++#define	SLAB_DMA	GFP_DMA
++
++/* Flags passed to kmem_cache_create(). The first three are only valid when
++ * the allocator as been build with SLAB_DEBUG_SUPPORT.
++ */
++#define	SLAB_DEBUG_FREE		0x00000100UL	/* Peform (expensive) checks on free */
++#define	SLAB_DEBUG_INITIAL	0x00000200UL	/* Call constructor (as verifier) */
++#define	SLAB_RED_ZONE		0x00000400UL	/* Red zone objs in a cache */
++#define	SLAB_POISON		0x00000800UL	/* Poison objects */
++#define	SLAB_NO_REAP		0x00001000UL	/* never reap from the cache */
++#define	SLAB_HWCACHE_ALIGN	0x00002000UL	/* align objs on a h/w cache lines */
++#define SLAB_CACHE_DMA		0x00004000UL	/* use GFP_DMA memory */
++#define SLAB_MUST_HWCACHE_ALIGN	0x00008000UL	/* force alignment */
++#define SLAB_STORE_USER		0x00010000UL	/* store the last owner for bug hunting */
++#define SLAB_RECLAIM_ACCOUNT	0x00020000UL	/* track pages allocated to indicate
++						   what is reclaimable later*/
++#define SLAB_PANIC		0x00040000UL	/* panic if kmem_cache_create() fails */
++#define SLAB_DESTROY_BY_RCU	0x00080000UL	/* defer freeing pages to RCU */
++
++/* Flags passed to a constructor function.  */
++#define	SLAB_CTOR_CONSTRUCTOR	0x001UL		/* if not set, then deconstructor */
++#define SLAB_CTOR_ATOMIC	0x002UL		/* tell constructor it can't sleep */
++#define	SLAB_CTOR_VERIFY	0x004UL		/* tell constructor it's a verify call */
++
++extern int FASTCALL(kmem_ptr_validate(struct kmem_cache *cachep, void *ptr));
++
++
++/*
++ *	General purpose allocator
++ */
++
++extern void kmalloc_init(void);
++
++struct cache_sizes {
++	size_t cs_size;
++	struct kmem_cache *cs_cache, *cs_dma_cache;
++};
++
++extern struct cache_sizes malloc_sizes[];
++
++extern void *kmalloc_node(size_t size, unsigned int __nocast flags, int node);
++extern void *__kmalloc(size_t, gfp_t);
++
++static inline void *kmalloc(size_t size, gfp_t flags)
++{
++	if (__builtin_constant_p(size)) {
++		int i = 0;
++#define CACHE(x) \
++		if (size <= x) \
++			goto found; \
++		else \
++			i++;
++#include <linux/kmalloc_sizes.h>
++#undef CACHE
++		{
++			extern void __you_cannot_kmalloc_that_much(void);
++			__you_cannot_kmalloc_that_much();
++		}
++found:
++		return kmem_cache_alloc((flags & GFP_DMA) ?
++			malloc_sizes[i].cs_dma_cache :
++			malloc_sizes[i].cs_cache, flags);
++	}
++	return __kmalloc(size, flags);
++}
++
++extern void *kzalloc(size_t, gfp_t);
++
++/**
++ * kcalloc - allocate memory for an array. The memory is set to zero.
++ * @n: number of elements.
++ * @size: element size.
++ * @flags: the type of memory to allocate.
++ */
++static inline void *kcalloc(size_t n, size_t size, gfp_t flags)
++{
++	if (n != 0 && size > INT_MAX / n)
++		return NULL;
++	return kzalloc(n * size, flags);
++}
++
++extern void kfree(const void *);
++extern unsigned int ksize(const void *);
++
++
++/*
++ *	System wide caches
++ */
++
++extern struct kmem_cache *vm_area_cachep;
++extern struct kmem_cache *names_cachep;
++extern struct kmem_cache *files_cachep;
++extern struct kmem_cache *filp_cachep;
++extern struct kmem_cache *fs_cachep;
++extern struct kmem_cache *signal_cachep;
++extern struct kmem_cache *sighand_cachep;
++extern struct kmem_cache *bio_cachep;
++
++
++/*
++ * 	???
++ */
++
++extern atomic_t slab_reclaim_pages;
++
++#endif
+Index: 2.6/mm/Makefile
+===================================================================
+--- 2.6.orig/mm/Makefile
++++ 2.6/mm/Makefile
+@@ -9,7 +9,7 @@ mmu-$(CONFIG_MMU)	:= fremap.o highmem.o 
+ 
+ obj-y			:= bootmem.o filemap.o mempool.o oom_kill.o fadvise.o \
+ 			   page_alloc.o page-writeback.o pdflush.o \
+-			   readahead.o slab.o swap.o truncate.o vmscan.o \
++			   readahead.o kmem.o kmalloc.o swap.o truncate.o vmscan.o \
+ 			   prio_tree.o $(mmu-y)
+ 
+ obj-$(CONFIG_SWAP)	+= page_io.o swap_state.o swapfile.o thrash.o
+Index: 2.6/test/include/stdlib.h
+===================================================================
+--- /dev/null
++++ 2.6/test/include/stdlib.h
+@@ -0,0 +1,11 @@
++#ifndef __STDLIB_H
++#define __STDLIB_H
++
++#include <stddef.h>
++
++extern void *malloc(size_t);
++extern void *calloc(size_t, size_t);
++extern void free(void *);
++extern void *realloc(void *, size_t);
++
++#endif
+Index: 2.6/test/mm/page_alloc.c
+===================================================================
+--- /dev/null
++++ 2.6/test/mm/page_alloc.c
+@@ -0,0 +1,44 @@
++#include <linux/kernel.h>
++#include <linux/mm.h>
++#include <linux/string.h>
++#include <linux/list.h>
++
++#include <asm/page.h>
++
++#include <stdlib.h>
++
++static LIST_HEAD(pages);
++
++struct page *__virt_to_page(unsigned long addr)
++{
++	struct page *page;
++
++	list_for_each_entry(page, &pages, memory_map) {
++		unsigned long virtual = (unsigned long) page->virtual;
++
++		if (virtual <= addr && addr < virtual+(1<<page->order)*PAGE_SIZE)
++			return page;
++	}
++	return NULL;
++}
++
++struct page *alloc_pages(gfp_t flags, unsigned int order)
++{
++	unsigned long nr_pages = 1<<order;
++	struct page *page = malloc(sizeof(*page));
++	memset(page, 0, sizeof(*page));
++	page->order = order;
++	page->virtual = calloc(nr_pages, PAGE_SIZE);
++	INIT_LIST_HEAD(&page->memory_map);
++	list_add(&page->memory_map, &pages);
++	return page;
++}
++
++void free_pages(unsigned long addr, unsigned int order)
++{
++	struct page *page = virt_to_page(addr);
++	free(page->virtual);
++	free(page);
++}
++
++
+Index: 2.6/include/linux/slab.h
+===================================================================
+--- 2.6.orig/include/linux/slab.h
++++ 2.6/include/linux/slab.h
+@@ -1,151 +1,6 @@
+-/*
+- * linux/mm/slab.h
+- * Written by Mark Hemment, 1996.
+- * (markhe@nextd.demon.co.uk)
+- */
+-
+ #ifndef _LINUX_SLAB_H
+ #define	_LINUX_SLAB_H
+ 
+-#if	defined(__KERNEL__)
+-
+-typedef struct kmem_cache kmem_cache_t;
+-
+-#include	<linux/config.h>	/* kmalloc_sizes.h needs CONFIG_ options */
+-#include	<linux/gfp.h>
+-#include	<linux/init.h>
+-#include	<linux/types.h>
+-#include	<asm/page.h>		/* kmalloc_sizes.h needs PAGE_SIZE */
+-#include	<asm/cache.h>		/* kmalloc_sizes.h needs L1_CACHE_BYTES */
+-
+-/* flags for kmem_cache_alloc() */
+-#define	SLAB_NOFS		GFP_NOFS
+-#define	SLAB_NOIO		GFP_NOIO
+-#define	SLAB_ATOMIC		GFP_ATOMIC
+-#define	SLAB_USER		GFP_USER
+-#define	SLAB_KERNEL		GFP_KERNEL
+-#define	SLAB_DMA		GFP_DMA
+-
+-#define SLAB_LEVEL_MASK		GFP_LEVEL_MASK
+-
+-#define	SLAB_NO_GROW		__GFP_NO_GROW	/* don't grow a cache */
+-
+-/* flags to pass to kmem_cache_create().
+- * The first 3 are only valid when the allocator as been build
+- * SLAB_DEBUG_SUPPORT.
+- */
+-#define	SLAB_DEBUG_FREE		0x00000100UL	/* Peform (expensive) checks on free */
+-#define	SLAB_DEBUG_INITIAL	0x00000200UL	/* Call constructor (as verifier) */
+-#define	SLAB_RED_ZONE		0x00000400UL	/* Red zone objs in a cache */
+-#define	SLAB_POISON		0x00000800UL	/* Poison objects */
+-#define	SLAB_NO_REAP		0x00001000UL	/* never reap from the cache */
+-#define	SLAB_HWCACHE_ALIGN	0x00002000UL	/* align objs on a h/w cache lines */
+-#define SLAB_CACHE_DMA		0x00004000UL	/* use GFP_DMA memory */
+-#define SLAB_MUST_HWCACHE_ALIGN	0x00008000UL	/* force alignment */
+-#define SLAB_STORE_USER		0x00010000UL	/* store the last owner for bug hunting */
+-#define SLAB_RECLAIM_ACCOUNT	0x00020000UL	/* track pages allocated to indicate
+-						   what is reclaimable later*/
+-#define SLAB_PANIC		0x00040000UL	/* panic if kmem_cache_create() fails */
+-#define SLAB_DESTROY_BY_RCU	0x00080000UL	/* defer freeing pages to RCU */
+-
+-/* flags passed to a constructor func */
+-#define	SLAB_CTOR_CONSTRUCTOR	0x001UL		/* if not set, then deconstructor */
+-#define SLAB_CTOR_ATOMIC	0x002UL		/* tell constructor it can't sleep */
+-#define	SLAB_CTOR_VERIFY	0x004UL		/* tell constructor it's a verify call */
+-
+-/* prototypes */
+-extern void __init kmem_cache_init(void);
+-
+-extern kmem_cache_t *kmem_cache_create(const char *, size_t, size_t, unsigned long,
+-				       void (*)(void *, kmem_cache_t *, unsigned long),
+-				       void (*)(void *, kmem_cache_t *, unsigned long));
+-extern int kmem_cache_destroy(kmem_cache_t *);
+-extern int kmem_cache_shrink(kmem_cache_t *);
+-extern void *kmem_cache_alloc(kmem_cache_t *, gfp_t);
+-extern void kmem_cache_free(kmem_cache_t *, void *);
+-extern unsigned int kmem_cache_size(kmem_cache_t *);
+-extern const char *kmem_cache_name(kmem_cache_t *);
+-extern kmem_cache_t *kmem_find_general_cachep(size_t size, gfp_t gfpflags);
+-
+-/* Size description struct for general caches. */
+-struct cache_sizes {
+-	size_t		 cs_size;
+-	kmem_cache_t	*cs_cachep;
+-	kmem_cache_t	*cs_dmacachep;
+-};
+-extern struct cache_sizes malloc_sizes[];
+-extern void *__kmalloc(size_t, gfp_t);
+-
+-static inline void *kmalloc(size_t size, gfp_t flags)
+-{
+-	if (__builtin_constant_p(size)) {
+-		int i = 0;
+-#define CACHE(x) \
+-		if (size <= x) \
+-			goto found; \
+-		else \
+-			i++;
+-#include "kmalloc_sizes.h"
+-#undef CACHE
+-		{
+-			extern void __you_cannot_kmalloc_that_much(void);
+-			__you_cannot_kmalloc_that_much();
+-		}
+-found:
+-		return kmem_cache_alloc((flags & GFP_DMA) ?
+-			malloc_sizes[i].cs_dmacachep :
+-			malloc_sizes[i].cs_cachep, flags);
+-	}
+-	return __kmalloc(size, flags);
+-}
+-
+-extern void *kzalloc(size_t, gfp_t);
+-
+-/**
+- * kcalloc - allocate memory for an array. The memory is set to zero.
+- * @n: number of elements.
+- * @size: element size.
+- * @flags: the type of memory to allocate.
+- */
+-static inline void *kcalloc(size_t n, size_t size, gfp_t flags)
+-{
+-	if (n != 0 && size > INT_MAX / n)
+-		return NULL;
+-	return kzalloc(n * size, flags);
+-}
+-
+-extern void kfree(const void *);
+-extern unsigned int ksize(const void *);
+-
+-#ifdef CONFIG_NUMA
+-extern void *kmem_cache_alloc_node(kmem_cache_t *, gfp_t flags, int node);
+-extern void *kmalloc_node(size_t size, gfp_t flags, int node);
+-#else
+-static inline void *kmem_cache_alloc_node(kmem_cache_t *cachep, gfp_t flags, int node)
+-{
+-	return kmem_cache_alloc(cachep, flags);
+-}
+-static inline void *kmalloc_node(size_t size, gfp_t flags, int node)
+-{
+-	return kmalloc(size, flags);
+-}
+-#endif
+-
+-extern int FASTCALL(kmem_cache_reap(int));
+-extern int FASTCALL(kmem_ptr_validate(kmem_cache_t *cachep, void *ptr));
+-
+-/* System wide caches */
+-extern kmem_cache_t	*vm_area_cachep;
+-extern kmem_cache_t	*names_cachep;
+-extern kmem_cache_t	*files_cachep;
+-extern kmem_cache_t	*filp_cachep;
+-extern kmem_cache_t	*fs_cachep;
+-extern kmem_cache_t	*signal_cachep;
+-extern kmem_cache_t	*sighand_cachep;
+-extern kmem_cache_t	*bio_cachep;
+-
+-extern atomic_t slab_reclaim_pages;
+-
+-#endif	/* __KERNEL__ */
++#include <linux/kmem.h>
+ 
+ #endif	/* _LINUX_SLAB_H */
+Index: 2.6/test/include/asm/page.h
+===================================================================
+--- /dev/null
++++ 2.6/test/include/asm/page.h
+@@ -0,0 +1,15 @@
++#ifndef __LINUX_PAGE_H
++#define __LINUX_PAGE_H
++
++#include <linux/mm.h>
++
++#define PAGE_OFFSET 0
++#define PAGE_SHIFT 12
++#define PAGE_SIZE 4096
++#define PAGE_MASK    (~(PAGE_SIZE-1))
++
++#define virt_to_page(addr) __virt_to_page((unsigned long) addr)
++
++extern struct page *__virt_to_page(unsigned long);
++
++#endif
+Index: 2.6/test/include/linux/spinlock.h
+===================================================================
+--- /dev/null
++++ 2.6/test/include/linux/spinlock.h
+@@ -0,0 +1,14 @@
++#ifndef __LINUX_SPINLOCK_H
++#define __LINUX_SPINLOCK_H
++
++#include <asm/atomic.h>
++
++typedef int spinlock_t;
++
++#define spin_lock_init(x)
++#define spin_lock_irqsave(x, y) (y = 1)
++#define spin_unlock_irqrestore(x, y) (y = 0)
++#define spin_lock(x)
++#define spin_unlock(x)
++
++#endif
+Index: 2.6/test/include/linux/mmzone.h
+===================================================================
+--- /dev/null
++++ 2.6/test/include/linux/mmzone.h
+@@ -0,0 +1,8 @@
++#ifndef __LINUX_MMZONE_H
++#define __LINUX_MMZONE_H
++
++#include <linux/threads.h>
++
++#define MAX_ORDER 11
++
++#endif
+Index: 2.6/test/include/linux/threads.h
+===================================================================
+--- /dev/null
++++ 2.6/test/include/linux/threads.h
+@@ -0,0 +1,6 @@
++#ifndef __LINUX_THREADS_H
++#define __LINUX_THREADS_H
++
++#define NR_CPUS 1
++
++#endif
+Index: 2.6/test/include/linux/module.h
+===================================================================
+--- /dev/null
++++ 2.6/test/include/linux/module.h
+@@ -0,0 +1,7 @@
++#ifndef __LINUX_MODULE_H
++#define __LINUX_MODULE_H
++
++#define EXPORT_SYMBOL(x)
++#define EXPORT_SYMBOL_GPL(x)
++
++#endif
+Index: 2.6/test/kernel/panic.c
+===================================================================
+--- /dev/null
++++ 2.6/test/kernel/panic.c
+@@ -0,0 +1,6 @@
++extern void abort(void);
++
++void panic(const char * fmt, ...)
++{
++	abort();
++}
+Index: 2.6/test/include/asm/pgtable.h
+===================================================================
+--- /dev/null
++++ 2.6/test/include/asm/pgtable.h
+@@ -0,0 +1,6 @@
++#ifndef __ASM_PGTABLE_H
++#define __ASM_PGTABLE_H
++
++#define kern_addr_valid(addr)    (1)
++
++#endif
+Index: 2.6/test/include/asm/semaphore.h
+===================================================================
+--- /dev/null
++++ 2.6/test/include/asm/semaphore.h
+@@ -0,0 +1,24 @@
++#ifndef __ASM_SEMAPHORE_H
++#define __ASM_SEMAPHORE_H
++
++struct semaphore {
++};
++
++static inline void init_MUTEX(struct semaphore *sem)
++{
++}
++
++static inline void up(struct semaphore *sem)
++{
++}
++
++static inline void down(struct semaphore *sem)
++{
++}
++
++static inline int down_trylock(struct semaphore *sem)
++{
++	return 1;
++}
++
++#endif
+Index: 2.6/test/include/asm/uaccess.h
+===================================================================
+--- /dev/null
++++ 2.6/test/include/asm/uaccess.h
+@@ -0,0 +1,4 @@
++#ifndef __ASM_UACCESS_H
++#define __ASM_UACCESS_H
++
++#endif
+Index: 2.6/test/include/linux/config.h
+===================================================================
+--- /dev/null
++++ 2.6/test/include/linux/config.h
+@@ -0,0 +1,8 @@
++#ifndef __LINUX_CONFIG_H
++#define __LINUX_CONFIG_H
++
++#include <linux/autoconf.h>
++
++#undef CONFIG_PROC_FS
++
++#endif
+Index: 2.6/test/include/linux/seq_file.h
+===================================================================
+--- /dev/null
++++ 2.6/test/include/linux/seq_file.h
+@@ -0,0 +1,4 @@
++#ifndef __LINUX_SEQFILE_H
++#define __LINUX_SEQFILE_H
++
++#endif
+Index: 2.6/test/include/asm/param.h
+===================================================================
+--- /dev/null
++++ 2.6/test/include/asm/param.h
+@@ -0,0 +1,6 @@
++#ifndef __ASM_PARAM_H
++#define __ASM_PARAM_H
++
++#define HZ 100
++
++#endif
+Index: 2.6/test/include/asm/percpu.h
+===================================================================
+--- /dev/null
++++ 2.6/test/include/asm/percpu.h
+@@ -0,0 +1,6 @@
++#ifndef __ARCH_I386_PERCPU__
++#define __ARCH_I386_PERCPU__
++
++#include <asm-generic/percpu.h>
++
++#endif /* __ARCH_I386_PERCPU__ */
+Index: 2.6/test/include/linux/sched.h
+===================================================================
+--- /dev/null
++++ 2.6/test/include/linux/sched.h
+@@ -0,0 +1,7 @@
++#ifndef __LINUX_SCHED_H
++#define __LINUX_SCHED_H
++
++#include <linux/cpumask.h>
++#include <asm/param.h>
++
++#endif
+Index: 2.6/test/kernel/timer.c
+===================================================================
+--- /dev/null
++++ 2.6/test/kernel/timer.c
+@@ -0,0 +1,5 @@
++#include <linux/timer.h>
++
++void fastcall init_timer(struct timer_list *timer)
++{
++}
+Index: 2.6/test/kernel/workqueue.c
+===================================================================
+--- /dev/null
++++ 2.6/test/kernel/workqueue.c
+@@ -0,0 +1,17 @@
++#include <linux/workqueue.h>
++
++int keventd_up(void)
++{
++	return 1;
++}
++
++int fastcall schedule_delayed_work(struct work_struct *work, unsigned long delay)
++{
++	return 1;
++}
++
++int schedule_delayed_work_on(int cpu,
++			struct work_struct *work, unsigned long delay)
++{
++	return 1;
++}
+Index: 2.6/test/include/asm/thread_info.h
+===================================================================
+--- /dev/null
++++ 2.6/test/include/asm/thread_info.h
+@@ -0,0 +1,13 @@
++#ifndef __ASM_THREADINFO_H
++#define __ASM_THREADINFO_H
++
++#include <linux/config.h>
++#include <linux/compiler.h>
++#include <asm/page.h>
++#include <asm/processor.h>
++
++struct thread_info {
++	unsigned long flags;
++};
++
++#endif

@@ -1,0 +1,598 @@
+Date: Sun, 8 Aug 1999 20:34:58 +0200 (CEST)
+From: Andrea Arcangeli <>
+Subject: [patch] page-lru against 2.3.13-pre8
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/8/9/75
+
+I ported the minimal page-lru code to 2.3.13-pre8 because I noticed that
+between 2.3.12 and 2.3.13-pre8 some related change (one from me ;) caused
+the original patch to not apply cleanly.
+The new page-lru patch is equivalent of the previous page_lru-2.3.12-H
+patch.
+Andrea
+diff -urN 2.3.13-pre8/fs/buffer.c 2.3.13-pre8-lru/fs/buffer.c
+--- 2.3.13-pre8/fs/buffer.c	Sun Aug  8 17:21:37 1999
++++ 2.3.13-pre8-lru/fs/buffer.c	Sun Aug  8 20:08:19 1999
+@@ -1247,7 +1247,7 @@
+ 	if (!PageLocked(page))
+ 		BUG();
+ 	if (!page->buffers)
+-		return 0;
++		return 1;
+ 
+ 	head = page->buffers;
+ 	bh = head;
+@@ -1288,10 +1288,13 @@
+ 	 */
+ 	if (!offset) {
+ 		if (!try_to_free_buffers(page))
++		{
+ 			atomic_add(PAGE_CACHE_SIZE, &buffermem);
++			return 0;
++		}
+ 	}
+ 
+-	return 0;
++	return 1;
+ }
+ 
+ static void create_empty_buffers(struct page *page, struct inode *inode, unsigned long blocksize)
+@@ -1899,6 +1902,7 @@
+ static int grow_buffers(int size)
+ {
+ 	unsigned long page;
++	struct page * page_map;
+ 	struct buffer_head *bh, *tmp;
+ 	struct buffer_head * insert_point;
+ 	int isize;
+@@ -1941,7 +1945,9 @@
+ 	free_list[isize].list = bh;
+ 	spin_unlock(&free_list[isize].lock);
+ 
+-	mem_map[MAP_NR(page)].buffers = bh;
++	page_map = mem_map + MAP_NR(page);
++	page_map->buffers = bh;
++	lru_cache_add(page_map);
+ 	atomic_add(PAGE_SIZE, &buffermem);
+ 	return 1;
+ }
+diff -urN 2.3.13-pre8/fs/dcache.c 2.3.13-pre8-lru/fs/dcache.c
+--- 2.3.13-pre8/fs/dcache.c	Tue Jul 13 02:01:39 1999
++++ 2.3.13-pre8-lru/fs/dcache.c	Sun Aug  8 20:08:19 1999
+@@ -20,6 +20,7 @@
+ #include <linux/malloc.h>
+ #include <linux/slab.h>
+ #include <linux/init.h>
++#include <linux/smp_lock.h>
+ 
+ #include <asm/uaccess.h>
+ 
+@@ -473,9 +474,11 @@
+ {
+ 	if (gfp_mask & __GFP_IO) {
+ 		int count = 0;
++		lock_kernel();
+ 		if (priority)
+ 			count = dentry_stat.nr_unused / priority;
+ 		prune_dcache(count);
++		unlock_kernel();
+ 	}
+ }
+ 
+diff -urN 2.3.13-pre8/include/linux/mm.h 2.3.13-pre8-lru/include/linux/mm.h
+--- 2.3.13-pre8/include/linux/mm.h	Wed Aug  4 12:28:17 1999
++++ 2.3.13-pre8-lru/include/linux/mm.h	Sun Aug  8 20:13:34 1999
+@@ -125,6 +125,7 @@
+ 	struct page *next_hash;
+ 	atomic_t count;
+ 	unsigned long flags;	/* atomic flags, some possibly updated asynchronously */
++	struct list_head lru;
+ 	wait_queue_head_t wait;
+ 	struct page **pprev_hash;
+ 	struct buffer_head * buffers;
+diff -urN 2.3.13-pre8/include/linux/swap.h 2.3.13-pre8-lru/include/linux/swap.h
+--- 2.3.13-pre8/include/linux/swap.h	Sun Aug  8 19:41:44 1999
++++ 2.3.13-pre8-lru/include/linux/swap.h	Sun Aug  8 20:13:34 1999
+@@ -64,6 +64,8 @@
+ 
+ extern int nr_swap_pages;
+ extern int nr_free_pages;
++extern int nr_lru_pages;
++extern struct list_head lru_cache;
+ extern atomic_t nr_async_pages;
+ extern struct inode swapper_inode;
+ extern atomic_t page_cache_size;
+@@ -160,6 +162,27 @@
+ 		count--;
+ 	return  count > 1;
+ }
++
++extern spinlock_t pagemap_lru_lock;
++
++/*
++ * Helper macros for lru_pages handling.
++ */
++#define	lru_cache_add(page)			\
++do {						\
++	spin_lock(&pagemap_lru_lock);		\
++	list_add(&(page)->lru, &lru_cache);	\
++	nr_lru_pages++;				\
++	spin_unlock(&pagemap_lru_lock);		\
++} while (0)
++
++#define	lru_cache_del(page)			\
++do {						\
++	spin_lock(&pagemap_lru_lock);		\
++	list_del(&(page)->lru);			\
++	nr_lru_pages--;				\
++	spin_unlock(&pagemap_lru_lock);		\
++} while (0)
+ 
+ #endif /* __KERNEL__*/
+ 
+diff -urN 2.3.13-pre8/ipc/shm.c 2.3.13-pre8-lru/ipc/shm.c
+--- 2.3.13-pre8/ipc/shm.c	Sun Aug  8 17:21:41 1999
++++ 2.3.13-pre8-lru/ipc/shm.c	Sun Aug  8 20:08:19 1999
+@@ -719,10 +719,12 @@
+ 	int loop = 0;
+ 	int counter;
+ 	struct page * page_map;
++	int ret = 0;
+ 	
++	lock_kernel();
+ 	counter = shm_rss >> prio;
+ 	if (!counter || !(swap_nr = get_swap_page()))
+-		return 0;
++		goto out_unlock;
+ 
+  check_id:
+ 	shp = shm_segs[swap_id];
+@@ -755,7 +757,7 @@
+ 	if (--counter < 0) { /* failed */
+ 		failed:
+ 		swap_free (swap_nr);
+-		return 0;
++		goto out_unlock;
+ 	}
+ 	if (page_count(mem_map + MAP_NR(pte_page(page))) != 1)
+ 		goto check_table;
+@@ -768,7 +770,10 @@
+ 	swap_successes++;
+ 	shm_swp++;
+ 	shm_rss--;
+-	return 1;
++	ret = 1;
++ out_unlock:
++	unlock_kernel();
++	return ret;
+ }
+ 
+ /*
+diff -urN 2.3.13-pre8/mm/filemap.c 2.3.13-pre8-lru/mm/filemap.c
+--- 2.3.13-pre8/mm/filemap.c	Sun Aug  8 17:21:41 1999
++++ 2.3.13-pre8-lru/mm/filemap.c	Sun Aug  8 20:08:19 1999
+@@ -33,6 +33,8 @@
+  *
+  * finished 'unifying' the page and buffer cache and SMP-threaded the
+  * page-cache, 21.05.1999, Ingo Molnar <mingo@redhat.com>
++ *
++ * SMP-threaded pagemap-LRU 1999, Andrea Arcangeli <andrea@suse.de>
+  */
+ 
+ atomic_t page_cache_size = ATOMIC_INIT(0);
+@@ -40,6 +42,11 @@
+ struct page **page_hash_table;
+ 
+ spinlock_t pagecache_lock = SPIN_LOCK_UNLOCKED;
++/*
++ * NOTE: to avoid deadlocking you must never acquire the pagecache_lock with
++ *       the pagemap_lru_lock held.
++ */
++spinlock_t pagemap_lru_lock = SPIN_LOCK_UNLOCKED;
+ 
+ 
+ void __add_page_to_hash_queue(struct page * page, struct page **p)
+@@ -117,6 +124,7 @@
+ 		}
+ 		if (page_count(page) != 2)
+ 			printk("hm, busy page invalidated? (not necesserily a bug)\n");
++		lru_cache_del(page);
+ 
+ 		remove_page_from_inode_queue(page);
+ 		remove_page_from_hash_queue(page);
+@@ -151,8 +159,9 @@
+ 
+ 			lock_page(page);
+ 
+-			if (inode->i_op->flushpage)
+-				inode->i_op->flushpage(inode, page, 0);
++			if (!inode->i_op->flushpage ||
++			    inode->i_op->flushpage(inode, page, 0))
++				lru_cache_del(page);
+ 
+ 			/*
+ 			 * We remove the page from the page cache
+@@ -216,81 +225,61 @@
+ 
+ int shrink_mmap(int priority, int gfp_mask)
+ {
+-	static unsigned long clock = 0;
+-	unsigned long limit = num_physpages << 1;
++	int ret = 0, count;
++	LIST_HEAD(young);
++	LIST_HEAD(old);
++	LIST_HEAD(forget);
++	struct list_head * page_lru, * dispose;
+ 	struct page * page;
+-	int count, users;
+ 
+-	count = limit >> priority;
++	count = nr_lru_pages / (priority+1);
+ 
+-	page = mem_map + clock;
+-	do {
+-		int referenced;
++	spin_lock(&pagemap_lru_lock);
+ 
+-		/* This works even in the presence of PageSkip because
+-		 * the first two entries at the beginning of a hole will
+-		 * be marked, not just the first.
+-		 */
+-		page++;
+-		clock++;
+-		if (clock >= max_mapnr) {
+-			clock = 0;
+-			page = mem_map;
+-		}
+-		if (PageSkip(page)) {
+-			/* next_hash is overloaded for PageSkip */
+-			page = page->next_hash;
+-			clock = page - mem_map;
+-		}
+-		
+-		referenced = test_and_clear_bit(PG_referenced, &page->flags);
++	while (count > 0 && (page_lru = lru_cache.prev) != &lru_cache)
++	{
++		page = list_entry(page_lru, struct page, lru);
++		list_del(page_lru);
++
++		dispose = &lru_cache;
++		if (test_and_clear_bit(PG_referenced, &page->flags))
++			/* Roll the page at the top of the lru list,
++			 * we could also be more aggressive putting
++			 * the page in the young-dispose-list, so
++			 * avoiding to free young pages in each pass.
++			 */
++			goto dispose_continue;
+ 
++		dispose = &old;
++		/* don't account passes over not DMA pages */
+ 		if ((gfp_mask & __GFP_DMA) && !PageDMA(page))
+-			continue;
++			goto dispose_continue;
+ 
+ 		count--;
+ 
+-		/*
+-		 * Some common cases that we just short-circuit without
+-		 * getting the locks - we need to re-check this once we
+-		 * have the lock, but that's fine.
+-		 */
+-		users = page_count(page);
+-		if (!users)
+-			continue;
+-		if (!page->buffers) {
+-			if (!page->inode)
+-				continue;
+-			if (users > 1)
+-				continue;
+-		}
+-
+-		/*
+-		 * ok, now the page looks interesting. Re-check things
+-		 * and keep the lock.
+-		 */
++		dispose = &young;
++		if (TryLockPage(page))
++			goto dispose_continue;
++
++		/* Release the pagemap_lru lock even if the page is not yet
++		   queued in any lru queue since we have just locked down
++		   the page so nobody else may SMP race with us running
++		   a lru_cache_del() (lru_cache_del() always run with the
++		   page locked down ;). */
++		spin_unlock(&pagemap_lru_lock);
++
++		/* avoid unscalable SMP locking */
++		if (!page->buffers && page_count(page) > 1)
++			goto unlock_noput_continue;
++
++		/* Take the pagecache_lock spinlock held to avoid
++		   other tasks to notice the page while we are looking at its
++		   page count. If it's a pagecache-page we'll free it
++		   in one atomic transaction after checking its page count. */
+ 		spin_lock(&pagecache_lock);
+-		if (!page->inode && !page->buffers) {
+-			spin_unlock(&pagecache_lock);
+-			continue;
+-		}
+-		if (!page_count(page)) {
+-			spin_unlock(&pagecache_lock);
+-			BUG();
+-			continue;
+-		}
+-		get_page(page);
+-		if (TryLockPage(page)) {
+-			spin_unlock(&pagecache_lock);
+-			goto put_continue;
+-		}
+ 
+-		/*
+-		 * we keep pagecache_lock locked and unlock it in
+-		 * each branch, so that the page->inode case doesnt
+-		 * have to re-grab it. Here comes the 'real' logic
+-		 * to free memory:
+-		 */
++		/* avoid freeing the page while it's locked */
++		get_page(page);
+ 
+ 		/* Is it a buffer page? */
+ 		if (page->buffers) {
+@@ -301,7 +290,7 @@
+ 			if (!page->inode)
+ 			{
+ 				atomic_sub(PAGE_CACHE_SIZE, &buffermem);
+-				goto made_progress;
++				goto made_buffer_progress;
+ 			}
+ 			spin_lock(&pagecache_lock);
+ 		}
+@@ -311,7 +300,7 @@
+ 		 * (count == 2 because we added one ourselves above).
+ 		 */
+ 		if (page_count(page) != 2)
+-			goto spin_unlock_continue;
++			goto cache_unlock_continue;
+ 
+ 		/*
+ 		 * Is it a page swap page? If so, we want to
+@@ -320,35 +309,68 @@
+ 		 */
+ 		if (PageSwapCache(page)) {
+ 			spin_unlock(&pagecache_lock);
+-			if (referenced && swap_count(page->offset) != 2)
+-				goto unlock_continue;
+ 			__delete_from_swap_cache(page);
+-			page_cache_release(page);
+-			goto made_progress;
++			goto made_inode_progress;
+ 		}	
+ 
+ 		/* is it a page-cache page? */
+-		if (!referenced && page->inode && !pgcache_under_min()) {
+-			remove_page_from_inode_queue(page);
+-			remove_page_from_hash_queue(page);
+-			page->inode = NULL;
+-			spin_unlock(&pagecache_lock);
+-
+-			page_cache_release(page);
+-			goto made_progress;
++		if (page->inode)
++		{
++			dispose = &old;
++			if (!pgcache_under_min())
++			{
++				remove_page_from_inode_queue(page);
++				remove_page_from_hash_queue(page);
++				page->inode = NULL;
++				spin_unlock(&pagecache_lock);
++				goto made_inode_progress;
++			}
++			goto cache_unlock_continue;
+ 		}
+-spin_unlock_continue:
++
++		dispose = &forget;
++		printk(KERN_ERR "shrink_mmap: unknown LRU page!\n");
++
++cache_unlock_continue:
+ 		spin_unlock(&pagecache_lock);
+ unlock_continue:
+ 		UnlockPage(page);
+-put_continue:
+ 		put_page(page);
+-	} while (count > 0);
+-	return 0;
+-made_progress:
++dispose_relock_continue:
++		/* even if the dispose list is local, a truncate_inode_page()
++		   may remove a page from its queue so always
++		   synchronize with the lru lock while accesing the
++		   page->lru field */
++		spin_lock(&pagemap_lru_lock);
++		list_add(page_lru, dispose);
++		continue;
++
++unlock_noput_continue:
++		UnlockPage(page);
++		goto dispose_relock_continue;
++
++dispose_continue:
++		list_add(page_lru, dispose);
++	}
++	goto out;
++
++made_inode_progress:
++	page_cache_release(page);
++made_buffer_progress:
+ 	UnlockPage(page);
+ 	put_page(page);
+-	return 1;
++	ret = 1;
++	spin_lock(&pagemap_lru_lock);
++	/* nr_lru_pages needs the spinlock */
++	nr_lru_pages--;
++
++out:
++	list_splice(&young, &lru_cache);
++	list_splice(&old, lru_cache.prev);
++
++	spin_unlock(&pagemap_lru_lock);
++
++	return ret;
+ }
+ 
+ static inline struct page * __find_page_nolock(struct inode * inode, unsigned long offset, struct page *page)
+@@ -465,13 +487,14 @@
+ {
+ 	unsigned long flags;
+ 
+-	flags = page->flags & ~((1 << PG_uptodate) | (1 << PG_error));
+-	page->flags = flags |  ((1 << PG_locked) | (1 << PG_referenced));
++	flags = page->flags & ~((1 << PG_uptodate) | (1 << PG_error) | (1 << PG_referenced));
++	page->flags = flags | (1 << PG_locked);
+ 	page->owner = current;	/* REMOVEME */
+ 	get_page(page);
+ 	page->offset = offset;
+ 	add_page_to_inode_queue(inode, page);
+ 	__add_page_to_hash_queue(page, hash);
++	lru_cache_add(page);
+ }
+ 
+ void add_to_page_cache(struct page * page, struct inode * inode, unsigned long offset)
+diff -urN 2.3.13-pre8/mm/page_alloc.c 2.3.13-pre8-lru/mm/page_alloc.c
+--- 2.3.13-pre8/mm/page_alloc.c	Tue Jul 13 02:02:40 1999
++++ 2.3.13-pre8-lru/mm/page_alloc.c	Sun Aug  8 20:08:19 1999
+@@ -20,6 +20,8 @@
+ 
+ int nr_swap_pages = 0;
+ int nr_free_pages = 0;
++int nr_lru_pages;
++LIST_HEAD(lru_cache);
+ 
+ /*
+  * Free area management
+@@ -127,7 +129,6 @@
+ 		if (PageLocked(page))
+ 			PAGE_BUG(page);
+ 
+-		page->flags &= ~(1 << PG_referenced);
+ 		free_pages_ok(page - mem_map, 0);
+ 		return 1;
+ 	}
+@@ -145,7 +146,6 @@
+ 				PAGE_BUG(map);
+ 			if (PageLocked(map))
+ 				PAGE_BUG(map);
+-			map->flags &= ~(1 << PG_referenced);
+ 			free_pages_ok(map_nr, order);
+ 			return 1;
+ 		}
+@@ -269,8 +269,9 @@
+  	unsigned long total = 0;
+ 
+ 	printk("Free pages:      %6dkB\n ( ",nr_free_pages<<(PAGE_SHIFT-10));
+-	printk("Free: %d (%d %d %d)\n",
++	printk("Free: %d, lru_cache: %d (%d %d %d)\n",
+ 		nr_free_pages,
++		nr_lru_pages,
+ 		freepages.min,
+ 		freepages.low,
+ 		freepages.high);
+diff -urN 2.3.13-pre8/mm/swap_state.c 2.3.13-pre8-lru/mm/swap_state.c
+--- 2.3.13-pre8/mm/swap_state.c	Tue Jul 13 02:02:10 1999
++++ 2.3.13-pre8-lru/mm/swap_state.c	Sun Aug  8 20:08:19 1999
+@@ -214,8 +214,6 @@
+ 		   page_address(page), page_count(page));
+ #endif
+ 	PageClearSwapCache(page);
+-	if (inode->i_op->flushpage)
+-		inode->i_op->flushpage(inode, page, 0);
+ 	remove_inode_page(page);
+ }
+ 
+@@ -239,6 +237,15 @@
+ 	swap_free (entry);
+ }
+ 
++static void delete_from_swap_cache_nolock(struct page *page)
++{
++	if (!swapper_inode.i_op->flushpage ||
++	    swapper_inode.i_op->flushpage(&swapper_inode, page, 0))
++		lru_cache_del(page);
++
++	__delete_from_swap_cache(page);
++}
++
+ /*
+  * This must be called only on pages that have
+  * been verified to be in the swap cache.
+@@ -247,7 +254,7 @@
+ {
+ 	lock_page(page);
+ 
+-	__delete_from_swap_cache(page);
++	delete_from_swap_cache_nolock(page);
+ 
+ 	UnlockPage(page);
+ 	page_cache_release(page);
+@@ -267,9 +274,7 @@
+ 	 */
+ 	lock_page(page);
+ 	if (PageSwapCache(page) && !is_page_shared(page)) {
+-		long entry = page->offset;
+-		remove_from_swap_cache(page);
+-		swap_free(entry);
++		delete_from_swap_cache_nolock(page);
+ 		page_cache_release(page);
+ 	}
+ 	UnlockPage(page);
+diff -urN 2.3.13-pre8/mm/vmscan.c 2.3.13-pre8-lru/mm/vmscan.c
+--- 2.3.13-pre8/mm/vmscan.c	Sun Aug  8 17:21:41 1999
++++ 2.3.13-pre8-lru/mm/vmscan.c	Sun Aug  8 20:11:42 1999
+@@ -319,7 +319,9 @@
+ {
+ 	struct task_struct * p;
+ 	int counter;
++	int __ret = 0;
+ 
++	lock_kernel();
+ 	/* 
+ 	 * We make one or two passes through the task list, indexed by 
+ 	 * assign = {0, 1}:
+@@ -382,11 +384,13 @@
+ 
+ 			if (ret < 0)
+ 				kill_proc(pid, SIGBUS, 1);
+-			return 1;
++			__ret = 1;
++			goto out;
+ 		}
+ 	}
+ out:
+-	return 0;
++	unlock_kernel();
++	return __ret;
+ }
+ 
+ /*
+@@ -403,8 +407,6 @@
+ 	int priority;
+ 	int count = SWAP_CLUSTER_MAX;
+ 
+-	lock_kernel();
+-
+ 	/* Always trim SLAB caches when memory gets low. */
+ 	kmem_cache_reap(gfp_mask);
+ 
+@@ -432,7 +434,6 @@
+ 		shrink_dcache_memory(priority, gfp_mask);
+ 	} while (--priority >= 0);
+ done:
+-	unlock_kernel();
+ 
+ 	return priority >= 0;
+ }

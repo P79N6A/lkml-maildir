@@ -1,0 +1,192 @@
+Date: Mon, 07 Feb 2000 23:30:27 +0200
+From: Don <>
+Subject: 2.2.14: top & /proc speedup patch
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/2/7/113
+
+And little more, as a matter of fact. First of all, I made the
+readprofile-2.1 version few years back with few improvements over the
+old 2.0 version by somebody else. Since there doesn't seem to have been
+any further development on the code, I am now releasing readprofile-3.0,
+which is currently downloadable from 
+http://www.nic.fi/~jsantala/linux
+(This way I will also be able to trick you to visit my web-site once I
+bother or feel like doing it;). The main new thing is that you can now
+get a list of the tick-counts side-by-side with a disassembly of the
+kernel code provided you have vmlinux file available. Few other
+improvements have also been made. But please note, the original version
+2.0 documents recommends setting readprofile suid root - DON'T EVER do
+that. It's full of backdoors/security holes. The only reason you might
+want to do this is reset the profiling counters (And why would you want
+any user to be able to do it?) and if you absolutely need this ability,
+set up a shell-script to do it.
+Now, while testing the debugger I spotted some inefficiencies in the
+current kernel as pertains to procps package and the /proc filesystem.
+In short, it occurs the number of active processes in the system is
+re-calculated each time any file is looked for in the /proc filesystem
+root directory. In truth this count is only needed when the /proc
+directory is statted, because the number of files in it depends on the
+number of processes. However, where the recalculation code currently is,
+it doesn't even quarantee the stat() output is right, and for example
+with top running a significant amount of CPU is diverted to recalculate
+the number of processes in the system times the number of processes in
+the system, every second... Worse yet, the process table is locked
+during this calculation.
+What I've done is simply use the hooks provided in VFS-layer for network
+file-systems to defer calculating the number of processes to stat()
+time. The benefit is the system CPU-time spent while for example in top
+is slightly reduced, and stat() on the proc filesystem root provides
+more meaningful data.
+After this change, it became apparent the radix-conversions first from
+binary to decimal in kernel and then from decimal to binary in the top
+program were next major CPU-hogs for top. Unfortunately
+radix-conversions can't be, at least portably, optimized all that much.
+However, I firmly believe every little bit helps... In fact an open
+radix conversion is never needed in kernel. The target radix is always
+8, 10 or 16. It is possible to hard-code these radixes into the macro
+and let the compiler decide how to optimize them. 8 and 16 can be done
+with plain shifts, and at least gcc is able to do away with imul even
+for radix 10. In addition the digit-tables are really only needed for
+radix beyond 10. It's possible to add a final case for radixes other
+than 8, 10 and 16 to be on the safe side, but currently these aren't
+used so I haven't.
+ -Donwulff
+diff --unified --recursive lihnux/fs/proc/inode.c linux/fs/proc/inode.c
+--- lihnux/fs/proc/inode.c	Sat May  9 04:10:30 1998
++++ linux/fs/proc/inode.c	Mon Feb  7 23:20:31 2000
+@@ -285,19 +285,6 @@
+ 		if (de->fill_inode)
+ 			de->fill_inode(inode, 1);
+ 	}
+-	/*
+-	 * Fixup the root inode's nlink value
+-	 */
+-	if (inode->i_ino == PROC_ROOT_INO) {
+-		struct task_struct *p;
+-
+-		read_lock(&tasklist_lock);
+-		for_each_task(p) {
+-			if (p->pid)
+-				inode->i_nlink++;
+-		}
+-		read_unlock(&tasklist_lock);
+-	}
+ out:
+ 	return inode;
+ 
+diff --unified --recursive lihnux/fs/proc/root.c linux/fs/proc/root.c
+--- lihnux/fs/proc/root.c	Wed Oct 27 03:53:42 1999
++++ linux/fs/proc/root.c	Mon Feb  7 23:20:31 2000
+@@ -29,6 +29,7 @@
+ 
+ static int proc_root_readdir(struct file *, void *, filldir_t);
+ static struct dentry *proc_root_lookup(struct inode *,struct dentry *);
++static int proc_revalidate(struct dentry *);
+ static int proc_unlink(struct inode *, struct dentry *);
+ 
+ static unsigned char proc_alloc_map[PROC_NDYNAMIC / 8] = {0};
+@@ -140,7 +141,10 @@
+ 	NULL,			/* writepage */
+ 	NULL,			/* bmap */
+ 	NULL,			/* truncate */
+-	NULL			/* permission */
++	NULL,			/* permission */
++	NULL,			/* smap */
++	NULL,			/* updatepage */
++	proc_revalidate,	/* revalidate */
+ };
+ 
+ /*
+@@ -819,17 +823,6 @@
+ 	struct inode *inode;
+ 	int len;
+ 
+-	if (dir->i_ino == PROC_ROOT_INO) { /* check for safety... */
+-		dir->i_nlink = proc_root.nlink;
+-
+-		read_lock(&tasklist_lock);
+-		for_each_task(p) {
+-			if (p->pid)
+-				dir->i_nlink++;
+-		}
+-		read_unlock(&tasklist_lock);
+-	}
+-
+ 	if (!proc_lookup(dir, dentry))
+ 		return NULL;
+ 	
+@@ -866,6 +859,27 @@
+ 	dentry->d_op = &proc_dentry_operations;
+ 	d_add(dentry, inode);
+ 	return NULL;
++}
++
++/*
++ * Update the root dentry/inodes i_nlink count for statting here.
++ */
++
++static int proc_revalidate(struct dentry * dentry)
++{
++	struct task_struct *p;
++	struct inode * inode = dentry->d_inode;
++
++	inode->i_nlink = proc_root.nlink;
++
++	read_lock(&tasklist_lock);
++	for_each_task(p) {
++		if (p->pid)
++			inode->i_nlink++;
++	}
++	read_unlock(&tasklist_lock);
++
++	return 0;
+ }
+ 
+ /*
+diff --unified --recursive lihnux/lib/vsprintf.c linux/lib/vsprintf.c
+--- lihnux/lib/vsprintf.c	Mon Mar 15 21:19:05 1999
++++ linux/lib/vsprintf.c	Mon Feb  7 23:20:51 2000
+@@ -66,10 +66,22 @@
+ #define SPECIAL	32		/* 0x */
+ #define LARGE	64		/* use 'ABCDEF' instead of 'abcdef' */
+ 
+-#define do_div(n,base) ({ \
++#define do_div8(n) ({ \
+ int __res; \
+-__res = ((unsigned long) n) % (unsigned) base; \
+-n = ((unsigned long) n) / (unsigned) base; \
++__res = ((unsigned long) n) % 8; \
++n = ((unsigned long) n) / 8; \
++__res; })
++
++#define do_div10(n) ({ \
++int __res; \
++__res = ((unsigned long) n) % 10; \
++n = ((unsigned long) n) / 10; \
++__res; })
++
++#define do_div16(n) ({ \
++int __res; \
++__res = ((unsigned long) n) % 16; \
++n = ((unsigned long) n) / 16; \
+ __res; })
+ 
+ static char * number(char * str, long num, int base, int size, int precision
+@@ -109,8 +121,12 @@
+ 	i = 0;
+ 	if (num == 0)
+ 		tmp[i++]='0';
+-	else while (num != 0)
+-		tmp[i++] = digits[do_div(num,base)];
++	else if (base==10) while (num != 0)
++		tmp[i++] = '0'+do_div10(num);
++	else if (base==16) while (num != 0)
++		tmp[i++] = digits[do_div16(num)];
++	else
++		tmp[i++] = '0'+do_div8(num);
+ 	if (i > precision)
+ 		precision = i;
+ 	size -= precision;

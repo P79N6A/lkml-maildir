@@ -1,0 +1,151 @@
+Date: Sat, 2 Sep 2000 02:49:34 -0400
+From: "Dan Maas" <>
+Subject: Re: thread rant [semi-OT]
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/9/2/191
+
+> All portability issues aside, if one is writing an application in
+> Linux that one would be tempted to make multithreaded for
+> whatever reason, what would be the better Linux way of doing
+> things?
+Let's go back to basics. Look inside your computer. See what's there:
+1) one (or more) CPUs
+2) some RAM
+3) a PCI bus, containing:
+4)   -- a SCSI/IDE controller
+5)   -- a network card
+6)   -- a graphics card
+These are all the parts of your computer that are smart enough to accomplish
+some amount of work on their own. The SCSI or IDE controller can read data
+from disk without bothering any other components. The network card can send
+and receive packets fairly autonomously. Each CPU in an SMP system operates
+nearly independently. An ideal application could have all of these devices
+doing useful work at the same time.
+When people think of "multithreading," often they are just looking for a way
+to extract more concurrency from their machine. You want all these
+independent parts to be working on your task simultaneously. There are many
+different mechanisms for achieveing this. Here we go...
+A naively-written "server" program (eg a web server) might be coded like so:
+* Read configuration file - all other work stops while data is fetched from
+disk
+* Parse configuration file - all other work stops while CPU/RAM work on
+parsing the file
+* Wait for a network connection - all other work stops while waiting for
+incoming packets
+* Read request from client - all other work stops while waiting for incoming
+packets
+* Process request - all other work stops while CPU/RAM figure out what to do
+                  - all other work stops while disk fetches requested file
+* Write reply to client - all other work stops until final buffer
+transmitted
+I've phrased the descriptions to emphasize that only one resource is being
+used at once - the rest of the system sits twiddling its thumbs until the
+one device in question finishes its task.
+Can we do better? Yes, thanks to various programming techniques that allow
+us to keep more of the system busy. The most important bottleneck is
+probably the network - it makes no sense for our server to wait while a slow
+client takes its time acknowledging our packets. By using standard UNIX
+multiplexed I/O (select()/poll()), we can send buffers of data to the kernel
+just when space becomes available in the outgoing queue; we can also accept
+client requests piecemeal, as the individual packets flow in. And while
+we're waiting for packets from one client, we can be processing another
+client's request.
+The improved program performs better since it keeps the CPU and network busy
+at the same time. However, it will be more difficult to write, since we have
+to maintain the connection state manually, rather than implicitly on the
+call stack.
+So now the server handles many clients at once, and it gracefully handles
+slow clients. Can we do even better? Yes, let's look at the next
+bottleneck - disk I/O. If a client asks for a file that's not in memory, the
+whole server will come to a halt while it read()s the data in. But the
+SCSI/IDE controller is smart enough to handle this alone; why not let the
+CPU and network take care of other clients while the disk does its work?
+How do we go about doing this? Well, it's UNIX, right? We talk to disk files
+the same way we talk to network sockets, so let's just select()/poll() on
+the disk files too, and everything will be dandy... (Unfortunately we can't
+do that - the designers of UNIX made a huge mistake and decided against
+implementing non-blocking disk I/O as they had with network I/O. Big booboo.
+For that reason, it was impossible to do concurrent disk I/O until the POSIX
+Asynchronous I/O standard came along. So we go learn this whole bloated API,
+in the process finding out that we can no longer use select()/poll(), and
+must switch to POSIX RT signals - sigwaitinfo() - to control our server***).
+After the dust has settled, we can now keep the CPU, network card, and the
+disk busy all the time -- so our server is even faster.
+Notice that our program has been made heavily concurrent, and I haven't even
+used the word "thread" yet!
+Let's take it one step further. Packets and buffers are now coming in and
+out so quickly that the CPU is sweating just handling all the I/O. But say
+we have one or three more CPU's sitting there idle - how can we get them
+going, too? We need to run multiple request handlers at once.
+Conventional multithreading is *one* possible way to accomplish this; it's
+rather brute-force, since the threads share all their memory, sockets, etc.
+(and full VM sharing doesn't scale optimally, since interrupts must be sent
+to all the CPUs when the memory layout changes).
+Lots of UNIX servers run multiple *processes*- the "sub-servers" might not
+share anything, or they might file cache or request queue. If we were brave,
+we'd think carefully about what resources really should be shared between
+the sub-servers, and then implement it manually using Linux's awesome
+clone() API. But we're not, so let's retreat to the brightly-lit
+neightborhood that is pthreads.
+We break out the POSIX pthread standard, and find it's quite a bit more
+usable than AIO. We set up one server thread for each CPU; the threads now
+share a common queue of requests****. We add locking primitives around the
+shared data structures in our file cache. Now as soon as a new packet or
+disk buffer arrives, any one of the CPUs can grab it and perform the
+associated processing, while the other CPUs handle their own work. The
+server gets even faster.
+That's basically the state-of-the-art in concurrent servers as it stands
+today. All of the independent devices in the computer are being used
+simultaneously; the server plows through its workload, never waiting for
+network packets or disk I/O. There are still bottlenecks - for instance, RAM
+and PCI bandwidth are limited resources. We can't just keep adding more CPUs
+to make it faster, since they all contend for access to the same pool of RAM
+and the same bus. If the server still isn't fast enough, we need a better
+machine architecture that separates RAM and I/O busses into
+concurrently-accessible pools (e.g. a high-end SGI server).
+There are various other tricks that can be done to speed up network servers,
+like passing files directly from the buffer cache to the network card. This
+one is currently frowned upon by the Linux community, since the time spent
+copying data around the system is small compared to the overhead imposed by
+fiddling with virtual memory. Lots of work does go into reducing system call
+and context switch overhead; that's one of the reasons TUX was developed.
+Let's drop the "web server" example and talk about another application that
+benefits from concurrency - number crunching. This is a much simpler case,
+since the only resources you're worried about are the CPUs and RAM. To get
+all the CPU's going at once, you'll need to run multiple threads or
+processes. To get truly optimal throughput, you might choose to go the
+process route, so that shared memory is kept to an absolute minimum. (Not
+that pthreads is a terrible choice; it can work very well for this purpose)
+In summary, when "multithreading" floats into your mind, think
+"concurrency." Think very carefully about how you might simultaneously
+exploit all of the independent resources in your computer. Due to the long
+and complex history of OS development, a different API is usually required
+to communicate with each device. (e.g. old-school UNIX has always handled
+non-blocking network I/O with select(), but non-blocking disk I/O is rather
+new and must be done with AIO or threads; and don't even ask about
+asynchronous access to the graphics card =).
+Don't let these differences obscure your goal: just figure out how to use
+the machine to its fullest potential. That's the Linux way of doing things:
+think, then act.
+-- Dan
+The ideas here mostly come from informative pages like Dan Kegel's "C10K"
+http://www.kegel.com/c10k.html,
+ and from reading various newsgroup postings
+and UNIX books.
+*** POSIX AIO is so ugly, in fact, that it's not unheard-of to simply spawn
+a pool of threads that handle disk I/O. You can send requests and replies
+via a pipe or socket, which fits right in with the old select()/poll() event
+loop
+*** If we're servicing many, many clients at once, then running a huge
+select()/poll() in each thread will have outrageous overhead. In that case,
+we'd have to use a shared POSIX I/O signal queue, which can be done with
+clone(), but not pthreads()... See Zach Brown's phhttpd
+http://www.zabbo.net/phhttpd/
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+Please read the FAQ at 
+http://www.tux.org/lkml/

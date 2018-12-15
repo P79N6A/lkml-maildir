@@ -1,0 +1,181 @@
+Date: Sun, 1 Aug 1999 02:17:53 +0200 (CEST)
+From: Eric Lammerts <>
+Subject: Re: Handling interrupts from userspace
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/7/31/87
+
+On Thu, 29 Jul 1999, Alan Cox wrote:
+> The kernel has to clear the IRQ cause on PCI or Nubus which means it has
+> to know about the card. Writing a small card specific driver to send
+> a signal each irq and clear the irq in kernel space works
+The interrupt handler can also disable the IRQ in the PIC. This
+will prevent further interrupts after exiting the handler.
+I wrote a kernel module that implements this. It works as follows:
+1) you open a special character device. The module grabs the IRQ and
+   disables it.
+2) you do a read() on the device. This enables the interrupt in the
+   PIC and blocks the process until an interrupt occurs. Then the
+   interrupt is disabled again (in the PIC) and the read() returns 0.
+3) you clear the IRQ on the card.
+4) goto 2) if you want.
+When you close the device, the interrupt is freed.
+I attached the code to this mail. I've tested it with 2.2.9 and
+printer port interrupts generated with a button attached to /ACK.
+There's no poll() support but it would be trivial to add that.
+Eric
+-- 
+Eric Lammerts <eric@scintilla.utwente.nl>
+"Don't you know there ain't no devil?
+ There's just God when he's drunk."     -- Tom Waits
+/*
+ * usirq
+ * use interrupts from userspace.
+ * 
+ * (c) copyright 1999 Eric Lammerts <eric@scintilla.utwente.nl>
+ * $Id: usirq.c,v 1.3 1999/07/31 23:55:26 eric Exp $
+ * 
+ * This is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published
+ * by the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ * 
+ * It is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU General Public License for more details.
+ * 
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+ */
+#define __KERNEL__
+#define MODULE
+#include <linux/version.h>
+#include <linux/module.h>
+#include <linux/sched.h>
+#include <linux/kernel.h>
+#include <linux/interrupt.h>
+#include <linux/fcntl.h>
+#include <linux/errno.h>
+#include <asm/irq.h>
+MODULE_AUTHOR("Eric Lammerts <eric@scintilla.utwente.nl");
+MODULE_DESCRIPTION("Userspace interrupt driver");
+#define MAX_IRQS 16
+MODULE_PARM(debug,"i");
+static int debug;
+static struct {
+	int open:1;
+	int enabled:1;
+	struct wait_queue *waitq;
+} usirq[MAX_IRQS];
+static void usirq_interrupt(int irq, void *dev_id, struct pt_regs *regs)
+{
+	disable_irq_nosync(irq);
+	if(debug) printk("usirq_interrupt: disable_irq_nosync(%d)\n", irq);
+	usirq[irq].enabled = 0;
+	if(usirq[irq].waitq)
+		wake_up_interruptible(&usirq[irq].waitq);
+}
+static int usirq_open(struct inode * inode, struct file * file)
+{
+	unsigned int retval;
+	int minor = MINOR(inode->i_rdev);
+	if (usirq[minor].open)
+		return -EBUSY;
+	usirq[minor].enabled = 1;
+	retval = request_irq(minor, usirq_interrupt, 0, "usirq", NULL);
+	if (retval < 0)
+		return retval;
+	cli();
+	if(usirq[minor].enabled) disable_irq(minor);
+	sti();
+	usirq[minor].open = 1;
+	MOD_INC_USE_COUNT;
+	return 0;
+}
+static int usirq_close(struct inode * inode, struct file * file)
+{
+	int minor = MINOR(inode->i_rdev);
+	usirq[minor].open = 0;
+	free_irq(minor, NULL);
+	MOD_DEC_USE_COUNT;
+	return 0;
+}
+static ssize_t usirq_read(struct file *file, char *buf, size_t nbytes, loff_t *ppos)
+{
+	int minor = MINOR(file->f_dentry->d_inode->i_rdev);
+	
+	usirq[minor].enabled = 1;
+	if(debug) printk("usirq_read: enable_irq(%d)\n", minor);
+	enable_irq(minor);
+	if(!usirq[minor].enabled) /* apparently the irq happened right away */
+		return 0;
+		
+	if (file->f_flags & O_NONBLOCK)
+		return -EAGAIN;
+	interruptible_sleep_on(&usirq[minor].waitq);
+	cli();
+	if(usirq[minor].enabled) {
+		disable_irq(minor);
+		if(debug) printk("usirq_read: disable_irq(%d)\n", minor);
+	}
+	sti();
+	current->state = TASK_RUNNING;
+	usirq[minor].waitq = NULL;
+	if(signal_pending(current))
+		return -ERESTARTSYS;
+	if(!usirq[minor].enabled)	/* interrupt occurred */
+		return 0;
+	printk(KERN_ERR "usirq_read: no signal and no irq?!?\n");
+	return 0;
+}
+static struct file_operations usirq_fops = {
+	NULL,			/* lseek */
+	usirq_read,
+	NULL,			/* write */
+	NULL,			/* readdir */
+	NULL,			/* poll */
+	NULL,			/* ioctl */
+	NULL,			/* mmap */
+	usirq_open,
+	NULL,			/* flush */
+	usirq_close
+};
+int init_module(void)
+{
+	if (register_chrdev(USIRQ_MAJOR, "usirq", &usirq_fops) < 0) {
+		printk(KERN_ERR "usirq: register_chrdev failed.\n");
+		return -EIO;
+	}
+	return 0;
+}
+void cleanup_module(void)
+{
+	unregister_chrdev(USIRQ_MAJOR, "usirq");
+}
+# $Id: Makefile,v 1.2 1999/07/31 23:45:43 eric Exp $
+CC = gcc
+CFLAGS = -Wall -O2 -fomit-frame-pointer -I/usr/src/linux/include
+USIRQ_MAJOR = 62 
+usirq.o: usirq.c
+	$(CC) $(CFLAGS) -DUSIRQ_MAJOR=$(USIRQ_MAJOR) -c usirq.c -o usirq.o
+dev:
+	-rm -f /dev/usirq{3,4,5,6,7,8,9,10,11,12,13,14,15}
+	mknod /dev/usirq3  c $(USIRQ_MAJOR) 3
+	mknod /dev/usirq4  c $(USIRQ_MAJOR) 4
+	mknod /dev/usirq5  c $(USIRQ_MAJOR) 5
+	mknod /dev/usirq6  c $(USIRQ_MAJOR) 6
+	mknod /dev/usirq7  c $(USIRQ_MAJOR) 7
+	mknod /dev/usirq8  c $(USIRQ_MAJOR) 8
+	mknod /dev/usirq9  c $(USIRQ_MAJOR) 9
+	mknod /dev/usirq10 c $(USIRQ_MAJOR) 10
+	mknod /dev/usirq11 c $(USIRQ_MAJOR) 11
+	mknod /dev/usirq12 c $(USIRQ_MAJOR) 12
+	mknod /dev/usirq13 c $(USIRQ_MAJOR) 13
+	mknod /dev/usirq14 c $(USIRQ_MAJOR) 14
+	mknod /dev/usirq15 c $(USIRQ_MAJOR) 15
+clean:
+	-rm -f usirq.o

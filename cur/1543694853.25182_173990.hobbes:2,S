@@ -1,0 +1,259 @@
+Date: Mon, 20 Oct 2003 19:56:23 -0700
+From: "Pallipadi, Venkatesh" <>
+Subject: [PATCH] 1/3 Dynamic cpufreq governor and updates to ACPI P-state driver
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2003/10/20/267
+
+Patch 1/3: Changes to ACPI P-state driver, to handle MSR 
+based transitions frequency transitions and make the driver 
+SMP aware.
+diffstat dbs1.patch 
+arch/i386/kernel/cpu/cpufreq/Kconfig |    4 
+arch/i386/kernel/cpu/cpufreq/acpi.c  |  141
++++++++++++++++++++++++++++--------
+include/acpi/processor.h             |    1 
+3 files changed, 116 insertions(+), 30 deletions(-)
+diff -purN linux-2.6.0-test7/arch/i386/kernel/cpu/cpufreq/acpi.c
+linux-2.6.0-test7-dbs/arch/i386/kernel/cpu/cpufreq/acpi.c
+--- linux-2.6.0-test7/arch/i386/kernel/cpu/cpufreq/acpi.c
+2003-10-20 00:24:43.000000000 -0700
++++ linux-2.6.0-test7-dbs/arch/i386/kernel/cpu/cpufreq/acpi.c
+2003-10-20 02:11:01.000000000 -0700
+@@ -99,7 +99,9 @@ acpi_processor_get_performance_control (
+ 
+ 	reg = (struct acpi_pct_register *) (obj.buffer.pointer);
+ 
+-	if (reg->space_id != ACPI_ADR_SPACE_SYSTEM_IO) {
++	perf->space_id = (int) reg->space_id;
++	if (reg->space_id != ACPI_ADR_SPACE_SYSTEM_IO && 
++			reg->space_id != ACPI_ADR_SPACE_FIXED_HARDWARE)
+{
+ 		ACPI_DEBUG_PRINT((ACPI_DB_ERROR,
+ 			"Unsupported address space [%d]
+(control_register)\n",
+ 			(u32) reg->space_id));
+@@ -126,7 +128,8 @@ acpi_processor_get_performance_control (
+ 
+ 	reg = (struct acpi_pct_register *) (obj.buffer.pointer);
+ 
+-	if (reg->space_id != ACPI_ADR_SPACE_SYSTEM_IO) {
++	if (reg->space_id != ACPI_ADR_SPACE_SYSTEM_IO && 
++			reg->space_id != ACPI_ADR_SPACE_FIXED_HARDWARE)
+{
+ 		ACPI_DEBUG_PRINT((ACPI_DB_ERROR,
+ 			"Unsupported address space [%d]
+(status_register)\n",
+ 			(u32) reg->space_id));
+@@ -224,16 +227,100 @@ end:
+ 	return_VALUE(result);
+ }
+ 
++struct set_performance_param {
++	int 					cpu;
++	struct acpi_processor_performance	*perf;
++	unsigned int 				state;
++	unsigned int 				async;
++	unsigned int 				retval;
++};
++
++static void
++target_cpu_set_performance(struct set_performance_param	*param)
++{
++	struct acpi_processor_performance	*perf = param->perf;
++	u16		port = 0;
++	int		state = param->state;
++	unsigned int	value = perf->states[state].control;
++	int		i = 0;
++
++	ACPI_FUNCTION_TRACE("target_cpu_set_performance");
++	if (perf->space_id == ACPI_ADR_SPACE_FIXED_HARDWARE) {
++		ACPI_DEBUG_PRINT((ACPI_DB_INFO, "Writing 0x%x to MSR
+0x%x\n", 
++					value, perf->control_register));
++		wrmsr(perf->control_register, value, 0);
++	} else {
++		port = perf->control_register;
++		ACPI_DEBUG_PRINT((ACPI_DB_INFO, 
++			"Writing 0x%04x to port 0x%04x\n", value,
+port));
++
++		outl(value, port); 
++	}
++
++	if (param->async) {
++		/* We don't want to wait for the status change here, as 
++		 * that will affect performance, especially with
+frequent 
++		 * frequency switches. We assume the tranisition 
++		 * gone through and continue.
++		 */
++		param->retval = perf->states[state].status;
++		return_VOID;
++	}
++
++	if (perf->space_id == ACPI_ADR_SPACE_FIXED_HARDWARE) {
++		ACPI_DEBUG_PRINT((ACPI_DB_INFO, 
++			"Looking for 0x%02x from MSR 0x%04x\n",
++			(u16) perf->states[state].status, 
++			perf->status_register));
++
++		for (i = 0; i < 100; i++) {
++			unsigned long unused_hi;
++			rdmsr(perf->status_register, value, unused_hi);
++			if (value == perf->states[state].status)
++				break;
++			udelay(10);
++		}
++	} else {
++		port = perf->status_register;
++
++		ACPI_DEBUG_PRINT((ACPI_DB_INFO, 
++			"Looking for 0x%04x from port 0x%04x\n",
++			(u16) perf->states[state].status, port));
++
++		for (i = 0; i < 100; i++) {
++			value = inl(port);
++			if (value == perf->states[state].status)
++				break;
++			udelay(10);
++		}
++	}
++	param->retval = value;
++	return_VOID;
++}
++
++#ifdef CONFIG_SMP
++static void
++target_cpu_set_performance_ipi(void *data)
++{
++	struct set_performance_param	*param;
++
++	param = (struct set_performance_param *) data;
++	if (param->cpu != smp_processor_id())
++		return;
++
++	target_cpu_set_performance(param);
++}
++#endif
+ 
+ static int
+ acpi_processor_set_performance (
+ 	struct acpi_processor_performance	*perf,
+ 	int			state)
+ {
+-	u16			port = 0;
+-	u16			value = 0;
++	unsigned int		value = 0;
+ 	int			i = 0;
+ 	struct cpufreq_freqs    cpufreq_freqs;
++	struct set_performance_param param;
+ 
+ 	ACPI_FUNCTION_TRACE("acpi_processor_set_performance");
+ 
+@@ -267,8 +354,12 @@ acpi_processor_set_performance (
+ 
+ 	/* cpufreq frequency struct */
+ 	cpufreq_freqs.cpu = perf->pr->id;
+-	cpufreq_freqs.old = perf->states[perf->state].core_frequency;
+-	cpufreq_freqs.new = perf->states[state].core_frequency;
++	/*
++	 * cpufreq_notifier needs to send the freq in KHz. But acpi
++	 * data we have is in MHz
++	 */
++	cpufreq_freqs.old = perf->states[perf->state].core_frequency *
+1000;
++	cpufreq_freqs.new = perf->states[state].core_frequency * 1000;
+ 
+ 	/* notify cpufreq */
+ 	cpufreq_notify_transition(&cpufreq_freqs, CPUFREQ_PRECHANGE);
+@@ -276,35 +367,27 @@ acpi_processor_set_performance (
+ 	/*
+ 	 * First we write the target state's 'control' value to the
+ 	 * control_register.
+-	 */
+-
+-	port = perf->control_register;
+-	value = (u16) perf->states[state].control;
+-
+-	ACPI_DEBUG_PRINT((ACPI_DB_INFO, 
+-		"Writing 0x%04x to port 0x%04x\n", value, port));
+-
+-	outw(value, port); 
+-
+-	/*
+ 	 * Then we read the 'status_register' and compare the value with
+the
+ 	 * target state's 'status' to make sure the transition was
+successful.
+ 	 * Note that we'll poll for up to 1ms (100 cycles of 10us)
+before
+ 	 * giving up.
+ 	 */
+ 
+-	port = perf->status_register;
+-
+-	ACPI_DEBUG_PRINT((ACPI_DB_INFO, 
+-		"Looking for 0x%04x from port 0x%04x\n",
+-		(u16) perf->states[state].status, port));
+-
+-	for (i=0; i<100; i++) {
+-		value = inw(port);
+-		if (value == (u16) perf->states[state].status)
+-			break;
+-		udelay(10);
+-	}
++	param.cpu = perf - performance;
++	param.perf = perf;
++	param.state = state;
++#ifdef CONFIG_SMP
++	param.async = 1; /* We don't want to wait in IPI context */
++	if (param.cpu != smp_processor_id())
++		smp_call_function(target_cpu_set_performance_ipi,
++				(void *)&param, 1, 1);
++	else
++		target_cpu_set_performance(&param);
++#else
++	param.async = 0;
++	target_cpu_set_performance(&param);
++#endif
++	value = param.retval;
+ 
+ 	/* notify cpufreq */
+ 	cpufreq_notify_transition(&cpufreq_freqs, CPUFREQ_POSTCHANGE);
+diff -purN linux-2.6.0-test7/arch/i386/kernel/cpu/cpufreq/Kconfig
+linux-2.6.0-test7-dbs/arch/i386/kernel/cpu/cpufreq/Kconfig
+--- linux-2.6.0-test7/arch/i386/kernel/cpu/cpufreq/Kconfig
+2003-10-14 16:28:32.000000000 -0700
++++ linux-2.6.0-test7-dbs/arch/i386/kernel/cpu/cpufreq/Kconfig
+2003-10-20 02:27:39.000000000 -0700
+@@ -36,7 +36,9 @@ config X86_ACPI_CPUFREQ
+ 	depends on CPU_FREQ_TABLE && ACPI_PROCESSOR
+ 	help
+ 	  This driver adds a CPUFreq driver which utilizes the ACPI
+-	  Processor Performance States.
++	  Processor Performance States. This can work with variety
++	  of platforms and support both Intel Speedstep and Intel
+Enhanced 
++	  Speedstep, as long as BIOS-ACPI provides the P-state
+information.
+ 
+ 	  For details, take a look at linux/Documentation/cpu-freq. 
+ 
+diff -purN linux-2.6.0-test7/include/acpi/processor.h
+linux-2.6.0-test7-dbs/include/acpi/processor.h
+--- linux-2.6.0-test7/include/acpi/processor.h	2003-10-20
+00:24:43.000000000 -0700
++++ linux-2.6.0-test7-dbs/include/acpi/processor.h	2003-10-20
+02:11:08.000000000 -0700
+@@ -73,6 +73,7 @@ struct acpi_processor_performance {
+ 	u16			control_register;
+ 	u16			status_register;
+ 	int			state_count;
++	int			space_id;
+ 	struct acpi_processor_px states[ACPI_PROCESSOR_MAX_PERFORMANCE];
+ 	struct cpufreq_frequency_table
+freq_table[ACPI_PROCESSOR_MAX_PERFORMANCE];
+ 	struct acpi_processor   *pr;[unhandled content-type:application/octet-stream]

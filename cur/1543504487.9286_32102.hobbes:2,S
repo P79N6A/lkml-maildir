@@ -1,0 +1,1473 @@
+Date: Sun, 1 Aug 1999 00:53:14 +0200 (CEST)
+From: Ingo Molnar <>
+Subject: [patch] lowlatency-2.2.10-N2, 'multimedia latency improvement' patch
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/7/31/81
+
+this is the next version of the 'low latencies' patch. Changes relative to
+-M6: it fixes long latency code paths in various dcache, inode cache,
+buffer cache and page cache functions - without impacting functionality.
+There are still some places left to fix (most notably some file-IO and
+buffer-cache parts), but the bulk of it is covered by this patch. Later on
+i plan to rewrite some functions completely, such as the si_*info() ones.
+-- mingo
+--- linux/fs/proc/array.c.orig	Mon Jul 26 12:39:10 1999
++++ linux/fs/proc/array.c	Sun Aug  1 01:00:15 1999
+@@ -963,6 +963,8 @@
+ 	do {
+ 		pte_t page = *pte;
+ 
++		conditional_schedule();
++
+ 		address += PAGE_SIZE;
+ 		pte++;
+ 		if (pte_none(page))
+--- linux/fs/ext2/namei.c.orig	Fri May 14 08:25:58 1999
++++ linux/fs/ext2/namei.c	Sun Aug  1 01:00:15 1999
+@@ -147,6 +147,7 @@
+ 			offset += de_len;
+ 			de = (struct ext2_dir_entry_2 *)
+ 				((char *) de + de_len);
++			conditional_schedule();
+ 		}
+ 
+ 		brelse (bh);
+--- linux/fs/exec.c.orig	Sun Jun 13 19:50:04 1999
++++ linux/fs/exec.c	Sun Aug  1 01:00:16 1999
+@@ -291,6 +291,7 @@
+ 			str += bytes_to_copy;
+ 			len -= bytes_to_copy;
+ 		}
++		conditional_schedule();
+ 	}
+ 	if (from_kmem==2)
+ 		set_fs(old_fs);
+--- linux/fs/buffer.c.orig	Thu May 13 22:14:04 1999
++++ linux/fs/buffer.c	Sun Aug  1 01:00:16 1999
+@@ -169,6 +169,7 @@
+ 	do {
+ 		retry = 0;
+ repeat:
++		  run_task_queue(&tq_disk);
+ 		/* We search all lists as a failsafe mechanism, not because we expect
+ 		 * there to be dirty buffers on any of the other lists.
+ 		 */
+@@ -176,6 +177,11 @@
+ 		if (!bh)
+ 			goto repeat2;
+ 		for (i = nr_buffers_type[BUF_DIRTY]*2 ; i-- > 0 ; bh = next) {
++			if (current->need_resched) {
++				schedule();
++				goto repeat;
++			}
++		  	run_task_queue(&tq_disk);
+ 			if (bh->b_list != BUF_DIRTY)
+ 				goto repeat;
+ 			next = bh->b_next_free;
+@@ -231,6 +237,11 @@
+ 		if (!bh)
+ 			break;
+ 		for (i = nr_buffers_type[BUF_LOCKED]*2 ; i-- > 0 ; bh = next) {
++			if (current->need_resched) {
++				schedule();
++				goto repeat2;
++			}
++		  	run_task_queue(&tq_disk);
+ 			if (bh->b_list != BUF_LOCKED)
+ 				goto repeat2;
+ 			next = bh->b_next_free;
+@@ -808,6 +819,7 @@
+ 
+ 	if (buf->b_count) {
+ 		buf->b_count--;
++		conditional_schedule();
+ 		return;
+ 	}
+ 	printk("VFS: brelse: Trying to free free buffer\n");
+@@ -829,6 +841,7 @@
+ 	buf->b_state = 0;
+ 	remove_from_queues(buf);
+ 	put_last_free(buf);
++	conditional_schedule();
+ }
+ 
+ /*
+@@ -1602,6 +1615,11 @@
+ 		bh = lru_list[nlist];
+ 		if(bh) 
+ 			 for (i = nr_buffers_type[nlist]; i-- > 0; bh = next) {
++				if (current->need_resched) {
++					schedule();
++					goto repeat;
++				}
++		  		run_task_queue(&tq_disk);
+ 				 /* We may have stalled while waiting for I/O to complete. */
+ 				 if(bh->b_list != nlist) goto repeat;
+ 				 next = bh->b_next_free;
+@@ -1750,11 +1768,12 @@
+ 		 {
+ 			 ndirty = 0;
+ 		 repeat:
+-
+ 			 bh = lru_list[nlist];
+ 			 if(bh) 
+ 				  for (i = nr_buffers_type[nlist]; i-- > 0 && ndirty < bdf_prm.b_un.ndirty; 
+ 				       bh = next) {
++			 		  conditional_schedule();
++					  run_task_queue(&tq_disk);
+ 					  /* We may have stalled while waiting for I/O to complete. */
+ 					  if(bh->b_list != nlist) goto repeat;
+ 					  next = bh->b_next_free;
+--- linux/fs/dcache.c.orig	Mon Jul 26 12:36:43 1999
++++ linux/fs/dcache.c	Sun Aug  1 01:00:16 1999
+@@ -41,7 +41,7 @@
+  * This hash-function tries to avoid losing too many bits of hash
+  * information, yet avoid using a prime hash-size or similar.
+  */
+-#define D_HASHBITS     10
++#define D_HASHBITS     14
+ #define D_HASHSIZE     (1UL << D_HASHBITS)
+ #define D_HASHMASK     (D_HASHSIZE-1)
+ 
+@@ -214,6 +214,7 @@
+ 	if (page_count)
+ 		max_value = -1;
+ 
++restart:
+ 	next = tail->prev;
+ 	while (next != &dentry_unused && depth--) {
+ 		struct list_head *tmp = next;
+@@ -221,6 +222,16 @@
+ 		struct inode *inode = dentry->d_inode;
+ 		unsigned long value = 0;	
+ 
++		/*
++		 * reschedule, there can be many dentries around ...
++		 * We can restart at 'tail' without introducing additional
++		 * work, because list entries are removed as we process them.
++		 */
++		if (current->need_resched) {
++			schedule();
++			goto restart;
++		}
++
+ 		next = tmp->prev;
+ 		if (dentry->d_count) {
+ 			dentry_stat.nr_unused--;
+@@ -289,6 +300,9 @@
+ 		struct dentry *dentry;
+ 		struct list_head *tmp = dentry_unused.prev;
+ 
++		/*
++		 * Tough to make preemptable as well ...
++		 */
+ 		if (tmp == &dentry_unused)
+ 			break;
+ 		dentry_stat.nr_unused--;
+@@ -300,6 +314,7 @@
+ 			if (!--count)
+ 				break;
+ 		}
++		conditional_schedule();
+ 	}
+ }
+ 
+@@ -324,8 +339,14 @@
+ 	 * Pass one ... move the dentries for the specified
+ 	 * superblock to the most recent end of the unused list.
+ 	 */
++restart:
+ 	next = dentry_unused.next;
+ 	while (next != &dentry_unused) {
++		if (current->need_resched) {
++			schedule();
++			goto restart;
++		}
++
+ 		tmp = next;
+ 		next = tmp->next;
+ 		dentry = list_entry(tmp, struct dentry, d_lru);
+@@ -415,6 +436,9 @@
+ 		struct list_head *tmp = next;
+ 		struct dentry *dentry = list_entry(tmp, struct dentry, d_child);
+ 		next = tmp->next;
++		/*
++		 * Tough one to make preemptable ...
++		 */
+ 		if (!dentry->d_count) {
+ 			list_del(&dentry->d_lru);
+ 			list_add(&dentry->d_lru, dentry_unused.prev);
+--- linux/fs/inode.c.orig	Tue May  4 19:57:12 1999
++++ linux/fs/inode.c	Sun Aug  1 01:00:16 1999
+@@ -97,7 +97,7 @@
+ 	}
+ }
+ 
+-static void __wait_on_inode(struct inode * inode)
++static inline void __wait_on_inode(struct inode * inode)
+ {
+ 	struct wait_queue wait = { current, NULL };
+ 
+@@ -112,8 +112,9 @@
+ 	current->state = TASK_RUNNING;
+ }
+ 
+-static inline void wait_on_inode(struct inode *inode)
++static void wait_on_inode(struct inode *inode)
+ {
++	conditional_schedule();
+ 	if (inode->i_state & I_LOCK)
+ 		__wait_on_inode(inode);
+ }
+@@ -153,6 +154,7 @@
+ 		spin_unlock(&inode_lock);
+ 
+ 		write_inode(inode);
++		conditional_schedule();
+ 
+ 		spin_lock(&inode_lock);
+ 		inode->i_state &= ~I_LOCK;
+@@ -263,6 +265,7 @@
+ 			break;
+ 		inode = list_entry(tmp, struct inode, i_list);
+ 		clear_inode(inode);
++		conditional_schedule();
+ 		count++;
+ 	}
+ 
+@@ -342,21 +345,37 @@
+ static int free_inodes(void)
+ {
+ 	struct list_head list, *entry, *freeable = &list;
+-	int found = 0;
++	/*
++	 * We free at most 1024 inodes at once - freeing too many
++	 * introduces very nasty scheduling latencies.
++	 */
++	int found = 0, count = 128;
+ 
+ 	INIT_LIST_HEAD(freeable);
+ 	entry = inode_in_use.next;
+ 	while (entry != &inode_in_use) {
+ 		struct list_head *tmp = entry;
+-
++	/*
++	 * Tough one to time-limit ...
++	 */
+ 		entry = entry->next;
+-		if (!CAN_UNUSE(INODE(tmp)))
++		if (!CAN_UNUSE(INODE(tmp))) {
++			if (current->need_resched) {
++				INODE(tmp)->i_count++;
++				spin_unlock(&inode_lock);
++				schedule();
++				spin_lock(&inode_lock);
++				INODE(tmp)->i_count--;
++			}
+ 			continue;
++		}
+ 		list_del(tmp);
+ 		list_del(&INODE(tmp)->i_hash);
+ 		INIT_LIST_HEAD(&INODE(tmp)->i_hash);
+ 		list_add(tmp, freeable);
+ 		found = 1;
++		if (!--count)
++			break;
+ 	}
+ 
+ 	if (found)
+--- linux/fs/super.c.orig	Fri May 14 08:25:58 1999
++++ linux/fs/super.c	Sun Aug  1 01:00:16 1999
+@@ -445,6 +445,7 @@
+ 		if (!sb->s_dirt)
+ 			continue;
+ 		/* N.B. Should lock the superblock while writing */
++		conditional_schedule();
+ 		wait_on_super(sb);
+ 		if (!sb->s_dev || !sb->s_dirt)
+ 			continue;
+--- linux/fs/pipe.c.orig	Sat Jul 31 11:51:23 1999
++++ linux/fs/pipe.c	Sun Aug  1 01:00:16 1999
+@@ -107,6 +107,7 @@
+ 		return -ERESTARTSYS;
+ 	}
+ 	while (count>0) {
++		conditional_schedule();
+ 		while ((PIPE_FREE(*inode) < free) || PIPE_LOCK(*inode)) {
+ 			if (!PIPE_READERS(*inode)) { /* no readers */
+ 				send_sig(SIGPIPE,current,0);
+--- linux/kernel/sched.c.orig	Mon May 10 18:55:21 1999
++++ linux/kernel/sched.c	Sun Aug  1 01:00:16 1999
+@@ -1914,10 +1914,13 @@
+ 		/*
+ 		 * Short delay requests up to 2 ms will be handled with
+ 		 * high precision by a busy wait for all real-time processes.
++		 * But even real-time processes have to be preempted by an
++		 * even higher priority RT-thread, so we sleep in short 10
++		 * usec periods and recheck need_resched.
+ 		 *
+ 		 * Its important on SMP not to do this holding locks.
+ 		 */
+-		udelay((t.tv_nsec + 999) / 1000);
++		udelay_resched((t.tv_nsec + 999) / 1000);
+ 		return 0;
+ 	}
+ 
+--- linux/kernel/fork.c.orig	Sat Jul 31 09:39:15 1999
++++ linux/kernel/fork.c	Sun Aug  1 01:00:16 1999
+@@ -276,6 +276,7 @@
+ 		pprev = &tmp->vm_next;
+ 		if (retval)
+ 			goto fail_nomem;
++		conditional_schedule();
+ 	}
+ 	retval = 0;
+ 	if (mm->map_count >= AVL_MIN_MAP_COUNT)
+@@ -370,6 +371,7 @@
+ 		return 0;
+ 	}
+ 
++	conditional_schedule();
+ 	retval = -ENOMEM;
+ 	mm = mm_alloc();
+ 	if (!mm)
+@@ -404,6 +406,7 @@
+ 		atomic_inc(&current->fs->count);
+ 		return 0;
+ 	}
++	conditional_schedule();
+ 	tsk->fs = kmalloc(sizeof(*tsk->fs), GFP_KERNEL);
+ 	if (!tsk->fs)
+ 		return -1;
+@@ -453,6 +456,7 @@
+ 		goto out;
+ 	}
+ 
++	conditional_schedule();
+ 	tsk->files = NULL;
+ 	error = -ENOMEM;
+ 	newf = kmem_cache_alloc(files_cachep, SLAB_KERNEL);
+@@ -504,6 +508,7 @@
+ 		atomic_inc(&current->sig->count);
+ 		return 0;
+ 	}
++	conditional_schedule();
+ 	tsk->sig = kmalloc(sizeof(*tsk->sig), GFP_KERNEL);
+ 	if (!tsk->sig)
+ 		return -1;
+--- linux/kernel/exit.c.orig	Sat Jul 31 12:43:56 1999
++++ linux/kernel/exit.c	Sun Aug  1 01:00:16 1999
+@@ -170,6 +170,7 @@
+ 				if (file) {
+ 					files->fd[i] = NULL;
+ 					filp_close(file, files);
++					conditional_schedule();
+ 				}
+ 			}
+ 			i++;
+--- linux/mm/swapfile.c.orig	Tue Jun  8 01:27:06 1999
++++ linux/mm/swapfile.c	Sun Aug  1 01:00:17 1999
+@@ -713,14 +713,30 @@
+ 
+ void si_swapinfo(struct sysinfo *val)
+ {
+-	unsigned int i, j;
++	struct swap_info_struct * p;
++	unsigned int i, max;
+ 
+ 	val->freeswap = val->totalswap = 0;
+-	for (i = 0; i < nr_swapfiles; i++) {
+-		if ((swap_info[i].flags & SWP_WRITEOK) != SWP_WRITEOK)
++	for (p = swap_info; p < swap_info+nr_swapfiles; p++) {
++		if ((p->flags & SWP_WRITEOK) != SWP_WRITEOK)
+ 			continue;
+-		for (j = 0; j < swap_info[i].max; ++j)
+-			switch (swap_info[i].swap_map[j]) {
++		max = p->max;
++		for (i = 0; i < max; ++i) {
++			/*
++			 * This is for statistics only - no problem if
++			 * we reschedule in the middle, but we have to
++			 * be a bit careful not to process removed
++			 * swapfiles.
++			 */
++			if (!(i & 255)) {
++				if (current->need_resched) {
++					schedule();
++					if (((p->flags & SWP_WRITEOK) !=
++						SWP_WRITEOK) || (max != p->max))
++							break;
++				}
++			}
++			switch (p->swap_map[i]) {
+ 				case SWAP_MAP_BAD:
+ 					continue;
+ 				case 0:
+@@ -728,6 +744,7 @@
+ 				default:
+ 					++val->totalswap;
+ 			}
++		}
+ 	}
+ 	val->freeswap <<= PAGE_SHIFT;
+ 	val->totalswap <<= PAGE_SHIFT;
+--- linux/mm/memory.c.orig	Sat Jul 31 10:00:17 1999
++++ linux/mm/memory.c	Sun Aug  1 01:00:17 1999
+@@ -281,6 +281,10 @@
+ 					goto out;
+ 				src_pte++;
+ 				dst_pte++;
++				/*
++				 * Reduce scheduling latencies:
++				 */
++				conditional_schedule();
+ 			} while ((unsigned long)src_pte & PTE_TABLE_MASK);
+ 		
+ cont_copy_pmd_range:	src_pmd++;
+@@ -348,9 +352,15 @@
+ 		pte++;
+ 		size--;
+ 		if (pte_none(page))
+-			continue;
++			goto continue_loop;
+ 		pte_clear(pte-1);
+ 		freed += free_pte(page);
++continue_loop:
++		/*
++		 * Avoid large scheduling latencies when exiting big
++		 * tasks:
++		 */
++		conditional_schedule();
+ 	}
+ 	return freed;
+ }
+--- linux/mm/page_alloc.c.orig	Sat Jul 31 11:23:46 1999
++++ linux/mm/page_alloc.c	Sun Aug  1 01:00:17 1999
+@@ -209,6 +209,8 @@
+ 	}
+ #endif
+ 
++	if (gfp_mask & __GFP_WAIT)
++		conditional_schedule();
+ 	/*
+ 	 * If this is a recursive call, we'd better
+ 	 * do our best to just allocate things without
+--- linux/mm/slab.c.orig	Sat Jul 31 17:42:25 1999
++++ linux/mm/slab.c	Sun Aug  1 01:00:17 1999
+@@ -1352,6 +1352,8 @@
+ 	/* Sanity check. */
+ 	if (!cachep)
+ 		goto nul_ptr;
++	if ((flags & SLAB_LEVEL_MASK) != SLAB_ATOMIC)
++		conditional_schedule();
+ 	spin_lock_irqsave(&cachep->c_spinlock, save_flags);
+ try_again:
+ 	/* Get slab alloc is to come from. */
+--- linux/mm/filemap.c.orig	Sat Jul 31 16:27:18 1999
++++ linux/mm/filemap.c	Sun Aug  1 01:00:17 1999
+@@ -96,6 +96,10 @@
+ 	while ((page = *p) != NULL) {
+ 		unsigned long offset = page->offset;
+ 
++		if (current->need_resched) {
++			schedule();
++			goto repeat;
++		}
+ 		/* page wholly truncated - free it */
+ 		if (offset >= start) {
+ 			if (PageLocked(page)) {
+@@ -727,7 +731,8 @@
+ 			filp->f_ramax = MIN_READAHEAD;
+ 
+ 		{
+-			int error = inode->i_op->readpage(filp, page);
++			int error;
++			error = inode->i_op->readpage(filp, page);
+ 			if (!error)
+ 				goto found_page;
+ 			desc->error = error;
+@@ -742,7 +747,8 @@
+ 		 * because this happens only if there were errors.
+ 		 */
+ 		{
+-			int error = inode->i_op->readpage(filp, page);
++			int error;
++			error = inode->i_op->readpage(filp, page);
+ 			if (!error) {
+ 				wait_on_page(page);
+ 				if (PageUptodate(page) && !PageError(page))
+--- linux/include/linux/sched.h.orig	Tue May 11 19:35:45 1999
++++ linux/include/linux/sched.h	Sun Aug  1 01:00:17 1999
+@@ -5,6 +5,7 @@
+ 
+ extern unsigned long event;
+ 
++#include <linux/condsched.h>
+ #include <linux/binfmts.h>
+ #include <linux/personality.h>
+ #include <linux/tasks.h>
+@@ -119,7 +120,7 @@
+ extern void show_state(void);
+ extern void trap_init(void);
+ 
+-#define	MAX_SCHEDULE_TIMEOUT	LONG_MAX
++#define	MAX_SCHEDULE_TIMEOUT    LONG_MAX
+ extern signed long FASTCALL(schedule_timeout(signed long timeout));
+ asmlinkage void schedule(void);
+ 
+@@ -225,7 +226,7 @@
+ 						0-0xFFFFFFFF for kernel-thread
+ 					 */
+ 	struct exec_domain *exec_domain;
+-	long need_resched;
++	volatile long need_resched;
+ 
+ /* various fields */
+ 	long counter;
+--- linux/include/linux/locks.h.orig	Tue May 11 19:36:15 1999
++++ linux/include/linux/locks.h	Sun Aug  1 01:00:17 1999
+@@ -18,12 +18,14 @@
+ {
+ 	if (test_bit(BH_Lock, &bh->b_state))
+ 		__wait_on_buffer(bh);
++	conditional_schedule();
+ }
+ 
+ extern inline void lock_buffer(struct buffer_head * bh)
+ {
+ 	while (test_and_set_bit(BH_Lock, &bh->b_state))
+ 		__wait_on_buffer(bh);
++	conditional_schedule();
+ }
+ 
+ extern inline void unlock_buffer(struct buffer_head *bh)
+@@ -43,6 +45,7 @@
+ {
+ 	if (sb->s_lock)
+ 		__wait_on_super(sb);
++	conditional_schedule();
+ }
+ 
+ extern inline void lock_super(struct super_block * sb)
+--- linux/include/linux/console_struct.h.orig	Mon Jul 26 14:50:08 1999
++++ linux/include/linux/console_struct.h	Sun Aug  1 01:00:17 1999
+@@ -18,6 +18,7 @@
+ 	unsigned int	vc_size_row;		/* Bytes per row */
+ 	struct consw	*vc_sw;
+ 	unsigned short	*vc_screenbuf;		/* In-memory character/attribute buffer */
++	unsigned long	vc_videobuf;		/* In-memory copy of text VideoRAM */
+ 	unsigned int	vc_screenbuf_size;
+ 	unsigned char	vc_attr;		/* Current attributes */
+ 	unsigned char	vc_def_color;		/* Default colors */
+--- linux/include/linux/selection.h.orig	Mon Jul 26 16:09:15 1999
++++ linux/include/linux/selection.h	Sun Aug  1 01:00:17 1999
+@@ -7,8 +7,6 @@
+ #ifndef _LINUX_SELECTION_H_
+ #define _LINUX_SELECTION_H_
+ 
+-#include <linux/vt_buffer.h>
+-
+ extern int sel_cons;
+ 
+ extern void clear_selection(void);
+--- linux/include/linux/vt_buffer.h.orig	Mon Jul 26 15:54:32 1999
++++ linux/include/linux/vt_buffer.h	Sun Aug  1 01:00:17 1999
+@@ -19,25 +19,129 @@
+ #include <asm/vga.h>
+ #endif
+ 
++#define VT_DOUBLEBUF 1
++
+ #ifndef VT_BUF_HAVE_RW
+-#define scr_writew(val, addr) (*(addr) = (val))
+-#define scr_readw(addr) (*(addr))
+-#define scr_memcpyw(d, s, c) memcpy(d, s, c)
+-#define scr_memmovew(d, s, c) memmove(d, s, c)
+-#define VT_BUF_HAVE_MEMCPYW
+-#define VT_BUF_HAVE_MEMMOVEW
+-#define scr_memcpyw_from(d, s, c) memcpy(d, s, c)
+-#define scr_memcpyw_to(d, s, c) memcpy(d, s, c)
+-#define VT_BUF_HAVE_MEMCPYF
++
++#if VT_DOUBLEBUF
++
++extern unsigned long vga_vram_base, vga_vram_end;
++
++extern inline unsigned short * __v2m(const unsigned short * s, int cons)
++{
++	struct vc_data *c;
++	unsigned short * __res;
++
++	c = vc_cons[cons].d;
++
++	if (*c->vc_display_fg == c) {
++		__res = (unsigned short *)(c->vc_videobuf+
++			((unsigned long)(s) - vga_vram_base));
++		/*
++		 * debugging hacks:
++		 */
++		if (((unsigned int)s < vga_vram_base) ||
++			((unsigned int)s > vga_vram_end)) {
++//			printk("P1:<%p->%p(%p)>?\n", s, __res, (void *)&&__y);
++			__res = (unsigned short *)(s);
++		} else {
++			if ((__res < (unsigned short *)c->vc_videobuf) || (__res >= (unsigned short *)(c->vc_videobuf+128*1024))) {
++//				printk("P2:<%p->%p(%p)>?\n", s, __res, (void *)&&__y);
++				__res = (unsigned short *)(s);
++			}
++		}
++	} else
++		__res = (unsigned short *)(s);
++	return __res;
++}
++
++#define v2m(x) __v2m(x,currcons)
++
++// #define v2m(x) ({ unsigned short * __res; if (vc_cons[currcons].d->vc_videobuf) __res = (unsigned short *)(vc_cons[currcons].d->vc_videobuf+((unsigned long)(x)-vc_cons[currcons].d->vc_origin)); else { extern int magic_flag; magic_flag++; __res = (unsigned short *)(x); } __res; })
++// #define v2m(x) ({ unsigned short * __res; __res = (unsigned short *)(vc_cons[currcons].d->vc_videobuf+((unsigned long)(x)-vga_vram_base)); __res; })
++
++#if 1
++extern inline void __scr_writew(u16 val, u16 *addr, int currcons)
++{
++	*addr = val;
++	*(v2m(addr)) = val;
++}
++#define scr_writew(val, addr) __scr_writew(val, addr, currcons)
++
++# define scr_readw(addr) ({*(v2m(addr));})
++#else
++# define scr_writew(val, addr) ({*(addr) = (val); })
++# define scr_readw(addr) ({*(addr);})
++#endif
++
++extern inline void __scr_memcpyw(void * d, void * s,
++		 unsigned int c, int currcons)
++{
++	memcpy(v2m(d), v2m(s), c);
++	memcpy(d, v2m(d), c);
++}
++#define scr_memcpyw(d, s, c) __scr_memcpyw(d, s, c, currcons)
++
++extern inline void __scr_memmovew(void * d, void * s,
++		 unsigned int c, int currcons)
++{
++	memmove(v2m(d), v2m(s), c);
++	memcpy(d, v2m(d), c);
++}
++# define scr_memmovew(d, s, c) __scr_memmovew(d, s, c, currcons)
++# define VT_BUF_HAVE_MEMCPYW
++# define VT_BUF_HAVE_MEMMOVEW
++extern inline void __scr_memcpyw_to(void * d, void * s,
++		unsigned int c, int currcons)
++{
++	memcpy(v2m(d), s, c);
++	memcpy(d, s, c);
++}
++# define scr_memcpyw_to(d, s, c) __scr_memcpyw_to(d, s, c, currcons)
++# define scr_memcpyw_from(d, s, c) ({ memcpy(d, v2m(s), c);})
++# define VT_BUF_HAVE_MEMCPYF
++
++# define scr_writew_nonbuffered(val, addr) ({*(addr) = (val); })
++# define scr_readw_nonbuffered(addr) ({*(addr);})
++# define scr_memcpyw_nonbuffered(d, s, c) ({ memcpy(d, s, c); })
++# define scr_memmovew_nonbuffered(d, s, c) ({ memmove(d, s, c); })
++# define VT_BUF_HAVE_MEMCPYW
++# define VT_BUF_HAVE_MEMMOVEW
++# define scr_memcpyw_from_nonbuffered(d, s, c) ({ memcpy(d, s, c);})
++# define scr_memcpyw_to_nonbuffered(d, s, c) ({ memcpy(d, s, c);})
++# define VT_BUF_HAVE_MEMCPYF
++#else
++
++# define scr_writew(val, addr) ({*(addr) = (val); })
++# define scr_readw(addr) ({*(addr);})
++# define scr_memcpyw(d, s, c) ({ memcpy(d, s, c); })
++# define scr_memmovew(d, s, c) ({ memmove(d, s, c); })
++# define VT_BUF_HAVE_MEMCPYW
++# define VT_BUF_HAVE_MEMMOVEW
++# define scr_memcpyw_from(d, s, c) ({ memcpy(d, s, c);})
++# define scr_memcpyw_to(d, s, c) ({ memcpy(d, s, c);})
++# define VT_BUF_HAVE_MEMCPYF
++#endif
++
+ #endif
+ 
+ #ifndef VT_BUF_HAVE_MEMSETW
+-extern inline void scr_memsetw(u16 *s, u16 c, unsigned int count)
++extern inline void __scr_memsetw(u16 *s, u16 c,
++				 unsigned int count, int currcons)
+ {
+ 	count /= 2;
+ 	while (count--)
+ 		scr_writew(c, s++);
+ }
++#define scr_memsetw(s,c,count) __scr_memsetw(s,c,count,currcons)
++extern inline void scr_memsetw_nonbuffered(u16 *s, u16 c,
++				 unsigned int count)
++{
++	count /= 2;
++	while (count--)
++		scr_writew_nonbuffered(c, s++);
++}
++
+ #endif
+ 
+ #ifndef VT_BUF_HAVE_MEMCPYW
+--- linux/include/linux/delay.h.orig	Sat Jul 31 16:02:46 1999
++++ linux/include/linux/delay.h	Sun Aug  1 01:00:17 1999
+@@ -25,13 +25,24 @@
+ #define MAX_UDELAY_MS	5
+ #endif
+ 
+-#ifdef notdef
++/*
++ * the 'preemptive' version of udelay. In some cases we want to use
++ * this variant, it guarantees that preemption will happing within
++ * 10 usecs (despite doing busy waiting). Not all drivers can use
++ * this automatically, the driver has to be sufficiently reentrant.
++ */
++#define udelay_resched(n) (\
++	{	int i; \
++		for (i = 0; i < 100; i++) { \
++			conditional_schedule(); \
++			udelay(10); \
++		} \
++	})
++
+ #define mdelay(n) (\
+ 	{unsigned long msec=(n); while (msec--) udelay(1000);})
+-#else
+-#define mdelay(n) (\
+-	(__builtin_constant_p(n) && (n)<=MAX_UDELAY_MS) ? udelay((n)*1000) : \
+-	({unsigned long msec=(n); while (msec--) udelay(1000);}))
+-#endif
++#define mdelay_resched(n) (\
++	{unsigned long msec=(n); while (msec--) udelay_resched(1000);})
++
+ 
+ #endif /* defined(_LINUX_DELAY_H) */
+--- linux/include/linux/fs.h.orig	Sat Jul 31 17:26:38 1999
++++ linux/include/linux/fs.h	Sun Aug  1 01:00:17 1999
+@@ -8,6 +8,7 @@
+ 
+ #include <linux/config.h>
+ #include <linux/linkage.h>
++#include <linux/condsched.h>
+ #include <linux/limits.h>
+ #include <linux/wait.h>
+ #include <linux/types.h>
+@@ -756,24 +757,26 @@
+ #define BUF_DIRTY	2	/* Dirty buffers, not yet scheduled for write */
+ #define NR_LIST		3
+ 
+-void mark_buffer_uptodate(struct buffer_head * bh, int on);
++extern void mark_buffer_uptodate(struct buffer_head * bh, int on);
+ 
+-extern inline void mark_buffer_clean(struct buffer_head * bh)
+-{
+-	if (test_and_clear_bit(BH_Dirty, &bh->b_state)) {
+-		if (bh->b_list == BUF_DIRTY)
+-			refile_buffer(bh);
+-	}
+-}
+-
+-extern inline void mark_buffer_dirty(struct buffer_head * bh, int flag)
+-{
+-	if (!test_and_set_bit(BH_Dirty, &bh->b_state)) {
+-		set_writetime(bh, flag);
+-		if (bh->b_list != BUF_DIRTY)
+-			refile_buffer(bh);
+-	}
+-}
++#define mark_buffer_clean(bh) \
++do { \
++	if (test_and_clear_bit(BH_Dirty, &(bh)->b_state)) { \
++		if ((bh)->b_list == BUF_DIRTY) \
++			refile_buffer(bh); \
++	} \
++	conditional_schedule(); \
++} while(0)
++
++#define mark_buffer_dirty(bh,flag) \
++do { \
++	if (!test_and_set_bit(BH_Dirty, &(bh)->b_state)) { \
++		set_writetime(bh, flag); \
++		if ((bh)->b_list != BUF_DIRTY) \
++			refile_buffer(bh); \
++	} \
++	conditional_schedule(); \
++} while(0)
+ 
+ extern int check_disk_change(kdev_t dev);
+ extern int invalidate_inodes(struct super_block * sb);
+--- linux/include/linux/condsched.h.orig	Sat Jul 31 19:48:04 1999
++++ linux/include/linux/condsched.h	Sun Aug  1 01:00:17 1999
+@@ -0,0 +1,16 @@
++#ifndef _LINUX_CONDSCHED_H
++#define _LINUX_CONDSCHED_H
++
++
++#ifndef __ASSEMBLY__
++#define conditional_schedule() \
++do { \
++        if (current->need_resched) { \
++		current->state = TASK_RUNNING; \
++                schedule(); \
++	} \
++} while(0)
++#endif
++
++#endif
++
+--- linux/include/asm-i386/uaccess.h.orig	Tue May 11 19:35:46 1999
++++ linux/include/asm-i386/uaccess.h	Sun Aug  1 01:00:17 1999
+@@ -6,6 +6,7 @@
+  */
+ #include <linux/config.h>
+ #include <linux/sched.h>
++#include <linux/condsched.h>
+ #include <asm/page.h>
+ 
+ #define VERIFY_READ 0
+@@ -253,6 +254,7 @@
+ #define __copy_user(to,from,size)					\
+ do {									\
+ 	int __d0, __d1;							\
++	conditional_schedule();							\
+ 	__asm__ __volatile__(						\
+ 		"0:	rep; movsl\n"					\
+ 		"	movl %3,%0\n"					\
+@@ -275,6 +277,7 @@
+ #define __copy_user_zeroing(to,from,size)				\
+ do {									\
+ 	int __d0, __d1;							\
++	conditional_schedule();							\
+ 	__asm__ __volatile__(						\
+ 		"0:	rep; movsl\n"					\
+ 		"	movl %3,%0\n"					\
+@@ -324,6 +327,7 @@
+ 	int __d0, __d1;						\
+ 	switch (size & 3) {					\
+ 	default:						\
++		conditional_schedule();					\
+ 		__asm__ __volatile__(				\
+ 			"0:	rep; movsl\n"			\
+ 			"1:\n"					\
+@@ -408,6 +412,7 @@
+ 	int __d0, __d1;						\
+ 	switch (size & 3) {					\
+ 	default:						\
++		conditional_schedule();					\
+ 		__asm__ __volatile__(				\
+ 			"0:	rep; movsl\n"			\
+ 			"1:\n"					\
+--- linux/include/asm-i386/smplock.h.orig	Tue May 11 19:35:46 1999
++++ linux/include/asm-i386/smplock.h	Sun Aug  1 01:00:17 1999
+@@ -4,6 +4,7 @@
+  * i386 SMP lock implementation
+  */
+ #include <linux/interrupt.h>
++#include <linux/condsched.h>
+ #include <asm/spinlock.h>
+ 
+ extern spinlock_t kernel_flag;
+@@ -22,6 +23,7 @@
+ /*
+  * Re-acquire the kernel lock
+  */
++
+ #define reacquire_kernel_lock(task) \
+ do { \
+ 	if (task->lock_depth >= 0) \
+--- linux/drivers/char/mem.c.orig	Mon May 10 19:18:34 1999
++++ linux/drivers/char/mem.c	Sun Aug  1 01:00:17 1999
+@@ -366,8 +366,7 @@
+ 		unsigned long unwritten = clear_user(buf, PAGE_SIZE);
+ 		if (unwritten)
+ 			return size + unwritten - PAGE_SIZE;
+-		if (current->need_resched)
+-			schedule();
++		conditional_schedule();
+ 		buf += PAGE_SIZE;
+ 		size -= PAGE_SIZE;
+ 	} while (size);
+--- linux/drivers/char/lp.c.orig	Mon May 10 19:26:31 1999
++++ linux/drivers/char/lp.c	Sun Aug  1 01:00:17 1999
+@@ -234,8 +234,7 @@
+ {
+ 	if (!parport_yield_blocking (lp_table[minor].dev))
+ 	{
+-		if (current->need_resched)
+-			schedule ();
++		conditional_schedule();
+ 	} else
+ 		lp_table[minor].irq_missed = 1;
+ }
+--- linux/drivers/char/random.c.orig	Thu Dec 31 21:03:49 1998
++++ linux/drivers/char/random.c	Sun Aug  1 01:00:17 1999
+@@ -1280,8 +1280,9 @@
+ 				ret = -EINTR;
+ 				break;
+ 			}
+-			schedule();
+ 		}
++		if (to_user)
++			conditional_schedule();
+ 	}
+ 
+ 	/* Wipe data just returned from memory */
+--- linux/drivers/char/n_tty.c.orig	Sun Apr 25 02:49:37 1999
++++ linux/drivers/char/n_tty.c	Sun Aug  1 01:00:18 1999
+@@ -953,7 +953,7 @@
+ 		if (((minimum - (b - buf)) < tty->minimum_to_wake) &&
+ 		    ((minimum - (b - buf)) >= 1))
+ 			tty->minimum_to_wake = (minimum - (b - buf));
+-		
++
+ 		if (!input_available_p(tty, 0)) {
+ 			if (test_bit(TTY_OTHER_CLOSED, &tty->flags)) {
+ 				retval = -EIO;
+--- linux/drivers/char/tty_io.c.orig	Mon Mar 22 19:06:21 1999
++++ linux/drivers/char/tty_io.c	Sun Aug  1 01:00:18 1999
+@@ -652,6 +652,7 @@
+ 	struct inode *inode = file->f_dentry->d_inode;
+ 	
+ 	up(&inode->i_sem);
++	conditional_schedule();
+ 	if (down_interruptible(&inode->i_atomic_write)) {
+ 		down(&inode->i_sem);
+ 		return -ERESTARTSYS;
+@@ -671,8 +672,7 @@
+ 		ret = -ERESTARTSYS;
+ 		if (signal_pending(current))
+ 			break;
+-		if (current->need_resched)
+-			schedule();
++		conditional_schedule();
+ 	}
+ 	if (written) {
+ 		file->f_dentry->d_inode->i_mtime = CURRENT_TIME;
+@@ -1643,7 +1643,7 @@
+ {
+ 	struct tty_struct *tty, *real_tty;
+ 	int retval;
+-	
++
+ 	tty = (struct tty_struct *)file->private_data;
+ 	if (tty_paranoia_check(tty, inode->i_rdev, "tty_ioctl"))
+ 		return -EINVAL;
+--- linux/drivers/char/console.c.orig	Thu Mar 11 01:51:35 1999
++++ linux/drivers/char/console.c	Sun Aug  1 01:00:18 1999
+@@ -104,6 +104,8 @@
+ 
+ #include "console_macros.h"
+ 
++#include <linux/vt_buffer.h>
++
+ 
+ struct consw *conswitchp = NULL;
+ 
+@@ -640,6 +642,7 @@
+ 		return -ENOMEM;
+ 	    vc_cons[currcons].d = (struct vc_data *)p;
+ 	    vt_cons[currcons] = (struct vt_struct *)(p+sizeof(struct vc_data));
++	    videobuf = 0;
+ 	    visual_init(currcons, 1);
+ 	    if (!*vc_cons[currcons].d->vc_uni_pagedir_loc)
+ 		con_set_default_unimap(currcons);
+@@ -1816,9 +1819,10 @@
+ 	disable_bh(CONSOLE_BH);
+ 	while (!tty->stopped && count) {
+ 		enable_bh(CONSOLE_BH);
+-		if (from_user)
++		if (from_user) {
++			conditional_schedule();
+ 			__get_user(c, buf);
+-		else
++		} else
+ 			c = *buf;
+ 		buf++; n++; count--;
+ 		disable_bh(CONSOLE_BH);
+@@ -2342,6 +2346,7 @@
+ 		kmem_start += sizeof(struct vc_data);
+ 		vt_cons[currcons] = (struct vt_struct *) kmem_start;
+ 		kmem_start += sizeof(struct vt_struct);
++		videobuf = 0;
+ 		visual_init(currcons, 1);
+ 		screenbuf = (unsigned short *) kmem_start;
+ 		kmem_start += screenbuf_size;
+@@ -2419,6 +2424,7 @@
+ 			save_screen(i);
+ 		old_was_color = vc_cons[i].d->vc_can_do_color;
+ 		vc_cons[i].d->vc_sw->con_deinit(vc_cons[i].d);
++		videobuf = 0;
+ 		visual_init(i, 0);
+ 		update_attr(i);
+ 
+--- linux/drivers/char/console_macros.h.orig	Mon Jul 26 15:04:30 1999
++++ linux/drivers/char/console_macros.h	Sun Aug  1 01:00:18 1999
+@@ -1,6 +1,7 @@
+ #define cons_num	(vc_cons[currcons].d->vc_num)
+ #define sw		(vc_cons[currcons].d->vc_sw)
+ #define screenbuf	(vc_cons[currcons].d->vc_screenbuf)
++#define videobuf	(vc_cons[currcons].d->vc_videobuf)
+ #define screenbuf_size	(vc_cons[currcons].d->vc_screenbuf_size)
+ #define origin		(vc_cons[currcons].d->vc_origin)
+ #define scr_top		(vc_cons[currcons].d->vc_scr_top)
+--- linux/drivers/char/pc_keyb.c.orig	Sat Jul 31 15:27:31 1999
++++ linux/drivers/char/pc_keyb.c	Sun Aug  1 01:00:18 1999
+@@ -104,9 +104,9 @@
+  * Controller Status register are set 0."
+  */
+ 
+-static void kb_wait(void)
++static void kb_wait(unsigned long * flags)
+ {
+-	unsigned long timeout = KBC_TIMEOUT;
++	unsigned long timeout = KBC_TIMEOUT*10;
+ 
+ 	do {
+ 		/*
+@@ -117,8 +117,13 @@
+ 
+ 		if (! (status & KBD_STAT_IBF))
+ 			return;
+-		mdelay(1);
+-		timeout--;
++		/*
++		 * We release/regrab the controller lock before delaying
++		 * the process - to reduce scheduling latencies.
++		 */
++		spin_unlock_irq(&kbd_controller_lock);
++		udelay_resched(100);
++		spin_lock_irqsave(&kbd_controller_lock, *flags);
+ 	} while (timeout);
+ #ifdef KBD_REPORT_TIMEOUTS
+ 	printk(KERN_WARNING "Keyboard timed out[1]\n");
+@@ -471,7 +476,7 @@
+ 	int retries = 3;
+ 
+ 	do {
+-		unsigned long timeout = KBD_TIMEOUT;
++		unsigned long timeout = KBD_TIMEOUT*10;
+ 
+ 		acknowledge = 0; /* Set by interrupt routine on receipt of ACK. */
+ 		resend = 0;
+@@ -482,7 +487,7 @@
+ 				return 1;
+ 			if (resend)
+ 				break;
+-			mdelay(1);
++			udelay(100);
+ 			if (!--timeout) {
+ #ifdef KBD_REPORT_TIMEOUTS
+ 				printk(KERN_WARNING "Keyboard timeout[2]\n");
+@@ -555,13 +560,13 @@
+ 
+ static int __init kbd_wait_for_input(void)
+ {
+-	long timeout = KBD_INIT_TIMEOUT;
++	long timeout = KBD_INIT_TIMEOUT*10;
+ 
+ 	do {
+ 		int retval = kbd_read_input();
+ 		if (retval >= 0)
+ 			return retval;
+-		mdelay(1);
++		udelay(100);
+ 	} while (--timeout);
+ 	return -1;
+ }
+@@ -571,7 +576,7 @@
+ 	unsigned long flags;
+ 
+ 	spin_lock_irqsave(&kbd_controller_lock, flags);
+-	kb_wait();
++	kb_wait(&flags);
+ 	outb(data, address);
+ 	spin_unlock_irqrestore(&kbd_controller_lock, flags);
+ }
+@@ -582,9 +587,9 @@
+ 	unsigned long flags;
+ 
+ 	spin_lock_irqsave(&kbd_controller_lock, flags);
+-	kb_wait();
++	kb_wait(&flags);
+ 	outb(KBD_CCMD_WRITE_MODE, KBD_CNTL_REG);
+-	kb_wait();
++	kb_wait(&flags);
+ 	outb(cmd, KBD_DATA_REG);
+ 	spin_unlock_irqrestore(&kbd_controller_lock, flags);
+ }
+@@ -731,10 +736,10 @@
+ 	 * bit is also set to 1 in the Status Register, we assume this
+ 	 * controller has an Auxiliary Port (a.k.a. Mouse Port).
+ 	 */
+-	kb_wait();
++	kb_wait(&flags);
+ 	outb(KBD_CCMD_WRITE_AUX_OBUF, KBD_CNTL_REG);
+ 
+-	kb_wait();
++	kb_wait(&flags);
+ 	outb(0x5a, KBD_DATA_REG); /* 0x5a is a random dummy value. */
+ 
+ 	do {
+@@ -748,7 +753,7 @@
+ 			}
+ 			break;
+ 		}
+-		mdelay(1);
++		udelay(100);
+ 	} while (--loops);
+ 	spin_unlock_irqrestore(&kbd_controller_lock, flags);
+ 
+@@ -763,9 +768,9 @@
+ 	unsigned long flags;
+ 
+ 	spin_lock_irqsave(&kbd_controller_lock, flags);
+-	kb_wait();
++	kb_wait(&flags);
+ 	outb(KBD_CCMD_WRITE_MOUSE, KBD_CNTL_REG);
+-	kb_wait();
++	kb_wait(&flags);
+ 	outb(val, KBD_DATA_REG);
+ 	spin_unlock_irqrestore(&kbd_controller_lock, flags);
+ }
+@@ -778,13 +783,13 @@
+ 	unsigned long flags;
+ 
+ 	spin_lock_irqsave(&kbd_controller_lock, flags);
+-	kb_wait();
++	kb_wait(&flags);
+ 	outb(KBD_CCMD_WRITE_MOUSE, KBD_CNTL_REG);
+-	kb_wait();
++	kb_wait(&flags);
+ 	outb(val, KBD_DATA_REG);
+ 	/* we expect an ACK in response. */
+ 	mouse_reply_expected++;
+-	kb_wait();
++	kb_wait(&flags);
+ 	spin_unlock_irqrestore(&kbd_controller_lock, flags);
+ }
+ 
+@@ -914,6 +919,7 @@
+ 			get_user(c, buffer++);
+ 			aux_write_dev(c);
+ 			written++;
++			conditional_schedule();
+ 		} while (--count);
+ 		retval = -EIO;
+ 		if (written) {
+--- linux/drivers/video/vgacon.c.orig	Wed May 12 01:30:36 1999
++++ linux/drivers/video/vgacon.c	Sun Aug  1 01:00:18 1999
+@@ -33,6 +33,8 @@
+  *  more details.
+  */
+ 
++#define VGA_LOCAL 1
++
+ #include <linux/config.h>
+ #include <linux/types.h>
+ #include <linux/sched.h>
+@@ -51,6 +53,8 @@
+ 
+ #include <asm/io.h>
+ 
++#include <linux/vt_buffer.h>
++
+ 
+ #define BLANK 0x0020
+ 
+@@ -96,8 +100,8 @@
+ 
+ 
+ /* Description of the hardware situation */
+-static unsigned long   vga_vram_base;		/* Base of video memory */
+-static unsigned long   vga_vram_end;		/* End of video memory */
++unsigned long   vga_vram_base;		/* Base of video memory */
++unsigned long   vga_vram_end;		/* End of video memory */
+ static u16             vga_video_port_reg;	/* Video register select port */
+ static u16             vga_video_port_val;	/* Video register value port */
+ static unsigned int    vga_video_num_columns;	/* Number of text columns */
+@@ -115,6 +119,7 @@
+ static int	       vga_video_font_height;
+ static unsigned int    vga_rolled_over = 0;
+ 
++static char vga_vram_copy[128*1024];	/* In-memory copy of video memory */
+ 
+ void no_scroll(char *str, int *ints)
+ {
+@@ -267,24 +272,24 @@
+ 	 *	Are there smarter methods around?
+ 	 */
+ 	p = (u16 *)vga_vram_base;
+-	saved1 = scr_readw(p);
+-	saved2 = scr_readw(p + 1);
+-	scr_writew(0xAA55, p);
+-	scr_writew(0x55AA, p + 1);
+-	if (scr_readw(p) != 0xAA55 || scr_readw(p + 1) != 0x55AA) {
+-		scr_writew(saved1, p);
+-		scr_writew(saved2, p + 1);
++	saved1 = scr_readw_nonbuffered(p);
++	saved2 = scr_readw_nonbuffered(p + 1);
++	scr_writew_nonbuffered(0xAA55, p);
++	scr_writew_nonbuffered(0x55AA, p + 1);
++	if (scr_readw_nonbuffered(p) != 0xAA55 || scr_readw_nonbuffered(p + 1) != 0x55AA) {
++		scr_writew_nonbuffered(saved1, p);
++		scr_writew_nonbuffered(saved2, p + 1);
+ 		goto no_vga;
+ 	}
+-	scr_writew(0x55AA, p);
+-	scr_writew(0xAA55, p + 1);
+-	if (scr_readw(p) != 0x55AA || scr_readw(p + 1) != 0xAA55) {
+-		scr_writew(saved1, p);
+-		scr_writew(saved2, p + 1);
++	scr_writew_nonbuffered(0x55AA, p);
++	scr_writew_nonbuffered(0xAA55, p + 1);
++	if (scr_readw_nonbuffered(p) != 0x55AA || scr_readw_nonbuffered(p + 1) != 0xAA55) {
++		scr_writew_nonbuffered(saved1, p);
++		scr_writew_nonbuffered(saved2, p + 1);
+ 		goto no_vga;
+ 	}
+-	scr_writew(saved1, p);
+-	scr_writew(saved2, p + 1);
++	scr_writew_nonbuffered(saved1, p);
++	scr_writew_nonbuffered(saved2, p + 1);
+ 
+ 	if (vga_video_type == VIDEO_TYPE_EGAC
+ 	    || vga_video_type == VIDEO_TYPE_VGAC
+@@ -318,6 +323,8 @@
+ 	vgacon_uni_pagedir[1]++;
+ 	if (!vgacon_uni_pagedir[0] && p)
+ 		con_set_default_unimap(c->vc_num);
++
++	c->vc_videobuf = (unsigned long) vga_vram_copy;
+ }
+ 
+ static inline void vga_set_mem_top(struct vc_data *c)
+@@ -365,6 +372,7 @@
+ static void vgacon_invert_region(struct vc_data *c, u16 *p, int count)
+ {
+ 	int col = vga_can_do_color;
++	int currcons = c->vc_num;
+ 
+ 	while (count--) {
+ 		u16 a = scr_readw(p);
+@@ -372,7 +380,7 @@
+ 			a = ((a) & 0x88ff) | (((a) & 0x7000) >> 4) | (((a) & 0x0700) << 4);
+ 		else
+ 			a ^= ((a & 0x0700) == 0x0100) ? 0x7000 : 0x7700;
+-		scr_writew(a, p++);
++		__scr_writew(a, p++, c->vc_num);
+ 	}
+ }
+ 
+@@ -451,6 +459,7 @@
+ 
+ static int vgacon_switch(struct vc_data *c)
+ {
++	int currcons = c->vc_num;
+ 	/*
+ 	 * We need to save screen size here as it's the only way
+ 	 * we can spot the screen has been resized and we need to
+@@ -641,10 +650,10 @@
+ 			return 0;
+ 		}
+ 		vgacon_set_origin(c);
+-		scr_memsetw((void *)vga_vram_base, BLANK, c->vc_screenbuf_size);
++		__scr_memsetw((void *)vga_vram_base, BLANK, c->vc_screenbuf_size, c->vc_num);
+ 		return 1;
+ 	case -1:			/* Entering graphic mode */
+-		scr_memsetw((void *)vga_vram_base, BLANK, c->vc_screenbuf_size);
++		__scr_memsetw((void *)vga_vram_base, BLANK, c->vc_screenbuf_size, c->vc_num);
+ 		vga_is_gfx = 1;
+ 		return 1;
+ 	default:			/* VESA blanking */
+@@ -940,6 +949,7 @@
+ static void vgacon_save_screen(struct vc_data *c)
+ {
+ 	static int vga_bootup_console = 0;
++	int currcons = c->vc_num;
+ 
+ 	if (!vga_bootup_console) {
+ 		/* This is a gross hack, but here is the only place we can
+@@ -954,10 +964,15 @@
+ 		scr_memcpyw_from((u16 *) c->vc_screenbuf, (u16 *) c->vc_origin, c->vc_screenbuf_size);
+ }
+ 
++unsigned int scroll_lat, max_scroll_lat, max_scroll_size, max_scroll_addr1,
++max_scroll_addr2;
++
+ static int vgacon_scroll(struct vc_data *c, int t, int b, int dir, int lines)
+ {
++	unsigned long long t0, t1;
+ 	unsigned long oldo;
+ 	unsigned int delta;
++	int currcons = c->vc_num;
+ 	
+ 	if (t || b != c->vc_rows || vga_is_gfx)
+ 		return 0;
+@@ -970,16 +985,19 @@
+ 
+ 	oldo = c->vc_origin;
+ 	delta = lines * c->vc_size_row;
++t0 = t1 = 0;
+ 	if (dir == SM_UP) {
+ 		if (c->vc_scr_end + delta >= vga_vram_end) {
+-			scr_memcpyw((u16 *)vga_vram_base,
+-				    (u16 *)(oldo + delta),
+-				    c->vc_screenbuf_size - delta);
++rdtscll(t0);
++		scr_memcpyw((u16 *)vga_vram_base,
++				(u16 *)(oldo + delta),
++				c->vc_screenbuf_size - delta);
++rdtscll(t1);
+ 			c->vc_origin = vga_vram_base;
+ 			vga_rolled_over = oldo - vga_vram_base;
+ 		} else
+ 			c->vc_origin += delta;
+-		scr_memsetw((u16 *)(c->vc_origin + c->vc_screenbuf_size - delta), c->vc_video_erase_char, delta);
++		__scr_memsetw((u16 *)(c->vc_origin + c->vc_screenbuf_size - delta), c->vc_video_erase_char, delta, c->vc_num);
+ 	} else {
+ 		if (oldo - delta < vga_vram_base) {
+ 			scr_memmovew((u16 *)(vga_vram_end - c->vc_screenbuf_size + delta),
+@@ -990,8 +1008,18 @@
+ 		} else
+ 			c->vc_origin -= delta;
+ 		c->vc_scr_end = c->vc_origin + c->vc_screenbuf_size;
+-		scr_memsetw((u16 *)(c->vc_origin), c->vc_video_erase_char, delta);
++		__scr_memsetw((u16 *)(c->vc_origin), c->vc_video_erase_char, delta, c->vc_num);
+ 	}
++
++scroll_lat = (unsigned int)(t1-t0) / 400;
++if (max_scroll_lat < scroll_lat) {
++	int currcons = c->vc_num;
++	max_scroll_lat = scroll_lat;
++	max_scroll_addr1 = (unsigned int)v2m((unsigned short *)vga_vram_base);
++	max_scroll_addr2 = (unsigned int)v2m((unsigned short *)(oldo + delta));
++	max_scroll_size = (unsigned int)(c->vc_screenbuf_size - delta);
++}
++
+ 	c->vc_scr_end = c->vc_origin + c->vc_screenbuf_size;
+ 	c->vc_visible_origin = c->vc_origin;
+ 	vga_set_mem_top(c);
+--- linux/arch/i386/mm/fault.c.orig	Sun Nov 22 18:38:19 1998
++++ linux/arch/i386/mm/fault.c	Sun Aug  1 01:00:18 1999
+@@ -174,7 +174,7 @@
+ 			tsk->tss.screen_bitmap |= 1 << bit;
+ 	}
+ 	up(&mm->mmap_sem);
+-	return;
++	goto out;
+ 
+ /*
+  * Something tried to access memory that isn't in our memory map..
+@@ -189,7 +189,7 @@
+ 		tsk->tss.error_code = error_code;
+ 		tsk->tss.trap_no = 14;
+ 		force_sig(SIGSEGV, tsk);
+-		return;
++		goto out;
+ 	}
+ 
+ 	/*
+@@ -202,7 +202,7 @@
+ 
+ 		if (nr == 6) {
+ 			do_invalid_op(regs, 0);
+-			return;
++			goto out;
+ 		}
+ 	}
+ 
+@@ -210,7 +210,7 @@
+ 	/* Are we prepared to handle this kernel fault?  */
+ 	if ((fixup = search_exception_table(regs->eip)) != 0) {
+ 		regs->eip = fixup;
+-		return;
++		goto out;
+ 	}
+ 
+ /*
+@@ -229,7 +229,7 @@
+ 		 * CPU state on certain buggy processors.
+ 		 */
+ 		printk("Ok");
+-		return;
++		goto out;
+ 	}
+ 
+ 	if (address < PAGE_SIZE)
+@@ -270,4 +270,5 @@
+ 	/* Kernel mode? Handle exceptions or die */
+ 	if (!(error_code & 4))
+ 		goto no_context;
++out:
+ }
+--- linux/arch/i386/mm/init.c.orig	Thu Jan 21 20:28:40 1999
++++ linux/arch/i386/mm/init.c	Sun Aug  1 01:00:18 1999
+@@ -488,6 +488,12 @@
+ 	val->freeram = nr_free_pages << PAGE_SHIFT;
+ 	val->bufferram = buffermem;
+ 	while (i-- > 0)  {
++		/*
++		 * si_meminfo() cannot be exact, but it can cause _long_
++		 * scheduling latencies on big memory boxes.
++		 */
++		if (!(i & 31))
++			conditional_schedule();
+ 		if (PageReserved(mem_map+i))
+ 			continue;
+ 		val->totalram++;
+--- linux/arch/i386/lib/usercopy.c.orig	Sat Jul 31 12:58:19 1999
++++ linux/arch/i386/lib/usercopy.c	Sun Aug  1 01:00:18 1999
+@@ -10,6 +10,7 @@
+ unsigned long
+ __generic_copy_to_user(void *to, const void *from, unsigned long n)
+ {
++	conditional_schedule();
+ 	if (access_ok(VERIFY_WRITE, to, n))
+ 		__copy_user(to,from,n);
+ 	return n;
+@@ -18,6 +19,7 @@
+ unsigned long
+ __generic_copy_from_user(void *to, const void *from, unsigned long n)
+ {
++	conditional_schedule();
+ 	if (access_ok(VERIFY_READ, from, n))
+ 		__copy_user_zeroing(to,from,n);
+ 	return n;
+@@ -60,6 +62,7 @@
+ __strncpy_from_user(char *dst, const char *src, long count)
+ {
+ 	long res;
++	conditional_schedule();
+ 	__do_strncpy_from_user(dst, src, count, res);
+ 	return res;
+ }
+@@ -68,6 +71,7 @@
+ strncpy_from_user(char *dst, const char *src, long count)
+ {
+ 	long res = -EFAULT;
++	conditional_schedule();
+ 	if (access_ok(VERIFY_READ, src, 1))
+ 		__do_strncpy_from_user(dst, src, count, res);
+ 	return res;
+@@ -102,6 +106,7 @@
+ unsigned long
+ clear_user(void *to, unsigned long n)
+ {
++	conditional_schedule();
+ 	if (access_ok(VERIFY_WRITE, to, n))
+ 		__do_clear_user(to, n);
+ 	return n;
+@@ -124,6 +129,7 @@
+ {
+ 	unsigned long res;
+ 
++	conditional_schedule();
+ 	__asm__ __volatile__(
+ 		"0:	repne; scasb\n"
+ 		"	notl %0\n"

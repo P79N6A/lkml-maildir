@@ -1,0 +1,237 @@
+Date: Tue, 21 Sep 1999 17:03:30 +0200 (CEST)
+From: Andrea Arcangeli <>
+Subject: Re: [patch] __lock_sock race condition in 2.3.18*
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/9/21/126
+
+On Mon, 20 Sep 1999, Andrea Arcangeli wrote:
+>Yes. I think what happened is this:
+>
+>	task1		task2
+>	-----		-----
+>	lock_sock(sk1)
+>			tcp_get_info()
+>			increase lhash users
+>			lock_sock(sk1)
+>			block
+>	tcp_listen_wlock()
+>	block
+>
+>-> deadlock
+My guess was right.
+>Actually I am going to discover the exact path of task1 (the task2 path is
+>trivial, it's just a cat /proc/net/tcp) with this little debugging code.
+Ok, the problem is definietly tcp_get_info and not the other path as the
+other paths need the sock locked while hashing/unhashing (for example in
+tcp_close() calling tcp_set_state(TCP_CLOSE)).
+The real problem I had in fixing this is that tcp_get_info() it's _not_
+buggy and instead it's doing the right thing. So basically I had to
+invent another way to serialize the syn_wait_queue reads since we simply
+can't grab the lock_sock() in tcp_get_info().
+Now I grab a read lock before walking over the syn wait queue if I don't
+own the lock_sock, and all writers will have to grab the write lock (plus
+the usual lock_sock). I did that and infact everything is fine now and I
+can't lockup anymore.
+Here it is the fix against 2.3.18ac6 (or ac7 as there aren't been tcp
+patches in the meantime).
+diff -urN 2.3.18ac6/include/net/sock.h 2.3.18ac6-netlockup/include/net/sock.h
+--- 2.3.18ac6/include/net/sock.h	Mon Sep 20 22:44:38 1999
++++ 2.3.18ac6-netlockup/include/net/sock.h	Tue Sep 21 16:25:47 1999
+@@ -312,6 +312,16 @@
+ 	__u32	last_seg_size;	/* Size of last incoming segment */
+ 	__u32	rcv_mss;	/* MSS used for delayed ACK decisions */ 
+ 
++	/* The syn_wait_lock is necessary only to avoid tcp_get_info having
++	   to grab the main lock sock while browsing the listening hash
++	   (otherwise it's deadlock prone).
++	   This lock is acquired in read mode only from tcp_get_info() and
++	   it's acquired in write mode _only_ from code that is actively
++	   changing the syn_wait_queue. All readers that are holding
++	   the master sock lock don't need to grab this lock in read mode
++	   too as the syn_wait_queue writes are always protected from
++	   the main sock lock. */
++	rwlock_t		syn_wait_lock;
+ 	struct open_request	*syn_wait_queue;
+ 	struct open_request	**syn_wait_last;
+ 
+diff -urN 2.3.18ac6/include/net/tcp.h 2.3.18ac6-netlockup/include/net/tcp.h
+--- 2.3.18ac6/include/net/tcp.h	Mon Sep 20 22:44:38 1999
++++ 2.3.18ac6-netlockup/include/net/tcp.h	Tue Sep 21 16:25:59 1999
+@@ -1129,23 +1129,57 @@
+ 
+ extern __inline__ void tcp_synq_unlink(struct tcp_opt *tp, struct open_request *req, struct open_request *prev)
+ {
++	write_lock(&tp->syn_wait_lock);
+ 	if(!req->dl_next)
+ 		tp->syn_wait_last = (struct open_request **)prev;
+ 	prev->dl_next = req->dl_next;
++	write_unlock(&tp->syn_wait_lock);
+ }
+ 
+ extern __inline__ void tcp_synq_queue(struct tcp_opt *tp, struct open_request *req)
+ { 
++	write_lock(&tp->syn_wait_lock);
+ 	req->dl_next = NULL;
+ 	*tp->syn_wait_last = req; 
+ 	tp->syn_wait_last = &req->dl_next;
++	write_unlock(&tp->syn_wait_lock);
+ }
+ 
+ extern __inline__ void tcp_synq_init(struct tcp_opt *tp)
+ {
++	write_lock(&tp->syn_wait_lock);
+ 	tp->syn_wait_queue = NULL;
+ 	tp->syn_wait_last = &tp->syn_wait_queue;
++	write_unlock(&tp->syn_wait_lock);
+ }
++
++extern __inline__ void __tcp_synq_init(struct tcp_opt *tp)
++{
++	tp->syn_wait_lock = RW_LOCK_UNLOCKED;
++	tp->syn_wait_queue = NULL;
++	tp->syn_wait_last = &tp->syn_wait_queue;
++}
++
++#define tcp_synq_unlink_bh(tp, req, prev)		\
++	do {						\
++		local_bh_disable();			\
++		tcp_synq_unlink((tp), (req), (prev));	\
++		local_bh_enable();			\
++	} while (0)
++
++#define tcp_synq_queue_bh(tp, req)		\
++	do {					\
++		local_bh_disable();		\
++		tcp_synq_queue((tp), (req));	\
++		local_bh_enable();		\
++	} while (0)
++
++#define tcp_synq_init_bh(tp)			\
++	do {					\
++		local_bh_disable();		\
++		tcp_synq_init(tp);		\
++		local_bh_enable();		\
++	} while (0)
+ 
+ extern void __tcp_inc_slow_timer(struct tcp_sl_timer *slt);
+ extern __inline__ void tcp_inc_slow_timer(int timer)
+diff -urN 2.3.18ac6/net/ipv4/tcp.c 2.3.18ac6-netlockup/net/ipv4/tcp.c
+--- 2.3.18ac6/net/ipv4/tcp.c	Mon Sep 20 01:15:46 1999
++++ 2.3.18ac6-netlockup/net/ipv4/tcp.c	Tue Sep 21 15:54:39 1999
+@@ -1491,7 +1491,7 @@
+ 	}
+ 	BUG_TRAP(tp->syn_backlog == 0);
+ 	BUG_TRAP(sk->ack_backlog == 0);
+-	tcp_synq_init(tp);
++	tcp_synq_init_bh(tp);
+ }
+ 
+ static __inline__ void tcp_kill_sk_queues(struct sock *sk)
+@@ -1785,7 +1785,7 @@
+ 			goto out;
+ 	}
+ 
+-	tcp_synq_unlink(tp, req, prev);
++	tcp_synq_unlink_bh(tp, req, prev);
+ 	newsk = req->sk;
+ 	req->class->destructor(req);
+ 	tcp_openreq_free(req);
+diff -urN 2.3.18ac6/net/ipv4/tcp_input.c 2.3.18ac6-netlockup/net/ipv4/tcp_input.c
+--- 2.3.18ac6/net/ipv4/tcp_input.c	Mon Sep 20 01:15:47 1999
++++ 2.3.18ac6-netlockup/net/ipv4/tcp_input.c	Tue Sep 21 16:14:53 1999
+@@ -2406,7 +2406,7 @@
+ 		newtp->syn_seq = req->rcv_isn;
+ 		newtp->fin_seq = req->rcv_isn;
+ 		newtp->urg_data = 0;
+-		tcp_synq_init(newtp);
++		__tcp_synq_init(newtp);
+ 		newtp->syn_backlog = 0;
+ 		if (skb->len >= 536)
+ 			newtp->last_seg_size = skb->len; 
+diff -urN 2.3.18ac6/net/ipv4/tcp_ipv4.c 2.3.18ac6-netlockup/net/ipv4/tcp_ipv4.c
+--- 2.3.18ac6/net/ipv4/tcp_ipv4.c	Tue Sep 14 14:35:58 1999
++++ 2.3.18ac6-netlockup/net/ipv4/tcp_ipv4.c	Tue Sep 21 15:46:25 1999
+@@ -1964,7 +1964,7 @@
+ 	sk->write_space = tcp_write_space; 
+ 
+ 	/* Init SYN queue. */
+-	tcp_synq_init(tp);
++	__tcp_synq_init(tp);
+ 
+ 	sk->tp_pinfo.af_tcp.af_specific = &ipv4_specific;
+ 
+@@ -2114,7 +2114,7 @@
+ 			}
+ 
+ skip_listen:
+-			lock_sock(sk);
++			read_lock_bh(&tp->syn_wait_lock);
+ 			for (req = tp->syn_wait_queue; req; req = req->dl_next, num++) {
+ 				if (req->sk)
+ 					continue;
+@@ -2127,12 +2127,12 @@
+ 				get_openreq(sk, req, tmpbuf, num);
+ 				len += sprintf(buffer+len, "%-127s\n", tmpbuf);
+ 				if(len >= length) {
++					read_unlock_bh(&tp->syn_wait_lock);
+ 					tcp_listen_unlock();
+-					release_sock(sk);
+ 					goto out_no_bh;
+ 				}
+ 			}
+-			release_sock(sk);
++			read_unlock_bh(&tp->syn_wait_lock);
+ 		}
+ 	}
+ 	tcp_listen_unlock();
+diff -urN 2.3.18ac6/net/ipv6/tcp_ipv6.c 2.3.18ac6-netlockup/net/ipv6/tcp_ipv6.c
+--- 2.3.18ac6/net/ipv6/tcp_ipv6.c	Tue Sep 14 14:35:29 1999
++++ 2.3.18ac6-netlockup/net/ipv6/tcp_ipv6.c	Tue Sep 21 15:47:42 1999
+@@ -1843,7 +1843,7 @@
+ 	sk->max_ack_backlog = SOMAXCONN;
+ 
+ 	/* Init SYN queue. */
+-	tcp_synq_init(tp);
++	__tcp_synq_init(tp);
+ 
+ 	sk->tp_pinfo.af_tcp.af_specific = &ipv6_specific;
+ 
+@@ -2027,7 +2027,7 @@
+ 				}
+ 			}
+ 
+-			lock_sock(sk);
++			read_lock_bh(&tp->syn_wait_lock);
+ 			for (req = tp->syn_wait_queue; req; req = req->dl_next, num++) {
+ 				if (req->sk)
+ 					continue;
+@@ -2039,12 +2039,12 @@
+ 				get_openreq6(sk, req, tmpbuf, num);
+ 				len += sprintf(buffer+len, LINE_FMT, tmpbuf);
+ 				if(len >= length) { 
+-					release_sock(sk);
++					read_unlock_bh(&tp->syn_wait_lock);
+ 					tcp_listen_unlock();
+ 					goto out_no_bh;
+ 				}
+ 			}
+-			release_sock(sk);
++			read_unlock_bh(&tp->syn_wait_lock);
+ 		}
+ 	}
+ 	tcp_listen_unlock();
+Using another approch to avoid adding (a small) locking to the common code
+as I did just to get the netstat information looks a pain to me as it
+would harm a lot netstat performances and while I am under some kind of
+attack I want netstat to have the maximal priority against the
+other network code, so I like my approch that avoids blocking/restarting 
+in the middle of a tcp_get_info().
+Andrea
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

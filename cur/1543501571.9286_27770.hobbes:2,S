@@ -1,0 +1,177 @@
+Date: Sat, 3 Jul 1999 13:39:09 +0200 (METDST)
+From: Richard Guenther <>
+Subject: [RFC][PATCH] scripts with stdin replaced
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/7/3/30
+
+Hi!
+The following patch extends binfmt_misc to substitute stdin
+of the wrapper with the to be executed binary. This could
+be used f.e. to implement suid-perl scripts without having
+suidperl:
+echo ':suidperl:MIS::#suidperl::/usr/bin/perl:' >
+/proc/sys/fs/binfmt_misc/register
+prepend the to be executed script with '#suidperl' and make
+it 6755.
+Replacing stdin deals with the race conditions that prevent
+scripts from being suid in the first place. Of course it
+prevents the script from reading stdin, too.
+Richard.
+PS: this is just a quick patch to show that it is easy to
+    implement and to get comments about the semantics.
+    the patch has to be verified to be correct regarding to
+    permissions/file handling
+--
+Richard Guenther <richard.guenther@student.uni-tuebingen.de>
+PGP: 2E829319 - 2F 83 FC 93 E9 E4 19 E2 93 7A 32 42 45 37 23 57
+WWW: 
+http://www.anatom.uni-tuebingen.de/~richi/
+--- linux-2.2.0/fs/binfmt_misc.c.original	Fri Jul  2 17:40:37 1999
++++ linux-2.2.0/fs/binfmt_misc.c	Fri Jul  2 18:59:32 1999
+@@ -18,9 +18,14 @@
+ #include <linux/config.h>
+ #include <linux/module.h>
+ 
++#include <asm/current.h>
++#include <linux/sched.h>
+ #include <linux/kernel.h>
++#include <linux/smp_lock.h>
+ #include <linux/errno.h>
+ #include <linux/fs.h>
++#include <linux/file.h>
++#include <linux/mm.h>
+ #include <linux/malloc.h>
+ #include <linux/binfmts.h>
+ #include <linux/init.h>
+@@ -57,6 +62,8 @@
+ };
+ 
+ #define ENTRY_ENABLED 1		/* the old binfmt_entry.enabled */
++#define ENTRY_SUBST_CAP 6       /* substitute uid/gid/cap from binary */
++#define ENTRY_SUBST_STDIN 7	/* replace stdin of interpreter with binary */
+ #define	ENTRY_MAGIC 8		/* not filename detection */
+ 
+ static int load_misc_binary(struct linux_binprm *bprm, struct pt_regs *regs);
+@@ -187,8 +194,10 @@
+ 	struct dentry * dentry;
+ 	char iname[128];
+ 	char *iname_addr = iname;
+-	int retval;
+-
++	int retval, flags;
++	int newstdin, e_uid, e_gid;
++	kernel_cap_t cap_inheritable, cap_permitted, cap_effective;
++	
+ 	MOD_INC_USE_COUNT;
+ 	retval = -ENOEXEC;
+ 	if (!enabled)
+@@ -200,18 +209,36 @@
+ 	if (fmt) {
+ 		strncpy(iname, fmt->interpreter, 127);
+ 		iname[127] = '\0';
++		flags = fmt->flags;
+ 	}
+ 	read_unlock(&entries_lock);
+ 	if (!fmt)
+ 		goto _ret;
+ 
++	/* replace stdin of interpreter with file to be executed */
++	if (flags & ENTRY_SUBST_STDIN) {
++		if (fcheck(0)) {
++			printk(KERN_DEBUG "closing old stdin\n");
++			sys_close(0);
++		}
++		newstdin = open_dentry(bprm->dentry, O_RDONLY);
++		printk(KERN_DEBUG "file got id %i\n", newstdin);
++		e_uid = bprm->e_uid;
++		e_gid = bprm->e_gid;
++		cap_inheritable = bprm->cap_inheritable;
++	 	cap_permitted = bprm->cap_permitted;
++		cap_effective = bprm->cap_effective;
++	}
++
+ 	dput(bprm->dentry);
+ 	bprm->dentry = NULL;
+ 
+ 	/* Build args for interpreter */
+ 	remove_arg_zero(bprm);
+-	bprm->p = copy_strings(1, &bprm->filename, bprm->page, bprm->p, 2);
+-	bprm->argc++;
++	if (!(flags & ENTRY_SUBST_STDIN)) {
++		bprm->p = copy_strings(1, &bprm->filename, bprm->page, bprm->p, 2);
++		bprm->argc++;
++	}
+ 	bprm->p = copy_strings(1, &iname_addr, bprm->page, bprm->p, 2);
+ 	bprm->argc++;
+ 	retval = -E2BIG;
+@@ -226,8 +253,18 @@
+ 	bprm->dentry = dentry;
+ 
+ 	retval = prepare_binprm(bprm);
+-	if (retval >= 0)
++	if (retval >= 0) {
++		/* allow set-uid binaries for stdin input */
++		if (flags & ENTRY_SUBST_STDIN
++		    && flags & ENTRY_SUBST_CAP) {
++			bprm->e_uid = e_uid;
++			bprm->e_gid = e_gid;
++			bprm->cap_inheritable = cap_inheritable;
++			bprm->cap_permitted = cap_permitted;
++			bprm->cap_effective = cap_effective;
++		}
+ 		retval = search_binary_handler(bprm, regs);
++	}
+ _ret:
+ 	MOD_DEC_USE_COUNT;
+ 	return retval;
+@@ -277,7 +314,7 @@
+ 
+ /*
+  * This registers a new binary format, it recognises the syntax
+- * ':name:type:offset:magic:mask:interpreter:'
++ * ':name:flags:offset:magic:mask:interpreter:'
+  * where the ':' is the IFS, that can be chosen with the first char
+  */
+ static int proc_write_register(struct file *file, const char *buffer,
+@@ -307,11 +344,28 @@
+ 
+ 	/* we can use bit 3 of type for ext/magic
+ 	   flag due to the nice encoding of E and M */
+-	if ((*sp & ~('E' | 'M')) || (sp[1] != del))
+-		err = -EINVAL;
+-	else
+-		e->flags = (*sp++ & (ENTRY_MAGIC | ENTRY_ENABLED));
+-	cnt -= 2; sp++;
++	e->flags = ENTRY_ENABLED;
++	while (*sp != del && err == 0) {
++		switch (*sp) {
++			case 'E':
++				e->flags &= ~ENTRY_MAGIC;
++				break;
++			case 'M':
++				e->flags |= ENTRY_MAGIC;
++				break;
++			case 'I':
++				e->flags |= ENTRY_SUBST_STDIN;
++				break;
++			case 'S':
++				e->flags |= ENTRY_SUBST_CAP;
++				break;
++			default:
++				err = -EINVAL;
++				break;
++		}
++		sp++; cnt--;
++	}
++	sp++; cnt--;
+ 
+ 	e->offset = 0;
+ 	while (cnt-- && isdigit(*sp))
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

@@ -1,0 +1,173 @@
+Date: Wed, 26 May 1999 02:36:41 +0200 (CEST)
+From: Andrea Arcangeli <>
+Subject: Re: ia32 ip checksum optimizations
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/5/28/79
+
+On Tue, 25 May 1999, Artur Skawina wrote:
+>it's faster for the aligned buffer, multiple-of-four len case, it's
+>slower when len&3, and it's a lot slower for the unaligned buffer case.
+[..]
+csum_partial:
+	pushl %esi
+	pushl %ebx
+	movl 20(%esp),%eax	# Function arg: unsigned int sum
+	movl 16(%esp),%ecx	# Function arg: int len
+	movl 12(%esp),%esi	# Function arg:	const unsigned char *buf
+	testl $2, %esi         
+	^^^^^^^^^^^^^^
+	jnz 30f                 
+[..]
+The underlined line won't check for 4byte alignment of %esi. I think you
+are missing this bit of the current 686 csum_partial. Otherwise I don't
+follow you.
+You now should note that %esi maybe equal to 1 or 0x11 or 0x21 and you'll
+go ahead in the unrolled loop. That's not exactly the bug but now I think
+to see why you don't see the `andl' buggy. Yes, if %esi would be 4byte
+aligned then the andl wouldn't trigger an Oops or a segfault in userspace,
+even if was reading in overflow after the buffer boundary for some byte,
+because pages of memory are always 4byte aligned. But with the current
+code %esi can be _not_ 4byte aligned.
+To check if %esi is 4byte aligned you should do:
+	testl $3, %esi
+instead, and then rewrite the slow path to 4byte align %esi (instead of
+computing the checksum for two bytes and go ahead as happens now).
+>> About the non-32bit aligned %esi, it was _not_ needed here.
+>
+>see my previous msg, for explanation.
+>
+>(basically, you get an impressive 0.5% speed increase ;), 
+> but take a significant hit (44%) in case the buffer isn't
+> properly aligned)
+You are right here, running the unrolled loop with %esi not 4byte aligned
+is a big lose.
+>> And btw, I think %esi is going to be aligned.
+>
+>and you have verified this?
+The skb->data is going to be aligned because skb->data originally is a
+kmalloced area (kmalloc return regions aligned with the L1 cache that it's
+32 or 16 byte in all x86), then skb->data it's advanced by skb_pull of
+4byte aligned regions. I am not aware of an hardware protocol that uses an
+header not 32bit aligned though.
+Even if it could happen to have in an alien-case the checksum pool not
+32bit aligned, that wouldn't be sure the standard case, and it would work
+_fine_ anyway, just with the cksum runing 44% slower.
+>> Sure seems faster here. Please read the numbers I posted in my emails with
+>> the patch.
+>
+>haven't seen any such post yet.
+Did you ever seen my patch? The numbers are included in my email with the
+patch attacched.
+>> >What 'potential buffer overflow'?
+>> 
+>> andl.
+>
+>and? :)
+The underline the line cause the buffer overflow:
+[..]
+	# Handle the last 1-3 bytes without jumping
+	notl %ecx		# 1->2, 2->1, 3->0, higher bits are masked
+	movl $0xffffff,%ebx	# by the shll and shrl instructions
+	shll $3,%ecx
+	shrl %cl,%ebx
+	andl -128(%esi),%ebx	# esi is 4-aligned so should be ok
+				  ^^^ esi won't be 4byte aligned for the
+				      point above
+[..]
+>> You obviously have _not_ yet seen the buffer overflow I spotted and then
+>> fixed with my patch. When you'll have seen it, then I suggest you to make
+>> sure that your experimental chksums are not buggy, and if they are buggy
+>> then fix it, and make sure to repeat the benchmarks. Thanks.
+>
+>well, if you really expect anybody to look at this why don't you
+>show a case where the original code fails... Since it works, as you say,
+>"only by _luck_" this shouldn't be very hard :^)
+Here it is in userspace (the same DaveM's cksum_helper hacked by me in
+order to exploit the checksum buffer-overflow got linked before with the
+2.3.3 checksum and then with the 2.3.3 checksum with my patch applyed):
+andrea@laser:~/devel/cksum$ gcc checksum-2.3.3.S cksum_helper.c -O2 -mpentium -DCPU=686 -lefence
+andrea@laser:~/devel/cksum$ ./a.out 
+  Electric Fence 2.0.5 Copyright (C) 1987-1995 Bruce Perens.
+verify_csum_partial.Segmentation fault
+		    ^^^^^^^^^^^^^^^^^^
+andrea@laser:~/devel/cksum$ gcc checksum.S cksum_helper.c -O2 -mpentium -DCPU=686 -lefence
+andrea@laser:~/devel/cksum$ ./a.out 
+  Electric Fence 2.0.5 Copyright (C) 1987-1995 Bruce Perens.
+verify_csum_partial................
+To make you happy now I also reproduced in the kernel. Look this
+mini-kernel module:
+#include <linux/module.h>
+#include <linux/modversions.h>
+#include <linux/vmalloc.h>
+int init_module(void)
+{
+	char * buff = vmalloc(PAGE_SIZE);
+	if (!buff)
+		goto oom;
+	csum_partial1(buff+1, PAGE_SIZE-1, 0);
+ oom:
+	return 1;
+}
+(csum_partial1 is the plain 2.3.3 686 csum_partial routine; I had to
+rename it to avoid running the csum_partial code of the running kernel)
+black:/home/andrea# insmod ./new.o 
+Segmentation fault
+dmesg says:
+Unable to handle kernel paging request at virtual address c281b000
+							  ^^^^^^^^ next page
+current->tss.cr3 = 0190b000, %cr3 = 0190b000
+*pde = 0009d063
+*pte = 00000000
+Oops: 0000
+CPU:    0
+EIP:    0010:[<c2818157>]
+EFLAGS: 00010293
+eax: 8b8004c8   ebx: 00ffffff   ecx: ffffffe0   edx: 00000fff
+esi: c281b07d   edi: c2818052   ebp: c190df34   esp: c190df24
+ds: 0018   es: 0018   ss: 0018
+Process insmod (pid: 182, process nr: 21, stackpage=c190d000)
+Stack: c2818072 c281a001 00000fff 00000000 00000000 c0114293 c190c000
+0804f718 
+       c2818000 bffffaac fffffee0 00000120 c190df70 00000420 00000001
+c190c000 
+       ffffffea c192a000 c1c00000 00000050 c280c000 c2818050 0000045c
+00000000 
+Call Trace: [<c2818072>] [<c281a001>] [<c0114293>] [<c2818000>]
+[<c280c000>] [<c2818050>] [<c0107a04>] 
+       [<c2818000>] 
+Code: 23 5e 80 01 d8 83 d0 00 5b 5e c3 89 f6 53 57 56 8b 74 24 10 
+Is this enough to convince you that the 2.3.3 and 2.2.9 csum_partial-code
+has a buffer overflow bug?
+My code fix the bug fine. Infact if I replace the call csum_partial1 with
+csum_partial, that so will get resolved as the csum_partial linked with
+the running kernel (that here it's _mine_ csum_partial) then insmodding
+the test-module won't generate the oops anymore.
+------------ change topic to "having %esi 4byte aligned or not" ----------
+If you would find a case where skb->data is not 4byte aligned then you
+would convince me to _write_ the code to make %esi 32bit aligned before
+entering the unrolled loop. (note that right now %esi is _not_ enforced to
+be 32bit aligned and you never noticed)
+And if something, we could consider to change csum_partial_copy_generic to
+try to align at least one between %esi and %edi if they are different and 
+both not 32bit aligned.
+Note also that %esi in the csum-copy case, is the pointer given from
+userspace. And userspace can also provide a not 32bit aligned region. But
+%edi is the skb that will just be 32bit aligned. And so you are just in
+the best condition you can have, since you can't 32bit align both %esi and
+%edi if they are different.
+Finally right now I am still very happy with my patch I posted in the list
+(I had not the need to change it (yet :)) and it still think it should be
+applyed to both 2.3.3 and 2.2.9 (for the record: I don't know if it will
+apply cleanly to 2.2.9 but once applyed to 2.3.3 the checksum.S of 2.3.3
+can be copyed with cp to the 2.2.9 tree to automagically fix also the %esi
+and %ebx clobbering that got fixed somewhere between 2.2.9 and 2.3.3).
+Comments?
+Andrea Arcangeli
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

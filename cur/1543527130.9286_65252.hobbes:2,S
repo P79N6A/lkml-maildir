@@ -1,0 +1,577 @@
+Date: Wed, 23 Feb 2000 12:08:13 -0500 (EST)
+From: Ingo Molnar <>
+Subject: [patch] block device stacking support, raid-2.3.47-B6
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/2/23/128
+
+Heinz, Andrea, Linus,
+various ideas/patches regarding block device stacking support were
+floating around in the last couple of days, here is a patch against
+vanilla 2.3.47 that solves both RAID's and LVM's needs sufficiently:
+	
+http://www.redhat.com/~mingo/raid-patches/raid-2.3.47-B6
+(also attached) Andrea's patch from yesterday touches some of the issues
+but RAID has different needs wrt. ->make_request():
+- RAID1 and RAID5 needs truly recursive ->make_request() stacking because
+  the relationship between the request-bh and the IO-bh is not 1:1. In the
+  case of RAID0/linear and LVM the mapping is 1:1, so no on-stack
+  recursion is necessery.
+- re-grabbing the device queue in generic_make_request() is necessery,
+  just think of RAID0+LVM stacking.
+- IO-errors have to be initiated in the layer that notices them.
+- i dont agree with moving the ->make_request() function to be
+  a per-major thing, in the (near) future i'd like to implement RAID
+  personalities via several sub-queues of a single RAID-blockdevice,
+  avoiding the current md_make_request internal step completely.
+- renaming ->make_request_fn() to ->logical_volume_fn is both misleading
+  and unnecessery.
+i've added the good bits (i hope i found all of them) from Andrea's patch
+as well: the end_io() fix in md.c, the ->make_request() change returning
+IO errors, and avoiding an unnecessery get_queue() in the fast path.
+the patch changes blkdev->make_request_fn() semantics, but these work
+pretty well both for RAID0, LVM & RAID1/RAID5:
+  (bh->b_dev, bh->b_blocknr) => just like today, never modified, this is
+                                the 'physical index' of the buffer-cache.
+  internally any special ->make_request() function is forbidden to access
+  b_dev and b_blocknr too, b_rdev and b_rsector has to be used.
+  ll_rw_block() correctly installs an identity mapping first, and all
+  stacked devices just iterate one more step.
+  bh->b_rdev: the 'current target device'
+  bh->b_rsector: the 'current target sector'
+  the return values of ->make_request_fn():
+	ret == 0: dont continue iterating and dont submit IO
+	ret  > 0: continue iterating
+	ret  < 0: IO error (already handled by the layer which noticed it)
+  we explicitly rely on ll_rw_blk getting the BH_Lock and not calling
+  ->make_request() on this bh more than once.
+with these semantics all the variations are possible, it's up to the
+device to use the one it likes best:
+ - device resolves one mapping step and returns 1 (RAID0, LVM)
+ - device calls generic_make_request() and return 1 (RAID1, RAID5)
+ - device resolves recursion internally and returns 0 (future RAID0),
+          returns 1 if recursion cannot be resolved internally.
+generic_make_request() returns 0 if it has submitted IO - thus
+generic_make_request() can also be used as a queue's ->make_request_fn()
+function - it's completely symmetric. (not that anyone would want to do
+this)
+NOTE: a device might still resolve stacking internally, if it can. Eg. the
+next version of raid0.c will do a while loop internally if we map
+RAID0->RAID0. The performance advantage is obvious: no indirect function
+calls and no get_queue(). LVM could do the same as well.
+(the patch modifies lvm.c to reflect these new semantics, to not rely on
+b_dev and b_blocknr and to not call generic_make_request(), and fixes the
+lvm.c hack avoiding MD<->LVM stacking. These changes are untested.)
+with this method it was pretty straightforward to add stacked RAID0 and
+linear device support, here is a sample RAID0+RAID0 => RAID0 stacking:
+	[root@moon /root]# cat /proc/mdstat
+	Personalities : [linear] [raid0]
+	read_ahead 1024 sectors
+	md2 : active raid0 mdb[1] mda[0]
+	      1661472 blocks 4k chunks
+	md1 : active raid0 sdf1[1] sde1[0]
+	      830736 blocks 4k chunks
+	md0 : active raid0 sdd1[1] sdc1[0]
+	      830736 blocks 4k chunks
+	unused devices: <none>
+	[root@moon /root]# df /mnt
+	Filesystem           1k-blocks      Used Available Use% Mounted on
+	/dev/md2               1607473        13   1524387   0% /mnt
+The LVM changes are not tested. The RAID0/linear changes compile/boot/work
+just fine and are reasonably well-tested and understood.
+any objections?
+	Ingo
+--- linux/include/linux/raid/md_k.h.orig	Wed Feb 23 06:00:20 2000
++++ linux/include/linux/raid/md_k.h	Wed Feb 23 06:22:02 2000
+@@ -75,6 +75,8 @@
+ 
+ extern inline mddev_t * kdev_to_mddev (kdev_t dev)
+ {
++	if (MAJOR(dev) != MD_MAJOR)
++		BUG();
+         return mddev_map[MINOR(dev)].mddev;
+ }
+ 
+@@ -213,7 +215,7 @@
+ 	char *name;
+ 	int (*map)(mddev_t *mddev, kdev_t dev, kdev_t *rdev,
+ 		unsigned long *rsector, unsigned long size);
+-	int (*make_request)(mddev_t *mddev, int rw, struct buffer_head * bh);
++	int (*make_request)(request_queue_t *q, mddev_t *mddev, int rw, struct buffer_head * bh);
+ 	void (*end_request)(struct buffer_head * bh, int uptodate);
+ 	int (*run)(mddev_t *mddev);
+ 	int (*stop)(mddev_t *mddev);
+--- linux/include/linux/blkdev.h.orig	Wed Feb 23 05:51:54 2000
++++ linux/include/linux/blkdev.h	Wed Feb 23 09:12:04 2000
+@@ -53,7 +53,7 @@
+ 				 int);
+ typedef void (request_fn_proc) (request_queue_t *q);
+ typedef request_queue_t * (queue_proc) (kdev_t dev);
+-typedef void (make_request_fn) (int rw, struct buffer_head *bh);
++typedef int (make_request_fn) (request_queue_t *q, int rw, struct buffer_head *bh);
+ typedef void (plug_device_fn) (request_queue_t *q, kdev_t device);
+ typedef void (unplug_device_fn) (void *q);
+ 
+@@ -129,7 +129,8 @@
+ extern void grok_partitions(struct gendisk *dev, int drive, unsigned minors, long size);
+ extern void register_disk(struct gendisk *dev, kdev_t first, unsigned minors, struct block_device_operations *ops, long size);
+ extern void generic_unplug_device(void * data);
+-extern void generic_make_request(int rw, struct buffer_head * bh);
++extern int generic_make_request(request_queue_t *q, int rw,
++						struct buffer_head * bh);
+ extern request_queue_t * blk_get_queue(kdev_t dev);
+ 
+ /*
+--- linux/drivers/block/ll_rw_blk.c.orig	Wed Feb 23 05:38:05 2000
++++ linux/drivers/block/ll_rw_blk.c	Wed Feb 23 09:45:51 2000
+@@ -952,96 +952,122 @@
+ 	bh->b_end_io(bh, test_bit(BH_Uptodate, &bh->b_state));
+ }
+ 
+-void generic_make_request(int rw, struct buffer_head * bh)
++static inline void buffer_IO_error(struct buffer_head * bh)
+ {
+-	request_queue_t * q;
+-	unsigned long flags;
++	mark_buffer_clean(bh);
++	/*
++	 * b_end_io has to clear the BH_Uptodate bitflag in the error case!
++	 */
++	bh->b_end_io(bh, 0);
++}
+ 
+-	q = blk_get_queue(bh->b_rdev);
++int generic_make_request (request_queue_t *q, int rw, struct buffer_head * bh)
++{
++	unsigned long flags;
++	int ret;
+ 
++	/*
++	 * Resolve the mapping until finished. (drivers are
++	 * still free to implement/resolve their own stacking
++	 * by explicitly returning 0)
++	 */
++
++	while (q->make_request_fn) {
++		ret = q->make_request_fn(q, rw, bh);
++		if (ret > 0) {
++			q = blk_get_queue(bh->b_rdev);
++			continue;
++		}
++		return ret;
++	}
++	/*
++	 * Does the block device want us to queue
++	 * the IO request? (normal case)
++	 */
+ 	__make_request(q, rw, bh);
+-
+ 	spin_lock_irqsave(&io_request_lock,flags);
+ 	if (q && !q->plugged)
+ 		(q->request_fn)(q);
+ 	spin_unlock_irqrestore(&io_request_lock,flags);
+-}
+ 
++	return 0;
++}
+ 
+ /* This function can be used to request a number of buffers from a block
+    device. Currently the only restriction is that all buffers must belong to
+    the same device */
+ 
+-static void __ll_rw_block(int rw, int nr, struct buffer_head * bh[],int haslock)
++static void __ll_rw_block(int rw, int nr, struct buffer_head * bhs[],
++								int haslock)
+ {
++	struct buffer_head *bh;
++	request_queue_t *q;
+ 	unsigned int major;
+ 	int correct_size;
+-	request_queue_t *q;
+ 	int i;
+ 
+-	major = MAJOR(bh[0]->b_dev);
+-	q = blk_get_queue(bh[0]->b_dev);
++	major = MAJOR(bhs[0]->b_dev);
++	q = blk_get_queue(bhs[0]->b_dev);
+ 	if (!q) {
+ 		printk(KERN_ERR
+ 	"ll_rw_block: Trying to read nonexistent block-device %s (%ld)\n",
+-		kdevname(bh[0]->b_dev), bh[0]->b_blocknr);
++		kdevname(bhs[0]->b_dev), bhs[0]->b_blocknr);
+ 		goto sorry;
+ 	}
+ 
+ 	/* Determine correct block size for this device. */
+ 	correct_size = BLOCK_SIZE;
+ 	if (blksize_size[major]) {
+-		i = blksize_size[major][MINOR(bh[0]->b_dev)];
++		i = blksize_size[major][MINOR(bhs[0]->b_dev)];
+ 		if (i)
+ 			correct_size = i;
+ 	}
+ 
+ 	/* Verify requested block sizes. */
+ 	for (i = 0; i < nr; i++) {
+-		if (bh[i]->b_size != correct_size) {
++		bh = bhs[i];
++		if (bh->b_size != correct_size) {
+ 			printk(KERN_NOTICE "ll_rw_block: device %s: "
+ 			       "only %d-char blocks implemented (%u)\n",
+-			       kdevname(bh[0]->b_dev),
+-			       correct_size, bh[i]->b_size);
++			       kdevname(bhs[0]->b_dev),
++			       correct_size, bh->b_size);
+ 			goto sorry;
+ 		}
+ 	}
+ 
+-	if ((rw & WRITE) && is_read_only(bh[0]->b_dev)) {
++	if ((rw & WRITE) && is_read_only(bhs[0]->b_dev)) {
+ 		printk(KERN_NOTICE "Can't write to read-only device %s\n",
+-		       kdevname(bh[0]->b_dev));
++		       kdevname(bhs[0]->b_dev));
+ 		goto sorry;
+ 	}
+ 
+ 	for (i = 0; i < nr; i++) {
++		bh = bhs[i];
++
+ 		/* Only one thread can actually submit the I/O. */
+ 		if (haslock) {
+-			if (!buffer_locked(bh[i]))
++			if (!buffer_locked(bh))
+ 				BUG();
+ 		} else {
+-			if (test_and_set_bit(BH_Lock, &bh[i]->b_state))
++			if (test_and_set_bit(BH_Lock, &bh->b_state))
+ 				continue;
+ 		}
+-		set_bit(BH_Req, &bh[i]->b_state);
++		set_bit(BH_Req, &bh->b_state);
+ 
+-		if (q->make_request_fn)
+-			q->make_request_fn(rw, bh[i]);
+-		else {
+-			bh[i]->b_rdev = bh[i]->b_dev;
+-			bh[i]->b_rsector = bh[i]->b_blocknr*(bh[i]->b_size>>9);
++		/*
++		 * First step, 'identity mapping' - RAID or LVM might
++		 * further remap this.
++		 */
++		bh->b_rdev = bh->b_dev;
++		bh->b_rsector = bh->b_blocknr * (bh->b_size>>9);
+ 
+-			generic_make_request(rw, bh[i]);
+-		}
++		generic_make_request(q, rw, bh);
+ 	}
+-
+ 	return;
+ 
+ sorry:
+-	for (i = 0; i < nr; i++) {
+-		mark_buffer_clean(bh[i]); /* remeber to refile it */
+-		clear_bit(BH_Uptodate, &bh[i]->b_state);
+-		bh[i]->b_end_io(bh[i], 0);
+-	}
++	for (i = 0; i < nr; i++)
++		buffer_IO_error(bhs[i]);
+ 	return;
+ }
+ 
+--- linux/drivers/block/md.c.orig	Wed Feb 23 05:39:59 2000
++++ linux/drivers/block/md.c	Wed Feb 23 09:43:27 2000
+@@ -75,16 +75,16 @@
+ 
+ static struct gendisk md_gendisk=
+ {
+-	MD_MAJOR,
+-	"md",
+-	0,
+-	1,
+-	md_hd_struct,
+-	md_size,
+-	MAX_MD_DEVS,
+-	NULL,
+-	NULL,
+-	&md_fops,
++	major: MD_MAJOR,
++	major_name: "md",
++	minor_shift: 0,
++	max_p: 1,
++	part: md_hd_struct,
++	sizes: md_size,
++	nr_real: MAX_MD_DEVS,
++	real_devices: NULL,
++	next: NULL,
++	fops: &md_fops,
+ };
+ 
+ void md_plug_device (request_queue_t *mdqueue, kdev_t dev)
+@@ -178,17 +178,16 @@
+ 	return;
+ }
+ 
+-void md_make_request (int rw, struct buffer_head * bh)
++static int md_make_request (request_queue_t *q, int rw, struct buffer_head * bh)
+ {
+-	mddev_t *mddev = kdev_to_mddev(bh->b_dev);
++	mddev_t *mddev = kdev_to_mddev(bh->b_rdev);
+ 
+-	if (!mddev || !mddev->pers)
+-		bh->b_end_io(bh, 0);
++	if (mddev && mddev->pers)
++		return mddev->pers->make_request(q, mddev, rw, bh);
+ 	else {
+-		if ((rw == READ || rw == READA) && buffer_uptodate(bh))
+-			bh->b_end_io(bh, 1);
+-		else
+-			mddev->pers->make_request(mddev, rw, bh);
++		mark_buffer_clean(bh);
++		bh->b_end_io(bh, 0);
++		return -1;
+ 	}
+ }
+ 
+@@ -234,28 +233,6 @@
+ 	return mddev;
+ }
+ 
+-static void free_mddev (mddev_t *mddev)
+-{
+-	if (!mddev) {
+-		MD_BUG();
+-		return;
+-	}
+-
+-	/*
+-	 * Make sure nobody else is using this mddev
+-	 * (careful, we rely on the global kernel lock here)
+-	 */
+-	while (md_atomic_read(&mddev->resync_sem.count) != 1)
+-		schedule();
+-	while (md_atomic_read(&mddev->recovery_sem.count) != 1)
+-		schedule();
+-
+-	del_mddev_mapping(mddev, MKDEV(MD_MAJOR, mdidx(mddev)));
+-	md_list_del(&mddev->all_mddevs);
+-	MD_INIT_LIST_HEAD(&mddev->all_mddevs);
+-	kfree(mddev);
+-}
+-
+ struct gendisk * find_gendisk (kdev_t dev)
+ {
+ 	struct gendisk *tmp = gendisk_head;
+@@ -757,6 +734,32 @@
+ 		MD_BUG();
+ }
+ 
++static void free_mddev (mddev_t *mddev)
++{
++	if (!mddev) {
++		MD_BUG();
++		return;
++	}
++
++	export_array(mddev);
++	md_size[mdidx(mddev)] = 0;
++	md_hd_struct[mdidx(mddev)].nr_sects = 0;
++
++	/*
++	 * Make sure nobody else is using this mddev
++	 * (careful, we rely on the global kernel lock here)
++	 */
++	while (md_atomic_read(&mddev->resync_sem.count) != 1)
++		schedule();
++	while (md_atomic_read(&mddev->recovery_sem.count) != 1)
++		schedule();
++
++	del_mddev_mapping(mddev, MKDEV(MD_MAJOR, mdidx(mddev)));
++	md_list_del(&mddev->all_mddevs);
++	MD_INIT_LIST_HEAD(&mddev->all_mddevs);
++	kfree(mddev);
++}
++
+ #undef BAD_CSUM
+ #undef BAD_MAGIC
+ #undef OUT_OF_MEM
+@@ -1723,13 +1726,7 @@
+ 		printk (STILL_MOUNTED, mdidx(mddev));
+ 		OUT(-EBUSY);
+ 	}
+-  
+-	/*
+-	 * complain if it's already stopped
+-	 */
+-	if (!mddev->nb_dev)
+-		OUT(-ENXIO);
+-
++ 
+ 	if (mddev->pers) {
+ 		/*
+ 		 * It is safe to call stop here, it only frees private
+@@ -1796,9 +1793,6 @@
+ 	 * Free resources if final stop
+ 	 */
+ 	if (!ro) {
+-		export_array(mddev);
+-		md_size[mdidx(mddev)] = 0;
+-		md_hd_struct[mdidx(mddev)].nr_sects = 0;
+ 		free_mddev(mddev);
+ 
+ 		printk (KERN_INFO "md%d stopped.\n", mdidx(mddev));
+@@ -3279,15 +3273,15 @@
+ {
+ 	int i;
+ 
+-	blksize_size[MD_MAJOR] = md_blocksizes;
+-	max_readahead[MD_MAJOR] = md_maxreadahead;
+-
+ 	for(i = 0; i < MAX_MD_DEVS; i++) {
+ 		md_blocksizes[i] = 1024;
++		md_size[i] = 0;
+ 		md_maxreadahead[i] = MD_READAHEAD;
+ 		register_disk(&md_gendisk, MKDEV(MAJOR_NR,i), 1, &md_fops, 0);
+-
+ 	}
++	blksize_size[MD_MAJOR] = md_blocksizes;
++	blk_size[MAJOR_NR] = md_size;
++	max_readahead[MD_MAJOR] = md_maxreadahead;
+ 
+ 	printk("md.c: sizeof(mdp_super_t) = %d\n", (int)sizeof(mdp_super_t));
+ 
+--- linux/drivers/block/lvm.c.orig	Wed Feb 23 05:53:29 2000
++++ linux/drivers/block/lvm.c	Wed Feb 23 09:35:15 2000
+@@ -192,7 +192,7 @@
+ static void lvm_dummy_device_request(request_queue_t *);
+ #define	DEVICE_REQUEST	lvm_dummy_device_request
+ 
+-static void lvm_make_request_fn(int, struct buffer_head*);
++static int lvm_make_request_fn(request_queue_t *, int, struct buffer_head*);
+ 
+ static int lvm_blk_ioctl(struct inode *, struct file *, uint, ulong);
+ static int lvm_blk_open(struct inode *, struct file *);
+@@ -1292,14 +1292,14 @@
+  */
+ static int lvm_map(struct buffer_head *bh, int rw)
+ {
+-	int minor = MINOR(bh->b_dev);
++	int minor = MINOR(bh->b_rdev);
+ 	int ret = 0;
+ 	ulong index;
+ 	ulong pe_start;
+ 	ulong size = bh->b_size >> 9;
+-	ulong rsector_tmp = bh->b_blocknr * size;
++	ulong rsector_tmp = bh->b_rsector;
+ 	ulong rsector_sav;
+-	kdev_t rdev_tmp = bh->b_dev;
++	kdev_t rdev_tmp = bh->b_rdev;
+ 	kdev_t rdev_sav;
+ 	lv_t *lv = vg[VG_BLK(minor)]->lv[LV_BLK(minor)];
+ 
+@@ -1513,11 +1513,10 @@
+ /*
+  * make request function
+  */
+-static void lvm_make_request_fn(int rw, struct buffer_head *bh)
++static int lvm_make_request_fn(request_queue_t *q, int rw, struct buffer_head *bh)
+ {
+ 	lvm_map(bh, rw);
+-	if (bh->b_rdev != MD_MAJOR) generic_make_request(rw, bh); 
+-	return;
++	return 1;
+ }
+ 
+ 
+--- linux/drivers/block/raid0.c.orig	Wed Feb 23 06:01:08 2000
++++ linux/drivers/block/raid0.c	Wed Feb 23 09:34:52 2000
+@@ -223,23 +223,23 @@
+  * Of course, those facts may not be valid anymore (and surely won't...)
+  * Hey guys, there's some work out there ;-)
+  */
+-static int raid0_make_request (mddev_t *mddev, int rw, struct buffer_head * bh)
++static int raid0_make_request (request_queue_t *q, mddev_t *mddev,
++					int rw, struct buffer_head * bh)
+ {
+-	unsigned long size = bh->b_size >> 10;
++	int blk_in_chunk, chunksize_bits, chunk, chunk_size;
+ 	raid0_conf_t *conf = mddev_to_conf(mddev);
+ 	struct raid0_hash *hash;
+ 	struct strip_zone *zone;
+ 	mdk_rdev_t *tmp_dev;
+-	int blk_in_chunk, chunksize_bits, chunk, chunk_size;
+ 	long block, rblock;
+ 
+ 	chunk_size = mddev->param.chunk_size >> 10;
+ 	chunksize_bits = ffz(~chunk_size);
+-	block = bh->b_blocknr * size;
++	block = bh->b_rsector >> 1;
+ 	hash = conf->hash_table + block / conf->smallest->size;
+ 
+ 	/* Sanity check */
+-	if (chunk_size < (block % chunk_size) + size)
++	if (chunk_size < (block % chunk_size) + (bh->b_size >> 10))
+ 		goto bad_map;
+  
+ 	if (!hash)
+@@ -261,20 +261,19 @@
+ 	rblock = (chunk << chunksize_bits) + blk_in_chunk + zone->dev_offset;
+  
+ 	/*
+-	 * Important, at this point we are not guaranteed to be the only
+-	 * CPU modifying b_rdev and b_rsector! Only __make_request() later
+-	 * on serializes the IO. So in 2.4 we must never write temporary
+-	 * values to bh->b_rdev, like 2.2 and 2.0 did.
++	 * The new BH_Lock semantics in ll_rw_blk.c guarantee that this
++	 * is the only IO operation happening on this bh.
+ 	 */
+ 	bh->b_rdev = tmp_dev->dev;
+ 	bh->b_rsector = rblock << 1;
+ 
+-	generic_make_request(rw, bh);
+-
+-	return 0;
++	/*
++	 * Let the main block layer submit the IO and resolve recursion:
++	 */
++	return 1;
+ 
+ bad_map:
+-	printk ("raid0_make_request bug: can't convert block across chunks or bigger than %dk %ld %ld\n", chunk_size, bh->b_rsector, size);
++	printk ("raid0_make_request bug: can't convert block across chunks or bigger than %dk %ld %d\n", chunk_size, bh->b_rsector, bh->b_size >> 10);
+ 	return -1;
+ bad_hash:
+ 	printk("raid0_make_request bug: hash==NULL for block %ld\n", block);
+--- linux/drivers/block/linear.c.orig	Wed Feb 23 06:01:34 2000
++++ linux/drivers/block/linear.c	Wed Feb 23 09:35:02 2000
+@@ -121,14 +121,15 @@
+ 	return 0;
+ }
+ 
+-static int linear_make_request (mddev_t *mddev, int rw, struct buffer_head * bh)
++static int linear_make_request (request_queue_t *q, mddev_t *mddev,
++			int rw, struct buffer_head * bh)
+ {
+         linear_conf_t *conf = mddev_to_conf(mddev);
+         struct linear_hash *hash;
+         dev_info_t *tmp_dev;
+         long block;
+ 
+-	block = bh->b_blocknr * (bh->b_size >> 10);
++	block = bh->b_rsector >> 1;
+ 	hash = conf->hash_table + (block / conf->smallest->size);
+   
+ 	if (block >= (hash->dev0->size + hash->dev0->offset)) {
+@@ -149,8 +150,7 @@
+ 	bh->b_rdev = tmp_dev->dev;
+ 	bh->b_rsector = (block - tmp_dev->offset) << 1;
+ 
+-	generic_make_request(rw, bh);
+-	return 0;
++	return 1;
+ }
+ 
+ static int linear_status (char *page, mddev_t *mddev)

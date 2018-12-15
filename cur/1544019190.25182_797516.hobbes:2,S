@@ -1,0 +1,306 @@
+Date: Tue, 27 Jan 2009 12:59:14 -0800 (PST)
+From: Davide Libenzi <>
+Subject: Re: [patch 1/2] epoll fix own poll()
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2009/1/27/313
+
+On Tue, 27 Jan 2009, Davide Libenzi wrote:
+> 
+> The follwing patch fixes a bug inside the epoll's f_op->poll() code, that
+> returns POLLIN even though there are no actual ready monitored fds.
+> The bug shows up if you add an epoll fd inside another fd container (poll,
+> select, epoll).
+> The problem is that callback-based wake ups used by epoll, does not carry
+> (patches will follow, to fix this) any information about the events
+> that actually happened. So the callback code, since it can't call the file*
+> ->poll() inside the callback, chains the file* into a ready-list. So, suppose
+> you added an fd with EPOLLOUT only, and some data shows up on the fd, the
+> file* mapped by the fd will be added into the ready-list (via wakeup
+> callback). During normal epoll_wait() use, this condition is sorted out
+> at the time we're actually able to call the file*'s f_op->poll().
+> Inside the old epoll's f_op->poll() though, only a quick check
+> !list_empty(ready-list) was performed, and this could have led to reporting
+> POLLIN even though no ready fds would show up at a following epoll_wait().
+> In order to correctly report the ready status for an epoll fd, the ready-list
+> must be checked to see if any really available fd+event would be ready in
+> a following epoll_wait().
+> Operation (calling f_op->poll() from inside f_op->poll()) that, like wake ups,
+> must be handled with care because of the fact that epoll fds can be added
+> to other epoll fds.
+Forgot to include the test program that can be used to check for correct 
+event reporting, and long-chains/loop trimming code.
+- Davide
+/*
+ *  epoll_test by Davide Libenzi (Simple code to test epoll internals)
+ *  Copyright (C) 2008  Davide Libenzi
+ *
+ *  This program is free software; you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation; either version 2 of the License, or
+ *  (at your option) any later version.
+ *
+ *  This program is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *  GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License
+ *  along with this program; if not, write to the Free Software
+ *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+ *
+ *  Davide Libenzi <davidel@xmailserver.org>
+ *
+ */
+#include <sys/types.h>
+#include <unistd.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <signal.h>
+#include <limits.h>
+#include <poll.h>
+#include <sys/epoll.h>
+#include <sys/wait.h>
+#define EPWAIT_TIMEO	(1 * 1000)
+#ifndef POLLRDHUP
+#define POLLRDHUP 0x2000
+#endif
+#define EPOLL_MAX_CHAIN	100L
+#define EPOLL_TF_LOOP (1 << 0)
+struct epoll_test_cfg {
+	long size;
+	long flags;
+};
+static int xepoll_create(int n) {
+	int epfd;
+	if ((epfd = epoll_create(n)) == -1) {
+		perror("epoll_create");
+		exit(2);
+	}
+	return epfd;
+}
+static void xepoll_ctl(int epfd, int cmd, int fd, struct epoll_event *evt) {
+	if (epoll_ctl(epfd, cmd, fd, evt) < 0) {
+		perror("epoll_ctl");
+		exit(3);
+	}
+}
+static void xpipe(int *fds) {
+	if (pipe(fds)) {
+		perror("pipe");
+		exit(4);
+	}
+}
+static pid_t xfork(void) {
+	pid_t pid;
+	if ((pid = fork()) == (pid_t) -1) {
+		perror("pipe");
+		exit(5);
+	}
+	return pid;
+}
+static int run_forked_proc(int (*proc)(void *), void *data) {
+	int status;
+	pid_t pid;
+	if ((pid = xfork()) == 0)
+		exit((*proc)(data));
+	if (waitpid(pid, &status, 0) != pid) {
+		perror("waitpid");
+		return -1;
+	}
+	return WIFEXITED(status) ? WEXITSTATUS(status): -2;
+}
+static int check_events(int fd, int timeo) {
+	struct pollfd pfd;
+	fprintf(stdout, "Checking events for fd %d\n", fd);
+	memset(&pfd, 0, sizeof(pfd));
+	pfd.fd = fd;
+	pfd.events = POLLIN | POLLOUT;
+	if (poll(&pfd, 1, timeo) < 0) {
+		perror("poll()");
+		return 0;
+	}
+	if (pfd.revents & POLLIN)
+		fprintf(stdout, "\tPOLLIN\n");
+	if (pfd.revents & POLLOUT)
+		fprintf(stdout, "\tPOLLOUT\n");
+	if (pfd.revents & POLLERR)
+		fprintf(stdout, "\tPOLLERR\n");
+	if (pfd.revents & POLLHUP)
+		fprintf(stdout, "\tPOLLHUP\n");
+	if (pfd.revents & POLLRDHUP)
+		fprintf(stdout, "\tPOLLRDHUP\n");
+	return pfd.revents;
+}
+static int epoll_test_tty(void *data) {
+	int epfd, ifd = fileno(stdin), res;
+	struct epoll_event evt;
+	if (check_events(ifd, 0) != POLLOUT) {
+		fprintf(stderr, "Something is cooking on STDIN (%d)\n", ifd);
+		return 1;
+	}
+	epfd = xepoll_create(1);
+	fprintf(stdout, "Created epoll fd (%d)\n", epfd);
+	memset(&evt, 0, sizeof(evt));
+	evt.events = EPOLLIN;
+	xepoll_ctl(epfd, EPOLL_CTL_ADD, ifd, &evt);
+	if (check_events(epfd, 0) & POLLIN) {
+		res = epoll_wait(epfd, &evt, 1, 0);
+		if (res == 0) {
+			fprintf(stderr, "Epoll fd (%d) is ready when it shouldn't!\n",
+				epfd);
+			return 2;
+		}
+	}
+	return 0;
+}
+static int epoll_wakeup_chain(void *data) {
+	struct epoll_test_cfg *tcfg = data;
+	int i, res, epfd, bfd, nfd, pfds[2];
+	pid_t pid;
+	struct epoll_event evt;
+	memset(&evt, 0, sizeof(evt));
+	evt.events = EPOLLIN;
+	epfd = bfd = xepoll_create(1);
+	for (i = 0; i < tcfg->size; i++) {
+		nfd = xepoll_create(1);
+		xepoll_ctl(bfd, EPOLL_CTL_ADD, nfd, &evt);
+		bfd = nfd;
+	}
+	xpipe(pfds);
+	if (tcfg->flags & EPOLL_TF_LOOP)
+	{
+		xepoll_ctl(bfd, EPOLL_CTL_ADD, epfd, &evt);
+		/*
+		 * If we're testing for loop, we want that the wakeup
+		 * triggered by the write to the pipe done in the child
+		 * process, triggers a fake event. So we add the pipe
+		 * read size with EPOLLOUT events. This will trigger
+		 * an addition to the ready-list, but no real events
+		 * will be there. The the epoll kernel code will proceed
+		 * in calling f_op->poll() of the epfd, triggering the
+		 * loop we want to test.
+		 */
+		evt.events = EPOLLOUT;
+	}
+	xepoll_ctl(bfd, EPOLL_CTL_ADD, pfds[0], &evt);
+	/*
+	 * The pipe write must come after the poll(2) call inside
+	 * check_events(). This tests the nested wakeup code in
+	 * fs/eventpoll.c:ep_poll_safewake()
+	 * By having the check_events() (hence poll(2)) happens first,
+	 * we have poll wait queue filled up, and the write(2) in the
+	 * child will trigger the wakeup chain.
+	 */
+	if ((pid = xfork()) == 0) {
+		sleep(1);
+		write(pfds[1], "w", 1);
+		exit(0);
+	}
+	res = check_events(epfd, 2000) & POLLIN;
+	if (waitpid(pid, NULL, 0) != pid) {
+		perror("waitpid");
+		return -1;
+	}
+	return res;
+}
+static int epoll_poll_chain(void *data) {
+	struct epoll_test_cfg *tcfg = data;
+	int i, res, epfd, bfd, nfd, pfds[2];
+	pid_t pid;
+	struct epoll_event evt;
+	memset(&evt, 0, sizeof(evt));
+	evt.events = EPOLLIN;
+	epfd = bfd = xepoll_create(1);
+	for (i = 0; i < tcfg->size; i++) {
+		nfd = xepoll_create(1);
+		xepoll_ctl(bfd, EPOLL_CTL_ADD, nfd, &evt);
+		bfd = nfd;
+	}
+	xpipe(pfds);
+	if (tcfg->flags & EPOLL_TF_LOOP)
+	{
+		xepoll_ctl(bfd, EPOLL_CTL_ADD, epfd, &evt);
+		/*
+		 * If we're testing for loop, we want that the wakeup
+		 * triggered by the write to the pipe done in the child
+		 * process, triggers a fake event. So we add the pipe
+		 * read size with EPOLLOUT events. This will trigger
+		 * an addition to the ready-list, but no real events
+		 * will be there. The the epoll kernel code will proceed
+		 * in calling f_op->poll() of the epfd, triggering the
+		 * loop we want to test.
+		 */
+		evt.events = EPOLLOUT;
+	}
+	xepoll_ctl(bfd, EPOLL_CTL_ADD, pfds[0], &evt);
+	/*
+	 * The pipe write mush come before the poll(2) call inside
+	 * check_events(). This tests the nested f_op->poll calls code in
+	 * fs/eventpoll.c:ep_eventpoll_poll()
+	 * By having the pipe write(2) happen first, we make the kernel
+	 * epoll code to load the ready lists, and the following poll(2)
+	 * done inside check_events() will test nested poll code in
+	 * ep_eventpoll_poll().
+	 */
+	if ((pid = xfork()) == 0) {
+		write(pfds[1], "w", 1);
+		exit(0);
+	}
+	sleep(1);
+	res = check_events(epfd, 1000) & POLLIN;
+	if (waitpid(pid, NULL, 0) != pid) {
+		perror("waitpid");
+		return -1;
+	}
+	return res;
+}
+int main(int ac, char **av) {
+	int error;
+	struct epoll_test_cfg tcfg;
+	fprintf(stdout, "\n********** Testing TTY events\n");
+	error = run_forked_proc(epoll_test_tty, NULL);
+	fprintf(stdout, error == 0 ?
+		"********** OK\n": "********** FAIL (%d)\n", error);
+	tcfg.size = 3;
+	tcfg.flags = 0;
+	fprintf(stdout, "\n********** Testing short wakeup chain\n");
+	error = run_forked_proc(epoll_wakeup_chain, &tcfg);
+	fprintf(stdout, error == POLLIN ?
+		"********** OK\n": "********** FAIL (%d)\n", error);
+	tcfg.size = EPOLL_MAX_CHAIN;
+	tcfg.flags = 0;
+	fprintf(stdout, "\n********** Testing long wakeup chain (HOLD ON)\n");
+	error = run_forked_proc(epoll_wakeup_chain, &tcfg);
+	fprintf(stdout, error == 0 ?
+		"********** OK\n": "********** FAIL (%d)\n", error);
+	tcfg.size = 3;
+	tcfg.flags = 0;
+	fprintf(stdout, "\n********** Testing short poll chain\n");
+	error = run_forked_proc(epoll_poll_chain, &tcfg);
+	fprintf(stdout, error == POLLIN ?
+		"********** OK\n": "********** FAIL (%d)\n", error);
+	tcfg.size = EPOLL_MAX_CHAIN;
+	tcfg.flags = 0;
+	fprintf(stdout, "\n********** Testing long poll chain (HOLD ON)\n");
+	error = run_forked_proc(epoll_poll_chain, &tcfg);
+	fprintf(stdout, error == 0 ?
+		"********** OK\n": "********** FAIL (%d)\n", error);
+	tcfg.size = 3;
+	tcfg.flags = EPOLL_TF_LOOP;
+	fprintf(stdout, "\n********** Testing loopy wakeup chain (HOLD ON)\n");
+	error = run_forked_proc(epoll_wakeup_chain, &tcfg);
+	fprintf(stdout, error == 0 ?
+		"********** OK\n": "********** FAIL (%d)\n", error);
+	tcfg.size = 3;
+	tcfg.flags = EPOLL_TF_LOOP;
+	fprintf(stdout, "\n********** Testing loopy poll chain (HOLD ON)\n");
+	error = run_forked_proc(epoll_poll_chain, &tcfg);
+	fprintf(stdout, error == 0 ?
+		"********** OK\n": "********** FAIL (%d)\n", error);
+	return 0;
+}

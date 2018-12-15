@@ -1,0 +1,166 @@
+Date: Wed, 12 May 1999 14:01:32 +0900 (JST)
+From: Tom Holroyd <>
+Subject: 2.2.8 gettimeofday() still doesn't work on Alpha
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/5/12/66
+
+Just booted 2.2.8 on my PC164 and the timetest program (included below)
+produces negative deltas with high frequency.
+Mr. Elliott's patch for the lost_ticks problem was working for the last
+several kernel versions (but I didn't try 2.2.7), and it never went in. 
+Now the alpha kernel time.c has changed so the patch won't apply but
+do_gettimeofday() still doesn't work (on my 500 MHz machine, anyway). 
+IIRC, there was a problem with SMP vs. the old patch, and I'm guessing
+this was the cause of the non-application?  UP is fairly common though so
+maybe it could be applied in that case?
+I'm not on the list so cc: replies, thanks.
+Dr. Tom Holroyd
+I would dance and be merry,
+Life would be a ding-a-derry,
+If I only had a brain.
+	-- The Scarecrow
+timetest.c:
+#include <stdio.h>
+#include <sys/time.h>
+#include <sys/types.h>
+#include <unistd.h>
+int main()
+{
+  struct timeval t1,t2,*p1,*p2,*temp ;
+  long i,delta ;
+  int r ;
+  p1=&t1 ;
+  p2=&t2 ;
+  gettimeofday(p1,NULL) ;
+  for(i=0;;i++)
+    {
+      r=gettimeofday(p2,NULL) ;
+      delta=p2->tv_sec-p1->tv_sec ;
+      delta*=1000000 ;
+      delta+=p2->tv_usec-p1->tv_usec ;
+      if((r!=0) || (delta<0))
+	{
+	  perror("gettimeofday") ;
+printf("r=%d\t\ti=%ld\tsec=%ld\tusec=%ld\n",r,i-1,p1->tv_sec,p1->tv_usec);
+printf("delta=%ld\ti=%ld\tsec=%ld\tusec=%ld\n",delta,i,p2->tv_sec,p2->tv_usec);
+	}
+      temp=p1 ;
+      p1=p2 ;
+      p2=temp ;
+    }
+  return(0) ;
+}
+I'll go ahead and include a copy of Mr. Elliott's patch that I've been
+using (applies to 2.2.6).
+--- linux/arch/alpha/kernel/time.c.orig	Fri Mar 12 16:24:50 1999
++++ linux/arch/alpha/kernel/time.c	Tue Mar 30 16:24:53 1999
+@@ -62,6 +62,7 @@
+ } state;
+ 
+ unsigned long est_cycle_freq;
++extern volatile unsigned long lost_ticks;
+ 
+ 
+ static inline __u32 rpcc(void)
+@@ -95,14 +96,17 @@
+ 	/*
+ 	 * Calculate how many ticks have passed since the last update,
+ 	 * including any previous partial leftover.  Save any resulting
+-	 * fraction for the next pass.
++	 * fraction for the next pass.  Don't change anything unless
++	 * at least one tick has passed.
+ 	 */
+ 	now = rpcc();
+ 	delta = now - state.last_time;
+-	state.last_time = now;
+ 	delta = delta * state.scaled_ticks_per_cycle + state.partial_tick;
+-	state.partial_tick = delta & ((1UL << FIX_SHIFT) - 1); 
+ 	nticks = delta >> FIX_SHIFT;
++	if (nticks) {
++		state.last_time = now;
++		state.partial_tick = delta & ((1UL << FIX_SHIFT) - 1);
++	}
+ 
+ 	while (nticks > 0) {
+ 		do_timer(regs);
+@@ -314,15 +318,20 @@
+ void
+ do_gettimeofday(struct timeval *tv)
+ {
+-	unsigned long flags, now, delta_cycles, delta_usec;
++	unsigned long flags, delta_cycles, delta_usec;
+ 	unsigned long sec, usec;
++	unsigned long partial_tick;
++	unsigned int now;
++	unsigned int lost;
+ 
++	read_lock_irqsave(&xtime_lock, flags);  /* really save_and_cli()... */
+ 	now = rpcc();
+-	save_and_cli(flags);
+ 	sec = xtime.tv_sec;
+ 	usec = xtime.tv_usec;
+ 	delta_cycles = now - state.last_time;
+-	restore_flags(flags);
++	partial_tick = state.partial_tick;
++	lost = lost_ticks;
++	read_unlock_irqrestore(&xtime_lock, flags);
+ 
+ 	/*
+ 	 * usec = cycles * ticks_per_cycle * 2**48 * 1e6 / (2**48 * ticks)
+@@ -337,8 +346,12 @@
+ 	 * with no clear gain.
+ 	 */
+ 
+-	delta_usec = delta_cycles * state.scaled_ticks_per_cycle * 15625;
++	delta_usec = delta_cycles * state.scaled_ticks_per_cycle + partial_tick;
++	delta_usec *= 15625;
+ 	delta_usec = ((delta_usec / ((1UL << (FIX_SHIFT-6-1)) * HZ)) + 1) / 2;
++	if (lost) {
++		delta_usec += (lost * (16000000 / HZ)) >> 4;
++	}
+ 
+ 	usec += delta_usec;
+ 	if (usec >= 1000000) {
+@@ -353,13 +366,32 @@
+ void
+ do_settimeofday(struct timeval *tv)
+ {
+-	cli();
++	unsigned long delta_usec;
++
++	/*
++	 * The offset that is added into time in do_gettimeofday above must
++	 * be subtracted here to keep a coherent view of the time.  Without
++	 * this, a full-tick error is possible.
++	 */
++	write_lock_irq(&xtime_lock);            /* really cli()... */
++	delta_usec = (rpcc() - state.last_time) * state.scaled_ticks_per_cycle +
++	    state.partial_tick;
++	delta_usec *= 15625;
++	delta_usec = ((delta_usec / ((1UL << (FIX_SHIFT-6-1)) * HZ)) + 1) / 2;
++	if (lost_ticks) {
++		delta_usec += (lost_ticks * (16000000 / HZ)) >> 4;
++	}
+ 	xtime = *tv;
++	xtime.tv_usec -= delta_usec;
++	if (xtime.tv_usec < 0) {
++		xtime.tv_usec += 1000000;
++		xtime.tv_sec--;
++	}
+ 	time_adjust = 0;		/* stop active adjtime() */
+ 	time_status |= STA_UNSYNC;
+ 	time_maxerror = NTP_PHASE_LIMIT;
+ 	time_esterror = NTP_PHASE_LIMIT;
+-	sti();
++	write_unlock_irq(&xtime_lock);
+ }
+ 
+ 
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

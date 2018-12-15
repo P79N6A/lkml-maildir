@@ -1,0 +1,268 @@
+Date: Thu, 22 Jul 1999 14:37:34 +0200
+From: Pavel Machek <>
+Subject: Converting network device (i.e. irda) into tty
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/7/22/40
+
+Hi!
+I've written following kernel module to convert network device into
+tty. Why is it usefull?
+Well, I like unix for its "everything is a file" rule. Unfortunately,
+network devices do not follow same rules. I see no reason why I should
+not be allowed to run ppp over point-to-point ethernet.
+What is worse, there's even practical problem. Infrared
+connections. irda consorcium produced something very ugly. I'd like to
+use irda devices for some other protocol than irda. One such is
+available - it is called scarab (basically simplex slip). As long as
+I'm talking about <115200 speeds and about non-toshiba notebooks, it
+is ok. I can choose not to tell system ttyS1 is in fact irda and run
+scarab over it. But toshiba's irda port does not look like serial any
+more, so I have to use toshoboe module. But toshoboe looks like
+network device, not like tty (required for scarab). Ok, so here's
+module. It does not work too well, but it should give you hint of what
+I'm doing.
+Compile by
+gcc -D__KERNEL__ -I/usr/src/linux/include -Wall -Wstrict-prototypes  -O2 -fomit-frame-pointer -pipe -fno-strength-reduce -m386 -DCPU=386 -DMODULE   -c -o n2cd.o n2cd.c
+Some pieces are simply wrong (alloc_skb in n2cd_write), I'd be happy
+if someone told me how to repair them.
+								Pavel
+/*
+ * Copyright 1999 Pavel Machek, distribute under GPL version 2 or later.
+ *
+ * This converts network device into character device. 
+ */
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/types.h>
+#include <linux/skbuff.h>
+#include <linux/netdevice.h>
+#include <linux/ioport.h>
+#include <linux/delay.h>
+#include <linux/malloc.h>
+#include <linux/init.h>
+#include <linux/signal.h>
+#include <linux/errno.h>
+#include <linux/mm.h>
+#include <linux/poll.h>
+#include <linux/miscdevice.h>
+#include <linux/random.h>
+#include <linux/wait.h>
+#include <linux/fs.h>
+#include <linux/tty_driver.h>
+#include <linux/tty_flip.h>
+#include <linux/kbd_kern.h>
+#include <linux/pci.h>
+#include <asm/io.h>
+#include <asm/dma.h>
+#include <asm/byteorder.h>
+#include <asm/uaccess.h>
+#include <asm/system.h>
+#include <asm/irq.h>
+#define ID printk( "n2cd: " )
+//#define ETH_P_N2CD 1234
+//#define ETH_P_N2CD ETH_P_IP
+#define ETH_P_N2CD ETH_P_IRDA
+#define MAXDEVS 64
+static struct device *my_dev, *attached_device;
+static struct tty_struct *my_tty = NULL;
+/* --------------- My hack to overcome flip inadequacy -------------- */
+struct tq_struct tqueue;
+int todo = 0;
+static void do_softint(void *unused)
+{
+	if (todo & 1) {
+		if (my_tty->flags & (1 << TTY_DO_WRITE_WAKEUP))
+			if (my_tty->ldisc.write_wakeup) {
+				ID; printk( "Waking up line discipline\n" );
+				(my_tty->ldisc.write_wakeup)(my_tty);
+			}
+		wake_up_interruptible(&my_tty->write_wait);
+	}
+}
+/* --------------------- generic tir2000 handling -------------------------- */
+static void
+receive_byte(struct device *dev, int what)
+{
+	tty_insert_flip_char(my_tty, what, 0);
+}
+void
+send_wakeup( struct device *dev )
+{
+	ID; printk( "Should wakeup\n" );
+	todo |= 1;
+	queue_task(&tqueue, &tq_immediate);
+	mark_bh(IMMEDIATE_BH);
+}
+static int
+n2cd_rcv(struct sk_buff *skb, struct device *dev, struct packet_type *pt)
+{
+	char *data = skb->nh.raw;
+	int i;
+	ID; printk( "Message came (%d bytes)\n", skb->len );
+	if (!my_tty) {
+		printk( "Noone is listening\n" );
+		return 0;
+	}
+	for (i=0; i<skb->len; i++)
+		receive_byte(dev, data[i]);
+        tty_flip_buffer_push(my_tty);
+	return 0;
+}
+static struct packet_type n2cd_packet_type =
+{
+	__constant_htons(ETH_P_N2CD),
+	NULL,		/* All devices */
+	n2cd_rcv,
+	NULL,
+	NULL,
+#ifdef CONFIG_SWAP_VIA_NETWORK
+	1,
+#endif
+};
+/* ------------------------- Character device interface --------------------------- */
+static ssize_t n2cd_write(struct tty_struct *tty, int from_user, const unsigned char * buffer, int count)
+{
+	int r = 0;
+	struct sk_buff *skb;
+	char *target;
+	ID; printk( "write %d bytes...", count );
+	if (from_user && (r = verify_area(VERIFY_READ, buffer, count))) {
+		printk( "verify area failed\n" );
+                return r;
+	}
+	if (count>512)		/* Limit size to mtu */
+		count = 512;
+        skb = alloc_skb(3*count+50, GFP_KERNEL);
+        if (skb == NULL)
+                return 0;
+        skb_reserve(skb, count+25);
+        skb->nh.raw = skb->data;
+        target = (char *) skb_put(skb,count);
+	memcpy(target, buffer, count);
+        skb->dev = attached_device; /* My device - dev; */
+        skb->protocol = __constant_htons (ETH_P_N2CD);
+	dev_queue_xmit(skb); 
+	printk( "wrote %d bytes\n", count );
+	return count;
+}
+static int n2cd_open(struct tty_struct *tty, struct file * file)
+{
+	ID; printk( "Openning device\n" );
+	my_tty = tty;
+#if 0
+	my_tty->low_latency = 1;
+#endif
+	return 0;
+}
+static void n2cd_close(struct tty_struct *tty, struct file * file)
+{
+	ID; printk( "Closing device\n" );
+	my_tty = NULL;
+	ID; printk( "net close\n" );
+}
+void
+n2cd_attach(char *name)
+{
+	struct device *dev;
+        read_lock(&dev_base_lock);
+        for (dev = dev_base; dev != NULL; dev = dev->next) {
+		if (!strcmp(dev->name, name))
+			break;
+        }
+        read_unlock(&dev_base_lock);
+	if (!dev) {
+		ID; printk( "attach: device not found\n" );
+		return;
+	}
+	printk( "attaching to device %s\n", dev->name );
+	attached_device = dev;
+}
+static int n2cd_ioctl(struct tty_struct *tty, struct file *file, unsigned int cmd, unsigned long arg)
+{
+	printk( "ioctl came\n" );
+	if (cmd == 0xf506) {
+		return 0;
+	}
+	return -ENOIOCTLCMD;
+}
+static void n2cd_set_termios(struct tty_struct *tty, struct termios *old)
+{
+	printk( "set termios came\n" );
+}
+static int n2cd_chars_in_buffer(struct tty_struct *tty)
+{
+	return 0;
+}
+static void n2cd_wait_until_sent(struct tty_struct *tty, int timeout)
+{
+}
+static struct termios n2cd_deftermios = {
+        0,
+        0,
+        (B9600 | CS8 | CREAD | HUPCL | CLOCAL),
+        0,
+        0,
+        INIT_C_CC
+};
+static struct tty_driver n2cd_tty = {
+	0,
+};
+static struct tty_struct        *n2cd_ttys[MAXDEVS];
+static struct termios           *n2cd_termios[MAXDEVS];
+static struct termios           *n2cd_termioslocked[MAXDEVS];
+static int n2cd_refcount;
+#ifdef MODULE
+int init_module(void)
+{
+	printk( "n2cd: V0.1.0, copyright 1999 Pavel Machek\n" );
+	my_dev = kmalloc(1, GFP_KERNEL);
+	memset(&tqueue, 0, sizeof(tqueue));
+	tqueue.routine = do_softint;
+	tqueue.data = NULL;
+	n2cd_tty.magic = TTY_DRIVER_MAGIC;
+	n2cd_tty.name = "n2cd";
+	n2cd_tty.driver_name = "n2cd";
+	n2cd_tty.major = 63;
+	n2cd_tty.minor_start = 0;
+	n2cd_tty.num = 1;
+	n2cd_tty.type = TTY_DRIVER_TYPE_SERIAL;
+        n2cd_tty.table = n2cd_ttys;
+        n2cd_tty.termios = n2cd_termios;
+        n2cd_tty.termios_locked = n2cd_termioslocked;
+	n2cd_tty.refcount = &n2cd_refcount;
+	n2cd_tty.open = n2cd_open;
+	n2cd_tty.close = n2cd_close;
+	n2cd_tty.write = n2cd_write;
+	n2cd_tty.init_termios = n2cd_deftermios;
+	n2cd_tty.chars_in_buffer = n2cd_chars_in_buffer;
+	n2cd_tty.ioctl = n2cd_ioctl;
+	n2cd_tty.set_termios = n2cd_set_termios;
+	n2cd_tty.wait_until_sent = n2cd_wait_until_sent;
+	n2cd_attach("irda0");
+	if (tty_register_driver(&n2cd_tty)) {
+		ID; printk( "failed to register driver\n" );
+	}
+	dev_add_pack(&n2cd_packet_type);
+	return 0;
+}
+void cleanup_module(void)
+{
+	ID; printk( "cleanup\n" );
+	if (tty_unregister_driver(&n2cd_tty)) {
+		ID; printk( "failed to unregister driver; await armagedon\n" );
+	}
+}
+#endif
+-- 
+I'm really pavel@ucw.cz. Look at 
+http://195.113.31.123/~pavel.
+  Pavel
+Hi! I'm a .signature virus! Copy me into your ~/.signature, please!
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

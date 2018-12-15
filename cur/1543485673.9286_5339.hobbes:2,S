@@ -1,0 +1,261 @@
+Date: Sat, 13 Feb 1999 23:29:38 -0500 (EST)
+From: "Theodore Y. Ts'o" <>
+Subject: Re: fsync on large files
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/2/13/75
+
+   From: "Alan Curry" <pacman-kernel@cqc.com>
+   Date: 	Fri, 12 Feb 1999 22:36:51 -0500 (EST)
+   I'm coming late to this topic, but with a good reason: I just figured
+   out today that syslogd's fsyncs have been the cause of some major
+   performance problems on an ISP's central server. Load averages have
+   been unreasonably high and gradually getting worse. Today we realized
+   that there is a weekly cycle to it, and it matches the cycle of the
+   log rotation of /var/log/messages. As this log file grows (currently
+   36 megs with 2 days left before rotation) and beyond, with syslogd
+   fsync'ing every line it writes, syslogd hangs for long periods of
+   time, and when syslogd is hung, lots of other stuff hangs.
+Hmm.  That's an interesting problem.  This is the first time someone's
+called it to my attention that syslog was calling fsync() all the time,
+and obviously this causes a problem if there's a lot of syslogging going
+on and the log files are large.
+No, 2.2.1 won't do much better than 2.0.36, I don't think.  I've whipped
+up some patches to 2.2.1 which should solve the problem.  It probably
+wouldn't be too hard to backport them to 2.0.37, if someone were really
+2.2-phobic.  
+What the patch does is keep an array of the last four blocks which were
+modified since the last fsync().  If there have been no more than four
+blocks modified, then the ext2 filesystem can do a "fast fsync", which
+just flushes those four (or fewer) blocks to disk, without having to
+walk all of the indirect blocks looking for modified blocks.  This
+should be extremely effective for programs like syslog which are doing
+frequent fsync()'s with minimal amounts of data written between calls to
+fsync().
+A warning about this patch:
+It's less than 2 hours old.  Just because the patch is against a stable
+kernel doesn't mean that the patch is stable!  I've lightly tested it,
+and it works fine under my test environment; but if you install it on
+your production environment and it blows up and takes out all of your
+data, don't go crying to me.  Try it out on a scratch monkey first....
+						- Ted
+Patch generated: on Sat Feb 13 23:15:56 EST 1999 by tytso@rsts-11.mit.edu
+against Linux version 2.2.1
+===================================================================
+RCS file: fs/ext2/RCS/fsync.c,v
+retrieving revision 1.1
+diff -u -r1.1 fs/ext2/fsync.c
+--- fs/ext2/fsync.c	1999/01/31 23:28:35	1.1
++++ fs/ext2/fsync.c	1999/02/14 04:15:15
+@@ -250,36 +250,83 @@
+ 	return err;
+ }
+ 
+-/*
+- *	File may be NULL when we are called. Perhaps we shouldn't
+- *	even pass file to fsync ?
+- */
+-
+-int ext2_sync_file(struct file * file, struct dentry *dentry)
++static int sync_inode(struct inode *inode)
+ {
+-	int wait, err = 0;
+-	struct inode *inode = dentry->d_inode;
+-
++	int i, wait, err = 0;
++	__u32	*blklist;
++	
+ 	if (S_ISLNK(inode->i_mode) && !(inode->i_blocks))
+-		/*
+-		 * Don't sync fast links!
+-		 */
+-		goto skip;
++		return 0;
+ 
+-	for (wait=0; wait<=1; wait++)
+-	{
+-		err |= sync_direct (inode, wait);
+-		err |= sync_indirect (inode,
++	if (!S_ISDIR(inode->i_mode) && inode->u.ext2_i.i_ffsync_flag) {
++		blklist = inode->u.ext2_i.i_ffsync_blklist;
++		for (wait = 0; wait <=1; wait++) {
++			for (i=0; i < inode->u.ext2_i.i_ffsync_ptr; i++) {
++#if 0				/* Debugging */
++				if (!wait)
++					printk("Fasy sync: %d\n", blklist[i]);
++#endif				
++				err |= sync_block(inode, &blklist[i], wait);
++			}
++		}
++	} else {
++		for (wait=0; wait<=1; wait++) {
++			err |= sync_direct (inode, wait);
++			err |= sync_indirect (inode,
+ 				      inode->u.ext2_i.i_data+EXT2_IND_BLOCK,
+-				      wait);
+-		err |= sync_dindirect (inode,
++					      wait);
++			err |= sync_dindirect (inode,
+ 				       inode->u.ext2_i.i_data+EXT2_DIND_BLOCK, 
+-				       wait);
+-		err |= sync_tindirect (inode, 
++					       wait);
++			err |= sync_tindirect (inode, 
+ 				       inode->u.ext2_i.i_data+EXT2_TIND_BLOCK, 
+-				       wait);
++					       wait);
++		}
+ 	}
+-skip:
++	inode->u.ext2_i.i_ffsync_flag = 1;
++	inode->u.ext2_i.i_ffsync_ptr = 0;
+ 	err |= ext2_sync_inode (inode);
++	return err;
++}
++
++/*
++ * File may be NULL when we are called by msync on a vma.  In the
++ * future, the VFS layer should be changed to not pass the struct file
++ * parameter to the fsync function, since it's not used by any of the
++ * implementations (and the dentry parameter is all that we need).
++ */
++int ext2_sync_file(struct file * file, struct dentry *dentry)
++{
++	int err = 0;
++
++	err = sync_inode(dentry->d_inode);
++	if (dentry->d_parent && dentry->d_parent->d_inode)
++		err |= sync_inode(dentry->d_parent->d_inode);
++	
+ 	return err ? -EIO : 0;
++}
++
++/*
++ * This function adds a list of blocks to be written out by fsync.  If
++ * it exceeds NUM_EXT2_FFSYNC_BLKS, then we turn off the fast fsync flag.
++ */
++void ext2_ffsync_add_blk(struct inode *inode, __u32 blk)
++{
++	int	i;
++	__u32	*blklist;
++
++	if (inode->u.ext2_i.i_ffsync_flag == 0)
++		return;
++#if 0				/* Debugging */
++	printk("Add fast sync: %d\n", blk);
++#endif
++	blklist = inode->u.ext2_i.i_ffsync_blklist;
++	for (i=0; i < inode->u.ext2_i.i_ffsync_ptr; i++)
++		if (blklist[i] == blk)
++			return;
++	if (inode->u.ext2_i.i_ffsync_ptr > NUM_EXT2_FFSYNC_BLKS) {
++		inode->u.ext2_i.i_ffsync_flag = 0;
++		return;
++	}
++	blklist[inode->u.ext2_i.i_ffsync_ptr++] = blk;
+ }
+===================================================================
+RCS file: fs/ext2/RCS/super.c,v
+retrieving revision 1.1
+diff -u -r1.1 fs/ext2/super.c
+--- fs/ext2/super.c	1999/01/31 23:28:35	1.1
++++ fs/ext2/super.c	1999/01/31 23:28:38
+@@ -735,7 +735,11 @@
+ }
+ 
+ static struct file_system_type ext2_fs_type = {
++#ifdef EXT2_DEV_FS
++	"ext2dev",
++#else
+ 	"ext2", 
++#endif
+ 	FS_REQUIRES_DEV /* | FS_IBASKET */,	/* ibaskets have unresolved bugs */
+         ext2_read_super, 
+ 	NULL
+===================================================================
+RCS file: fs/ext2/RCS/file.c,v
+retrieving revision 1.1
+diff -u -r1.1 fs/ext2/file.c
+--- fs/ext2/file.c	1999/02/13 23:55:47	1.1
++++ fs/ext2/file.c	1999/02/14 02:29:08
+@@ -271,6 +271,7 @@
+ 		count -= c;
+ 		mark_buffer_uptodate(bh, 1);
+ 		mark_buffer_dirty(bh, 0);
++		ext2_ffsync_add_blk(inode, bh->b_blocknr);
+ 
+ 		if (filp->f_flags & O_SYNC)
+ 			bufferlist[buffercount++] = bh;
+===================================================================
+RCS file: fs/ext2/RCS/inode.c,v
+retrieving revision 1.1
+diff -u -r1.1 fs/ext2/inode.c
+--- fs/ext2/inode.c	1999/02/13 23:55:47	1.1
++++ fs/ext2/inode.c	1999/02/14 02:30:25
+@@ -125,6 +125,7 @@
+ 		mark_buffer_uptodate(bh, 1);
+ 		mark_buffer_dirty(bh, 1);
+ 		brelse (bh);
++		ext2_ffsync_add_blk(inode, bh->b_blocknr);
+ 	} else {
+ 		ext2_discard_prealloc (inode);
+ 		ext2_debug ("preallocation miss (%lu/%lu).\n",
+@@ -341,6 +342,7 @@
+ 	}
+ 	*p = le32_to_cpu(tmp);
+ 	mark_buffer_dirty(bh, 1);
++	ext2_ffsync_add_blk(inode, bh->b_blocknr);
+ 	if (IS_SYNC(inode) || inode->u.ext2_i.i_osync) {
+ 		ll_rw_block (WRITE, 1, &bh);
+ 		wait_on_buffer (bh);
+===================================================================
+RCS file: include/linux/RCS/ext2_fs_i.h,v
+retrieving revision 1.1
+diff -u -r1.1 include/linux/ext2_fs_i.h
+--- include/linux/ext2_fs_i.h	1999/01/31 23:28:35	1.1
++++ include/linux/ext2_fs_i.h	1999/02/14 00:19:41
+@@ -16,6 +16,8 @@
+ #ifndef _LINUX_EXT2_FS_I
+ #define _LINUX_EXT2_FS_I
+ 
++#define NUM_EXT2_FFSYNC_BLKS	4
++
+ /*
+  * second extended file system inode data in memory
+  */
+@@ -37,6 +39,14 @@
+ 	__u32	i_prealloc_count;
+ 	__u32	i_high_size;
+ 	int	i_new_inode:1;	/* Is a freshly allocated inode */
++	int	i_ffsync_flag:1; /* Fast sync flag */
++	unsigned long	i_bflags; /* The B-tree flags */
++	__u32	i_ffsync_blklist[NUM_EXT2_FFSYNC_BLKS];
++	__u16	i_ffsync_ptr;
++	struct wait_queue * i_bwait;
+ };
++
++/* Ext2 B-tree flags */
++#define EXT2_BTF_LOCKED	1
+ 
+ #endif	/* _LINUX_EXT2_FS_I */
+===================================================================
+RCS file: include/linux/RCS/ext2_fs.h,v
+retrieving revision 1.1
+diff -u -r1.1 include/linux/ext2_fs.h
+--- include/linux/ext2_fs.h	1999/02/14 00:19:56	1.1
++++ include/linux/ext2_fs.h	1999/02/14 02:40:08
+@@ -545,6 +545,7 @@
+ 
+ /* fsync.c */
+ extern int ext2_sync_file (struct file *, struct dentry *);
++extern void ext2_ffsync_add_blk(struct inode *inode, __u32 blk);
+ 
+ /* ialloc.c */
+ extern struct inode * ext2_new_inode (const struct inode *, int, int *);
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

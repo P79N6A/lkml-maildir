@@ -1,0 +1,700 @@
+Date: Fri, 12 Mar 1999 01:13:40 -0500 (EST)
+From: Chuck Lever <>
+Subject: [PATCH]: for discussion - buffer cache growth
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/3/12/7
+
+here's a patch i've been working on to help reduce system performance
+problems when manipulating large files.  as i mentioned in an earlier
+message to this list, measurable performance degradation occurs when the
+buffer cache grows very large.  this can occur when copying very large
+files, or when running filesystem-intensive applications that have a file
+data working set larger than physical memory.
+this patch has several purposes.
+first, it adds instrumentation to the buffer cache code.  this
+instrumentation could be used with some later implementation of sar to
+gather data about buffer cache performance.  i'd like some comments from
+the list about whether these are the right set of events to monitor.  once
+there is a reasonable set of counters, i can add a /proc file that exports
+this data from the kernel.
+second, it restores an upper bound to buffer cache growth.  my theory is
+that the degraded scenario occurs when shrink_mmap() begins to steal pages
+back from the buffer cache via try_to_free_buffers().  because
+shrink_mmap() specifies an arbitrary page it wants back, the buffer cache
+LRU ordering is compromised.  if this occurs once or twice, usually the
+harm is minimal.  when this happens repeatedly over a short period of
+time, as might happen when the system is experiencing a VM shortage, this
+can have catastrophic performance impact.
+in order to reduce the number of "buffer shrink" operations, the code now
+uses a simple algorithm to decide when to expand the cache size.  if there
+have been more grow requests than shrink requests, the cache continues to
+expand; otherwise, it stops growing the cache until balance is restored.
+if the growth request would make the cache larger than
+buffer_mem.max_percent, it also stops growing the cache.
+third, there is some code clean-up in this patch.  panic and console
+messages are clearer, and some extraneous code has been removed.  as well,
+the <alt>-<sysrq>-M output contains new statistics from the
+instrumentation i added.
+there is still a problem with my patch.  when the buffer cache stops
+growing, it begins recycling buffers instead of adding fresh pages to the
+cache in order to replenish the free buffer list.  as soon as this
+happens, any filesystem-intensive operations block, although there is
+still significant disk activity. programs continue to run, albeit slowly.  
+you can see this if you watch the "blocked processes" column of vmstat
+while applications are running.  this behavior is similar to
+system/application behavior on the stock kernel during the degraded
+scenario, so it might be a good way to reproduce the original problem.  
+i'd like some help solving the blocked processes problem, and comments on
+the instrumentation.  thanks!
+	- Chuck Lever
+--
+corporate:	<chuckl@netscape.com>
+personal:	<chucklever@netscape.net> or <cel@monkey.org>
+The Linux Scalability project:
+	
+http://www.citi.umich.edu/projects/citi-netscape/
+diff -u -r linux-2.2.3-reference/fs/buffer.c linux/fs/buffer.c
+--- linux-2.2.3-reference/fs/buffer.c	Tue Mar  9 13:58:42 1999
++++ linux/fs/buffer.c	Fri Mar 12 00:42:49 1999
+@@ -49,8 +49,9 @@
+  -1, -1, -1, -1, -1, -1, -1, -1, -1,-1, -1, -1, -1, -1, -1, -1,
+   6};
+ 
++#define MIN_BUFSIZE 512
+ #define BUFSIZE_INDEX(X) ((int) buffersize_index[(X)>>9])
+-#define MAX_BUF_PER_PAGE (PAGE_SIZE / 512)
++#define MAX_BUF_PER_PAGE (PAGE_SIZE / MIN_BUFSIZE)
+ #define NR_RESERVED (2*MAX_BUF_PER_PAGE)
+ #define MAX_UNUSED_BUFFERS NR_RESERVED+20 /* don't ever have more than this 
+ 					     number of unused buffer heads */
+@@ -114,6 +115,36 @@
+ int bdflush_min[N_PARAM] = {  0,  10,    5,   25,  0,   1*HZ,   1*HZ, 1, 1};
+ int bdflush_max[N_PARAM] = {100,5000, 2000, 2000,100, 600*HZ, 600*HZ, 2047, 5};
+ 
++/*
++ * Can the buffer be thrown out?
++ */
++#define BUFFER_BUSY_BITS	((1<<BH_Dirty) | (1<<BH_Lock) | (1<<BH_Protected))
++#define buffer_busy(bh)		((bh)->b_count || ((bh)->b_state & BUFFER_BUSY_BITS))
++
++/* align the next struct */
++__asm__ ("       .align 16\n");
++
++struct totals {
++	unsigned long lookups;
++	unsigned long hits;
++	unsigned long ndirty_written;
++	unsigned long bdflush;
++	unsigned long bdflush_wait;
++	unsigned long wait_on_buffer;
++	unsigned long refills;
++	unsigned long recycled;
++	unsigned long grow_buffers;
++	unsigned long free_buffers;
++	unsigned long freed_pages;
++	unsigned long invalidates;
++	unsigned long breads; 
++	unsigned long breadas;
++	unsigned long brw_page;
++	unsigned long brw_read;
++} buffer_counters = {0, };
++
++#undef DEBUG
++
+ void wakeup_bdflush(int);
+ 
+ /*
+@@ -130,6 +161,7 @@
+ 	struct task_struct *tsk = current;
+ 	struct wait_queue wait;
+ 
++	buffer_counters.wait_on_buffer++;
+ 	bh->b_count++;
+ 	wait.task = tsk;
+ 	add_wait_queue(&bh->b_wait, &wait);
+@@ -219,6 +251,7 @@
+ 			bh->b_count++;
+ 			next->b_count++;
+ 			bh->b_flushtime = 0;
++			buffer_counters.ndirty_written++;
+ 			ll_rw_block(WRITE, 1, &bh);
+ 			bh->b_count--;
+ 			next->b_count--;
+@@ -400,6 +433,7 @@
+ 	int nlist;
+ 	struct buffer_head * bh;
+ 
++	buffer_counters.invalidates++;
+ 	for(nlist = 0; nlist < NR_LIST; nlist++) {
+ 		bh = lru_list[nlist];
+ 		for (i = nr_buffers_type[nlist]*2 ; --i > 0 ; bh = bh->b_next_free) {
+@@ -416,6 +450,8 @@
+ 			clear_bit(BH_Dirty, &bh->b_state);
+ 			clear_bit(BH_Req, &bh->b_state);
+ 		}
++		/* XXX this ought to add each buffer to the back of the
++		       free list, eh? */
+ 	}
+ }
+ 
+@@ -439,9 +475,9 @@
+ static inline void remove_from_lru_list(struct buffer_head * bh)
+ {
+ 	if (!(bh->b_prev_free) || !(bh->b_next_free))
+-		panic("VFS: LRU block list corrupted");
++		panic("VFS: LRU list corrupted");
+ 	if (bh->b_dev == B_FREE)
+-		panic("LRU list corrupted");
++		panic("VFS: Free buffer found on LRU list");
+ 	bh->b_prev_free->b_next_free = bh->b_next_free;
+ 	bh->b_next_free->b_prev_free = bh->b_prev_free;
+ 
+@@ -456,11 +492,11 @@
+ {
+ 	int isize = BUFSIZE_INDEX(bh->b_size);
+ 	if (!(bh->b_prev_free) || !(bh->b_next_free))
+-		panic("VFS: Free block list corrupted");
++		panic("VFS: Free list corrupted");
+ 	if(bh->b_dev != B_FREE)
+-		panic("Free list corrupted");
++		panic("VFS: In-use buffer found on free list");
+ 	if(!free_list[isize])
+-		panic("Free list empty");
++		panic("VFS: Free list empty");
+ 	if(bh->b_next_free == bh)
+ 		 free_list[isize] = NULL;
+ 	else {
+@@ -486,66 +522,62 @@
+ 
+ static inline void put_last_lru(struct buffer_head * bh)
+ {
+-	if (bh) {
+-		struct buffer_head **bhp = &lru_list[bh->b_list];
++	struct buffer_head **bhp = &lru_list[bh->b_list];
+ 
+-		if (bh == *bhp) {
+-			*bhp = bh->b_next_free;
+-			return;
+-		}
+-
+-		if(bh->b_dev == B_FREE)
+-			panic("Wrong block for lru list");
++	if (bh == *bhp) {
++		*bhp = bh->b_next_free;
++		return;
++	}
+ 
+-		/* Add to back of free list. */
+-		remove_from_lru_list(bh);
+-		if(!*bhp) {
+-			*bhp = bh;
+-			(*bhp)->b_prev_free = bh;
+-		}
++	if(bh->b_dev == B_FREE)
++		panic("put_last_lru: In-use buffer found on LRU list");
+ 
+-		bh->b_next_free = *bhp;
+-		bh->b_prev_free = (*bhp)->b_prev_free;
+-		(*bhp)->b_prev_free->b_next_free = bh;
++	/* Add to back of lru list. */
++	remove_from_lru_list(bh);
++	if(!*bhp) {
++		*bhp = bh;
+ 		(*bhp)->b_prev_free = bh;
+ 	}
++
++	bh->b_next_free = *bhp;
++	bh->b_prev_free = (*bhp)->b_prev_free;
++	(*bhp)->b_prev_free->b_next_free = bh;
++	(*bhp)->b_prev_free = bh;
+ }
+ 
+ static inline void put_last_free(struct buffer_head * bh)
+ {
+-	if (bh) {
+-		struct buffer_head **bhp = &free_list[BUFSIZE_INDEX(bh->b_size)];
+-
+-		bh->b_dev = B_FREE;  /* So it is obvious we are on the free list. */
++	struct buffer_head **bhp = &free_list[BUFSIZE_INDEX(bh->b_size)];
+ 
+-		/* Add to back of free list. */
+-		if(!*bhp) {
+-			*bhp = bh;
+-			bh->b_prev_free = bh;
+-		}
++	bh->b_dev = B_FREE;  /* So it is obvious we are on the free list. */
+ 
+-		bh->b_next_free = *bhp;
+-		bh->b_prev_free = (*bhp)->b_prev_free;
+-		(*bhp)->b_prev_free->b_next_free = bh;
+-		(*bhp)->b_prev_free = bh;
++	/* Add to back of free list. */
++	if(!*bhp) {
++		*bhp = bh;
++		bh->b_prev_free = bh;
+ 	}
++
++	bh->b_next_free = *bhp;
++	bh->b_prev_free = (*bhp)->b_prev_free;
++	(*bhp)->b_prev_free->b_next_free = bh;
++	(*bhp)->b_prev_free = bh;
+ }
+ 
+ static void insert_into_queues(struct buffer_head * bh)
+ {
+-	/* put at end of free list */
+ 	if(bh->b_dev == B_FREE) {
+ 		put_last_free(bh);
+ 	} else {
+ 		struct buffer_head **bhp = &lru_list[bh->b_list];
+ 
++		/* Add to back of lru list */
+ 		if(!*bhp) {
+ 			*bhp = bh;
+ 			bh->b_prev_free = bh;
+ 		}
+ 
+ 		if (bh->b_next_free)
+-			panic("VFS: buffer LRU pointers corrupted");
++			panic("insert_into_queues: LRU list corrupted");
+ 
+ 		bh->b_next_free = *bhp;
+ 		bh->b_prev_free = (*bhp)->b_prev_free;
+@@ -575,6 +607,7 @@
+ {		
+ 	struct buffer_head * next;
+ 
++	buffer_counters.lookups++;
+ 	next = hash(dev,block);
+ 	for (;;) {
+ 		struct buffer_head *tmp = next;
+@@ -586,6 +619,7 @@
+ 		next = tmp;
+ 		break;
+ 	}
++	if (next) buffer_counters.hits++;
+ 	return next;
+ }
+ 
+@@ -599,9 +633,11 @@
+ struct buffer_head * get_hash_table(kdev_t dev, int block, int size)
+ {
+ 	struct buffer_head * bh;
++
+ 	bh = find_buffer(dev,block,size);
+-	if (bh)
++	if (bh) {
+ 		bh->b_count++;
++	}
+ 	return bh;
+ }
+ 
+@@ -633,9 +669,9 @@
+ 	if (!blksize_size[MAJOR(dev)])
+ 		return;
+ 
+-	/* Size must be a power of two, and between 512 and PAGE_SIZE */
+-	if (size > PAGE_SIZE || size < 512 || (size & (size-1)))
+-		panic("Invalid blocksize passed to set_blocksize");
++	/* Size must be a power of two, and between MIN_BUFSIZE and PAGE_SIZE */
++	if (size > PAGE_SIZE || size < MIN_BUFSIZE || (size & (size-1)))
++		panic("VFS: Invalid blocksize passed to set_blocksize");
+ 
+ 	if (blksize_size[MAJOR(dev)][MINOR(dev)] == 0 && size == BLOCK_SIZE) {
+ 		blksize_size[MAJOR(dev)][MINOR(dev)] = size;
+@@ -674,15 +710,27 @@
+ 	}
+ }
+ 
+-/*
+- * We used to try various strange things. Let's not.
+- */
+-static void refill_freelist(int size)
++void recycle_buffers(int size)
+ {
+-	if (!grow_buffers(size)) {
+-		wakeup_bdflush(1);
+-		current->policy |= SCHED_YIELD;
+-		schedule();
++	/* try recycling buffers */
++	int needed = PAGE_SIZE / size;
++	struct buffer_head *next, *bh;
++
++	recover_reusable_buffer_heads();
++
++	bh = lru_list[BUF_CLEAN];
++	while (bh && needed > 0) {
++		next = bh->b_next_free;
++		if (!buffer_busy(bh) &&
++		    bh->b_size == size) {
++			remove_from_queues(bh);
++			put_last_free(bh);
++			buffer_counters.recycled++;
++			needed--;
++		}
++		if (next == lru_list[BUF_CLEAN])
++			break;
++		bh = next;
+ 	}
+ }
+ 
+@@ -708,52 +756,45 @@
+  * Ok, this is getblk, and it isn't very clear, again to hinder
+  * race-conditions. Most of the code is seldom used, (ie repeating),
+  * so it should be much more efficient than it looks.
+- *
+- * The algorithm is changed: hopefully better, and an elusive bug removed.
+- *
+- * 14.02.92: changed it to sync dirty buffers a bit: better performance
+- * when the filesystem starts to get full of dirty blocks (I hope).
+  */
+ struct buffer_head * getblk(kdev_t dev, int block, int size)
+ {
+ 	struct buffer_head * bh;
+ 	int isize;
+ 
+-repeat:
+-	bh = get_hash_table(dev, block, size);
+-	if (bh) {
+-		if (!buffer_dirty(bh)) {
+-			if (buffer_uptodate(bh))
+-				 put_last_lru(bh);
+-			bh->b_flushtime = 0;
++	for (;;) {
++		bh = get_hash_table(dev, block, size);
++		if (bh) {
++			put_last_lru(bh);
++			if (!buffer_dirty(bh))
++				bh->b_flushtime = 0;
++			return bh;
+ 		}
+-		return bh;
+-	}
+ 
+-	isize = BUFSIZE_INDEX(size);
+-get_free:
+-	bh = free_list[isize];
+-	if (!bh)
+-		goto refill;
+-	remove_from_free_list(bh);
++		isize = BUFSIZE_INDEX(size);
++		do {
++			bh = free_list[isize];
++			if (bh) {
++				remove_from_free_list(bh);
++				init_buffer(bh, dev, block,
++						end_buffer_io_sync, NULL);
++				bh->b_state=0;
++				insert_into_queues(bh);
++				return bh;
++			}
+ 
+-	/* OK, FINALLY we know that this buffer is the only one of its kind,
+-	 * and that it's unused (b_count=0), unlocked, and clean.
+-	 */
+-	init_buffer(bh, dev, block, end_buffer_io_sync, NULL);
+-	bh->b_state=0;
+-	insert_into_queues(bh);
+-	return bh;
++			/* refill the free list */
++			buffer_counters.refills++;
+ 
+-	/*
+-	 * If we block while refilling the free list, somebody may
+-	 * create the buffer first ... search the hashes again.
+-	 */
+-refill:
+-	refill_freelist(size);
+-	if (!find_buffer(dev,block,size))
+-		goto get_free;
+-	goto repeat;
++		        if (!grow_buffers(size)) {
++				recycle_buffers(size);
++		                wakeup_bdflush(1);
++                		current->policy |= SCHED_YIELD;
++                		schedule();
++        		}
++		} while (!find_buffer(dev,block,size));
++	}
++	/*NOTREACHED*/
+ }
+ 
+ void set_writetime(struct buffer_head * buf, int flag)
+@@ -864,6 +905,7 @@
+ {
+ 	struct buffer_head * bh = getblk(dev, block, size);
+ 
++	buffer_counters.breads++;
+ 	if (bh) {
+ 		touch_buffer(bh);
+ 		if (buffer_uptodate(bh))
+@@ -896,6 +938,7 @@
+ 	int index;
+ 	int i, j;
+ 
++	buffer_counters.breadas++;
+ 	if (pos >= filesize)
+ 		return NULL;
+ 
+@@ -1243,6 +1286,10 @@
+ 	struct buffer_head *bh, *prev, *next, *arr[MAX_BUF_PER_PAGE];
+ 	int block, nr;
+ 
++	buffer_counters.brw_page++;
++	if (rw == READ)
++		buffer_counters.brw_read++;
++
+ 	if (!PageLocked(page))
+ 		panic("brw_page: page not locked for I/O");
+ 	clear_bit(PG_uptodate, &page->flags);
+@@ -1305,6 +1352,8 @@
+ 	prev->b_this_page = bh;
+ 	
+ 	if (nr) {
++		if (rw == WRITE)
++			buffer_counters.ndirty_written++;
+ 		ll_rw_block(rw, nr, arr);
+ 		/* The rest of the work is done in mark_buffer_uptodate()
+ 		 * and unlock_buffer(). */
+@@ -1356,7 +1405,7 @@
+ 	struct dentry *dentry = file->f_dentry;
+ 	struct inode *inode = dentry->d_inode;
+ 	unsigned long block;
+-	int *p, nr[PAGE_SIZE/512];
++	int *p, nr[MAX_BUF_PER_PAGE];
+ 	int i;
+ 
+ 	atomic_inc(&page->count);
+@@ -1389,11 +1438,18 @@
+ 	struct buffer_head * insert_point;
+ 	int isize;
+ 
+-	if ((size & 511) || (size > PAGE_SIZE)) {
++	buffer_counters.grow_buffers++;
++
++	if ((size & (MIN_BUFSIZE-1)) || (size > PAGE_SIZE)) {
+ 		printk("VFS: grow_buffers: size = %d\n",size);
+ 		return 0;
+ 	}
+ 
++	if (nr_free_pages < freepages.min || buffer_over_max())
++		return 0;
++	if (buffer_counters.grow_buffers < buffer_counters.free_buffers)
++		return 0;
++
+ 	if (!(page = __get_free_page(GFP_BUFFER)))
+ 		return 0;
+ 	bh = create_buffers(page, size, 0);
+@@ -1431,22 +1487,26 @@
+ }
+ 
+ /*
+- * Can the buffer be thrown out?
+- */
+-#define BUFFER_BUSY_BITS	((1<<BH_Dirty) | (1<<BH_Lock) | (1<<BH_Protected))
+-#define buffer_busy(bh)		((bh)->b_count || ((bh)->b_state & BUFFER_BUSY_BITS))
+-
+-/*
+  * try_to_free_buffers() checks if all the buffers on this particular page
+  * are unused, and free's the page if so.
+  *
+  * Wake up bdflush() if this fails - if we're running low on memory due
+  * to dirty buffers, we need to flush them out as quickly as possible.
+  */
+-int try_to_free_buffers(struct page * page_map)
++int try_to_free_buffers(struct page * page_map, int priority)
+ {
+ 	struct buffer_head * tmp, * bh = page_map->buffers;
+ 
++	buffer_counters.free_buffers++;
++
++	if (buffer_under_min()) return 0;
++
++	/* send caller away empty-handed unless this is urgent */
++	if (priority > 5) {
++		wakeup_bdflush(0);
++		return 0;
++	}
++
+ 	tmp = bh;
+ 	do {
+ 		struct buffer_head * p = tmp;
+@@ -1475,6 +1535,7 @@
+ 	buffermem -= PAGE_SIZE;
+ 	page_map->buffers = NULL;
+ 	__free_page(page_map);
++	buffer_counters.freed_pages++;
+ 	return 1;
+ }
+ 
+@@ -1485,13 +1546,38 @@
+ 	struct buffer_head * bh;
+ 	int found = 0, locked = 0, dirty = 0, used = 0, lastused = 0;
+ 	int protected = 0;
+-	int nlist;
++	int nlist, nsize;
+ 	static char *buf_types[NR_LIST] = {"CLEAN","LOCKED","DIRTY"};
+ 
+ 	printk("Buffer memory:   %6dkB\n",buffermem>>10);
+ 	printk("Buffer heads:    %6d\n",nr_buffer_heads);
+ 	printk("Buffer blocks:   %6d\n",nr_buffers);
+ 
++	printk("min/max buffer cache size: %dK/%dK\n",
++		(unsigned int) (buffer_mem.min_percent * num_physpages) / 25,
++		(unsigned int) (buffer_mem.max_percent * num_physpages) / 25);
++	printk("cache hit rate: %d%% (%ld hits in %ld lookups)\n",
++		(unsigned) ((buffer_counters.hits * 100)/buffer_counters.lookups),
++		buffer_counters.hits, buffer_counters.lookups);
++	printk("total buffers flushed: %ld  total buffers recycled: %ld\n",
++		buffer_counters.ndirty_written, buffer_counters.recycled);
++	printk("bdflush runs: %ld  times we waited for it: %ld\n",
++		buffer_counters.bdflush, buffer_counters.bdflush_wait);
++	printk("total waits for a buffer: %ld\n",
++		buffer_counters.wait_on_buffer);
++	printk("requests to grow/shrink buffer cache: %ld/%ld\n",
++		buffer_counters.grow_buffers, buffer_counters.free_buffers);
++	printk("pages freed during shrink requests: %ld\n",
++		buffer_counters.freed_pages);
++	printk("free list refills: %ld\n", buffer_counters.refills);
++
++	printk("bread() calls: %ld  breada() calls: %ld\n",
++		buffer_counters.breads, buffer_counters.breadas);
++	printk("brw_page() calls: %ld  read/write: %ld/%ld\n",
++		buffer_counters.brw_page, buffer_counters.brw_read,
++		(buffer_counters.brw_page - buffer_counters.brw_read));
++	printk("invalidates: %ld\n", buffer_counters.invalidates);
++
+ 	for(nlist = 0; nlist < NR_LIST; nlist++) {
+ 	  found = locked = dirty = used = lastused = protected = 0;
+ 	  bh = lru_list[nlist];
+@@ -1514,6 +1600,18 @@
+ 		 buf_types[nlist], found, used, lastused,
+ 		 locked, protected, dirty);
+ 	};
++
++	for(nsize = 0; nsize < NR_SIZES; nsize++) {
++	  found = 0;
++	  bh = free_list[nsize];
++	  if(!bh) continue;
++
++	  do {
++		found++;
++		bh = bh->b_next_free;
++	  } while (bh != free_list[nsize]);
++	  printk("    FREE: %d %d byte buffers\n", found, (nsize+1)<<9);
++	}
+ }
+ 
+ 
+@@ -1533,7 +1631,7 @@
+ 	hash_table = (struct buffer_head **) __get_free_pages(GFP_ATOMIC, order);
+ 	
+ 	if (!hash_table)
+-		panic("Failed to allocate buffer hash table\n");
++		panic("buffer_init: Failed to allocate buffer hash table\n");
+ 	memset(hash_table, 0, nr_hash * sizeof(struct buffer_head *));
+ 	bh_hash_mask = nr_hash-1;
+ 
+@@ -1542,7 +1640,7 @@
+ 				      0,
+ 				      SLAB_HWCACHE_ALIGN, NULL, NULL);
+ 	if(!bh_cachep)
+-		panic("Cannot create buffer head SLAB cache\n");
++		panic("buffer_init: Cannot create buffer head SLAB cache\n");
+ 	/*
+ 	 * Allocate the reserved buffer heads.
+ 	 */
+@@ -1575,6 +1673,8 @@
+ {
+ 	if (current == bdflush_tsk)
+ 		return;
++
++	if (wait) buffer_counters.bdflush_wait++;
+ 	wake_up(&bdflush_wait);
+ 	if (wait) {
+ 		run_task_queue(&tq_disk);
+@@ -1648,6 +1748,7 @@
+ #ifdef DEBUG
+ 				 if(nlist != BUF_DIRTY) ncount++;
+ #endif
++				 buffer_counters.ndirty_written++;
+ 				 ll_rw_block(WRITE, 1, &bh);
+ 				 bh->b_count--;
+ 				 next->b_count--;
+@@ -1656,7 +1757,7 @@
+ 	run_task_queue(&tq_disk);
+ #ifdef DEBUG
+ 	if (ncount) printk("sync_old_buffers: %d dirty buffers not on dirty list\n", ncount);
+-	printk("Wrote %d/%d buffers\n", nwritten, ndirty);
++	printk("sync_old_buffers: wrote %d/%d buffers\n", nwritten, ndirty);
+ #endif
+ 	run_task_queue(&tq_disk);
+ 	return 0;
+@@ -1752,6 +1853,7 @@
+ #ifdef DEBUG
+ 		printk("bdflush() activated...");
+ #endif
++		buffer_counters.bdflush++;
+ 
+ 		CHECK_EMERGENCY_SYNC
+ 
+@@ -1798,6 +1900,7 @@
+ 					  bh->b_count++;
+ 					  ndirty++;
+ 					  bh->b_flushtime = 0;
++					  buffer_counters.ndirty_written++;
+ 					  if (major == LOOP_MAJOR) {
+ 						  ll_rw_block(wrta_cmd,1, &bh);
+ 						  wrta_cmd = WRITEA;
+@@ -1814,8 +1917,8 @@
+ 				  }
+ 		 }
+ #ifdef DEBUG
+-		if (ncount) printk("sys_bdflush: %d dirty buffers not on dirty list\n", ncount);
+-		printk("sleeping again.\n");
++		if (ncount) printk("%d dirty buffers not on dirty list\n", ncount);
++		printk(" wrote %d, sleeping again.\n");
+ #endif
+ 		/* If we didn't write anything, but there are still
+ 		 * dirty buffers, then make the next write to a
+diff -u -r linux-2.2.3-reference/include/linux/fs.h linux/include/linux/fs.h
+--- linux-2.2.3-reference/include/linux/fs.h	Tue Mar  9 13:58:44 1999
++++ linux/include/linux/fs.h	Thu Mar 11 00:08:51 1999
+@@ -745,7 +745,7 @@
+ 
+ extern void refile_buffer(struct buffer_head * buf);
+ extern void set_writetime(struct buffer_head * buf, int flag);
+-extern int try_to_free_buffers(struct page *);
++extern int try_to_free_buffers(struct page *, int);
+ 
+ extern int nr_buffers;
+ extern int buffermem;
+diff -u -r linux-2.2.3-reference/include/linux/mm.h linux/include/linux/mm.h
+--- linux-2.2.3-reference/include/linux/mm.h	Tue Mar  9 13:58:44 1999
++++ linux/include/linux/mm.h	Thu Mar 11 00:08:51 1999
+@@ -384,6 +384,8 @@
+ 
+ #define buffer_under_min()	((buffermem >> PAGE_SHIFT) * 100 < \
+ 				buffer_mem.min_percent * num_physpages)
++#define buffer_over_max()	((buffermem >> PAGE_SHIFT) * 100 > \
++				buffer_mem.max_percent * num_physpages)
+ #define pgcache_under_min()	(page_cache_size * 100 < \
+ 				page_cache.min_percent * num_physpages)
+ 
+diff -u -r linux-2.2.3-reference/mm/filemap.c linux/mm/filemap.c
+--- linux-2.2.3-reference/mm/filemap.c	Tue Mar  9 13:58:44 1999
++++ linux/mm/filemap.c	Wed Mar 10 12:39:30 1999
+@@ -199,9 +199,7 @@
+ 
+ 		/* Is it a buffer page? */
+ 		if (page->buffers) {
+-			if (buffer_under_min())
+-				continue;
+-			if (!try_to_free_buffers(page))
++			if (!try_to_free_buffers(page, priority))
+ 				continue;
+ 			return 1;
+ 		}

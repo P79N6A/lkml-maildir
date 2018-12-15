@@ -1,0 +1,279 @@
+Date: Sat, 10 Jul 1999 04:39:08 +0200 (MEST)
+From: Bernd Kaindl <>
+Subject: Re: [test program] for OOM situations
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/7/9/140
+
+On Fri, 9 Jul 1999, Bernd Kaindl wrote:
+> The kernel was still running, but the SYSRQ-S Emergency sync did'nt work
+> again, also not after much SYSRQ-I. SYSRQ-T still showed my hogs and
+> SYSRQ-P showed stext_lock most of the time. The second function i saw
+> was in stext_lock.
+I forgot to apply Andreas buffer patch for 2.2.10 which he posted here lately,
+so I retested with it:
+This is a simple version of the script(without the actual hogs)
+which I used to make the machine unuseable.
+setctsid /dev/tty3 ./kaboom 8888888888888 &
+setctsid /dev/tty4 ./kaboom 8888888888888 &
+setctsid /dev/tty5 ./kaboom 8888888888888 &
+setctsid /dev/tty6 ./kaboom 8888888888888 &
+setctsid /dev/tty7 ./thehog3 &
+setctsid /dev/tty8 ./thehog3 &
+setctsid /dev/tty9 ./thehog3 &
+setctsid /dev/tty10 ./thehog3 &
+kaboom is a simple recursive stack eater, thehog3 is a forking
+and allocating mix.
+Normally, Linux should be able to kill all these attackers, but
+unfortunately it is not, the kernel is busy in some deadlock.
+Now the new EIPs which I got from SYSRQ-P:
+801faffa (stext_lock)
+801fb001 (stext_lock)
+80124604 (kmem_cache_free)
+801252fa (kswapd)
+Note: the SYSRQ messages appreared on tty8, regardless in which
+VT is was typing the SYSRQ.
+On second test with the same kernel, I got these SYSRQ-P EIPs:
+shrink_mmap, try_to_swap_out and stext_lock. This second time,
+the kernel was still doing usermode stuff, but only on a occasional
+basis.
+Also, SYSRQ-M showed 40MB of buffers but malloc failed.
+I've also other reports where the system was unuseable,
+but 90 MB of buffers existed.
+I also experience e.g. swapped-out processes while there where
+90MB of buffers! I think swapping out unused processes in favor
+to buffers should be a changeable option of the kernel.
+I personally don't care how much buffers my background compiling
+batch jobs have, I'm interested in interactive response, not
+swapped out user processes.
+We have a nice level for CPU time, but what is missing with current
+buffer management, is a nice level for swapping out other processes
+in favor of more buffers. Understood?
+What about reinstalling old buffer management code of 2.2.0pre3?
+At least, when the machine goes OOM, the kernel should switch from
+buffering-mode to free-the-buffers-mode.
+Linus, before this isn't fixed, 2.2.x is not adviseable for use on
+real big servers, so you may end up people living with 2.0.x as
+long as 2.4 is not released.
+Care to comment, Linus?
+- Bernhard
+PS:
+I'll gladly send anyone any information which may be needed to
+fix this.
+PS: Here is an untested patch against 2.2.10-andrea-VM9 which
+should reiterate 2.2.0pre3 buffer code:
+----------------------------------------------------------------------------
+--- /usr/src/linux-2.2.10_andrea/fs/buffer.c	Wed Jun 23 20:23:38 1999
++++ buffer.c	Fri Jul  9 00:01:12 1999
+@@ -83,6 +83,10 @@
+ /* This is used by some architectures to estimate available memory. */
+ int buffermem = 0;
+ 
++/* bdflush stuff */
++static struct wait_queue * bdflush_done = NULL;
++static struct task_struct * bdflush_tsk = NULL;
++
+ /* Here is the parameter block for the bdflush process. If you add or
+  * remove any of the parameters, make sure to update kernel/sysctl.c.
+  */
+@@ -125,6 +129,9 @@
+ #define	too_many_dirty_buffers()			\
+ 	(size_buffers_type[BUF_DIRTY] >> PAGE_SHIFT >	\
+ 	 nr_free_pages+(buffermem>>(PAGE_SHIFT+1)))
++#define	many_old_buffers()				\
++	((size_buffers_type[BUF_CLEAN] + size_buffers_type[BUF_LOCKED]) \
++	 >> PAGE_SHIFT > nr_free_pages+(buffermem>>(PAGE_SHIFT+2)))
+ 
+ atomic_t wait_for_IO = ATOMIC_INIT(0);
+ 
+@@ -670,11 +677,172 @@
+ }
+ 
+ /*
++ * Find a candidate buffer to be reclaimed. 
++ */
++static struct buffer_head *find_candidate(struct buffer_head *bh,
++					  int *list_len, int size)
++{
++	if (!bh)
++		goto no_candidate;
++
++	for (; (*list_len) > 0; bh = bh->b_next_free, (*list_len)--) {
++		if () {
++			try_to_free_buffer(bh,&bh);
++			if (!bh)
++				break;
++			continue;
++		}
++		else if (buffer_locked(bh)	  &&
++			 bh->b_list == BUF_LOCKED &&
++			 !(too_many_dirty_buffers())) {
++			(*list_len) = 0;
++			goto no_candidate;
++		}
++		else if (!bh->b_count		&&
++			 !buffer_locked(bh)	&&
++			 !buffer_protected(bh)	&&
++			 !buffer_dirty(bh)) {
++			return bh;
++		}
++	}
++
++no_candidate:
++	return NULL;
++}
++
++static int recycle_used_buffers(int size)
++{
++	struct buffer_head * bh, * next;
++	struct buffer_head * candidate[BUF_DIRTY];
++	int buffers[BUF_DIRTY];
++	int i, obtained=0;
++	int needed = bdf_prm.b_un.nrefill * size;
++
++	/*
++	 * Update the needed amount based on the number of potentially
++	 * freeable buffers. We don't want to free more than one quarter
++	 * of the available buffers.
++	 */
++	i = (nr_buffers_type[BUF_CLEAN] + nr_buffers_type[BUF_LOCKED]) >> 2;
++	if (i < bdf_prm.b_un.nrefill) {
++		needed = i * size;
++		if (needed < PAGE_SIZE)
++			needed = PAGE_SIZE;
++	}
++
++	/*
++	 * Now try to get some buffers from the lru list.
++	 */
++
++	/*
++	 * First set the candidate pointers to usable buffers.  This
++	 * should be quick nearly all of the time.  N.B. There must be 
++	 * no blocking calls after setting up the candidate[] array!
++	 */
++	for (i = BUF_CLEAN; i<BUF_DIRTY; i++) {
++		buffers[i] = nr_buffers_type[i];
++		candidate[i] = find_candidate(lru_list[i], &buffers[i], size);
++	}
++
++	/*
++	 * Select the older of the available buffers until we reach our goal.
++	 */
++	for (;;) {
++		i = BUF_CLEAN;
++		if (!candidate[BUF_CLEAN]) {
++			if (!candidate[BUF_LOCKED])
++				break;
++			i = BUF_LOCKED;
++		}
++		else if (candidate[BUF_LOCKED] &&
++				(candidate[BUF_LOCKED]->b_lru_time < 
++				 candidate[BUF_CLEAN ]->b_lru_time))
++			i = BUF_LOCKED;
++		/*
++		 * Free the selected buffer and get the next candidate.
++		 */
++		bh = candidate[i];
++		next = bh->b_next_free;
++ 
++		obtained += bh->b_size;
++		remove_from_queues(bh);
++		put_last_free(bh);
++		if (obtained >= needed)
++			return 1;
++ 
++		if (--buffers[i] && bh != next)
++			candidate[i] = find_candidate(next, &buffers[i], size);
++		else
++			candidate[i] = NULL;
++	}
++
++	/*
++	 * If there are many dirty buffers, do a non-blocking wake-up.
++	 * This increases the chances of having buffers available
++	 * for the next call ...
++	 */
++	if (nr_buffers_type[BUF_DIRTY] > bdf_prm.b_un.nref_dirt)
++		wakeup_bdflush(0);
++
++	if (free_list[BUFSIZE_INDEX(size)])
++		return 1;
++
++	return 0;
++}
++
++static int wait_on_io(void)
++{
++	struct buffer_head * bh;
++	int i;
++
++	/*
++	 * In order to prevent a buffer shortage from exhausting
++	 * the system's reserved pages, we force tasks to wait 
++	 * before using reserved pages for buffers.  This is easily
++	 * accomplished by waiting on an unused locked buffer.
++	 */
++	if ((bh = lru_list[BUF_LOCKED]) != NULL) {
++		for (i = nr_buffers_type[BUF_LOCKED]; i--; bh = bh->b_next_free)
++		{
++			if (bh->b_size != size)
++				continue;
++			if (bh->b_count)
++				continue;
++			if (!buffer_locked(bh))
++				continue;
++			if (buffer_dirty(bh) || buffer_protected(bh))
++				continue;
++			if (MAJOR(bh->b_dev) == LOOP_MAJOR)
++				continue;
++			/*
++			 * We've found an unused, locked, non-dirty buffer of
++			 * the correct size.  Claim it so no one else can, 
++			 * then wait for it to unlock.
++			 */
++			bh->b_count++;
++			wait_on_buffer(bh);
++			bh->b_count--;
++			/*
++			 * Loop back to harvest this (and maybe other) buffers.
++			 */
++			return 1;
++		}
++	}
++
++	return 0;
++}
++
++/*
+  * We used to try various strange things. Let's not.
+  */
+ static void refill_freelist(int size)
+ {
++	if (many_old_buffers() && recycle_used_buffers())
++		return;
++
+ 	if (!grow_buffers(size)) {
++		if (wait_on_io() && recycle_used_buffers())
++			return;
+ 		if (many_dirty_buffers())
+ 		{
+ 			if (too_many_dirty_buffers())
+@@ -1655,9 +1823,6 @@
+  * response to dirty buffers.  Once this process is activated, we write back
+  * a limited number of buffers to the disks and then go back to sleep again.
+  */
+-static struct wait_queue * bdflush_done = NULL;
+-static struct task_struct * bdflush_tsk = NULL;
+-
+ void wakeup_bdflush(int sleep)
+ {
+ 	if (bdflush_tsk->state == TASK_INTERRUPTIBLE)
+----------------------------------------------------------------------------
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

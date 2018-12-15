@@ -1,0 +1,158 @@
+Date: Sun, 8 Jan 2006 16:02:10 -0800 (PST)
+From: Davide Libenzi <>
+Subject: [PATCH/RFC] POLLHUP tinkering ...
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2006/1/8/243
+
+Some time ago there was a discussion about adding a simple flag to the 
+Linux poll subsystem, to signal half-closed links during read operations and 
+epoll:
+http://lkml.org/lkml/2003/7/12/116
+The problem for users of EPOLLET is that they rely on a shorter-than-buffersize
+read to detect the end of the currant payload, and go back to wait for events 
+again. What they do is basically (in a very simplified way), once EPOLLIN is 
+received:
+ 	do {
+ 		n = read(fd, buf, bufsiz);
+ 		...
+ 	} while (n == bufsiz);
+But if and hangup happened with some data (data + FIN), they won't receive any 
+more events for the Linux poll subsystem (and epoll, when using the event 
+triggered interface), so they are forced to issue an extra read() after the 
+loop to detect the EOF condition. Besides from the extra read() overhead, 
+the code does not come exactly pretty. During the last few months I 
+received quite a few messages from dudes asking me why, after a 
+substantial agreement, that kind of patch has never been implemented. 
+After looking at the code yesterday, I realized that there is not need of 
+extra flags, and a correct POLLHUP reporting from f_op->poll() can do it.
+Linux almost everywhere reports the POLLHUP in a way that is useful for 
+EPOLLET users, with only few exceptions. In those few places the full 
+SHUTDOWN_MASK is expected in order to report POLLHUP, whereas the simple 
+RCV_SHUTDOWN would be sufficent to detect a shutdown peer. When 
+RCV_SHUTDOWN is set, the outbound data channel is definitely shutdown, so 
+POLLHUP is deserved in such condition. Returning POLLHUP upon RCV_SHUTDOWN 
+would automatically solve the above problem, and won't conflict with the 
+SUS definition of POLLHUP:
+[POLLHUP]
+The device has been disconnected. This event and POLLOUT are mutually 
+exclusive; a stream can never be writable if a hangup has occurred. 
+However, this event and POLLIN, POLLRDNORM, POLLRDBAND or POLLPRI are not 
+mutually exclusive. This flag is only valid in the revents bitmask; it is 
+ignored in the events member.
+With that in place, EPOLLET users can simply check for the EPOLLHUP flag 
+returned, and yank the session w/out extra cumbersome code.
+The attached patch is against 2.6.15-git4. Comments?
+- Davide
+net/bluetooth/af_bluetooth.c |    5 ++---
+net/core/datagram.c          |    5 ++---
+net/dccp/proto.c             |    4 ++--
+net/ipv4/tcp.c               |    4 ++--
+net/sctp/socket.c            |    5 ++---
+net/unix/af_unix.c           |    5 ++---
+6 files changed, 12 insertions(+), 16 deletions(-)
+diff -Nru linux-2.6.15/net/bluetooth/af_bluetooth.c linux-2.6.15.mod/net/bluetooth/af_bluetooth.c
+--- linux-2.6.15/net/bluetooth/af_bluetooth.c	2006-01-02 19:21:10.000000000 -0800
++++ linux-2.6.15.mod/net/bluetooth/af_bluetooth.c	2006-01-08 11:56:30.000000000 -0800
+@@ -238,11 +238,10 @@
+ 	if (sk->sk_err || !skb_queue_empty(&sk->sk_error_queue))
+ 		mask |= POLLERR;
+ 
+-	if (sk->sk_shutdown == SHUTDOWN_MASK)
++	if (sk->sk_shutdown & RCV_SHUTDOWN)
+ 		mask |= POLLHUP;
+ 
+-	if (!skb_queue_empty(&sk->sk_receive_queue) || 
+-			(sk->sk_shutdown & RCV_SHUTDOWN))
++	if (!skb_queue_empty(&sk->sk_receive_queue))
+ 		mask |= POLLIN | POLLRDNORM;
+ 
+ 	if (sk->sk_state == BT_CLOSED)
+diff -Nru linux-2.6.15/net/core/datagram.c linux-2.6.15.mod/net/core/datagram.c
+--- linux-2.6.15/net/core/datagram.c	2006-01-02 19:21:10.000000000 -0800
++++ linux-2.6.15.mod/net/core/datagram.c	2006-01-08 11:56:02.000000000 -0800
+@@ -439,12 +439,11 @@
+ 	/* exceptional events? */
+ 	if (sk->sk_err || !skb_queue_empty(&sk->sk_error_queue))
+ 		mask |= POLLERR;
+-	if (sk->sk_shutdown == SHUTDOWN_MASK)
++	if (sk->sk_shutdown & RCV_SHUTDOWN)
+ 		mask |= POLLHUP;
+ 
+ 	/* readable? */
+-	if (!skb_queue_empty(&sk->sk_receive_queue) ||
+-	    (sk->sk_shutdown & RCV_SHUTDOWN))
++	if (!skb_queue_empty(&sk->sk_receive_queue))
+ 		mask |= POLLIN | POLLRDNORM;
+ 
+ 	/* Connection-based need to check for termination and startup */
+diff -Nru linux-2.6.15/net/dccp/proto.c linux-2.6.15.mod/net/dccp/proto.c
+--- linux-2.6.15/net/dccp/proto.c	2006-01-02 19:21:10.000000000 -0800
++++ linux-2.6.15.mod/net/dccp/proto.c	2006-01-08 11:55:22.000000000 -0800
+@@ -175,10 +175,10 @@
+ 	if (sk->sk_err)
+ 		mask = POLLERR;
+ 
+-	if (sk->sk_shutdown == SHUTDOWN_MASK || sk->sk_state == DCCP_CLOSED)
++	if (sk->sk_state == DCCP_CLOSED)
+ 		mask |= POLLHUP;
+ 	if (sk->sk_shutdown & RCV_SHUTDOWN)
+-		mask |= POLLIN | POLLRDNORM;
++		mask |= POLLIN | POLLRDNORM | POLLHUP;
+ 
+ 	/* Connected? */
+ 	if ((1 << sk->sk_state) & ~(DCCPF_REQUESTING | DCCPF_RESPOND)) {
+diff -Nru linux-2.6.15/net/ipv4/tcp.c linux-2.6.15.mod/net/ipv4/tcp.c
+--- linux-2.6.15/net/ipv4/tcp.c	2006-01-02 19:21:10.000000000 -0800
++++ linux-2.6.15.mod/net/ipv4/tcp.c	2006-01-08 11:54:49.000000000 -0800
+@@ -362,10 +362,10 @@
+ 	 * NOTE. Check for TCP_CLOSE is added. The goal is to prevent
+ 	 * blocking on fresh not-connected or disconnected socket. --ANK
+ 	 */
+-	if (sk->sk_shutdown == SHUTDOWN_MASK || sk->sk_state == TCP_CLOSE)
++	if (sk->sk_state == TCP_CLOSE)
+ 		mask |= POLLHUP;
+ 	if (sk->sk_shutdown & RCV_SHUTDOWN)
+-		mask |= POLLIN | POLLRDNORM;
++		mask |= POLLIN | POLLRDNORM | POLLHUP;
+ 
+ 	/* Connected? */
+ 	if ((1 << sk->sk_state) & ~(TCPF_SYN_SENT | TCPF_SYN_RECV)) {
+diff -Nru linux-2.6.15/net/sctp/socket.c linux-2.6.15.mod/net/sctp/socket.c
+--- linux-2.6.15/net/sctp/socket.c	2006-01-02 19:21:10.000000000 -0800
++++ linux-2.6.15.mod/net/sctp/socket.c	2006-01-08 11:53:57.000000000 -0800
+@@ -4450,12 +4450,11 @@
+ 	/* Is there any exceptional events?  */
+ 	if (sk->sk_err || !skb_queue_empty(&sk->sk_error_queue))
+ 		mask |= POLLERR;
+-	if (sk->sk_shutdown == SHUTDOWN_MASK)
++	if (sk->sk_shutdown & RCV_SHUTDOWN)
+ 		mask |= POLLHUP;
+ 
+ 	/* Is it readable?  Reconsider this code with TCP-style support.  */
+-	if (!skb_queue_empty(&sk->sk_receive_queue) ||
+-	    (sk->sk_shutdown & RCV_SHUTDOWN))
++	if (!skb_queue_empty(&sk->sk_receive_queue))
+ 		mask |= POLLIN | POLLRDNORM;
+ 
+ 	/* The association is either gone or not ready.  */
+diff -Nru linux-2.6.15/net/unix/af_unix.c linux-2.6.15.mod/net/unix/af_unix.c
+--- linux-2.6.15/net/unix/af_unix.c	2006-01-02 19:21:10.000000000 -0800
++++ linux-2.6.15.mod/net/unix/af_unix.c	2006-01-08 11:53:28.000000000 -0800
+@@ -1877,12 +1877,11 @@
+ 	/* exceptional events? */
+ 	if (sk->sk_err)
+ 		mask |= POLLERR;
+-	if (sk->sk_shutdown == SHUTDOWN_MASK)
++	if (sk->sk_shutdown & RCV_SHUTDOWN)
+ 		mask |= POLLHUP;
+ 
+ 	/* readable? */
+-	if (!skb_queue_empty(&sk->sk_receive_queue) ||
+-	    (sk->sk_shutdown & RCV_SHUTDOWN))
++	if (!skb_queue_empty(&sk->sk_receive_queue))
+ 		mask |= POLLIN | POLLRDNORM;
+ 
+ 	/* Connection-based need to check for termination and startup */

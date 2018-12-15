@@ -1,0 +1,137 @@
+Date: Sat, 10 Jul 1999 18:55:32 +0200 (MET DST)
+From: Mikael Pettersson <>
+Subject: Re: New kernel/resource.c
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/7/10/53
+
+On Fri, 9 Jul 1999 18:21:32 -0700 (PDT), Linus Torvalds wrote:
+> I got tired of the problems with the resource management - lack of
+> hierarchy, and the stupid and utterly horrible static allocation.
+> 
+> So I rewrote it.
+> ...
+> The old "request_region()" thing still works, but not until after the
+> memory allocator has been initialized (because it uses kmalloc()). So
+> stuff that does resource allocation early during boot has to actually use
+> "struct resource" directly - normal device drivers can just ignore the
+> change.
+2.3.11-pre1 works fine here, but I noticed two problems:
+1. The legacy support stuff leaks memory. Both request_region()
+   and check_region() will kmalloc resource structs which are
+   never kfree'd.
+   The patch below fixes this by adding a kfree() to __check_region(),
+   having __request_region() set a flag RSRC_AUTOFREE in the
+   resource struct, and letting __release_region() kfree the
+   struct if this flag is set. This way, legacy drivers will
+   continue to work without leaking memory.
+2. drivers/video/vgacon.c calls request_region() before the
+   slab allocator and kmalloc are initialised, causing request_region
+   to silently fail and a "NULL ptr" message in the kernel log.
+   The patch below fixes this (for vgacon only) by transparently
+   translating its request_region() calls to request_resource()
+   calls with static parameters. (The patch (ab)uses the pre-
+   processor. I kind of like it, but others may find it gross.)
+/Mikael
+--- linux-2.3.11-pre1/kernel/resource.c.~1~	Sat Jul 10 13:44:02 1999
++++ linux-2.3.11-pre1/kernel/resource.c	Sat Jul 10 17:54:20 1999
+@@ -13,7 +13,7 @@
+ #include <linux/malloc.h>
+ 
+ struct resource pci_io_resource = { "PCI IO", 0x0000, 0xFFFF };
+-struct resource pci_mem_resource = { "PCI mem",	0x00000000, 0xFFFFFFFF };
++struct resource pci_mem_resource = { "PCI mem", 0x00000000, 0xFFFFFFFF };
+ 
+ /*
+  * This generates reports for /proc/ioports and /proc/memory
+@@ -101,7 +101,7 @@
+ 	return -EINVAL;
+ }
+ 
+-struct resource * __request_region(struct resource *parent, unsigned long start, unsigned long n, const char *name)
++struct resource * __request_region(struct resource *parent, unsigned long start, unsigned long n, const char *name, unsigned long flags)
+ {
+ 	struct resource *res = kmalloc(sizeof(*res), GFP_KERNEL);
+ 
+@@ -110,6 +110,7 @@
+ 		res->name = name;
+ 		res->start = start;
+ 		res->end = start + n - 1;
++		res->flags = flags;
+ 		if (request_resource(parent, res) != 0) {
+ 			kfree(res);
+ 			res = NULL;
+@@ -130,11 +131,12 @@
+ {
+ 	struct resource * res;
+ 
+-	res = __request_region(parent, start, n, "check-region");
++	res = __request_region(parent, start, n, "check-region", 0);
+ 	if (!res)
+ 		return -EBUSY;
+ 
+ 	release_resource(res);
++	kfree(res);
+ 	return 0;
+ }
+ 
+@@ -153,6 +155,8 @@
+ 			break;
+ 		if (tmp->start == start && tmp->end == end) {
+ 			*p = tmp->sibling;
++			if (tmp->flags & RSRC_AUTOFREE)
++				kfree(tmp);
+ 			break;
+ 		}
+ 		p = &tmp->sibling;
+--- linux-2.3.11-pre1/include/linux/ioport.h.~1~	Sat Jul 10 13:44:01 1999
++++ linux-2.3.11-pre1/include/linux/ioport.h	Sat Jul 10 17:44:59 1999
+@@ -18,6 +18,7 @@
+ 	unsigned long flags;
+ 	struct resource *parent, *sibling, *child;
+ };
++#define RSRC_AUTOFREE	0x80000000 /* __release_region() will free resource */
+ 
+ extern struct resource pci_io_resource;
+ extern struct resource pci_mem_resource;
+@@ -29,11 +30,11 @@
+ extern int release_resource(struct resource *new);
+ 
+ /* Convenience shorthand with allocation */
+-#define request_region(start,n,name)	__request_region(&pci_io_resource, (start), (n), (name))
+-extern struct resource * __request_region(struct resource *, unsigned long start, unsigned long n, const char *name);
++extern struct resource * __request_region(struct resource *, unsigned long start, unsigned long n, const char *name, unsigned long flags);
+ 
+-/* Compatibility cruft */
++/* Compatibility cruft with automatic allocation and deallocation */
+ #define check_region(start,n)	__check_region(&pci_io_resource, (start), (n))
++#define request_region(start,n,name) (void)__request_region(&pci_io_resource, (start), (n), (name), RSRC_AUTOFREE)
+ #define release_region(start,n)	__release_region(&pci_io_resource, (start), (n))
+ extern int __check_region(struct resource *, unsigned long, unsigned long);
+ extern void __release_region(struct resource *, unsigned long, unsigned long);
+--- linux-2.3.11-pre1/drivers/video/vgacon.c.~1~	Mon Jun 21 20:45:46 1999
++++ linux-2.3.11-pre1/drivers/video/vgacon.c	Sat Jul 10 17:57:06 1999
+@@ -115,6 +115,16 @@
+ static int	       vga_video_font_height;
+ static unsigned int    vga_rolled_over = 0;
+ 
++/* vgacon is initialised before kmalloc() is, so request_region()
++ * doesn't work. This macro translates vgacon's request_region()
++ * calls to equivalent request_resource() calls.
++ */
++#undef request_region
++#define request_region(start,n,name) \
++do { \
++	static struct resource region = { name, start, start+n-1 }; \
++	(void) request_resource(&pci_io_resource, &region); \
++} while(0)
+ 
+ void no_scroll(char *str, int *ints)
+ {
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

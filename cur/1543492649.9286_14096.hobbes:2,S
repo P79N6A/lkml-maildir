@@ -1,0 +1,158 @@
+Date: Tue, 13 Apr 1999 01:07:43 +0200 (CEST)
+From: Andrea Arcangeli <>
+Subject: Re: [patch] fix for cc1 Out of memory [Re: [TESTCASE] `Out of memory for cc1']
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/4/12/108
+
+On Mon, 12 Apr 1999, Linus Torvalds wrote:
+>I was looking at the shared memory code, and just basically I cannot
+>convince myself that it can be reliable. It has all these hacky things in
+>it to bypass the normal mm layer logic, and I would not be at all
+>surprised if it has serious problems when swapping. Whether this could
+I completly agree that adding a shm_nopage is a good thing. I just thought
+the same today when reading the shm code ;).
+>Didn't somebody (Andrea?) have a good test-program for shared memory under
+>low memory?
+I did a silly proggy some time ago to cause heavy shm swapout, but the
+problem is unrelated to low memory. The proggy that trigger the bug (clisp
+snapshot extracted by the great MikeG) runs with all the ram free and
+doesn't eat a bit of ram. And I still think the problem is shm unrelated,
+see below.
+>Andrea, Stephen, any comments/interest? 
+I'll tell you everything I understood this afternoon in debugging the
+testcase posted by Mike and _why_ I think it's a free_pgtable bug.
+The _only_ problem that cause segfault and oom is that pte_alloc() return
+us a pte (one page that will contains pte) that is not clean.
+You run:
+	pte_alloc()
+but you get a not zeroed page.
+Nothing more. So a bug-hiding patch could be to put a memset(pte, 0 ,
+PAGE_SIZE) before retunring the page from pte_alloc().
+Obviously this pte-not-zeroed page can be returned only from the
+pagetable-cache. Infact a trivial workaround for _this_ bug that doesn't
+need a recompile is simply to do:
+	echo 0 0 >/proc/sys/vm/pagetable_cache
+It's the first thing I tried when I see what was going on, and it worked
+like a charm.
+(maybe this workaround is interesting for distribution vendors that won't
+need to ask the user to download a binary image to get the bug fixed)
+The problem is that somebody is recalling clear_page_tables() (that is the
+only piece of code that calls pte_free()) on a PGD where there's still
+some not zapped (zeroed) pte.
+After a little grep:
+andrea@laser:/usr/src/linux/mm$ grep clear_page_tables *.c
+memory.c:void clear_page_tables(struct mm_struct *mm, unsigned long first,
+int nr)
+memory.c: * clear_page_tables().
+mmap.c:         clear_page_tables(mm, first, last-first);
+mmap.c: clear_page_tables(mm, 0, USER_PTRS_PER_PGD);
+I seen that the only piece of code that are recalling clear_page_tables()
+are exit_mmap() and free_pgtables().
+exit_mmap() is sure safe because it does a zap_page_range over _all_ vmas
+of the mm, before calling clear_page_tables() over the _whole_
+userspace-part-of-the-mm.
+So my conclusing is been that free_pgtables() was calling
+clear_page_tables on not-yet-cleared pte.
+So I thought a bit about the issue and the `first' and `last' variable of
+free_pgtables() looked buggy to me.
+My point is that zap_page_range run (in the past) starting from A to B. If
+then you call clear_page_tables() starting from `A & PGDIR_MASK' to `B +
+PGDIR_SIZE - 1', you are going to call pte_free() also on pagetables that
+are not been previously cleared by zap_page_range (outside the range
+A-B)...
+My previous two patches was avoiding _exactly_ that condition according to
+me, so while it's true that free_pgtables() wasn't run anymore with the
+testcase, I still think that my previous patch was right (even if maybe
+not too much aggressive ;).
+Freeing more pagetables than the requested ones is not obviously safe to
+me, but if you want to take the old behaviour (that as just said didn't
+looked so safe to me) here it is a new patch:
+Index: mmap.c
+===================================================================
+RCS file: /var/cvs/linux/mm/mmap.c,v
+retrieving revision 1.1.2.15
+diff -u -r1.1.2.15 mmap.c
+--- mmap.c	1999/04/09 16:53:46	1.1.2.15
++++ linux/mm/mmap.c	1999/04/12 22:45:33
+@@ -554,8 +554,11 @@
+  * "prev", if it exists, points to a vma before the one
+  * we just free'd - but there's no telling how much before.
+  */
+-static void free_pgtables(struct mm_struct * mm, struct vm_area_struct *prev,
+-	unsigned long start, unsigned long end)
++static inline void free_pgtables(struct mm_struct * mm,
++				 struct vm_area_struct *prev,
++				 unsigned long start, unsigned long end,
++				 unsigned long zapped_start,
++				 unsigned long zapped_end)
+ {
+ 	unsigned long first = start & PGDIR_MASK;
+ 	unsigned long last = (end + PGDIR_SIZE - 1) & PGDIR_MASK;
+@@ -589,7 +592,32 @@
+ 	first = first >> PGDIR_SHIFT;
+ 	last = last >> PGDIR_SHIFT;
+ 	if (last > first)
++	{
++		/* Make sure to pte_free() only zeroed page tables -arca */
++		if (zapped_start > (first << PGDIR_SHIFT))
++		{
++			unsigned long __start, __end;
++
++			__start = first << PGDIR_SHIFT;
++			__end = zapped_start;
++
++			flush_cache_range(mm, __start, __end);
++			zap_page_range(mm, __start, __end - __start);
++			flush_tlb_range(mm, __start, __end);
++		}
++		if (zapped_end < (last << PGDIR_SHIFT))
++		{
++			unsigned long __start, __end;
++
++			__start = zapped_end;
++			__end = last << PGDIR_SHIFT;
++
++			flush_cache_range(mm, __start, __end);
++			zap_page_range(mm, __start, __end - __start);
++			flush_tlb_range(mm, __start, __end);
++		}
+ 		clear_page_tables(mm, first, last-first);
++	}
+ }
+ 
+ /* Munmap is split into 2 main parts -- this part which finds
+@@ -675,13 +703,13 @@
+ 		 */
+ 		if (!unmap_fixup(mpnt, st, size, &extra))
+ 			kmem_cache_free(vm_area_cachep, mpnt);
++
++		free_pgtables(mm, prev, addr, addr+len, st, st+size);
+ 	}
+ 
+ 	/* Release the extra vma struct if it wasn't used */
+ 	if (extra)
+ 		kmem_cache_free(vm_area_cachep, extra);
+-
+-	free_pgtables(mm, prev, addr, addr+len);
+ 
+ 	mm->mmap_cache = NULL;	/* Kill the cache. */
+ 	return 0;
+With this patch I am simply running zap_page_range in the external
+interesection between the zapped-region and the PGD region, to make sure
+to _not_ pte_free() not yet cleared ptes. I checked that the patch above
+works fine here (it's running now with the testcase in background and I
+can still open netscape and run gcc without getting segfaults or OOM as
+with the previous patch).
+If this free_pgtables() aggressive-behaviour is completly safe I would
+like to understand why though ;). And if there are leaking-memory testcase
+(Alan?) I would like to take a look to understand better why we need such
+aggressive-behavior ;))). Thanks.
+Andrea Arcangeli
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

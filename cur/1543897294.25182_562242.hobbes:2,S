@@ -1,0 +1,141 @@
+Date: Mon, 25 Jun 2007 18:46:39 -0700
+From: "Dan Williams" <>
+Subject: Re: [RFC PATCH 0/6] Convert all tasklets to workqueues
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2007/6/25/377
+
+> so how about the following, different approach: anyone who has a tasklet
+> in any performance-sensitive codepath, please yell now. We'll also do a
+> proactive search for such places. We can convert those places to
+> softirqs, or move them back into hardirq context. Once this is done -
+> and i doubt it will go beyond 1-2 places - we can just mass-convert the
+> other 110 places to the lame but compatible solution of doing them in a
+> global thread context.
+>
+I have a driver / testcase that reacts negatively to a workqueue
+conversion.  This is with the iop-adma driver on an ARM based platform
+re-syncing a degraded raid5 array.  The driver is currently in -mm and
+it uses tasklets to run a short callback routine upon completion of an
+offloaded memcpy or xor operation.  Quick tests show that
+write-throughput does not go down too much, but resync speed, as
+reported by /proc/mdstat, drops from ~50MB/s to ~30MB/s.
+Context switches on this platform flush the L1 cache so bouncing
+between a workqueue and the MD thread is painful.
+The conversion patch is attached.
+--
+Dan
+diff --git a/drivers/dma/iop-adma.c b/drivers/dma/iop-adma.c
+index 5d8a6cf..7e89003 100644
+--- a/drivers/dma/iop-adma.c
++++ b/drivers/dma/iop-adma.c
+@@ -41,6 +41,8 @@
+ #define tx_to_iop_adma_slot(tx) \
+ 	container_of(tx, struct iop_adma_desc_slot, async_tx)
+ 
++static struct workqueue_struct *iop_adma_workqueue;
++
+ /**
+  * iop_adma_free_slots - flags descriptor slots for reuse
+  * @slot: Slot to free
+@@ -273,9 +275,11 @@ iop_adma_slot_cleanup(struct iop_adma_chan *iop_chan)
+ 	spin_unlock_bh(&iop_chan->lock);
+ }
+ 
+-static void iop_adma_tasklet(unsigned long data)
++static void iop_adma_work_routine(struct work_struct *work)
+ {
+-	struct iop_adma_chan *chan = (struct iop_adma_chan *) data;
++	struct iop_adma_chan *chan =
++		container_of(work, struct iop_adma_chan, work);
++
+ 	__iop_adma_slot_cleanup(chan);
+ }
+ 
+@@ -370,7 +374,7 @@ retry:
+ 		goto retry;
+ 
+ 	/* try to free some slots if the allocation fails */
+-	tasklet_schedule(&iop_chan->irq_tasklet);
++	queue_work(iop_adma_workqueue, &iop_chan->work);
+ 
+ 	return NULL;
+ }
+@@ -704,7 +708,7 @@ iop_adma_prep_dma_zero_sum(struct dma_chan *chan, unsigned int src_cnt,
+ static void iop_adma_dependency_added(struct dma_chan *chan)
+ {
+ 	struct iop_adma_chan *iop_chan = to_iop_adma_chan(chan);
+-	tasklet_schedule(&iop_chan->irq_tasklet);
++	queue_work(iop_adma_workqueue, &iop_chan->work);
+ }
+ 
+ static void iop_adma_free_chan_resources(struct dma_chan *chan)
+@@ -785,7 +789,7 @@ static irqreturn_t iop_adma_eot_handler(int irq, void *data)
+ 
+ 	dev_dbg(chan->device->common.dev, "%s\n", __FUNCTION__);
+ 
+-	tasklet_schedule(&chan->irq_tasklet);
++	queue_work(iop_adma_workqueue, &chan->work);
+ 
+ 	iop_adma_device_clear_eot_status(chan);
+ 
+@@ -798,7 +802,7 @@ static irqreturn_t iop_adma_eoc_handler(int irq, void *data)
+ 
+ 	dev_dbg(chan->device->common.dev, "%s\n", __FUNCTION__);
+ 
+-	tasklet_schedule(&chan->irq_tasklet);
++	queue_work(iop_adma_workqueue, &chan->work);
+ 
+ 	iop_adma_device_clear_eoc_status(chan);
+ 
+@@ -1244,8 +1248,6 @@ static int __devinit iop_adma_probe(struct platform_device *pdev)
+ 		ret = -ENOMEM;
+ 		goto err_free_iop_chan;
+ 	}
+-	tasklet_init(&iop_chan->irq_tasklet, iop_adma_tasklet, (unsigned long)
+-		iop_chan);
+ 
+ 	/* clear errors before enabling interrupts */
+ 	iop_adma_device_clear_err_status(iop_chan);
+@@ -1268,11 +1270,13 @@ static int __devinit iop_adma_probe(struct platform_device *pdev)
+ 
+ 	spin_lock_init(&iop_chan->lock);
+ 	init_timer(&iop_chan->cleanup_watchdog);
+-	iop_chan->cleanup_watchdog.data = (unsigned long) iop_chan;
+-	iop_chan->cleanup_watchdog.function = iop_adma_tasklet;
++	iop_chan->cleanup_watchdog.data = (unsigned long) &iop_chan->work;
++	iop_chan->cleanup_watchdog.function = iop_adma_work_routine;
+ 	INIT_LIST_HEAD(&iop_chan->chain);
+ 	INIT_LIST_HEAD(&iop_chan->all_slots);
+ 	INIT_RCU_HEAD(&iop_chan->common.rcu);
++	INIT_WORK(&iop_chan->work, iop_adma_work_routine);
++
+ 	iop_chan->common.device = dma_dev;
+ 	list_add_tail(&iop_chan->common.device_node, &dma_dev->channels);
+ 
+@@ -1443,6 +1447,10 @@ static struct platform_driver iop_adma_driver = {
+ 
+ static int __init iop_adma_init (void)
+ {
++	iop_adma_workqueue = create_workqueue("iop-adma");
++	if (!iop_adma_workqueue)
++		return -ENODEV;
++
+ 	/* it's currently unsafe to unload this module */
+ 	/* if forced, worst case is that rmmod hangs */
+ 	__unsafe(THIS_MODULE);
+diff --git a/include/asm-arm/hardware/iop_adma.h b/include/asm-arm/hardware/iop_adma.h
+index 8eb5990..7d8742b 100644
+--- a/include/asm-arm/hardware/iop_adma.h
++++ b/include/asm-arm/hardware/iop_adma.h
+@@ -67,7 +67,7 @@ struct iop_adma_chan {
+ 	struct list_head all_slots;
+ 	struct timer_list cleanup_watchdog;
+ 	int slots_allocated;
+-	struct tasklet_struct irq_tasklet;
++	struct work_struct work;
+ };
+ 
+ /**

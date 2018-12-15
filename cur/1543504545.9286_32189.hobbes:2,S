@@ -1,0 +1,755 @@
+Date: Sun, 1 Aug 1999 18:39:21 +0200
+From: Andi Kleen <>
+Subject: New 2.2 networking patchkit
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/8/1/66
+
+These are my accumulated networking bug fixes for 2.2
+This version should have all issues of the last patchkit corrected, I hope
+even Alexey is satisfied now :)  I propose it to be added to 2.2.11. 
+Changes:
+- Some changes for the Free/SWAN module
+- Fix for the TCP multiple writers bug with partial packets
+(which could lead to data corruption)
+- Send ACK in TIME-WAIT
+- Use the correct ISN for new connections in TIME-WAIT
+- Better flag checking for syncookies
+- Make sysctl(2) work for networking sysctls that require
+flush functions (e.g. those that require a sec->jiffies conversion) 
+- Tidy up a sequence check in SYN-RECV handling.
+- Don't reenter the protocol destructor, this is needed to safely unload
+protocol modules.
+It is also available on ftp.firstfloor.org:/pub/ak/2.2-patchkit*
+(always use highest number) 
+-Andi
+Index: linux/kernel/sysctl.c
+===================================================================
+RCS file: /vger/u4/cvs/linux/kernel/sysctl.c,v
+retrieving revision 1.56
+diff -u -u -p -r1.56 sysctl.c
+--- sysctl.c	1999/02/23 08:12:09	1.56
++++ sysctl.c	1999/08/01 16:28:28
+@@ -1002,6 +1002,34 @@ int sysctl_intvec(ctl_table *table, int 
+ 	return 0;
+ }
+ 
++/* Strategy function to convert jiffies to seconds */ 
++int sysctl_jiffies(ctl_table *table, int *name, int nlen,
++		void *oldval, size_t *oldlenp,
++		void *newval, size_t newlen, void **context)
++{
++	if (oldval) {
++		size_t olen;
++		if (oldlenp) { 
++			if (get_user(olen, oldlenp))
++				return -EFAULT;
++			if (olen!=sizeof(int))
++				return -EINVAL; 
++		}
++		if (put_user(*(int *)(table->data) / HZ, (int *)oldval) || 
++		    (oldlenp && put_user(sizeof(int),oldlenp)))
++			return -EFAULT;
++	}
++	if (newval && newlen) { 
++		int new;
++		if (newlen != sizeof(int))
++			return -EINVAL; 
++		if (get_user(new, (int *)newval))
++			return -EFAULT;
++		*(int *)(table->data) = new*HZ; 
++	}
++	return 1;
++}
++
+ int do_string (
+ 	void *oldval, size_t *oldlenp, void *newval, size_t newlen,
+ 	int rdwr, char *data, size_t max)
+Index: linux/net/netsyms.c
+===================================================================
+RCS file: /vger/u4/cvs/linux/net/netsyms.c,v
+retrieving revision 1.113.2.2
+diff -u -u -p -r1.113.2.2 netsyms.c
+--- netsyms.c	1999/06/30 10:01:53	1.113.2.2
++++ netsyms.c	1999/08/01 16:28:29
+@@ -21,6 +21,7 @@
+ #include <net/dst.h>
+ #include <net/checksum.h>
+ #include <linux/etherdevice.h>
++#include <net/route.h>
+ #ifdef CONFIG_HIPPI
+ #include <linux/hippidevice.h>
+ #endif
+@@ -186,6 +187,7 @@ EXPORT_SYMBOL(neigh_destroy);
+ EXPORT_SYMBOL(neigh_parms_alloc);
+ EXPORT_SYMBOL(neigh_parms_release);
+ EXPORT_SYMBOL(neigh_rand_reach_time);
++EXPORT_SYMBOL(neigh_compat_output); 
+ 
+ /*	dst_entry	*/
+ EXPORT_SYMBOL(dst_alloc);
+@@ -247,6 +249,7 @@ EXPORT_SYMBOL(__ip_finish_output);
+ EXPORT_SYMBOL(inet_dgram_ops);
+ EXPORT_SYMBOL(ip_cmsg_recv);
+ EXPORT_SYMBOL(__release_sock);
++EXPORT_SYMBOL(inet_addr_type); 
+ 
+ /* Route manipulation */
+ EXPORT_SYMBOL(ip_rt_ioctl);
+@@ -330,7 +333,6 @@ EXPORT_SYMBOL(tcp_inherit_port);
+ EXPORT_SYMBOL(tcp_v4_syn_recv_sock);
+ EXPORT_SYMBOL(tcp_v4_do_rcv);
+ EXPORT_SYMBOL(tcp_v4_connect);
+-EXPORT_SYMBOL(inet_addr_type);
+ EXPORT_SYMBOL(net_reset_timer);
+ EXPORT_SYMBOL(net_delete_timer);
+ EXPORT_SYMBOL(udp_prot);
+Index: linux/net/ipv4/af_inet.c
+===================================================================
+RCS file: /vger/u4/cvs/linux/net/ipv4/af_inet.c,v
+retrieving revision 1.87.2.4
+diff -u -u -p -r1.87.2.4 af_inet.c
+--- af_inet.c	1999/07/23 15:29:19	1.87.2.4
++++ af_inet.c	1999/08/01 16:28:32
+@@ -187,7 +187,6 @@ static __inline__ void kill_sk_later(str
+ 			atomic_read(&sk->rmem_alloc),
+ 			atomic_read(&sk->wmem_alloc)));
+ 
+-	sk->destroy = 1;
+ 	sk->ack_backlog = 0;
+ 	release_sock(sk);
+ 	net_reset_timer(sk, TIME_DESTROY, SOCK_DESTROY_TIME);
+@@ -202,8 +201,10 @@ void destroy_sock(struct sock *sk)
+   	 */
+   	net_delete_timer(sk);
+ 
+-	if (sk->prot->destroy)
++	if (sk->prot->destroy && !sk->destroy)
+ 		sk->prot->destroy(sk);
++
++	sk->destroy = 1;
+ 
+ 	kill_sk_queues(sk);
+ 
+Index: linux/net/ipv4/route.c
+===================================================================
+RCS file: /vger/u4/cvs/linux/net/ipv4/route.c,v
+retrieving revision 1.67.2.2
+diff -u -u -p -r1.67.2.2 route.c
+--- route.c	1999/07/23 15:29:26	1.67.2.2
++++ route.c	1999/08/01 16:28:35
+@@ -1927,16 +1927,30 @@ int ipv4_sysctl_rtcache_flush(ctl_table 
+ 		return -EINVAL;
+ }
+ 
++static int ipv4_sysctl_rtcache_flush_strategy(ctl_table *table, int *name, int nlen,
++			 void *oldval, size_t *oldlenp,
++			 void *newval, size_t newlen, 
++			 void **context)
++{
++	int delay;
++	if (newlen != sizeof(int))
++		return -EINVAL;
++	if (get_user(delay,(int *)newval))
++		return -EFAULT; 
++	rt_cache_flush(delay); 
++	return 0;
++}
++
+ ctl_table ipv4_route_table[] = {
+         {NET_IPV4_ROUTE_FLUSH, "flush",
+-         &flush_delay, sizeof(int), 0200, NULL,
+-         &ipv4_sysctl_rtcache_flush},
++         &flush_delay, sizeof(int), 0644, NULL,
++         &ipv4_sysctl_rtcache_flush, &ipv4_sysctl_rtcache_flush_strategy },
+ 	{NET_IPV4_ROUTE_MIN_DELAY, "min_delay",
+          &ip_rt_min_delay, sizeof(int), 0644, NULL,
+-         &proc_dointvec_jiffies},
++         &proc_dointvec_jiffies, &sysctl_jiffies},
+ 	{NET_IPV4_ROUTE_MAX_DELAY, "max_delay",
+          &ip_rt_max_delay, sizeof(int), 0644, NULL,
+-         &proc_dointvec_jiffies},
++         &proc_dointvec_jiffies, &sysctl_jiffies},
+ 	{NET_IPV4_ROUTE_GC_THRESH, "gc_thresh",
+          &ipv4_dst_ops.gc_thresh, sizeof(int), 0644, NULL,
+          &proc_dointvec},
+@@ -1945,13 +1959,13 @@ ctl_table ipv4_route_table[] = {
+          &proc_dointvec},
+ 	{NET_IPV4_ROUTE_GC_MIN_INTERVAL, "gc_min_interval",
+          &ip_rt_gc_min_interval, sizeof(int), 0644, NULL,
+-         &proc_dointvec_jiffies},
++         &proc_dointvec_jiffies, &sysctl_jiffies},
+ 	{NET_IPV4_ROUTE_GC_TIMEOUT, "gc_timeout",
+          &ip_rt_gc_timeout, sizeof(int), 0644, NULL,
+-         &proc_dointvec_jiffies},
++         &proc_dointvec_jiffies, &sysctl_jiffies},
+ 	{NET_IPV4_ROUTE_GC_INTERVAL, "gc_interval",
+          &ip_rt_gc_interval, sizeof(int), 0644, NULL,
+-         &proc_dointvec_jiffies},
++         &proc_dointvec_jiffies, &sysctl_jiffies},
+ 	{NET_IPV4_ROUTE_REDIRECT_LOAD, "redirect_load",
+          &ip_rt_redirect_load, sizeof(int), 0644, NULL,
+          &proc_dointvec},
+@@ -1972,7 +1986,7 @@ ctl_table ipv4_route_table[] = {
+          &proc_dointvec},
+ 	{NET_IPV4_ROUTE_MTU_EXPIRES, "mtu_expires",
+          &ip_rt_mtu_expires, sizeof(int), 0644, NULL,
+-         &proc_dointvec_jiffies},
++         &proc_dointvec_jiffies, &sysctl_jiffies},
+ 	 {0}
+ };
+ #endif
+Index: linux/net/ipv4/sysctl_net_ipv4.c
+===================================================================
+RCS file: /vger/u4/cvs/linux/net/ipv4/sysctl_net_ipv4.c,v
+retrieving revision 1.38
+diff -u -u -p -r1.38 sysctl_net_ipv4.c
+--- sysctl_net_ipv4.c	1999/01/02 16:51:48	1.38
++++ sysctl_net_ipv4.c	1999/08/01 16:28:35
+@@ -90,9 +90,23 @@ int ipv4_sysctl_forward(ctl_table *ctl, 
+ 	if (write && ipv4_devconf.forwarding != val)
+ 		inet_forward_change();
+ 
+-        return ret;
++	return ret;
+ }
+ 
++static int ipv4_sysctl_forward_strategy(ctl_table *table, int *name, int nlen,
++			 void *oldval, size_t *oldlenp,
++			 void *newval, size_t newlen, 
++			 void **context)
++{
++	int new;
++	if (newlen != sizeof(int))
++		return -EINVAL;
++	if (get_user(new,(int *)newval))
++		return -EFAULT; 
++	if (new != ipv4_devconf.forwarding) 
++		inet_forward_change(); 
++	return 0; /* caller does change again and handles handles oldval */ 
++}
+ 
+ ctl_table ipv4_table[] = {
+         {NET_IPV4_TCP_TIMESTAMPS, "tcp_timestamps",
+@@ -109,7 +123,7 @@ ctl_table ipv4_table[] = {
+          &proc_dointvec},
+         {NET_IPV4_FORWARD, "ip_forward",
+          &ipv4_devconf.forwarding, sizeof(int), 0644, NULL,
+-         &ipv4_sysctl_forward},
++         &ipv4_sysctl_forward,&ipv4_sysctl_forward_strategy},
+         {NET_IPV4_DEFAULT_TTL, "ip_default_ttl",
+          &ip_statistics.IpDefaultTTL, sizeof(int), 0644, NULL,
+          &proc_dointvec},
+@@ -132,12 +146,13 @@ ctl_table ipv4_table[] = {
+ 	 &sysctl_ip_masq_debug, sizeof(int), 0644, NULL, &proc_dointvec},
+ #endif
+ 	{NET_IPV4_IPFRAG_TIME, "ipfrag_time",
+-	 &sysctl_ipfrag_time, sizeof(int), 0644, NULL, &proc_dointvec_jiffies},
++	 &sysctl_ipfrag_time, sizeof(int), 0644, NULL, &proc_dointvec_jiffies, 
++	 &sysctl_jiffies},
+ 	{NET_IPV4_TCP_MAX_KA_PROBES, "tcp_max_ka_probes",
+ 	 &sysctl_tcp_max_ka_probes, sizeof(int), 0644, NULL, &proc_dointvec},
+ 	{NET_IPV4_TCP_KEEPALIVE_TIME, "tcp_keepalive_time",
+ 	 &sysctl_tcp_keepalive_time, sizeof(int), 0644, NULL, 
+-	 &proc_dointvec_jiffies},
++	 &proc_dointvec_jiffies, &sysctl_jiffies},
+ 	{NET_IPV4_TCP_KEEPALIVE_PROBES, "tcp_keepalive_probes",
+ 	 &sysctl_tcp_keepalive_probes, sizeof(int), 0644, NULL, 
+ 	 &proc_dointvec},
+@@ -148,7 +163,7 @@ ctl_table ipv4_table[] = {
+ 	 &sysctl_tcp_retries2, sizeof(int), 0644, NULL, &proc_dointvec},
+ 	{NET_IPV4_TCP_FIN_TIMEOUT, "tcp_fin_timeout",
+ 	 &sysctl_tcp_fin_timeout, sizeof(int), 0644, NULL, 
+-	 &proc_dointvec_jiffies},
++	 &proc_dointvec_jiffies, &sysctl_jiffies},
+ #ifdef CONFIG_SYN_COOKIES
+ 	{NET_TCP_SYNCOOKIES, "tcp_syncookies",
+ 	 &sysctl_tcp_syncookies, sizeof(int), 0644, NULL, &proc_dointvec},
+Index: linux/net/ipv4/tcp.c
+===================================================================
+RCS file: /vger/u4/cvs/linux/net/ipv4/tcp.c,v
+retrieving revision 1.140.2.1
+diff -u -u -p -r1.140.2.1 tcp.c
+--- tcp.c	1999/05/29 04:16:48	1.140.2.1
++++ tcp.c	1999/08/01 16:28:37
+@@ -725,6 +725,24 @@ static void wait_for_tcp_memory(struct s
+ 	lock_sock(sk);
+ }
+ 
++/*
++ * Wait for a buffer.
++ */ 
++static int wait_for_buffer(struct sock *sk) 
++{ 
++	struct wait_queue wait = { current, NULL }; 
++	int success = 0; 
++
++	release_sock(sk); 
++	add_wait_queue(sk->sleep, &wait); 
++	current->state = TASK_INTERRUPTIBLE; 
++	schedule(); 
++	current->state = TASK_RUNNING; 
++	remove_wait_queue(sk->sleep, &wait);
++	lock_sock(sk); 
++	return 0; 
++} 
++
+ /* When all user supplied data has been queued set the PSH bit */
+ #define PSH_NEEDED (seglen == 0 && iovlen == 0)
+ 
+@@ -802,11 +820,21 @@ int tcp_do_sendmsg(struct sock *sk, stru
+ 				    tp->snd_nxt < TCP_SKB_CB(skb)->end_seq) {
+ 					int last_byte_was_odd = (copy % 4);
+ 
++					/* 
++					 * Check for parallel writers sleeping in user access.
++					 */ 
++					if (tp->partial_writers++ > 0) { 
++						wait_for_buffer(sk);
++						tp->partial_writers--;
++						continue; 
++					}
++				
+ 					copy = mss_now - copy;
+ 					if(copy > skb_tailroom(skb))
+ 						copy = skb_tailroom(skb);
+ 					if(copy > seglen)
+ 						copy = seglen;
++		
+ 					if(last_byte_was_odd) {
+ 						if(copy_from_user(skb_put(skb, copy),
+ 								  from, copy))
+@@ -819,6 +847,7 @@ int tcp_do_sendmsg(struct sock *sk, stru
+ 							from, skb_put(skb, copy),
+ 							copy, skb->csum, &err);
+ 					}
++		
+ 					/*
+ 					 * FIXME: the *_user functions should
+ 					 *	  return how much data was
+@@ -838,6 +867,10 @@ int tcp_do_sendmsg(struct sock *sk, stru
+ 					seglen -= copy;
+ 					if (PSH_NEEDED)
+ 						TCP_SKB_CB(skb)->flags |= TCPCB_FLAG_PSH;
++
++					if (--tp->partial_writers > 0) 
++						wake_up_interruptible(sk->sleep); 
++
+ 					continue;
+ 				}
+ 			}
+Index: linux/net/ipv4/tcp_input.c
+===================================================================
+RCS file: /vger/u4/cvs/linux/net/ipv4/tcp_input.c,v
+retrieving revision 1.164.2.5
+diff -u -u -p -r1.164.2.5 tcp_input.c
+--- tcp_input.c	1999/06/30 09:27:05	1.164.2.5
++++ tcp_input.c	1999/08/01 16:28:40
+@@ -946,11 +946,13 @@ void tcp_timewait_kill(struct tcp_tw_buc
+ 
+ /* We come here as a special case from the AF specific TCP input processing,
+  * and the SKB has no owner.  Essentially handling this is very simple,
+- * we just keep silently eating rx'd packets until none show up for the
+- * entire timeout period.  The only special cases are for BSD TIME_WAIT
+- * reconnects and SYN/RST bits being set in the TCP header.
++ * we just keep silently eating rx'd packets, acking them if necessary,
++ * until none show up for the entire timeout period. 
++ *
++ * Return 0, TCP_TW_ACK, TCP_TW_RST
+  */
+-int tcp_timewait_state_process(struct tcp_tw_bucket *tw, struct sk_buff *skb,
++enum tcp_tw_status 
++tcp_timewait_state_process(struct tcp_tw_bucket *tw, struct sk_buff *skb,
+ 			       struct tcphdr *th, unsigned len)
+ {
+ 	/*	RFC 1122:
+@@ -971,7 +973,7 @@ int tcp_timewait_state_process(struct tc
+ 		struct tcp_func *af_specific = tw->af_specific;
+ 		__u32 isn;
+ 
+-		isn = tw->rcv_nxt + 128000;
++		isn = tw->snd_nxt + 128000;
+ 		if(isn == 0)
+ 			isn++;
+ 		tcp_tw_deschedule(tw);
+@@ -984,7 +986,7 @@ int tcp_timewait_state_process(struct tc
+ 		skb_set_owner_r(skb, sk);
+ 		af_specific = sk->tp_pinfo.af_tcp.af_specific;
+ 		if(af_specific->conn_request(sk, skb, isn) < 0)
+-			return 1; /* Toss a reset back. */
++			return TCP_TW_RST; /* Toss a reset back. */
+ 		return 0; /* Discard the frame. */
+ 	}
+ 
+@@ -999,13 +1001,17 @@ int tcp_timewait_state_process(struct tc
+ 			tcp_timewait_kill(tw);
+ 		}
+ 		if(!th->rst)
+-			return 1; /* toss a reset back */
++			return TCP_TW_RST; /* toss a reset back */
++		return 0;
+ 	} else {
+ 		/* In this case we must reset the TIMEWAIT timer. */
+ 		if(th->ack)
+ 			tcp_tw_reschedule(tw);
+ 	}
+-	return 0; /* Discard the frame. */
++	/* Ack old packets if necessary */ 
++	if (!after(TCP_SKB_CB(skb)->end_seq, tw->rcv_nxt)) 
++		return TCP_TW_ACK; 
++	return 0; 
+ }
+ 
+ /* Enter the time wait state.  This is always called from BH
+@@ -1064,6 +1070,7 @@ void tcp_time_wait(struct sock *sk)
+ 		tw->family	= sk->family;
+ 		tw->reuse	= sk->reuse;
+ 		tw->rcv_nxt	= sk->tp_pinfo.af_tcp.rcv_nxt;
++		tw->snd_nxt = sk->tp_pinfo.af_tcp.snd_nxt;
+ 		tw->af_specific	= sk->tp_pinfo.af_tcp.af_specific;
+ 
+ #if defined(CONFIG_IPV6) || defined(CONFIG_IPV6_MODULE)
+@@ -1535,7 +1542,6 @@ static int tcp_data(struct sk_buff *skb,
+ 	 * Now tell the user we may have some data.
+ 	 */
+ 	if (!sk->dead) {
+-		SOCK_DEBUG(sk, "Data wakeup.\n");
+ 		sk->data_ready(sk,0);
+ 	}
+ 	return(1);
+@@ -1975,7 +1981,7 @@ struct sock *tcp_check_req(struct sock *
+ 	flg &= __constant_htonl(0x00170000);
+ 	/* Only SYN set? */
+ 	if (flg == __constant_htonl(0x00020000)) {
+-		if (!after(TCP_SKB_CB(skb)->seq, req->rcv_isn)) {
++		if (TCP_SKB_CB(skb)->seq == req->rcv_isn) {
+ 			/*	retransmited syn.
+ 			 */
+ 			req->class->rtx_syn_ack(sk, req); 
+Index: linux/net/ipv4/tcp_ipv4.c
+===================================================================
+RCS file: /vger/u4/cvs/linux/net/ipv4/tcp_ipv4.c,v
+retrieving revision 1.175.2.7
+diff -u -u -p -r1.175.2.7 tcp_ipv4.c
+--- tcp_ipv4.c	1999/07/23 15:38:46	1.175.2.7
++++ tcp_ipv4.c	1999/08/01 16:28:42
+@@ -1008,6 +1014,46 @@ static void tcp_v4_send_reset(struct sk_
+ 	tcp_statistics.TcpOutRsts++;
+ }
+ 
++/* 
++ *	Send an ACK for a socket less packet (needed for time wait) 
++ *
++ *  FIXME: Does not echo timestamps yet.
++ *
++ *  Assumes that the caller did basic address and flag checks.
++ */
++static void tcp_v4_send_ack(struct sk_buff *skb, __u32 seq, __u32 ack)
++{
++	struct tcphdr *th = skb->h.th;
++	struct tcphdr rth;
++	struct ip_reply_arg arg;
++
++	/* Swap the send and the receive. */
++	memset(&rth, 0, sizeof(struct tcphdr)); 
++	rth.dest = th->source;
++	rth.source = th->dest; 
++	rth.doff = sizeof(struct tcphdr)/4;
++
++	rth.seq = seq;
++	rth.ack_seq = ack; 
++	rth.ack = 1;
++
++	memset(&arg, 0, sizeof arg); 
++	arg.iov[0].iov_base = (unsigned char *)&rth; 
++	arg.iov[0].iov_len  = sizeof rth;
++	arg.csum = csum_tcpudp_nofold(skb->nh.iph->daddr, 
++				      skb->nh.iph->saddr, /*XXX*/
++				      sizeof(struct tcphdr),
++				      IPPROTO_TCP,
++				      0); 
++	arg.n_iov = 1;
++	arg.csumoffset = offsetof(struct tcphdr, check) / 2; 
++
++	ip_send_reply(tcp_socket->sk, skb, &arg, sizeof rth);
++
++	tcp_statistics.TcpOutSegs++;
++}
++
++
+ #ifdef CONFIG_IP_TRANSPARENT_PROXY
+ 
+ /*
+@@ -1561,7 +1607,7 @@ static inline struct sock *tcp_v4_hnd_re
+ 			sk = tcp_check_req(sk, skb, req);
+ 		}
+ #ifdef CONFIG_SYN_COOKIES
+-		else {
++		else if (flg == __constant_htonl(0x00120000))  {
+ 			sk = cookie_v4_check(sk, skb, &(IPCB(skb)->opt));
+ 		}
+ #endif
+@@ -1721,10 +1767,19 @@ discard_it:
+   	return 0;
+ 
+ do_time_wait:
+-	if(tcp_timewait_state_process((struct tcp_tw_bucket *)sk,
+-				      skb, th, skb->len))
+-		goto no_tcp_socket;
+-	goto discard_it;
++	/* Sorry for the ugly switch. 2.3 will have a better solution. */ 
++	switch (tcp_timewait_state_process((struct tcp_tw_bucket *)sk,
++							   skb, th, skb->len)) {
++	case TCP_TW_ACK:
++		tcp_v4_send_ack(skb, ((struct tcp_tw_bucket *)sk)->snd_nxt,
++						((struct tcp_tw_bucket *)sk)->rcv_nxt); 
++		break; 
++	case TCP_TW_RST:
++		goto no_tcp_socket; 
++	default:
++		goto discard_it; 
++	}
++	return 0;
+ }
+ 
+ static void __tcp_v4_rehash(struct sock *sk)
+Index: linux/net/ipv6/tcp_ipv6.c
+===================================================================
+RCS file: /vger/u4/cvs/linux/net/ipv6/tcp_ipv6.c,v
+retrieving revision 1.104.2.5
+diff -u -u -p -r1.104.2.5 tcp_ipv6.c
+--- tcp_ipv6.c	1999/07/23 15:38:49	1.104.2.5
++++ tcp_ipv6.c	1999/08/01 16:28:44
+@@ -1121,6 +1121,57 @@ static void tcp_v6_send_reset(struct sk_
+ 	kfree_skb(buff);
+ }
+ 
++static void tcp_v6_send_ack(struct sk_buff *skb, __u32 seq, __u32 ack)
++{
++	struct tcphdr *th = skb->h.th, *t1; 
++	struct sk_buff *buff;
++	struct flowi fl;
++
++	buff = alloc_skb(MAX_HEADER + sizeof(struct ipv6hdr), GFP_ATOMIC);
++	if (buff == NULL) 
++	  	return;
++
++	skb_reserve(buff, MAX_HEADER + sizeof(struct ipv6hdr));
++
++	t1 = (struct tcphdr *) skb_push(buff,sizeof(struct tcphdr));
++
++	/* Swap the send and the receive. */
++	memset(t1, 0, sizeof(*t1));
++	t1->dest = th->source;
++	t1->source = th->dest;
++	t1->doff = sizeof(*t1)/4;
++	t1->ack = 1;
++	t1->seq = seq;
++	t1->ack_seq = ack; 
++
++	buff->csum = csum_partial((char *)t1, sizeof(*t1), 0);
++
++	fl.nl_u.ip6_u.daddr = &skb->nh.ipv6h->saddr;
++	fl.nl_u.ip6_u.saddr = &skb->nh.ipv6h->daddr;
++	fl.fl6_flowlabel = 0;
++
++	t1->check = csum_ipv6_magic(fl.nl_u.ip6_u.saddr,
++				    fl.nl_u.ip6_u.daddr, 
++				    sizeof(*t1), IPPROTO_TCP,
++				    buff->csum);
++
++	fl.proto = IPPROTO_TCP;
++	fl.oif = tcp_v6_iif(skb);
++	fl.uli_u.ports.dport = t1->dest;
++	fl.uli_u.ports.sport = t1->source;
++
++	/* sk = NULL, but it is safe for now. static socket required. */
++	buff->dst = ip6_route_output(NULL, &fl);
++
++	if (buff->dst->error == 0) {
++		ip6_xmit(NULL, buff, &fl, NULL);
++		tcp_statistics.TcpOutSegs++;
++		return;
++	}
++
++	kfree_skb(buff);
++}
++
+ static struct open_request *tcp_v6_search_req(struct tcp_opt *tp,
+ 					      struct ipv6hdr *ip6h,
+ 					      struct tcphdr *th,
+@@ -1409,10 +1460,19 @@ discard_it:
+ 	return 0;
+ 
+ do_time_wait:
+-	if(tcp_timewait_state_process((struct tcp_tw_bucket *)sk,
+-				      skb, th, skb->len))
++	switch (tcp_timewait_state_process((struct tcp_tw_bucket *)sk,
++									   skb, th, skb->len)) {
++	case TCP_TW_ACK:
++		tcp_v6_send_ack(skb, ((struct tcp_tw_bucket *)sk)->snd_nxt,
++						((struct tcp_tw_bucket *)sk)->rcv_nxt); 
++		break; 
++	case TCP_TW_RST:
+ 		goto no_tcp_socket;
+-	goto discard_it;
++	default:
++		goto discard_it; 
++	}
++
++	return 0;
+ }
+ 
+ static int tcp_v6_rebuild_header(struct sock *sk)
+Index: linux/linux/include/net/sock.h
+===================================================================
+RCS file: /vger/u4/cvs/linux/include/net/sock.h,v
+retrieving revision 1.109.2.2
+diff -u -u -p -r1.109.2.2 sock.h
+--- sock.h	1999/06/30 09:26:50	1.109.2.2
++++ sock.h	1999/08/01 16:28:51
+@@ -300,6 +300,7 @@ struct tcp_opt {
+ 
+ 	__u32	last_seg_size;	/* Size of last incoming segment */
+ 	__u32	rcv_mss;	/* MSS used for delayed ACK decisions */ 
++	__u32 	partial_writers; /* # of clients wanting at the head packet */
+ 
+ 	struct open_request	*syn_wait_queue;
+ 	struct open_request	**syn_wait_last;
+@@ -672,6 +673,7 @@ static inline void lock_sock(struct sock
+ #if 0
+ /* debugging code: the test isn't even 100% correct, but it can catch bugs */
+ /* Note that a double lock is ok in theory - it's just _usually_ a bug */
++/* Actually it can easily happen with multiple writers */ 
+ 	if (atomic_read(&sk->sock_readers)) {
+ 		__label__ here;
+ 		printk("double lock on socket at %p\n", &&here);
+Index: linux/linux/include/net/tcp.h
+===================================================================
+RCS file: /vger/u4/cvs/linux/include/net/tcp.h,v
+retrieving revision 1.107.2.4
+diff -u -u -p -r1.107.2.4 tcp.h
+--- tcp.h	1999/06/30 09:26:54	1.107.2.4
++++ tcp.h	1999/08/01 16:28:52
+@@ -120,6 +120,8 @@ struct tcp_tw_bucket {
+ 	/* These _must_ match the beginning of struct sock precisely.
+ 	 * XXX Yes I know this is gross, but I'd have to edit every single
+ 	 * XXX networking file if I created a "struct sock_header". -DaveM
++	 * Just don't forget -fno-strict-aliasing, but it should be really
++	 * fixed -AK
+ 	 */
+ 	struct sock		*sklist_next;
+ 	struct sock		*sklist_prev;
+@@ -140,12 +142,13 @@ struct tcp_tw_bucket {
+ 				nonagle;
+ 
+ 	/* And these are ours. */
+-	__u32			rcv_nxt;
++	__u32			rcv_nxt,snd_nxt;
+ 	struct tcp_func		*af_specific;
+ 	struct tcp_bind_bucket	*tb;
+ 	struct tcp_tw_bucket	*next_death;
+ 	struct tcp_tw_bucket	**pprev_death;
+ 	int			death_slot;
++	
+ #if defined(CONFIG_IPV6) || defined(CONFIG_IPV6_MODULE)
+ 	struct in6_addr		v6_daddr;
+ 	struct in6_addr		v6_rcv_saddr;
+@@ -476,7 +479,13 @@ extern int			tcp_rcv_established(struct 
+ 						    struct tcphdr *th, 
+ 						    unsigned len);
+ 
+-extern int			tcp_timewait_state_process(struct tcp_tw_bucket *tw,
++enum tcp_tw_status {
++		TCP_TW_SUCCESS = 0,
++		TCP_TW_RST = 1,
++		TCP_TW_ACK = 2
++		};
++
++extern enum tcp_tw_status tcp_timewait_state_process(struct tcp_tw_bucket *tw,
+ 							   struct sk_buff *skb,
+ 							   struct tcphdr *th,
+ 							   unsigned len);
+Index: linux/linux/include/linux/include/linux/in.h
+===================================================================
+RCS file: /vger/u4/cvs/linux/include/linux/in.h,v
+retrieving revision 1.19
+diff -u -u -p -r1.19 in.h
+--- in.h	1999/03/21 05:22:08	1.19
++++ in.h	1999/08/01 16:29:05
+@@ -38,6 +38,10 @@ enum {
+ 
+   IPPROTO_PIM    = 103,		/* Protocol Independent Multicast	*/
+ 
++  IPPROTO_ESP = 50,            /* Encapsulation Security Payload protocol */
++  IPPROTO_AH = 51,             /* Authentication Header protocol       */
++  IPPROTO_COMP   = 108,                /* Compression Header protocol */
++
+   IPPROTO_RAW	 = 255,		/* Raw IP packets			*/
+   IPPROTO_MAX
+ };
+Index: linux/linux/include/linux/include/linux/in6.h
+===================================================================
+RCS file: /vger/u4/cvs/linux/include/linux/in6.h,v
+retrieving revision 1.14
+diff -u -u -p -r1.14 in6.h
+--- in6.h	1999/04/22 10:07:25	1.14
++++ in6.h	1999/08/01 16:29:05
+@@ -129,8 +129,6 @@ struct in6_flowlabel_req
+ #define IPPROTO_HOPOPTS		0	/* IPv6 hop-by-hop options	*/
+ #define IPPROTO_ROUTING		43	/* IPv6 routing header		*/
+ #define IPPROTO_FRAGMENT	44	/* IPv6 fragmentation header	*/
+-#define IPPROTO_ESP		50	/* encapsulating security payload */
+-#define IPPROTO_AH		51	/* authentication header	*/
+ #define IPPROTO_ICMPV6		58	/* ICMPv6			*/
+ #define IPPROTO_NONE		59	/* IPv6 no next header		*/
+ #define IPPROTO_DSTOPTS		60	/* IPv6 destination options	*/
+Index: linux/linux/include/linux/include/linux/socket.h
+===================================================================
+RCS file: /vger/u4/cvs/linux/include/linux/socket.h,v
+retrieving revision 1.45
+diff -u -u -p -r1.45 socket.h
+--- socket.h	1999/04/22 06:37:03	1.45
++++ socket.h	1999/08/01 16:29:24
+@@ -158,7 +158,7 @@ struct ucred {
+ #define AF_DECnet	12	/* Reserved for DECnet project	*/
+ #define AF_NETBEUI	13	/* Reserved for 802.2LLC project*/
+ #define AF_SECURITY	14	/* Security callback pseudo AF */
+-#define pseudo_AF_KEY   15      /* PF_KEY key management API */
++#define AF_KEY   15      /* PF_KEY key management API */
+ #define AF_NETLINK	16
+ #define AF_ROUTE	AF_NETLINK /* Alias to emulate 4.4BSD */
+ #define AF_PACKET	17	/* Packet family		*/
+@@ -186,7 +186,7 @@ struct ucred {
+ #define PF_DECnet	AF_DECnet
+ #define PF_NETBEUI	AF_NETBEUI
+ #define PF_SECURITY	AF_SECURITY
+-#define PF_KEY          pseudo_AF_KEY
++#define PF_KEY      AF_KEY
+ #define PF_NETLINK	AF_NETLINK
+ #define PF_ROUTE	AF_ROUTE
+ #define PF_PACKET	AF_PACKET
+Index: linux/linux/include/linux/include/linux/sysctl.h
+===================================================================
+RCS file: /vger/u4/cvs/linux/include/linux/sysctl.h,v
+retrieving revision 1.71
+diff -u -u -p -r1.71 sysctl.h
+--- sysctl.h	1999/04/28 11:53:04	1.71
++++ sysctl.h	1999/08/01 16:29:25
+@@ -467,6 +467,7 @@ extern int do_sysctl_strategy (ctl_table
+ 
+ extern ctl_handler sysctl_string;
+ extern ctl_handler sysctl_intvec;
++extern ctl_handler sysctl_jiffies;
+ 
+ extern int do_string (
+ 	void *oldval, size_t *oldlenp, void *newval, size_t newlen,
+-- 
+This is like TV. I don't like TV.
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

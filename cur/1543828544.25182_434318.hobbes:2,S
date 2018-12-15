@@ -1,0 +1,123 @@
+Date: Mon, 19 Jun 2006 19:04:05 -0300
+From: Marcelo Tosatti <>
+Subject: Re: Linux 2.4.33-rc1
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2006/6/19/380
+
+Willy,
+On Mon, Jun 19, 2006 at 10:06:51AM +0200, Willy Tarreau wrote:
+> Hi Grant,
+> 
+> OK, it does *really* crash in vfs_unlink(), during the double_up on
+> dentry->inode-i_zombie (dentry->inode = NULL).
+> 
+> I suggest the following fix, I hope that it is correct and is not subject
+> to any race condition :
+> 
+> --- ./fs/namei.c.orig	2006-06-19 09:39:52.000000000 +0200
+> +++ ./fs/namei.c	2006-06-19 09:51:09.000000000 +0200
+> @@ -1478,12 +1478,14 @@
+>  int vfs_unlink(struct inode *dir, struct dentry *dentry)
+>  {
+>  	int error;
+> +	struct inode *inode;
+> 
+>  	error = may_delete(dir, dentry, 0);
+>  	if (error)
+>  		return error;
+> 
+> -	double_down(&dir->i_zombie, &dentry->d_inode->i_zombie);
+> +	inode = dentry->d_inode;
+> +	double_down(&dir->i_zombie, &inode->i_zombie);
+>  	error = -EPERM;
+>  	if (dir->i_op && dir->i_op->unlink) {
+>  		DQUOT_INIT(dir);
+> @@ -1495,7 +1497,7 @@
+>  			unlock_kernel();
+>  		}
+>  	}
+> -	double_up(&dir->i_zombie, &dentry->d_inode->i_zombie);
+> +	double_up(&dir->i_zombie, &inode->i_zombie);
+>  	if (!error) {
+>  		d_delete(dentry);
+>  		inode_dir_notify(dir, DN_DELETE);
+> 
+> I think it will *not* oops anymore with this fix, but I'd like someone to
+> review it to ensure that it is valid.
+Think this is the right thing to do, except that it must be guaranteed
+that the inode struct won't be freed in the meantime, need to grab a
+reference to it.
+Thanks!
+-- 
+v2.4.33-pre introduced a fix for lack of synchronization between
+link/unlink which requires vfs_unlink to grab i_zombie of both the
+victim and its parent with double_down().
+Problem is that NFS client deletes the victim dentry on ->unlink,
+resulting in a NULL dereference when vfs_unlink() tries to up
+dentry->d_inode->i_zombie.
+Keep a copy of the inode pointer, incrementing its reference counter, to
+fix the situation.
+diff --git a/fs/namei.c b/fs/namei.c
+index 42cce98..69da199 100644
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@ -1478,12 +1478,14 @@ exit:
+ int vfs_unlink(struct inode *dir, struct dentry *dentry)
+ {
+ 	int error;
++	struct inode *inode;
+ 
+ 	error = may_delete(dir, dentry, 0);
+ 	if (error)
+ 		return error;
+ 
+-	double_down(&dir->i_zombie, &dentry->d_inode->i_zombie);
++	inode = dentry->d_inode;
++	double_down(&dir->i_zombie, &inode->i_zombie);
+ 	error = -EPERM;
+ 	if (dir->i_op && dir->i_op->unlink) {
+ 		DQUOT_INIT(dir);
+@@ -1495,7 +1497,7 @@ int vfs_unlink(struct inode *dir, struct
+ 			unlock_kernel();
+ 		}
+ 	}
+-	double_up(&dir->i_zombie, &dentry->d_inode->i_zombie);
++	double_up(&dir->i_zombie, &inode->i_zombie);
+ 	if (!error) {
+ 		d_delete(dentry);
+ 		inode_dir_notify(dir, DN_DELETE);
+@@ -1509,6 +1511,7 @@ asmlinkage long sys_unlink(const char * 
+ 	char * name;
+ 	struct dentry *dentry;
+ 	struct nameidata nd;
++	struct inode *inode = NULL;
+ 
+ 	name = getname(pathname);
+ 	if(IS_ERR(name))
+@@ -1527,11 +1530,16 @@ asmlinkage long sys_unlink(const char * 
+ 		/* Why not before? Because we want correct error value */
+ 		if (nd.last.name[nd.last.len])
+ 			goto slashes;
++		inode = dentry->d_inode;
++		if (inode)
++			atomic_inc(&inode->i_count);
+ 		error = vfs_unlink(nd.dentry->d_inode, dentry);
+ 	exit2:
+ 		dput(dentry);
+ 	}
+ 	up(&nd.dentry->d_inode->i_sem);
++	if (inode)
++		iput(inode);
+ exit1:
+ 	path_release(&nd);
+ exit:
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+More majordomo info at  
+http://vger.kernel.org/majordomo-info.html
+Please read the FAQ at  
+http://www.tux.org/lkml/

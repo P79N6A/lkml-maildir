@@ -1,0 +1,411 @@
+Date: Mon, 21 Feb 2000 11:53:15 -0700
+From: "Jeff V. Merkey" <>
+Subject: Oops on 2.2.14 While Doing Direct I/O.
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/2/21/159
+
+Oops on 2.2.14 while doing direct I/O.  Offending code is attached.  If
+I use a call to getblk() instead of local allocating the buffer heads,
+it's doesn't crash.  I have checked that 512 byte aligned memory **IS**
+being passed to the drivers.  Driver is IDE.
+Jeff
+#if (LINUX_20 | LINUX_22)
+//
+//  low level disk sector interface routines
+//
+struct buffer_head *bh_head = 0;
+struct buffer_head *bh_tail = 0;
+ULONG bh_count = 0;
+#if (LINUX_SLEEP)
+struct semaphore bh_semaphore = MUTEX;
+#endif
+void lock_bh_free(void)
+{
+#if (LINUX_SLEEP)
+    if (WaitOnSemaphore(&bh_semaphore) == -EINTR)
+       NWFSPrint("lock bh was interrupted\n");
+#endif
+}
+void unlock_bh_free(void)
+{
+#if (LINUX_SLEEP)
+    SignalSemaphore(&bh_semaphore);
+#endif
+}
+void put_bh(struct buffer_head *bh)
+{
+    lock_bh_free();
+    if (bh_count > MAX_BUFFER_HEADS)
+    {
+       unlock_bh_free();
+       NWFSFree(bh);
+       return;
+    }
+    if (!bh_head)
+    {
+       bh_head = bh_tail = bh;
+       bh->b_next_free = bh->b_prev_free = 0;
+    }
+    else
+    {
+       bh_tail->b_next_free = bh;
+       bh->b_next_free = 0;
+       bh->b_prev_free = bh_tail;
+       bh_tail = bh;
+    }
+    bh_count++;
+    unlock_bh_free();
+    return;
+}
+struct buffer_head *get_bh(void)
+{
+    struct buffer_head *bh;
+    lock_bh_free();
+    if (bh_head)
+    {
+       bh = bh_head;
+       bh_head = bh->b_next_free;
+       if (bh_head)
+	  bh_head->b_prev_free = NULL;
+       else
+	  bh_tail = NULL;
+       if (bh_count)
+	  bh_count--;
+       bh->b_next_free = bh->b_prev_free = 0;
+       unlock_bh_free();
+       return bh;
+    }
+    else
+    {
+       unlock_bh_free();
+#if (LINUX_20 | LINUX_22)
+       bh = kmalloc(sizeof(struct buffer_head), GFP_BUFFER);
+#else
+       bh = NWFSIOAlloc(sizeof(struct buffer_head), BH_TAG);
+#endif
+       if (!bh)
+	  return 0;
+       NWFSSet(bh, 0, sizeof(struct buffer_head));
+       return bh;
+    }
+    unlock_bh_free();
+    return 0;
+}
+void free_bh_list(void)
+{
+    struct buffer_head *bh;
+    lock_bh_free();
+    while (bh_head)
+    {
+       bh = bh_head;
+       bh_head = bh->b_next_free;
+       if (bh_count)
+	  bh_count--;
+#if (LINUX_20 | LINUX_22)
+       kfree(bh);
+#else
+       NWFSFree(bh);
+#endif
+    }
+    bh_head = bh_tail = 0;
+    unlock_bh_free();
+    return;
+}
+#define LINUX_BUFFER_CACHE 1
+#if (LINUX_BUFFER_CACHE)
+ULONG pReadDiskSectors(ULONG disk, ULONG StartingLBA, BYTE *Sector,
+		      ULONG sectors, ULONG readAhead)
+{
+    register ULONG i, bytesRead = 0;
+    register ULONG bps;
+    register NWDISK *NWDisk;
+    register ULONG read_error = 0;
+    struct buffer_head *bh[sectors];
+    NWDisk = SystemDisk[disk];
+    bps = NWDisk->BytesPerSector;
+    for (i=0; i < sectors; i++)
+    {
+       if (!(bh[i] = getblk((ULONG)NWDisk->PhysicalDiskHandle,
+			    (StartingLBA + i), bps)))
+       {
+	  for (i=0; i < sectors; i++)
+	     if (bh[i])
+		brelse(bh[i]);
+	  return 0;
+       }
+    }
+    ll_rw_block(READA, sectors, bh);
+    for(i=0; i < sectors; i++)
+    {
+       wait_on_buffer(bh[i]);
+       if (buffer_uptodate(bh[i]))
+       {
+	  NWFSCopy(&Sector[i * bps], bh[i]->b_data, bps);
+	  bytesRead += bps;
+       }
+       else
+	  read_error = 1;
+       brelse(bh[i]);
+    }
+    return (read_error ? 0 : bytesRead);
+}
+ULONG pWriteDiskSectors(ULONG disk, ULONG StartingLBA, BYTE *Sector,
+		       ULONG sectors, ULONG readAhead)
+{
+    register ULONG i, bytesWritten = 0;
+    register ULONG bps;
+    struct buffer_head *bh[sectors];
+    register ULONG write_error = 0;
+    register NWDISK *NWDisk;
+    NWDisk = SystemDisk[disk];
+    bps = NWDisk->BytesPerSector;
+    for (i=0; i < sectors; i++)
+    {
+       if (!(bh[i] = getblk((ULONG)NWDisk->PhysicalDiskHandle,
+			    (StartingLBA + i), bps)))
+       {
+	  for (i=0; i < sectors; i++)
+	     if (bh[i])
+		brelse(bh[i]);
+	  return 0;
+       }
+       NWFSCopy(bh[i]->b_data, &Sector[i * bps], bps);
+       mark_buffer_uptodate(bh[i], 1);
+       mark_buffer_dirty(bh[i], 0);
+       bytesWritten += bps;
+    }
+    ll_rw_block(WRITEA, sectors, bh);
+    for (i=0; i < sectors; i++)
+    {
+       wait_on_buffer(bh[i]);
+       if (!buffer_uptodate(bh[i]))
+	  write_error = 1;
+       brelse(bh[i]);
+    }
+    run_task_queue(&tq_disk);
+    return (write_error ? 0 : bytesWritten);
+}
+ULONG pZeroFillDiskSectors(ULONG disk, ULONG StartingLBA, ULONG sectors,
+			  ULONG readAhead)
+{
+    register ULONG i, bytesWritten = 0;
+    register ULONG bps;
+    struct buffer_head *bh[sectors];
+    register ULONG write_error = 0;
+    register NWDISK *NWDisk;
+    NWDisk = SystemDisk[disk];
+    bps = NWDisk->BytesPerSector;
+    for (i=0; i < sectors; i++)
+    {
+       if (!(bh[i] = getblk((ULONG)NWDisk->PhysicalDiskHandle,
+			  (StartingLBA + i), bps)))
+       {
+	  for (i=0; i < sectors; i++)
+	     if (bh[i])
+		brelse(bh[i]);
+	  return 0;
+       }
+       NWFSSet(bh[i]->b_data, 0, bps);
+       mark_buffer_uptodate(bh[i], 1);
+       mark_buffer_dirty(bh[i], 0);
+       bytesWritten += bps;
+    }
+    ll_rw_block(WRITEA, sectors, bh);
+    for (i=0; i < sectors; i++)
+    {
+       wait_on_buffer(bh[i]);
+       if (!buffer_uptodate(bh[i]))
+	  write_error = 1;
+       brelse(bh[i]);
+    }
+    return (write_error ? 0 : bytesWritten);
+}
+#else
+//
+//  THIS CODE CRASHES WITH AN OOPS MESSAGE UNDER 2.2.14 (and all 2.2.X
+kernels)
+//
+//
+// this case assumes we will use the NWFS buffer cache and not allow
+// cache sharing with the linux buffer cache.
+//
+ULONG pReadDiskSectors(ULONG disk, ULONG StartingLBA, BYTE *Sector,
+		      ULONG sectors, ULONG readAhead)
+{
+    register ULONG i, j, bytesRead = 0;
+    register ULONG bps;
+    register NWDISK *NWDisk;
+    register ULONG read_error = 0;
+    struct buffer_head *bh[sectors];
+    NWDisk = SystemDisk[disk];
+    bps = NWDisk->BytesPerSector;
+    for (i=0; i < sectors; i++)
+    {
+       bh[i] = get_bh();
+       if (!bh[i])
+       {
+	  for (j=0; j < i; j++)
+	     if (bh[j])
+		put_bh(bh[j]);
+	  return 0;
+       }
+    }
+    for (i=0; i < sectors; i++)
+    {
+       bh[i]->b_this_page = bh[(i + 1) % sectors]; // create circular
+list
+       bh[i]->b_state = 0;
+       bh[i]->b_next_free = NULL;
+       bh[i]->b_count = 0;
+       bh[i]->b_size = 512;
+       bh[i]->b_data = (char *)&Sector[i * bps];
+       bh[i]->b_list = BUF_CLEAN;
+       bh[i]->b_dev = (int)NWDisk->PhysicalDiskHandle;
+       bh[i]->b_blocknr = (StartingLBA + i);
+       bh[i]->b_count = 1;
+       bh[i]->b_flushtime = 0;
+       clear_bit(BH_Uptodate, &bh[i]->b_state);
+    }
+    ll_rw_block(READA, sectors, bh);
+    for(i=0; i < sectors; i++)
+    {
+       wait_on_buffer(bh[i]);
+       if (buffer_uptodate(bh[i]))
+	  bytesRead += bps;
+       else
+	  read_error = 1;
+       put_bh(bh[i]);
+    }
+    return (read_error ? 0 : bytesRead);
+}
+ULONG pWriteDiskSectors(ULONG disk, ULONG StartingLBA, BYTE *Sector,
+		       ULONG sectors, ULONG readAhead)
+{
+    register ULONG i, j, bytesWritten = 0;
+    register ULONG bps;
+    register ULONG write_error = 0;
+    register NWDISK *NWDisk;
+    struct buffer_head *bh[sectors];
+    NWDisk = SystemDisk[disk];
+    bps = NWDisk->BytesPerSector;
+    for (i=0; i < sectors; i++)
+    {
+       bh[i] = get_bh();
+       if (!bh[i])
+       {
+	  for (j=0; j < i; j++)
+	     if (bh[j])
+		put_bh(bh[j]);
+	  return 0;
+       }
+    }
+    for (i=0; i < sectors; i++)
+    {
+       bh[i]->b_this_page = bh[(i + 1) % sectors]; // create circular
+list
+       bh[i]->b_state = 0;
+       bh[i]->b_next_free = NULL;
+       bh[i]->b_count = 0;
+       bh[i]->b_size = 512;
+       bh[i]->b_data = (char *)&Sector[i * bps];
+       bh[i]->b_list = BUF_CLEAN;
+       bh[i]->b_dev = (int)NWDisk->PhysicalDiskHandle;
+       bh[i]->b_blocknr = (StartingLBA + i);
+       bh[i]->b_count = 1;
+       bh[i]->b_flushtime = 0;
+       set_bit(BH_Uptodate, &bh[i]->b_state);
+       set_bit(BH_Dirty, &bh[i]->b_state);
+    }
+    ll_rw_block(WRITEA, sectors, bh);
+    for (i=0; i < sectors; i++)
+    {
+       wait_on_buffer(bh[i]);
+       if (buffer_uptodate(bh[i]))
+	  bytesWritten += bps;
+       else
+	  write_error = 1;
+       put_bh(bh[i]);
+    }
+    return (write_error ? 0 : bytesWritten);
+}
+ULONG pZeroFillDiskSectors(ULONG disk, ULONG StartingLBA, ULONG sectors,
+			  ULONG readAhead)
+{
+    register ULONG i, j, bytesWritten = 0;
+    register ULONG bps;
+    register ULONG write_error = 0;
+    register NWDISK *NWDisk;
+    struct buffer_head *bh[sectors];
+    NWDisk = SystemDisk[disk];
+    bps = NWDisk->BytesPerSector;
+    for (i=0; i < sectors; i++)
+    {
+       bh[i] = get_bh();
+       if (!bh[i])
+       {
+	  for (j=0; j < i; j++)
+	     if (bh[j])
+		put_bh(bh[j]);
+	  return 0;
+       }
+    }
+    for (i=0; i < sectors; i++)
+    {
+       bh[i]->b_this_page = bh[(i + 1) % sectors]; // create circular
+list
+       bh[i]->b_state = 0;
+       bh[i]->b_next_free = NULL;
+       bh[i]->b_count = 0;
+       bh[i]->b_size = 512;
+       bh[i]->b_data = (char *) ZeroBuffer;
+       bh[i]->b_list = BUF_CLEAN;
+       bh[i]->b_dev = (int)NWDisk->PhysicalDiskHandle;
+       bh[i]->b_blocknr = (StartingLBA + i);
+       bh[i]->b_count = 1;
+       bh[i]->b_flushtime = 0;
+       set_bit(BH_Uptodate, &bh[i]->b_state);
+       set_bit(BH_Dirty, &bh[i]->b_state);
+    }
+    ll_rw_block(WRITEA, sectors, bh);
+    for (i=0; i < sectors; i++)
+    {
+       wait_on_buffer(bh[i]);
+       if (buffer_uptodate(bh[i]))
+	  bytesWritten += bps;
+       else
+	  write_error = 1;
+       put_bh(bh[i]);
+    }
+    return (write_error ? 0 : bytesWritten);
+}
+#endif
+void SyncDevice(ULONG disk)
+{
+    sync_dev((int)disk);
+    return;
+}
+ULONG ReadDiskSectors(ULONG disk, ULONG LBA, BYTE *Sector,
+			     ULONG sectors, ULONG readAhead)
+{
+    return (pReadDiskSectors(disk, LBA, Sector, sectors, readAhead));
+}
+ULONG WriteDiskSectors(ULONG disk, ULONG LBA, BYTE *Sector,
+			      ULONG sectors, ULONG readAhead)
+{
+    return (pWriteDiskSectors(disk, LBA, Sector, sectors, readAhead));
+}
+ULONG ZeroFillDiskSectors(ULONG disk, ULONG StartingLBA,
+				 ULONG sectors, ULONG readAhead)
+{
+    return (pZeroFillDiskSectors(disk, StartingLBA, sectors,
+readAhead));
+}
+#endif
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

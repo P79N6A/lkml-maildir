@@ -1,0 +1,176 @@
+Date: Sun, 23 Jul 2000 02:59:31 -0500
+From: Mike Perry <>
+Subject: [PATCH]: serial oops fixes among others
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/7/23/9
+
+While playing around with the serial driver, I noticed some oddities:
+1. You could generate an oops by passing an alphabetic irq to setserial (this
+is technically a bug in setserial too, it just uses sscanf with no error
+checking). When given an alphabetic string for a %d, sscanf gives you some
+crazy negative number, which the serial driver just went and used to index
+into IRQ_ports. BOOM! Oops while in process setserial.
+2. You could set the IRQ to anything if you had CAP_SYS_ADMIN. Of course,
+request_irq failed, but I was noticing system hangs in some cases (like trying
+to change the IRQ to something sane) when the serial driver thought the IRQ
+was something taken by another device. I changed the behavior to return the
+appropriate error code instead.
+3. auto_irq wasn't being listened to when called from setserial. I changed
+this, but it seems that detect_uart_irq still doesn't work, at least on my
+system. I'm suspecting it might be my hardware, because I compared this
+routine with a DOS one I found, and they seemed equivalent (but then again,
+what the hell do I know about DOS? ;).
+4. detect_uart_irq returns zero on failure, but this is checked nowhere, as a
+result, if you did manage to autoconfigure and call this function, if it
+failed, your serial IRQ was set to the timer!
+The patch to fix all these (execpt detect_uart_irq's failure to detect) is
+attached.
+P.S. On an unrelated note, does anyone know why the latest ISDN code isn't in 
+2.4 yet? It'd be nice to be able have US NI1 support without std2kern'ing 
+the isdn cvs tree..
+-- 
+Mike Perry
+http://got.fscked.org
+?
+--- ./linux/drivers/char/serial.c	Sun Jul 23 01:50:49 2000
++++ ./linux.newser/drivers/char/serial.c	Sun Jul 23 01:59:14 2000
+@@ -1314,12 +1314,14 @@
+ 		retval = request_irq(state->irq, handler, SA_SHIRQ,
+ 				     "serial", &IRQ_ports[state->irq]);
+ 		if (retval) {
++#if 0
+ 			if (capable(CAP_SYS_ADMIN)) {
+ 				if (info->tty)
+ 					set_bit(TTY_IO_ERROR,
+ 						&info->tty->flags);
+ 				retval = 0;
+ 			}
++#endif
+ 			goto errout;
+ 		}
+ 	}
+@@ -2042,6 +2044,7 @@
+ 	unsigned int		i,change_irq,change_port;
+ 	int 			retval = 0;
+ 	unsigned long		new_port;
++	int autoirq = 0;
+ 
+ 	if (copy_from_user(&new_serial,new_info,sizeof(new_serial)))
+ 		return -EFAULT;
+@@ -2052,10 +2055,10 @@
+ 	if (HIGH_BITS_OFFSET)
+ 		new_port += (unsigned long) new_serial.port_high << HIGH_BITS_OFFSET;
+ 
+-	change_irq = new_serial.irq != state->irq;
++	change_irq = (new_serial.irq != state->irq || (new_serial.flags & ASYNC_AUTO_IRQ)); 
+ 	change_port = (new_port != ((int) state->port)) ||
+ 		(new_serial.hub6 != state->hub6);
+-  
++
+ 	if (!capable(CAP_SYS_ADMIN)) {
+ 		if (change_irq || change_port ||
+ 		    (new_serial.baud_base != state->baud_base) ||
+@@ -2073,9 +2076,13 @@
+ 		goto check_and_exit;
+ 	}
+ 
+-	new_serial.irq = irq_cannonicalize(new_serial.irq);
++	if ((new_serial.flags & ASYNC_AUTO_IRQ) 
++	    && (autoirq = detect_uart_irq(state)))
++		new_serial.irq = autoirq;
++	else
++	    new_serial.irq = irq_cannonicalize(new_serial.irq);
+ 
+-	if ((new_serial.irq >= NR_IRQS) || 
++	if ((new_serial.irq >= NR_IRQS) || (new_serial.irq < 0) || 
+ 	    (new_serial.baud_base < 9600)|| (new_serial.type < PORT_UNKNOWN) ||
+ 	    (new_serial.type > PORT_MAX) || (new_serial.type == PORT_CIRRUS) ||
+ 	    (new_serial.type == PORT_STARTECH)) {
+@@ -2171,8 +2178,12 @@
+ #endif
+ 			change_speed(info, 0);
+ 		}
+-	} else
+-		retval = startup(info);
++	} else if ((retval = startup(info))) {
++	    /* if something went wrong, restore the old setup */
++	    shutdown(info);
++	    *info->state = old_state;
++	    startup(info);
++	}
+ 	return retval;
+ }
+ 
+@@ -2308,7 +2319,7 @@
+ 
+ static int do_autoconfig(struct async_struct * info)
+ {
+-	int			retval;
++	int irq = 0;
+ 	
+ 	if (!capable(CAP_SYS_ADMIN))
+ 		return -EPERM;
+@@ -2319,15 +2330,13 @@
+ 	shutdown(info);
+ 
+ 	autoconfig(info->state);
+-	if ((info->state->flags & ASYNC_AUTO_IRQ) &&
++	if (((info->state->flags & ASYNC_AUTO_IRQ) &&
+ 	    (info->state->port != 0) &&
+-	    (info->state->type != PORT_UNKNOWN))
+-		info->state->irq = detect_uart_irq(info->state);
++	    (info->state->type != PORT_UNKNOWN)) &&
++	    (irq = detect_uart_irq(info->state)))
++		info->state->irq = irq;
+ 
+-	retval = startup(info);
+-	if (retval)
+-		return retval;
+-	return 0;
++	return startup(info);
+ }
+ 
+ /*
+@@ -3415,7 +3424,12 @@
+ 	if (state->flags & ASYNC_FOURPORT)
+ 		outb_p(save_ICP, ICP);
+ #endif
+-	return (irq > 0)? irq : 0;
++	irq = (irq > 0)? irq : 0;
++
++	if(!irq) 
++	    printk("serial: ttyS%d: auto_irq failed\n", state->line);
++
++	return irq;
+ }
+ 
+ /*
+@@ -5123,10 +5137,11 @@
+ 	for (i = 0, state = rs_table; i < NR_PORTS; i++,state++) {
+ 		if (state->type == PORT_UNKNOWN)
+ 			continue;
+-		if (   (state->flags & ASYNC_BOOT_AUTOCONF)
++		if (((state->flags & ASYNC_BOOT_AUTOCONF)
+ 		    && (state->flags & ASYNC_AUTO_IRQ)
+ 		    && (state->port != 0))
+-			state->irq = detect_uart_irq(state);
++		    && (i = detect_uart_irq(state)))
++			state->irq = i;
+ 		printk(KERN_INFO "ttyS%02d%s at 0x%04lx (irq = %d) is a %s\n",
+ 		       state->line + SERIAL_DEV_OFFSET,
+ 		       (state->flags & ASYNC_FOURPORT) ? " FourPort" : "",
+@@ -5229,8 +5244,9 @@
+ 	}
+ 	restore_flags(flags);
+ 
+-	if ((state->flags & ASYNC_AUTO_IRQ) && CONFIGURED_SERIAL_PORT(state))
+-		state->irq = detect_uart_irq(state);
++	if (((state->flags & ASYNC_AUTO_IRQ) && CONFIGURED_SERIAL_PORT(state))
++	    && (i = detect_uart_irq(state))) 
++		state->irq = i;
+ 
+        printk(KERN_INFO "ttyS%02d at %s 0x%04lx (irq = %d) is a %s\n",
+ 	      state->line + SERIAL_DEV_OFFSET,

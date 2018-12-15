@@ -1,0 +1,126 @@
+Date: Wed, 23 Jun 1999 17:23:39 +0200 (CEST)
+From: Ingo Molnar <>
+Subject: [fixpatch] pagecache-2.3.8-B4
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/6/23/127
+
+the attached patch fixes the reported 2.3.8 'access beyond end of device
+...' and metadata corruption problems, and the 'BUG in buffer.c ...'
+crash.
+there were two distinct problems. The first one is my fault, ll_rw_block() 
+was still not SMP-safe: mark_buffer_clean() in particular. The rest of
+ll_rw_blk.c seems to be safe and apart from raid1.c and raid5.c [i'll fix
+those] all other kernel files seem to be safe. This bug caused the bad
+metadata corruptions reported - one such common corruption was a botched
+indirect block, the subsequent bread() got a bad block address. The fix
+itself is not pretty, i hope it can be removed once buffer.c is threaded.
+the other problem was swapping related - brw_page() WRITEs with the
+async_io handler, after but the bh also got into the dirty queue, which
+later on eventually got revisited by bdflush, causing an incorrect
+PageUnlock() - which set off the alarm. I'm not completely sure how this
+could have happened - how can buffers beloning to anonymously swapped
+pages become ever dirty? My fix is neither complete nor correct, i'll try
+to fix it in a better way later today - but this quick fix seems to have
+done the trick, no more crashes when handling big files.
+	Ingo
+--- linux/fs/buffer.c.orig	Tue Jun 22 23:45:36 1999
++++ linux/fs/buffer.c	Wed Jun 23 15:56:08 1999
+@@ -674,6 +674,8 @@
+ void init_buffer(struct buffer_head *bh, kdev_t dev, int block,
+ 		 bh_end_io_t *handler, void *dev_id)
+ {
++	if (bh->b_count)
++		BH_BUG(bh);
+ 	bh->b_list = BUF_CLEAN;
+ 	bh->b_flushtime = 0;
+ 	bh->b_dev = dev;
+@@ -1217,6 +1219,7 @@
+ 	if (page->owner != -1)
+ 		PAGE_BUG(page);
+ 	page->owner = (int)current;
++	bh->b_end_io = end_buffer_io_sync;
+ 	UnlockPage(page);
+ 
+ 	return;
+--- linux/include/linux/fs.h.orig	Tue Jun 22 23:32:44 1999
++++ linux/include/linux/fs.h	Wed Jun 23 15:56:09 1999
+@@ -750,10 +750,17 @@
+ 
+ void mark_buffer_uptodate(struct buffer_head *, int);
+ 
++#define atomic_set_buffer_clean(bh) test_and_clear_bit(BH_Dirty, &(bh)->b_state)
++
++extern inline void __mark_buffer_clean(struct buffer_head *bh)
++{
++	refile_buffer(bh);
++}
++
+ extern inline void mark_buffer_clean(struct buffer_head * bh)
+ {
+-	if (test_and_clear_bit(BH_Dirty, &bh->b_state))
+-		refile_buffer(bh);
++	if (!atomic_set_buffer_clean(bh))
++		__mark_buffer_clean(bh);
+ }
+ 
+ extern void FASTCALL(__mark_buffer_dirty(struct buffer_head *bh, int flag));
+--- linux/drivers/block/ll_rw_blk.c.orig	Tue Jun 22 23:32:21 1999
++++ linux/drivers/block/ll_rw_blk.c	Wed Jun 23 15:56:09 1999
+@@ -17,6 +17,7 @@
+ #include <linux/locks.h>
+ #include <linux/mm.h>
+ #include <linux/init.h>
++#include <linux/smp_lock.h>
+ 
+ #include <asm/system.h>
+ #include <asm/io.h>
+@@ -317,13 +318,18 @@
+ 	req->next = NULL;
+ 
+ 	/*
++	 * we cannot refile the buffer within the io_request_lock without
++	 * deadlocking. Marking a buffer clean _earlier_ is always fine.
++	 */
++	lock_kernel();
++	mark_buffer_clean(req->bh);
++	unlock_kernel();
++	/*
+ 	 * We use the goto to reduce locking complexity
+ 	 */
+ 	spin_lock_irqsave(&io_request_lock,flags);
+ 	current_request = get_queue(req->rq_dev);
+ 
+-	if (req->bh)
+-		mark_buffer_clean(req->bh);
+ 	if (!(tmp = *current_request)) {
+ 		*current_request = req;
+ 		if (dev->current_request != &dev->plug)
+@@ -527,10 +533,21 @@
+ 			    	req->nr_sectors += count;
+ 			} else
+ 				continue;
+-
+-			mark_buffer_clean(bh);
+-			spin_unlock_irqrestore(&io_request_lock,flags);
+-		    	return;
++			{
++				int was_dirty;
++				struct buffer_head *bh;
++
++				bh = req->bh;
++				was_dirty = atomic_set_buffer_clean(bh);
++				spin_unlock_irqrestore(&io_request_lock,flags);
++
++				if (was_dirty) {
++					lock_kernel();
++					__mark_buffer_clean(bh);
++					unlock_kernel();
++				}
++		    		return;
++			}
+ 
+ 		} while ((req = req->next) != NULL);
+ 	}

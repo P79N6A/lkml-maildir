@@ -1,0 +1,160 @@
+Date: Tue, 22 Aug 2000 22:13:16 +1000 (EST)
+From: Neil Brown <>
+Subject: Re: Ramdisk / sync deadlock
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/8/22/4
+
+On Tuesday August 22, dxm@clouds.melbourne.sgi.com wrote:
+> 
+> System: SGI 1400 SMP w/ sym53c8xx SCSI.
+> Kernel: 2.4.0-test5
+> 
+> I've been hitting a SMP deadlock caused by creating traffic
+> on a ramdisk at the same time as syncing. The backtraces show
+> the locks causing the deadlock. I don't know how to fix this
+> one myself, so here's the info in case it helps...
+> 
+> CPU A
+> 
+>     insert_into_queues          <takes lru_list_lock>
+>     getblk
+>     rd_request
+>     generic_unplug_device       <takes io_request_lock>
+>     __wait_on_buffer
+>     unmap_buffer
+>     block_flushpage
+>     truncate_inode_pages
+>     vmtruncate
+>     inode_setattr
+>     notify_change
+>     do_truncate
+>     open_namei
+>     filp_open
+>     sys_open
+>     system_call
+> 
+> CPU B
+> 
+>     sym53c8xx_intr              <takes io_request_lock>
+>     handle_IRQ_event
+>     <scsi interrupt here>
+>     sync_buffers                <takes lru_list_lock>
+>     fsync_dev
+>     sys_sync
+>     system_call
+> 
+> Regards,
+My feeling is that the "wrong" that is happening is that getblk is
+being called inside the io_request_lock.
+This can be fixed quite easily by changing rd to not use a request
+queue at all, but passing each buffer directly from ll_rw_block
+through generic_make_request into rd.c, instead of queuing them up in
+a request queue.  After all, rd does *not* need an elevator algorithm.
+The following patch should do this, but is totally untested.  I don't
+even know that it compiles.
+Let me know how it goes if you try it.
+NeilBrown
+--- drivers/block/rd.c	2000/08/22 11:58:30	1.1
++++ drivers/block/rd.c	2000/08/22 12:06:49
+@@ -194,50 +194,48 @@
+  * 19-JAN-1998  Richard Gooch <rgooch@atnf.csiro.au>  Added devfs support
+  *
+  */
+-static void rd_request(request_queue_t * q)
++static int rd_make_request(request_queue_t * q, int rw, struct buffer_head *sbh)
+ {
+ 	unsigned int minor;
+ 	unsigned long offset, len;
+ 	struct buffer_head *rbh;
+-	struct buffer_head *sbh;
+ 
+-repeat:
+-	INIT_REQUEST;
+ 	
+-	minor = MINOR(CURRENT->rq_dev);
++	minor = MINOR(sbh->b_rdev);
++
++	if (minor >= NUM_RAMDISKS)
++		goto fail;
+ 
+-	if (minor >= NUM_RAMDISKS) {
+-		end_request(0);
+-		goto repeat;
+-	}
+ 	
+-	offset = CURRENT->sector << 9;
+-	len = CURRENT->current_nr_sectors << 9;
++	offset = sbh->b_rsector << 9;
++	len = sbh->b_size;
+ 
+-	if ((offset + len) > rd_length[minor]) {
+-		end_request(0);
+-		goto repeat;
+-	}
++	if ((offset + len) > rd_length[minor])
++		goto fail;
+ 
+-	if ((CURRENT->cmd != READ) && (CURRENT->cmd != WRITE)) {
+-		printk(KERN_INFO "RAMDISK: bad command: %d\n", CURRENT->cmd);
+-		end_request(0);
+-		goto repeat;
+-	}
+-
+-	sbh = CURRENT->bh;
+-	rbh = getblk(sbh->b_dev, sbh->b_blocknr, sbh->b_size);
+-	if (CURRENT->cmd == READ) {
++	if (rw==READA)
++		rw=READ;
++	if ((rw != READ) && (rw != WRITE)) {
++		printk(KERN_INFO "RAMDISK: bad command: %d\n", rw);
++		goto fail;
++	}
++
++	sbh = bh;
++	rbh = getblk(sbh->b_rdev, sbh->b_rsector*(sbh->b_size>>9), sbh->b_size);
++	if (rw == READ) {
+ 		if (sbh != rbh)
+-			memcpy(CURRENT->buffer, rbh->b_data, rbh->b_size);
++			memcpy(sbh->b_data, rbh->b_data, rbh->b_size);
+ 	} else
+ 		if (sbh != rbh)
+-			memcpy(rbh->b_data, CURRENT->buffer, rbh->b_size);
++			memcpy(rbh->b_data, sbh->b_data, rbh->b_size);
+ 	mark_buffer_protected(rbh);
+ 	brelse(rbh);
+ 
+-	end_request(1);
+-	goto repeat;
++	sbh->b_end_io(sbh,1);
++	return 0;
++ fail:
++	sbh->b_end_io(sbh,0);
++	return 0;
+ } 
+ 
+ static int rd_ioctl(struct inode *inode, struct file *file, unsigned int cmd, unsigned long arg)
+@@ -378,7 +376,6 @@
+ 
+ 	devfs_unregister (devfs_handle);
+ 	unregister_blkdev( MAJOR_NR, "ramdisk" );
+-	blk_cleanup_queue(BLK_DEFAULT_QUEUE(MAJOR_NR));
+ 	hardsect_size[MAJOR_NR] = NULL;
+ 	blksize_size[MAJOR_NR] = NULL;
+ 	blk_size[MAJOR_NR] = NULL;
+@@ -403,7 +400,7 @@
+ 		return -EIO;
+ 	}
+ 
+-	blk_init_queue(BLK_DEFAULT_QUEUE(MAJOR_NR), &rd_request);
++	blk_queue_make_request(BLK_DEFAULT_QUEUE(MAJOR_NR), &rd_make_request);
+ 
+ 	for (i = 0; i < NUM_RAMDISKS; i++) {
+ 		/* rd_size is given in kB */
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+Please read the FAQ at 
+http://www.tux.org/lkml/

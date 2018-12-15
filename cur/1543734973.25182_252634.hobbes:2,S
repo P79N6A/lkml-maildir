@@ -1,0 +1,171 @@
+Date: Wed, 15 Sep 2004 09:32:23 -0700
+From: john stultz <>
+Subject: Re: [RFC][PATCH] new timeofday core subsystem (v.A0)
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2004/9/15/178
+
+On Tue, 2004-09-14 at 23:46, Christoph Lameter wrote:
+> V3 of the concept for a time subsystem.
+>  * add a function to the time_source_t to be able to trigger the timer
+>    interrupt at a certain counter value instead of at regular intervals
+>  * function to map back from nanoseconds to counter units
+>  * add primitive scheduler that wakes up for timer events and
+>    figures out when to schedule the next event.
+>  * Some info at the end on how maybe have the NTP code interact with
+>    this stuff.
+> 
+> The deferral of the time_base updates actually is beneficial since it
+> allows a more accurate scaling of the counter and thus does not loose
+> remaining nanoseconds as often.
+> 
+> /****************************************************************
+>  * A concept for a new timer module
+>  * V3
+>  *
+>  * Christoph Lameter, September 14, 2003
+>  ***************************************************************/
+> 
+> struct time_source_t {
+> 	u8 type;
+> 	u8 shift;
+> 	u32 multiply;
+> 	void *address;
+> 	u64 mask;
+> 	int (*interrupt_at)(u64 counter_value);
+> };
+Could you explain the interrupt_at function further?
+> /* Exampe of a CPU time time source */
+> 	int itm_setup(u64 counter) {
+> 		set_itm(counter);
+> 		return 1;	/* Success */
+> 	}
+> 
+> 	make_time_source(1200000000, TIME_SOURCE_CPU, NULL, 44,itm_setup);
+> 
+> /* A memory based time source at 20Mhz 55 bits wide, no ability to fire an interrupt */
+> 
+> 	make_time_source(20000000, TIME_SOURCE_MMIO64, &my_timer_address, 55, NULL);
+> 
+> /* Example of handling a difficult time source. In SMP systems the CPU time sources are notoriously difficult to
+>  * sync. If we have such a problem  then insure at least sure that the time source never goes backward.
+>  */
+> 
+> u64 time_source_last;
+> 
+> u64 get_cpu_time_filtered() {
+> 	u64 x;
+> 	u64 l;
+> 
+> 	do {
+> 		l = time_source_last;
+> 		x = cycles();
+> 		if (x<l) return l;
+> 		/* the cmpxchg is going to hurt in terms of scalability ! */
+> 	} while (cmpxchg(&time_source_last, l, x) != l);
+> 	return x;
+> }
+> 
+> Generate the time_source with
+> 
+> 	make_time_source(1200000000, TIME_SOURCE_FUNCTION, cpu_time_filtered, 44, itm_setup);
+Out of curiosity, what happens in your fsyscall code in these cases
+where TIME_SOURCE_FUNCTION is used?
+> /* event scheduler to be able to run events at specific times */
+> 
+> struct event {
+> 	u64 when;
+> 	u64 param;
+> 	void (*run)(u64);
+> 	struct event next;
+> }
+> 
+> struct event *event_queue;
+> 
+> void event_run(void) {
+> 	u64 t;
+> 
+> 	spin_lock(event_handler);
+> 	t = now();
+> redo:
+> 	/* Run all events scheduled before now */
+> 	while (event_queue && event_queue->when <= t) {
+> 		struct event *e=event_queue;
+> 
+> 		e->run(e->param);
+> 		event_queue = e->next;
+> 		kfree(e);
+> 	}
+> 	if (event_queue = NULL) {
+> 		spin_unlock(event_handler);
+> 		return;
+> 	}
+> 	t = now();
+> 	d = t - event_queue->when;
+> 	if (d<= 0) goto retry;
+> 
+> 	time_source->interrupt_at(time_source_at_base + ns_to_time_source(event_queue->when - time_base));
+> 	spin_unlock(event_handler);
+> }
+> 
+> void event_new(u64 w,void (*r)(u64), u64 p) {
+> 	struct event *e=kmalloc(sizeof(struct event));
+> 
+> 	e->when =w;
+> 	e->param = p;
+> 	e->run = r;
+> 	spin_lock(event_handler);
+> 	if (event_queue) {
+> 		/* Insert time event at the appropriate time */
+> 		struct event *p = event_queue;
+> 		while (p->next && p->next->w < w) p = p->next;
+> 		e->next = p->next;
+> 		p->next = e;
+> 	} else
+> 		event_queue=e;
+> 	spin_unlock(event_handler);
+> 	event_run();
+> }
+> 
+> void scheduled_timer_interrupt(void) {
+> 	event_run();
+> }
+> 
+> /* simulation of the old tick behavior */
+> tick(u64 when) {
+> 	/* do tick stuff */
+> 
+> 	/* time base update .... */
+> 	time_source_adjust(0);
+> 	/* Schedule next timer tick */
+> 	event_new(when + NSEC_PER_SEC / HZ , tick,  when + NSEC_PER_SEC / HZ);
+> }
+Hmm. This is getting somewhat tangled in my mind. Who is calling tick()
+originally? How is event_run being called?
+> /* New tick would be scheduled by the ntp logic when a correction is needed.
+>  * ntp logic needs to decide when to skip a few nanosecond or slow down the clock or
+>  * make the clock run faster.
+>  * One way to do this is to accumulate a time difference to real time.
+>  * if this time difference is small and positive then skip time forward a bit.
+>  * if the time difference is negative then slow down the clock.
+>  * if the time difference is way too high then accelerate the clock
+>  */
+Well, this is still a bit vague.  do_adjtimex gives us 4 values we need
+to use in adjusting time. The parts-per-million (ppm - all of which are
+signed) tick adjustment value, the ppm frequency adjustment, the ppm
+offset adjustment, and the singleshot offset adjustment length (# of
+nsecs in which we apply the maximum ppm singleshot offset adjustment). 
+How do these 4 values get translated to adjusting the time source?
+You might want to just swipe my timeofday-core patch and re-work the
+timesource.h interface to your liking (make it like time_source_t). That
+way you get all the NTP details as well as the interrupt separation for
+free.
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+More majordomo info at  
+http://vger.kernel.org/majordomo-info.html
+Please read the FAQ at  
+http://www.tux.org/lkml/

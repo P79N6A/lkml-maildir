@@ -1,0 +1,431 @@
+Date: Thu, 8 Nov 2007 11:58:58 -0800 (PST)
+From: Christoph Lameter <>
+Subject: Some interesting observations when trying to optimize vmstat handling
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2007/11/8/204
+
+I looked into getting rid of the interrupt enable/disable when updating vm 
+statistics in vmstat.c. The SLUB removal of the interrupt enable/disable 
+doubled the performance of the fast path so maybe we can do the same to
+vm statistics.
+Measurements were done on an 8p SMP system (dual quad core Intel Xeon)
+Some numbers:
+inc_zone_page_state	Includes interrupt enable/disable
+__dec_zone_page_state	Does not perform interrupt enable/disable
+count_vm_event 		Simple increment with preempt disable/enable
+Base 2.6.24-rc2
+10000 x inc_zone_page_state		60 cycles per call
+10000 x __dec_zone_page_state		12 cycles per call
+10000 x count_vm_event			 6 cycles per call
+There is an interrupt enable overhead of 48 cycles that would be good to 
+be able to eliminate (Kernel code usually moves counter increments into
+a neighboring interrupt disable section so that __ function can be used).
+cmpxchg_local
+-------------
+The first approach was to simply use cmpxchg_local like in SLUB (see 
+attached patch):
+10000 x inc_zone_page_state		93 cycles per call
+10000 x __dec_zone_page_state		96 cycles
+10000 x count_vm_event			 6 cycles per call
+The processing of the counters got too complex. The problem with 
+cmpxchg_local here is that the differential has to be read before we 
+execute the cmpxchg_local. So the cacheline is acquired first in read mode 
+and then made exclusive on executing the cmpxchg_local.
+This is not helping.
+local inc
+---------
+I build some custom assembly code to perform local_inc on a vmstat 
+differential byte in order to avoid acquiring the cacheline in read node 
+first (code has still an unresolved very unlikely race):
+10000 x inc_zone_page_state		14 cycles per call
+10000 x __dec_zone_page_state		12 cycles per call
+10000 x count_vm_event			6 cycles per call
+inc_zone_page_state simply calls __inc_zone_page_state and disables
+preemption before doing so. So the simple function call costs 2 cycles.
+__dec_zone_page_state now has equal performance.
+Solution is likely also not acceptable due to:
+1. There is still an race with interrupts that could in lead to
+   counter overflow if an interrupt occurs during inc_zone_page_state
+   which then is interrupted again when we execute on the tail end of
+   the interrupt and that tail code is  interrupt again. If this happens
+   > 5 - 100 times then a counter overflow can occur.
+2. There is the need to add a local_inc for bytes to the local_t 
+   operations.
+Raw patch for local inc follows:
+---
+ mm/vmstat.c |  139 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 132 insertions(+), 7 deletions(-)
+Index: linux-2.6/mm/vmstat.c
+===================================================================
+--- linux-2.6.orig/mm/vmstat.c	2007-11-07 21:14:05.997039421 -0800
++++ linux-2.6/mm/vmstat.c	2007-11-07 23:28:10.625617837 -0800
+@@ -153,8 +153,126 @@ static void refresh_zone_stat_thresholds
+ 	}
+ }
+ 
++#ifdef CONFIG_FAST_CMPXCHG_LOCAL
++void __mod_zone_page_state(struct zone *zone, enum zone_stat_item item,
++				int delta)
++{
++	if (delta == 1)
++		__inc_zone_state(zone, item);
++	else if (delta == -1)
++		__dec_zone_state(zone, item);
++	else
++		zone_page_state_add(delta, zone, item);
++}
++EXPORT_SYMBOL(__mod_zone_page_state);
++
++void mod_zone_page_state(struct zone *zone, enum zone_stat_item item,
++					int delta)
++{
++	preempt_disable();
++	__mod_zone_page_state(zone, item, delta);
++	preempt_enable();
++}
++EXPORT_SYMBOL(mod_zone_page_state);
++
++static inline void inc_diff(s8 *p)
++{
++	__asm__ __volatile__(
++		"incb %0;"
++			: "=m" (p)
++			: "m" (p));
++}
++
++static inline void dec_diff(s8 *p)
++{
++	__asm__ __volatile__(
++		"decb %0;"
++			: "=m" (p)
++			: "m" (p));
++
++}
++
++static inline void sync_diff(struct zone *zone, s8 *p,
++		int i, int offset)
++{
++	/*
++	 * xchg_local() would be useful here but that does not exist.
++	 */
++	zone_page_state_add(xchg(p, offset) - offset, zone, i);
++}
++
++/*
++ * Optimized increment and decrement functions implemented using
++ * cmpxchg_local. These do not require interrupts to be disabled
++ * and enabled.
++ */
++void __inc_zone_state(struct zone *zone, enum zone_stat_item item)
++{
++	struct per_cpu_pageset *pcp = THIS_CPU(zone->pageset);
++	s8 t = pcp->stat_threshold;
++	s8 *p = pcp->vm_stat_diff + item;
++
++	inc_diff(p);
++	if (unlikely(*p >= t))
++		/*
++		 * There is a race here. An interrupt may occur
++		 * and increment the same differential. However, the
++		 * interrupt will then also end up here and call
++		 * sync_diff. After we return from the interrupt
++		 * the sync_diff here will have no effect since
++		 * p is going to be zero.
++		 */
++		sync_diff(zone, p, item, -(t / 2));
++}
++
++void __inc_zone_page_state(struct page *page, enum zone_stat_item item)
++{
++	__inc_zone_state(page_zone(page), item);
++}
++EXPORT_SYMBOL(__inc_zone_page_state);
++
++void __dec_zone_state(struct zone *zone, enum zone_stat_item item)
++{
++	struct per_cpu_pageset *pcp = THIS_CPU(zone->pageset);
++	s8 t = pcp->stat_threshold;
++	s8 *p = pcp->vm_stat_diff + item;
++
++	dec_diff(p);
++	if (unlikely(*p <= -t))
++		sync_diff(zone, p, item, t / 2);
++}
++
++void __dec_zone_page_state(struct page *page, enum zone_stat_item item)
++{
++	__dec_zone_state(page_zone(page), item);
++}
++EXPORT_SYMBOL(__dec_zone_page_state);
++
++void inc_zone_state(struct zone *zone, enum zone_stat_item item)
++{
++	preempt_disable();
++	__inc_zone_state(zone, item);
++	preempt_enable();
++}
++
++void inc_zone_page_state(struct page *page, enum zone_stat_item item)
++{
++	inc_zone_state(page_zone(page), item);
++}
++EXPORT_SYMBOL(inc_zone_page_state);
++
++void dec_zone_page_state(struct page *page, enum zone_stat_item item)
++{
++	preempt_disable();
++	__dec_zone_page_state(page, item);
++	preempt_enable();
++}
++EXPORT_SYMBOL(dec_zone_page_state);
++
++#else /* CONFIG_FAST_CMPXCHG_LOCAL */
++
+ /*
+- * For use when we know that interrupts are disabled.
++ * Functions that do not rely on cmpxchg_local
+  */
+ void __mod_zone_page_state(struct zone *zone, enum zone_stat_item item,
+ 				int delta)
+@@ -284,6 +402,17 @@ void dec_zone_page_state(struct page *pa
+ }
+ EXPORT_SYMBOL(dec_zone_page_state);
+ 
++static inline void sync_diff(struct zone *zone, struct per_cpu_pageset *p, int i)
++{
++	unsigned long flags;
++
++	local_irq_save(flags);
++	zone_page_state_add(p->vm_stat_diff[i], zone, i);
++	p->vm_stat_diff[i] = 0;
++	local_irq_restore(flags);
++}
++#endif /* !CONFIG_FAST_CMPXCHG_LOCAL */
++
+ /*
+  * Update the zone counters for one cpu.
+  *
+@@ -302,7 +431,6 @@ void refresh_cpu_vm_stats(int cpu)
+ {
+ 	struct zone *zone;
+ 	int i;
+-	unsigned long flags;
+ 
+ 	for_each_zone(zone) {
+ 		struct per_cpu_pageset *p;
+@@ -314,15 +442,12 @@ void refresh_cpu_vm_stats(int cpu)
+ 
+ 		for (i = 0; i < NR_VM_ZONE_STAT_ITEMS; i++)
+ 			if (p->vm_stat_diff[i]) {
+-				local_irq_save(flags);
+-				zone_page_state_add(p->vm_stat_diff[i],
+-					zone, i);
+-				p->vm_stat_diff[i] = 0;
++				sync_diff(zone, &p->vm_stat_diff[i], i, 0);
++
+ #ifdef CONFIG_NUMA
+ 				/* 3 seconds idle till flush */
+ 				p->expire = 3;
+ #endif
+-				local_irq_restore(flags);
+ 			}
+ #ifdef CONFIG_NUMA
+ 		/*
+---
+ include/linux/vmstat.h |   17 ++++--
+ mm/vmstat.c            |  122 ++++++++++++++++++++++++++++++++++++++++++++++---
+ 2 files changed, 127 insertions(+), 12 deletions(-)
+Index: linux-2.6/include/linux/vmstat.h
+===================================================================
+--- linux-2.6.orig/include/linux/vmstat.h	2007-11-07 16:49:39.985701332 -0800
++++ linux-2.6/include/linux/vmstat.h	2007-11-07 19:55:52.431617269 -0800
+@@ -202,15 +202,22 @@ extern void inc_zone_state(struct zone *
+ void __mod_zone_page_state(struct zone *, enum zone_stat_item item, int);
+ void __inc_zone_page_state(struct page *, enum zone_stat_item);
+ void __dec_zone_page_state(struct page *, enum zone_stat_item);
++void __inc_zone_state(struct zone *, enum zone_stat_item);
++void __dec_zone_state(struct zone *, enum zone_stat_item);
+ 
++#ifdef CONFIG_FAST_CMPXCHG_LOCAL
++#define inc_zone_page_state __inc_zone_page_state
++#define dec_zone_page_state __dec_zone_page_state
++#define mod_zone_page_state __mod_zone_page_state
++#define inc_zone_state __inc_zone_state
++#define dec_zone_state __dec_zone_state
++#else
+ void mod_zone_page_state(struct zone *, enum zone_stat_item, int);
+ void inc_zone_page_state(struct page *, enum zone_stat_item);
+ void dec_zone_page_state(struct page *, enum zone_stat_item);
+-
+-extern void inc_zone_state(struct zone *, enum zone_stat_item);
+-extern void __inc_zone_state(struct zone *, enum zone_stat_item);
+-extern void dec_zone_state(struct zone *, enum zone_stat_item);
+-extern void __dec_zone_state(struct zone *, enum zone_stat_item);
++void inc_zone_state(struct zone *, enum zone_stat_item);
++void dec_zone_state(struct zone *, enum zone_stat_item);
++#endif
+ 
+ void refresh_cpu_vm_stats(int);
+ #else /* CONFIG_SMP */
+Index: linux-2.6/mm/vmstat.c
+===================================================================
+--- linux-2.6.orig/mm/vmstat.c	2007-11-07 16:49:40.097701253 -0800
++++ linux-2.6/mm/vmstat.c	2007-11-07 19:59:07.391081633 -0800
+@@ -153,8 +153,109 @@ static void refresh_zone_stat_thresholds
+ 	}
+ }
+ 
++#ifdef CONFIG_FAST_CMPXCHG_LOCAL
++void __mod_zone_page_state(struct zone *zone, enum zone_stat_item item,
++				int delta)
++{
++	struct per_cpu_pageset *pcp = THIS_CPU(zone->pageset);
++	s8 *p = pcp->vm_stat_diff + item;
++	s8 old;
++	unsigned long new;
++	unsigned long add;
++
++	do {
++		add = 0;
++		old = *p;
++		new = old + delta;
++
++		if (unlikely(new > pcp->stat_threshold ||
++				new < -pcp->stat_threshold)) {
++			add = new;
++			new = 0;
++		}
++
++	} while (cmpxchg_local(p, old, new) != old);
++
++	if (add)
++		zone_page_state_add(add, zone, item);
++}
++EXPORT_SYMBOL(__mod_zone_page_state);
++
++/*
++ * Optimized increment and decrement functions implemented using
++ * cmpxchg_local. These do not require interrupts to be disabled
++ * and enabled.
++ */
++void __inc_zone_state(struct zone *zone, enum zone_stat_item item)
++{
++	struct per_cpu_pageset *pcp = THIS_CPU(zone->pageset);
++	s8 *p = pcp->vm_stat_diff + item;
++	int add;
++	unsigned long old;
++	unsigned long new;
++
++	do {
++		add = 0;
++		old = *p;
++		new = old + 1;
++
++		if (unlikely(new > pcp->stat_threshold)) {
++			add = new + pcp->stat_threshold / 2;
++			new = -(pcp->stat_threshold / 2);
++		}
++	} while (cmpxchg_local(p, old, new) != old);
++
++	if (add)
++		zone_page_state_add(add, zone, item);
++}
++
++void __inc_zone_page_state(struct page *page, enum zone_stat_item item)
++{
++	__inc_zone_state(page_zone(page), item);
++}
++EXPORT_SYMBOL(__inc_zone_page_state);
++
++void __dec_zone_state(struct zone *zone, enum zone_stat_item item)
++{
++	struct per_cpu_pageset *pcp = THIS_CPU(zone->pageset);
++	s8 *p = pcp->vm_stat_diff + item;
++	int sub;
++	unsigned long old;
++	unsigned long new;
++
++	do {
++		sub = 0;
++		old = *p;
++		new = old - 1;
++
++		if (unlikely(new < - pcp->stat_threshold)) {
++			sub = new - pcp->stat_threshold / 2;
++			new = pcp->stat_threshold / 2;
++		}
++	} while (cmpxchg_local(p, old, new) != old);
++
++	if (sub)
++		zone_page_state_add(sub, zone, item);
++}
++
++void __dec_zone_page_state(struct page *page, enum zone_stat_item item)
++{
++	__dec_zone_state(page_zone(page), item);
++}
++EXPORT_SYMBOL(__dec_zone_page_state);
++
++static inline void sync_diff(struct zone *zone, struct per_cpu_pageset *p, int i)
++{
++	/*
++	 * xchg_local() would be useful here but that does not exist.
++	 */
++	zone_page_state_add(xchg(&p->vm_stat_diff[i], 0), zone, i);
++}
++
++#else /* CONFIG_FAST_CMPXCHG_LOCAL */
++
+ /*
+- * For use when we know that interrupts are disabled.
++ * Functions that do not rely on cmpxchg_local
+  */
+ void __mod_zone_page_state(struct zone *zone, enum zone_stat_item item,
+ 				int delta)
+@@ -284,6 +385,17 @@ void dec_zone_page_state(struct page *pa
+ }
+ EXPORT_SYMBOL(dec_zone_page_state);
+ 
++static inline void sync_diff(struct zone *zone, struct per_cpu_pageset *p, int i)
++{
++	unsigned long flags;
++
++	local_irq_save(flags);
++	zone_page_state_add(p->vm_stat_diff[i], zone, i);
++	p->vm_stat_diff[i] = 0;
++	local_irq_restore(flags);
++}
++#endif /* !CONFIG_FAST_CMPXCHG_LOCAL */
++
+ /*
+  * Update the zone counters for one cpu.
+  *
+@@ -302,7 +414,6 @@ void refresh_cpu_vm_stats(int cpu)
+ {
+ 	struct zone *zone;
+ 	int i;
+-	unsigned long flags;
+ 
+ 	for_each_zone(zone) {
+ 		struct per_cpu_pageset *p;
+@@ -314,15 +425,12 @@ void refresh_cpu_vm_stats(int cpu)
+ 
+ 		for (i = 0; i < NR_VM_ZONE_STAT_ITEMS; i++)
+ 			if (p->vm_stat_diff[i]) {
+-				local_irq_save(flags);
+-				zone_page_state_add(p->vm_stat_diff[i],
+-					zone, i);
+-				p->vm_stat_diff[i] = 0;
++				sync_diff(zone, p, i);
++
+ #ifdef CONFIG_NUMA
+ 				/* 3 seconds idle till flush */
+ 				p->expire = 3;
+ #endif
+-				local_irq_restore(flags);
+ 			}
+ #ifdef CONFIG_NUMA
+ 		/*

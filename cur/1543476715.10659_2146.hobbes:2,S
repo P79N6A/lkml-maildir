@@ -1,0 +1,336 @@
+Date: Sun, 10 Jan 1999 22:39:42 +0000
+From: Jamie Lokier <>
+Subject: Re: Open by inode?  (was Re: knfsd)
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/1/11/148
+
+On Sat, Jan 09, 1999 at 01:02:47PM +0000, Alain Williams wrote:
+> *	Hack the file system code to handle a directory with an inode of
+> 	4 specially:
+> 	*	If you try to open a file in that directory the name
+> 		will be interpretted as an inode number and yeild that file.
+> 	*	If you try to read (ie 'ls') the directory you get nothing.
+> 	*	If you try to write to the directory (ie 'rm') it fails.
+> 
+> This has the advantage of needing no new system calls, just a small
+> change to the ext2 file system code. It can be secure, the directory can
+> be chowned/chgrped to limmit access, if the sysadmin doesn't want it at
+> all (generally the case) he either removes the directory or doesn't
+> create it in the first place.
+I like this.  I prefer an ext2 attribute on a directory.
+The change to implement this is small, but a little bit fiddly.  The
+basic lookup by inode is easy, but making sure the dentries are
+invalidated at the right times so we don't keep files around forever,
+not going wrong with requests for deleted inodes etc. hits various
+corners.
+Patch enclosed against 2.2.0-pre4; give it a go.
+To test, make a directory and pass its name to this program (compile
+after applying the kernel patch):
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <linux/ext2_fs.h>
+void main (int argc, char ** argv)
+{
+  for (; *argv; argv++)
+    {
+      unsigned long flags;
+      int fd = open (*argv, O_RDONLY|O_NONBLOCK);
+      ioctl (fd, EXT2_IOC_GETFLAGS, &flags);
+      flags |= EXT2_IOPEN_FL;
+      ioctl (fd, EXT2_IOC_SETFLAGS, &flags);
+      close (fd);
+    }
+}
+Then you can open inodes in that directory by number.  Any inode on the
+same filesystem is opened.  The directory always appears empty.
+I still haven't a clue what use this is! :-)
+Enjoy,
+-- Jamie
+--- linux/fs/ext2/dir.c.iopen	Fri Nov 20 14:21:01 1998
++++ linux/fs/ext2/dir.c	Sun Jan 10 06:25:53 1999
+@@ -117,6 +117,8 @@
+ 
+ 	if (!inode || !S_ISDIR(inode->i_mode))
+ 		return -EBADF;
++	if (inode->u.ext2_i.i_flags & EXT2_IOPEN_FL)
++		goto treat_as_empty;
+ 	sb = inode->i_sb;
+ 
+ 	stored = 0;
+@@ -215,6 +217,7 @@
+ 		offset = 0;
+ 		brelse (bh);
+ 	}
+-	UPDATE_ATIME(inode);
++treat_as_empty:
++	UPDATE_ATIME(inode);
+ 	return 0;
+ }
+--- linux/fs/ext2/namei.c.iopen	Sun Jan  3 07:55:30 1999
++++ linux/fs/ext2/namei.c	Sun Jan 10 22:05:44 1999
+@@ -16,6 +16,8 @@
+  *        David S. Miller (davem@caip.rutgers.edu), 1995
+  *  Directory entry file type support and forward compatibility hooks
+  *  	for B-tree directories by Theodore Ts'o (tytso@mit.edu), 1998
++ *  Open by inode number support by
++ *	Jamie Lokier <jamie@imbolc.ucc.ie>, 1999
+  */
+ 
+ #include <asm/uaccess.h>
+@@ -65,17 +67,22 @@
+  */
+ static struct buffer_head * ext2_find_entry (struct inode * dir,
+ 					     const char * const name, int namelen,
+-					     struct ext2_dir_entry_2 ** res_dir)
++					     struct ext2_dir_entry_2 ** res_dir,
++					     int * err)
+ {
+ 	struct super_block * sb;
+ 	struct buffer_head * bh_use[NAMEI_RA_SIZE];
+ 	struct buffer_head * bh_read[NAMEI_RA_SIZE];
+ 	unsigned long offset;
+-	int block, toread, i, err;
++	int block, toread, i;
+ 
+ 	*res_dir = NULL;
++	*err = 0;
+ 	if (!dir)
+ 		return NULL;
++	*err = -EPERM;
++	if (dir->u.ext2_i.i_flags & EXT2_IOPEN_FL)
++		return NULL;
+ 	sb = dir->i_sb;
+ 
+ 	if (namelen > EXT2_NAME_LEN)
+@@ -88,7 +95,7 @@
+ 
+ 		if ((block << EXT2_BLOCK_SIZE_BITS (sb)) >= dir->i_size)
+ 			break;
+-		bh = ext2_getblk (dir, block, 0, &err);
++		bh = ext2_getblk (dir, block, 0, err);
+ 		bh_use[block] = bh;
+ 		if (bh && !buffer_uptodate(bh))
+ 			bh_read[toread++] = bh;
+@@ -156,7 +163,7 @@
+ 		    dir->i_size)
+ 			bh = NULL;
+ 		else
+-			bh = ext2_getblk (dir, block + NAMEI_RA_SIZE, 0, &err);
++			bh = ext2_getblk (dir, block + NAMEI_RA_SIZE, 0, err);
+ 		bh_use[block % NAMEI_RA_SIZE] = bh;
+ 		if (bh && !buffer_uptodate(bh))
+ 			bh_read[toread++] = bh;
+@@ -165,19 +172,68 @@
+ failure:
+ 	for (i = 0; i < NAMEI_RA_SIZE; ++i)
+ 		brelse (bh_use[i]);
++	*err = -ENOENT;
+ 	return NULL;
+ }
+ 
++static struct dentry_operations ext2_iopen_dentry_ops =
++{
++  NULL, NULL, NULL, d_drop /* d_delete */, NULL, NULL
++};
++
++static int ext2_lookup_by_inode (struct inode * dir,
++				      struct dentry * dentry)
++{
++	struct inode * inode;
++	int err = -ENOENT;
++	unsigned long ino = 0;
++	const char * name = dentry->d_name.name;
++
++	while (*name) {
++		unsigned int ch = *name++ - '0';
++		if (ch > 9)
++			goto out;
++		if (ino > ~0UL / 10)
++			goto out;
++		ino = ino * 10 + ch;
++		if (ino < ch)
++			goto out;
++	}
++
++	inode = iget(dir->i_sb, ino);
++	if (!inode)
++		goto out;
++	if (inode->u.ext2_i.i_deleted) {
++		/*
++		 * Without this we can do bad things like linking to
++		 * deleted files without allocating the bitmaps.
++		 */
++		iput(inode);
++		err = -EPERM;
++		goto out;
++	}
++	/* Such generosity; we let you reopen unlinked but still open files. */
++	dentry->d_op = &ext2_iopen_dentry_ops;
++	d_add(dentry, inode);
++	err = 0;
++ out:
++	return err;
++}
++
+ int ext2_lookup(struct inode * dir, struct dentry *dentry)
+ {
+ 	struct inode * inode;
+ 	struct ext2_dir_entry_2 * de;
+ 	struct buffer_head * bh;
++	int err;
++
++	if (dir->u.ext2_i.i_flags & EXT2_IOPEN_FL)
++		return ext2_lookup_by_inode (dir, dentry);
+ 
+ 	if (dentry->d_name.len > EXT2_NAME_LEN)
+ 		return -ENAMETOOLONG;
+ 
+-	bh = ext2_find_entry (dir, dentry->d_name.name, dentry->d_name.len, &de);
++	bh = ext2_find_entry (dir, dentry->d_name.name, dentry->d_name.len, &de, &err);
+ 	inode = NULL;
+ 	if (bh) {
+ 		unsigned long ino = le32_to_cpu(de->inode);
+@@ -216,6 +272,9 @@
+ 	*res_dir = NULL;
+ 	if (!dir || !dir->i_nlink)
+ 		return NULL;
++	*err = -EPERM;
++	if (dir->u.ext2_i.i_flags & EXT2_IOPEN_FL)
++		return NULL;
+ 	sb = dir->i_sb;
+ 
+ 	if (namelen > EXT2_NAME_LEN)
+@@ -623,9 +682,9 @@
+ 		goto out;
+ 
+ 	retval = -ENOENT;
+-	bh = ext2_find_entry (dir, dentry->d_name.name, dentry->d_name.len, &de);
++	bh = ext2_find_entry (dir, dentry->d_name.name, dentry->d_name.len, &de, &retval);
+ 	if (!bh)
+-		goto end_rmdir;
++		goto out;
+ 
+ 	inode = dentry->d_inode;
+ 	DQUOT_INIT(inode);
+@@ -681,9 +740,9 @@
+ 		goto out;
+ 
+ 	retval = -ENOENT;
+-	bh = ext2_find_entry (dir, dentry->d_name.name, dentry->d_name.len, &de);
++	bh = ext2_find_entry (dir, dentry->d_name.name, dentry->d_name.len, &de, &retval);
+ 	if (!bh)
+-		goto end_unlink;
++		goto out;
+ 
+ 	inode = dentry->d_inode;
+ 	DQUOT_INIT(inode);
+@@ -870,11 +929,12 @@
+ 	int retval;
+ 
+ 	old_bh = new_bh = dir_bh = NULL;
++
+ 	retval = -ENAMETOOLONG;
+ 	if (old_dentry->d_name.len > EXT2_NAME_LEN)
+ 		goto end_rename;
+ 
+-	old_bh = ext2_find_entry (old_dir, old_dentry->d_name.name, old_dentry->d_name.len, &old_de);
++	old_bh = ext2_find_entry (old_dir, old_dentry->d_name.name, old_dentry->d_name.len, &old_de, &retval);
+ 	/*
+ 	 *  Check for inode number is _not_ due to possible IO errors.
+ 	 *  We might rmdir the source, keep it as pwd of some process
+@@ -882,13 +942,12 @@
+ 	 *  same name. Goodbye sticky bit ;-<
+ 	 */
+ 	old_inode = old_dentry->d_inode;
+-	retval = -ENOENT;
+ 	if (!old_bh || le32_to_cpu(old_de->inode) != old_inode->i_ino)
+ 		goto end_rename;
+ 
+ 	new_inode = new_dentry->d_inode;
+ 	new_bh = ext2_find_entry (new_dir, new_dentry->d_name.name,
+-				new_dentry->d_name.len, &new_de);
++				  new_dentry->d_name.len, &new_de, &retval);
+ 	if (new_bh) {
+ 		if (!new_inode) {
+ 			brelse (new_bh);
+--- linux/fs/ext2/ioctl.c.iopen	Sun Jan 10 06:09:45 1999
++++ linux/fs/ext2/ioctl.c	Sun Jan 10 11:14:28 1999
+@@ -31,13 +31,13 @@
+ 		if (get_user(flags, (int *) arg))
+ 			return -EFAULT;
+ 		flags = flags & EXT2_FL_USER_MODIFIABLE;
+-                /*
+-		 * The IMMUTABLE and APPEND_ONLY flags can only be changed by
+-		 * the super user when the security level is zero.
+- 		 */
+-		if ((flags & (EXT2_APPEND_FL | EXT2_IMMUTABLE_FL)) ^
+-		    (inode->u.ext2_i.i_flags &
+-		     (EXT2_APPEND_FL | EXT2_IMMUTABLE_FL))) {
++		/*
++		 * The IMMUTABLE, APPEND_ONLY and IOPEN flags can
++		 * only be changed by the super user when the security
++		 * level is zero.
++		 */
++		if ((flags & EXT2_FL_MODIFY_NEEDS_SECURITY)
++		    != (inode->u.ext2_i.i_flags & EXT2_FL_MODIFY_NEEDS_SECURITY)) {
+  			/* This test looks nicer. Thanks to Pauline Middelink */
+ 			if (!capable(CAP_LINUX_IMMUTABLE))
+ 				return -EPERM;
+--- linux/fs/ext2/ialloc.c.iopen	Thu Nov 12 12:05:51 1998
++++ linux/fs/ext2/ialloc.c	Sun Jan 10 10:00:11 1999
+@@ -479,6 +479,7 @@
+ 	inode->i_blocks = 0;
+ 	inode->i_mtime = inode->i_atime = inode->i_ctime = CURRENT_TIME;
+ 	inode->u.ext2_i.i_new_inode = 1;
++	inode->u.ext2_i.i_deleted = 0;
+ 	inode->u.ext2_i.i_flags = dir->u.ext2_i.i_flags;
+ 	if (S_ISLNK(mode))
+ 		inode->u.ext2_i.i_flags &= ~(EXT2_IMMUTABLE_FL | EXT2_APPEND_FL);
+--- linux/fs/ext2/inode.c.iopen	Sun Jan 10 09:57:01 1999
++++ linux/fs/ext2/inode.c	Sun Jan 10 14:26:58 1999
+@@ -48,9 +48,11 @@
+ void ext2_delete_inode (struct inode * inode)
+ {
+ 	if (inode->i_ino == EXT2_ACL_IDX_INO ||
+-	    inode->i_ino == EXT2_ACL_DATA_INO)
++	    inode->i_ino == EXT2_ACL_DATA_INO ||
++	    inode->u.ext2_i.i_deleted)
+ 		return;
+ 	inode->u.ext2_i.i_dtime	= CURRENT_TIME;
++	inode->u.ext2_i.i_deleted = 1;
+ 	mark_inode_dirty(inode);
+ 	ext2_update_inode(inode, IS_SYNC(inode));
+ 	inode->i_size = 0;
+@@ -532,6 +534,7 @@
+ 	inode->i_blocks = le32_to_cpu(raw_inode->i_blocks);
+ 	inode->i_version = ++event;
+ 	inode->u.ext2_i.i_new_inode = 0;
++	inode->u.ext2_i.i_deleted = (raw_inode->i_links_count == 0);
+ 	inode->u.ext2_i.i_flags = le32_to_cpu(raw_inode->i_flags);
+ 	inode->u.ext2_i.i_faddr = le32_to_cpu(raw_inode->i_faddr);
+ 	inode->u.ext2_i.i_frag_no = raw_inode->i_frag;
+--- linux/include/linux/ext2_fs.h.iopen	Wed Jan  6 13:48:33 1999
++++ linux/include/linux/ext2_fs.h	Sun Jan 10 04:53:00 1999
+@@ -198,10 +198,12 @@
+ #define EXT2_ECOMPR_FL			0x00000800 /* Compression error */
+ /* End compression flags --- maybe not all used */	
+ #define EXT2_BTREE_FL			0x00001000 /* btree format dir */
++#define EXT2_IOPEN_FL			0x00002000 /* open-by-inode dir */
+ #define EXT2_RESERVED_FL		0x80000000 /* reserved for ext2 lib */
+ 
+-#define EXT2_FL_USER_VISIBLE		0x00001FFF /* User visible flags */
+-#define EXT2_FL_USER_MODIFIABLE		0x000000FF /* User modifiable flags */
++#define EXT2_FL_USER_VISIBLE		0x00003FFF /* User visible flags */
++#define EXT2_FL_USER_MODIFIABLE		0x000020FF /* User modifiable flags */
++#define EXT2_FL_MODIFY_NEEDS_SECURITY	0x00002030 /* Iff CAP_LINUX_IMMUTABLE*/
+ 
+ /*
+  * ioctl commands
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

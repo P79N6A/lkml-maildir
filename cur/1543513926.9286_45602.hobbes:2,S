@@ -1,0 +1,215 @@
+Date: Sun, 24 Oct 1999 12:21:43 +0200 (CEST)
+From: manfreds <>
+Subject: [patch] fix for smp tlb flush
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/10/24/13
+
+The current tlb flush code could use outdated TLB entries if a CPU
+implements speculative TLB reads. I think this is possible, my patch below
+fixes that. (Please correct me if I'm wrong, but I'm quite sure that the
+race which I described yesterday is possible)
+The patch is tested on Dual P/II, and it compiles on UP and SMP.
+[Ingo, you are the maintainer of the low-level SMP code,
+but Linus wrote the tlb flush code. Will you forward the patch to Linus,
+or should I send it directly to Linus?]
+--
+	Manfred
+<<<<<<<<<<<<<<<<<
+// $Header: /pub/cvs/ms/patches/patch-smpflush,v 1.1 1999/10/24 10:00:28 manfreds Exp $
+// Kernel Version:
+//  VERSION = 2
+//  PATCHLEVEL = 3
+//  SUBLEVEL = 23
+//  EXTRAVERSION =
+diff -r -u 2.3/arch/i386/kernel/irq.c build-2.3/arch/i386/kernel/irq.c
+--- 2.3/arch/i386/kernel/irq.c	Fri Oct 22 22:58:22 1999
++++ build-2.3/arch/i386/kernel/irq.c	Sun Oct 24 11:05:30 1999
+@@ -204,13 +204,8 @@
+  */
+ static inline void check_smp_invalidate(int cpu)
+ {
+-	if (test_bit(cpu, &smp_invalidate_needed)) {
+-		struct mm_struct *mm = current->mm;
+-		clear_bit(cpu, &smp_invalidate_needed);
+-		if (mm)
+-			atomic_set_mask(1 << cpu, &mm->cpu_vm_mask);
+-		local_flush_tlb();
+-	}
++	if (test_bit(cpu, &smp_invalidate_needed))
++		do_flush_tlb_local();
+ }
+ 
+ static void show(char * str)
+diff -r -u 2.3/arch/i386/kernel/smp.c build-2.3/arch/i386/kernel/smp.c
+--- 2.3/arch/i386/kernel/smp.c	Sat Oct  9 22:51:26 1999
++++ build-2.3/arch/i386/kernel/smp.c	Sun Oct 24 11:45:21 1999
+@@ -102,7 +102,8 @@
+ /* The 'big kernel lock' */
+ spinlock_t kernel_flag = SPIN_LOCK_UNLOCKED;
+ 
+-volatile unsigned long smp_invalidate_needed;
++volatile unsigned long smp_invalidate_needed; /* immediate flush required */
++volatile unsigned long smp_tlbflush_required; /* flush before returning to user space */
+ 
+ /*
+  * the following functions deal with sending IPIs between CPUs.
+@@ -319,13 +320,9 @@
+ 			/*
+ 			 * Take care of "crossing" invalidates
+ 			 */
+-			if (test_bit(cpu, &smp_invalidate_needed)) {
+-				struct mm_struct *mm = current->mm;
+-				clear_bit(cpu, &smp_invalidate_needed);
+-				if (mm)
+-					atomic_set_mask(1 << cpu, &mm->cpu_vm_mask);
+-				local_flush_tlb();
+-			}
++			if (test_bit(cpu, &smp_invalidate_needed))
++				do_flush_tlb_local();
++
+ 			--stuck;
+ 			if (!stuck) {
+ 				printk("stuck on TLB IPI wait (CPU#%d)\n",cpu);
+@@ -345,7 +342,7 @@
+  */	
+ void flush_tlb_current_task(void)
+ {
+-	unsigned long vm_mask = 1 << current->processor;
++	unsigned long vm_mask = 1 << smp_processor_id();
+ 	struct mm_struct *mm = current->mm;
+ 	unsigned long cpu_mask = mm->cpu_vm_mask & ~vm_mask;
+ 
+@@ -356,7 +353,7 @@
+ 
+ void flush_tlb_mm(struct mm_struct * mm)
+ {
+-	unsigned long vm_mask = 1 << current->processor;
++	unsigned long vm_mask = 1 << smp_processor_id();
+ 	unsigned long cpu_mask = mm->cpu_vm_mask & ~vm_mask;
+ 
+ 	mm->cpu_vm_mask = 0;
+@@ -369,7 +366,7 @@
+ 
+ void flush_tlb_page(struct vm_area_struct * vma, unsigned long va)
+ {
+-	unsigned long vm_mask = 1 << current->processor;
++	unsigned long vm_mask = 1 << smp_processor_id();
+ 	struct mm_struct *mm = vma->vm_mm;
+ 	unsigned long cpu_mask = mm->cpu_vm_mask & ~vm_mask;
+ 
+@@ -381,12 +378,29 @@
+ 	flush_tlb_others(cpu_mask);
+ }
+ 
+-void flush_tlb_all(void)
++static inline void do_flush_tlb_all_local(void)
+ {
+-	flush_tlb_others(~(1 << current->processor));
+ 	local_flush_tlb();
++	if(current->mm==0) {
++		unsigned long cpu = smp_processor_id();
++		clear_bit(cpu, &current->active_mm->cpu_vm_mask);
++
++		set_bit(cpu,&smp_tlbflush_required);
++	}
++}
++
++static void flush_tlb_all_ipi(void* info)
++{
++	do_flush_tlb_all_local();
+ }
+ 
++void flush_tlb_all(void)
++{
++	if(cpu_online_map ^ (1<<smp_processor_id()))
++		smp_call_function (flush_tlb_all_ipi,0,1,1);
++
++	do_flush_tlb_all_local();
++}
+ 
+ /*
+  * this function sends a 'reschedule' IPI to another CPU.
+@@ -513,15 +527,9 @@
+  */
+ asmlinkage void smp_invalidate_interrupt(void)
+ {
+-	struct task_struct *tsk = current;
+-	unsigned int cpu = tsk->processor;
++	if (test_bit(smp_processor_id(), &smp_invalidate_needed))
++		do_flush_tlb_local();
+ 
+-	if (test_and_clear_bit(cpu, &smp_invalidate_needed)) {
+-		struct mm_struct *mm = tsk->mm;
+-		if (mm)
+-			atomic_set_mask(1 << cpu, &mm->cpu_vm_mask);
+-		local_flush_tlb();
+-	}
+ 	ack_APIC_irq();
+ 
+ }
+diff -r -u 2.3/include/asm-i386/mmu_context.h build-2.3/include/asm-i386/mmu_context.h
+--- 2.3/include/asm-i386/mmu_context.h	Tue Aug 10 09:54:24 1999
++++ build-2.3/include/asm-i386/mmu_context.h	Sun Oct 24 11:40:30 1999
+@@ -10,9 +10,12 @@
+ #define destroy_context(mm)		do { } while(0)
+ #define init_new_context(tsk,mm)	do { } while (0)
+ 
++#ifdef __SMP__
++extern volatile unsigned long smp_tlbflush_required;
++#endif
++
+ static inline void switch_mm(struct mm_struct *prev, struct mm_struct *next, struct task_struct *tsk, unsigned cpu)
+ {
+-
+ 	if (prev != next) {
+ 		/*
+ 		 * Re-load LDT if necessary
+@@ -23,6 +26,13 @@
+ 		/* Re-load page tables */
+ 		asm volatile("movl %0,%%cr3": :"r" (__pa(next->pgd)));
+ 		clear_bit(cpu, &prev->cpu_vm_mask);
++	} else {
++#ifdef __SMP__
++		if(test_bit(cpu, &smp_tlbflush_required)) {
++			clear_bit(cpu, &smp_tlbflush_required);
++			local_flush_tlb();
++		}
++#endif
+ 	}
+ 	set_bit(cpu, &next->cpu_vm_mask);
+ }
+diff -r -u 2.3/include/asm-i386/pgtable.h build-2.3/include/asm-i386/pgtable.h
+--- 2.3/include/asm-i386/pgtable.h	Fri Oct 22 22:58:29 1999
++++ build-2.3/include/asm-i386/pgtable.h	Sun Oct 24 11:24:27 1999
+@@ -100,6 +100,23 @@
+ 	flush_tlb_mm(mm);
+ }
+ 
++extern volatile unsigned long smp_invalidate_needed;
++extern volatile unsigned long smp_tlbflush_required;
++
++static inline void do_flush_tlb_local(void)
++{
++	unsigned long cpu = smp_processor_id();
++	struct mm_struct *mm = current->mm;
++
++	clear_bit(cpu, &smp_invalidate_needed);
++	if (mm) {
++		set_bit(cpu, &mm->cpu_vm_mask);
++		local_flush_tlb();
++	} else {
++		set_bit(cpu,&smp_tlbflush_required);
++	}
++}
++
+ #endif
+ #endif /* !__ASSEMBLY__ */
+ 
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

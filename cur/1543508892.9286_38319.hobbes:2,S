@@ -1,0 +1,241 @@
+Date: Fri, 10 Sep 1999 21:14:00 -0400
+From: Jeff Garzik <>
+Subject: Re: [patch] pci probing
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/9/10/165
+
+Alan Cox wrote:
+> 
+> > Can you elaborate on what my patch lacks?  My patch seems much more
+> > flexible than Don's method used in tulip.c and 3c59x.c at least.  In
+> > fact if you rip out all the net-driver-specific stuff from struct
+> > pci_id_info, his method looks a lot like mine (without a couple
+> > features).
+> 
+> Have a look on cesdis.gsfc.nasa.gov:/pub/linux/drivers/v2.3/
+> 
+> The pci scan code in that does pci scans but also handles stuff like checking
+> latency and correcting it when needed
+Thanks.
+Besides the obvious net-centric code, his code was only more flexible
+such that there was a per-entry callback.  My flexibility came from
+being able to specify probe order, per-entry and per-probe data pointers
+(dev_data, drvr_data), and matching a limited number of devices.
+What do you think of this merge of Donald's code, attached?  Most of the
+PCI_COMMAND stuff is net-driver-specific and absent in my patch, as it
+is not applicable to general use.
+Regards,
+	Jeff
+-- 
+Custom driver development	|    Never worry about theory as long
+Open source programming		|    as the machinery does what it's
+				|    supposed to do.  -- R. A. Heinlein--- include/linux/pci.h.orig	Fri Sep 10 18:04:27 1999
++++ include/linux/pci.h	Fri Sep 10 20:55:46 1999
+@@ -1598,5 +1598,45 @@
+ 
+ void pci_fixup_device(int pass, struct pci_dev *dev);
+ 
++
++/*
++ * pci probing for drivers
++ *
++ * callback should return >= 0 on success (continue probing), or
++ * negative value on error (stop probing)
++ */
++
++enum {
++	PCI_PR_NO_ACPI_WAKE	= (1 << 0), /* disable ACPI wakeup */
++	PCI_PR_SET_MASTER	= (1 << 1), /* set bus mastering */
++};
++
++struct pci_probe_entry;
++typedef int (*pci_probe_callback) (struct pci_dev *dev,
++				   const struct pci_probe_entry *ent,
++				   int match_num,
++				   void *drvr_data);
++
++struct pci_probe_entry {
++	unsigned short vendor;	/* vendor id, PCI_ANY_ID, or 0 for last entry */
++	unsigned short device;	/* device id, PCI_ANY_ID, or 0 for last entry */
++
++	pci_probe_callback cb;
++	void *dev_data;		/* driver-private, entry-specific data */
++
++	u32 flags;		/* PCI_PR_xxx flags, above */
++	u32 check_region_mask;	/* set bit(x) for check_region(resource[x]) */
++
++	unsigned short subsys_vendor, subsys_vendor_mask; /* =0,0 to ignore */
++	unsigned short subsys_device, subsys_device_mask; /* =0,0 to ignore */
++	unsigned char revision, revision_mask; /* =0,0 to ignore */
++
++	u8 min_pci_latency;	/* =0 to not check/set minimum PCI latency */
++};
++
++int pci_driver_probe (struct pci_probe_entry *list, size_t match_limit,
++		      void *drvr_data);
++
++
+ #endif /* __KERNEL__ */
+ #endif /* LINUX_PCI_H */
+--- drivers/pci/pci.c.orig	Fri Sep 10 18:04:40 1999
++++ drivers/pci/pci.c	Fri Sep 10 21:06:22 1999
+@@ -113,6 +113,9 @@
+ }
+ 
+ 
++
++
++
+ /*
+  *  For given resource region of given device, return the resource
+  *  region of parent bus the given region is contained in or where
+@@ -148,6 +151,137 @@
+ }
+ 
+ 
++/* returns 1 if matched, 0 if not */
++static inline int pci_probe_device_matched (u8 rev, const struct pci_dev *dev,
++				            const struct pci_probe_entry *ent)
++{
++	if ((rev & ent->revision_mask) != ent->revision) goto not_matched;
++
++	if ((dev->subsystem_vendor & ent->subsys_vendor_mask) !=
++	    ent->subsys_vendor) goto not_matched;
++
++	if ((dev->subsystem_device & ent->subsys_device_mask) !=
++	    ent->subsys_device) goto not_matched;
++
++	return 1;
++
++not_matched:
++	return 0;
++}
++
++
++
++/* returns negative on error */
++static int pci_probe_do_match (size_t match_num, struct pci_dev *dev,
++			       const struct pci_probe_entry *ent,
++			       void *drvr_data)
++{
++	int rc = 0;
++
++	printk (KERN_DEBUG "Matched PCI device %s\n", dev->name);
++
++#if 0
++	if (! (ent->flags & PCI_PR_NO_ACPI_WAKE))
++		acpi_wake (dev);
++#endif
++
++	if (ent->flags & PCI_PR_SET_MASTER)
++		pci_set_master (dev);
++
++	if (ent->min_pci_latency > 0) {
++		u8 pci_latency;
++
++		pci_read_config_byte(dev, PCI_LATENCY_TIMER, &pci_latency);
++		if (pci_latency < ent->min_pci_latency) {
++			printk(KERN_INFO "  PCI latency timer (CFLT) is "
++			       "unreasonably low at %d.  Setting to %d.\n",
++			       pci_latency, ent->min_pci_latency);
++			pci_write_config_byte(dev, PCI_LATENCY_TIMER,
++					      ent->min_pci_latency);
++		}
++	}
++
++	if (ent->check_region_mask) {
++		int i, rc;
++		unsigned long n;
++		struct resource *res;
++
++		for (i = 0; i < DEVICE_COUNT_RESOURCE; i++) {
++			if (! (ent->check_region_mask & (1 << i)))
++				continue;
++
++			n = dev->resource[i].end - dev->resource[i].start + 1;
++
++			if (dev->resource[i].flags & IORESOURCE_IO) {
++				res = &ioport_resource;
++			} else {
++				res = &iomem_resource;
++			}
++
++			rc = __check_region (res, dev->resource[i].start, n);
++			if (rc)
++				return rc;
++		}
++	}
++
++	if (ent->cb)
++		rc = (* ent->cb) (dev, ent, match_num, drvr_data);
++
++	return rc;
++}
++
++
++
++/*
++ * pci_driver_probe
++ *
++ * Probe for a list of PCI ids, calling a callback function for
++ * each successful match.
++ *
++ * Returns number of matches (>= 0), or negative on error.
++ */
++
++int pci_driver_probe (struct pci_probe_entry *list, size_t match_limit,
++		      void *drvr_data)
++{
++	struct pci_dev *dev;
++	struct pci_probe_entry *ent;
++	size_t matches = 0;
++	int rc;
++	u8 rev;
++
++	if (!list)
++		return -ENODEV;
++
++	ent = list;
++	while (ent->vendor && ent->device) {
++		dev = pci_find_device (ent->vendor, ent->device, NULL);
++		while (dev) {
++			pci_read_config_byte (dev, PCI_REVISION_ID, &rev);
++
++			if (pci_probe_device_matched (rev, dev, ent)) {
++				rc = pci_probe_do_match (matches, dev,
++							 ent, drvr_data);
++				if (rc < 0)
++					return rc;
++
++				matches++;
++
++				if (match_limit && match_limit == matches)
++					return matches;
++			}
++
++			dev = pci_find_device (ent->vendor, ent->device, dev);
++		}
++
++		ent++;
++	}
++
++	return matches;
++}
++
++
++
+ /*
+  * This interrupt-safe spinlock protects all accesses to PCI
+  * configuration space.
+@@ -203,6 +337,8 @@
+ 		pci_write_config_byte(dev, PCI_LATENCY_TIMER, 64);
+ 	}
+ }
++
++
+ 
+ /*
+  * Assign new address to PCI resource.  We hope our resource information

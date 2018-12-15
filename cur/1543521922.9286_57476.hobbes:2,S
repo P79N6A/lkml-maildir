@@ -1,0 +1,393 @@
+Date: Thu, 13 Jan 2000 18:38:43 GMT
+From: "Stephen C. Tweedie" <>
+Subject: [Patch] sard disk accounting for 2.3.40-pre1
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/1/13/204
+
+Hi,
+The patch below, on top of the gendisk patch I just sent out, adds
+advanced disk IO accounting for all disks, both per-disk and
+per-partition.  The accounting is performed through the gendisk struct
+and is exported via /proc/partitions.  The gendisk data is protected by
+the IO request lock on SMP.
+You can query the stats output through the "sard" program at
+	
+ftp://ftp.uk.linux.org/pub/linux/sct/fs/profiling/sard.cc
+Stats output include device queue %age utilisation, average queue
+length, number of IOs and total IO size both read and write, and average
+service latency.
+There is something odd showing up on one of my scsi disks on one test
+box with this code running: on an idle machine, every 30 seconds or so,
+an IO persists for exactly 4.5 seconds: it looks as if there is a
+run_task_queue() on the disk queue missing somewhere.  I've not found it
+yet...
+--Stephen
+----------------------------------------------------------------
+--- linux-2.3.39-gendisk/drivers/block/ll_rw_blk.c.~1~	Tue Dec 21 14:42:06 1999
++++ linux-2.3.39-gendisk/drivers/block/ll_rw_blk.c	Thu Jan 13 16:08:30 2000
+@@ -123,6 +123,14 @@
+  */
+ int * max_segments[MAX_BLKDEV] = { NULL, NULL, };
+ 
++/* 
++ * MUTEX locking to prevent concurrent fsync()s to the block devices.
++ * (Concurrent syncs thrash the disk enormously and result in much worse
++ * performance than serial syncs.)
++ */
++char blk_synclock[MAX_BLKDEV] = {0};
++
++
+ static inline int get_max_sectors(kdev_t dev)
+ {
+ 	if (!max_sectors[MAJOR(dev)])
+@@ -358,6 +366,124 @@
+ 		printk(KERN_ERR "drive_stat_acct: cmd not R/W?\n");
+ }
+ 
++/* Return up to two hd_structs on which to do IO accounting for a given
++ * request.  On a partitioned device, we want to account both against
++ * the partition and against the whole disk.  */
++static void locate_hd_struct(struct request *req, 
++			     struct hd_struct **hd1,
++			     struct hd_struct **hd2)
++{
++	struct gendisk *gd;
++
++	*hd1 = NULL;
++	*hd2 = NULL;
++	
++	gd = major_gendisk[MAJOR(req->rq_dev)];
++	if (gd && gd->part) {
++		/* Mask out the partition bits: account for the entire disk */
++		int devnr = MINOR(req->rq_dev) >> gd->minor_shift;
++
++		if (devnr < gd->max_nr) {
++			int whole_minor = devnr << gd->minor_shift;
++			*hd1 = &gd->part[whole_minor];
++			if (whole_minor != MINOR(req->rq_dev))
++				*hd2= &gd->part[MINOR(req->rq_dev)];
++		}
++	}
++}
++
++/* Round off the performance stats on an hd_struct.  The average IO
++ * queue length and utilisation statistics are maintained by observing
++ * the current state of the queue length and the amount of time it has
++ * been in this state for.  Normally, that accounting is done on IO
++ * completion, but that can result in more than a second's worth of IO
++ * being accounted for within any one second, leading to >100%
++ * utilisation.  To deal with that, we do a round-off before returning
++ * the results when reading /proc/partitions, accounting immediately for
++ * all queue usage up to the current jiffies and restarting the counters
++ * again. */
++void disk_round_stats(struct hd_struct *hd)
++{
++	unsigned long now = jiffies;
++	
++	hd->aveq += (hd->ios_in_flight * (jiffies - hd->last_queue_change));
++	hd->last_queue_change = now;
++
++	if (hd->ios_in_flight)
++		hd->io_ticks += (now - hd->last_idle_time);
++	hd->last_idle_time = now;	
++}
++
++
++static inline void down_ios(struct hd_struct *hd)
++{
++	disk_round_stats(hd);	
++	--hd->ios_in_flight;
++}
++
++static inline void up_ios(struct hd_struct *hd)
++{
++	disk_round_stats(hd);
++	++hd->ios_in_flight;
++}
++
++static void account_io_start(struct hd_struct *hd, struct request *req,
++			     int merge, int sectors)
++{
++	switch (req->cmd) {
++	case READ:
++		if (merge)
++			hd->rd_merges++;
++		hd->rd_sectors += sectors;
++		break;
++	case WRITE:
++		if (merge)
++			hd->wr_merges++;
++		hd->wr_sectors += sectors;
++		break;
++	default:
++	}
++	if (!merge)
++		up_ios(hd);
++}
++
++static void account_io_end(struct hd_struct *hd, struct request *req)
++{
++	unsigned long duration = jiffies - req->start_time;
++	switch (req->cmd) {
++	case READ:
++		hd->rd_ticks += duration;
++		hd->rd_ios++;
++		break;
++	case WRITE:
++		hd->wr_ticks += duration;
++		hd->wr_ios++;
++		break;
++	default:
++	}
++	down_ios(hd);
++}
++
++void req_new_io(struct request *req, int merge, int sectors)
++{
++	struct hd_struct *hd1, *hd2;
++	locate_hd_struct(req, &hd1, &hd2);
++	if (hd1)
++		account_io_start(hd1, req, merge, sectors);
++	if (hd2)
++		account_io_start(hd2, req, merge, sectors);
++}
++
++void req_finished_io(struct request *req)
++{
++	struct hd_struct *hd1, *hd2;
++	locate_hd_struct(req, &hd1, &hd2);
++	if (hd1)
++		account_io_end(hd1, req);
++	if (hd2)	
++		account_io_end(hd2, req);
++}
++
+ /*
+  * add-request adds a request to the linked list.
+  * It disables interrupts (aquires the request spinlock) so that it can muck
+@@ -375,6 +501,8 @@
+ 	unsigned long flags;
+ 
+ 	drive_stat_acct(req, req->nr_sectors, 1);
++	req->start_time = jiffies;
++	req_new_io(req, 0, req->nr_sectors);
+ 	req->next = NULL;
+ 
+ 	/*
+@@ -432,7 +560,8 @@
+ {
+ 	struct request *next = req->next;
+ 	int total_segments;
+-
++	struct hd_struct *hd1, *hd2;
++	
+ 	if (!next)
+ 		return;
+ 	if (req->sector + req->nr_sectors != next->sector)
+@@ -469,6 +598,15 @@
+ 	next->rq_status = RQ_INACTIVE;
+ 	req->next = next->next;
+ 	wake_up (&wait_for_request);
++
++	/* One last thing: we have removed a request, so we now have one
++	   less expected IO to complete for accounting purposes. */
++
++	locate_hd_struct(req, &hd1, &hd2);
++	if (hd1)
++		down_ios(hd1);
++	if (hd2)	
++		down_ios(hd2);
+ }
+ 
+ static void __make_request(request_queue_t * q,
+@@ -730,6 +868,7 @@
+ 			    	req->sector = sector;
+ 			    	req->nr_sectors += count;
+ 				drive_stat_acct(req, count, 0);
++				req_new_io(req, 1, count);
+ 			} else
+ 				continue;
+ 
+@@ -924,6 +1063,7 @@
+ void
+ end_that_request_last( struct request *req ) 
+ {
++	req_finished_io(req);
+ 	if (req->sem != NULL)
+ 		up(req->sem);
+ 	req->rq_status = RQ_INACTIVE;
+--- linux-2.3.39-gendisk/drivers/scsi/scsi_lib.c.~1~	Thu Jan 13 15:04:58 2000
++++ linux-2.3.39-gendisk/drivers/scsi/scsi_lib.c	Thu Jan 13 16:08:30 2000
+@@ -375,6 +375,7 @@
+ 	if (req->sem != NULL) {
+ 		up(req->sem);
+ 	}
++	req_finished_io(req);
+ 	add_blkdev_randomness(MAJOR(req->rq_dev));
+ 
+ 	/*
+--- linux-2.3.39-gendisk/fs/block_dev.c.~1~	Thu Jan 13 15:19:47 2000
++++ linux-2.3.39-gendisk/fs/block_dev.c	Thu Jan 13 16:09:43 2000
+@@ -10,6 +10,7 @@
+ #include <linux/fcntl.h>
+ #include <linux/malloc.h>
+ #include <linux/kmod.h>
++#include <linux/genhd.h>
+ 
+ #include <asm/uaccess.h>
+ 
+--- linux-2.3.39-gendisk/fs/buffer.c~	Thu Jan 13 15:05:02 2000
++++ linux-2.3.39-gendisk/fs/buffer.c	Thu Jan 13 17:31:15 2000
+@@ -272,6 +272,7 @@
+ 		 * more buffers on the second pass).
+ 		 */
+ 	} while (wait && retry && ++pass<=2);
++	run_task_queue(&tq_disk);
+ 	return err;
+ }
+ 
+@@ -280,8 +281,8 @@
+ 	sync_buffers(dev, 0);
+ 	sync_supers(dev);
+ 	sync_inodes(dev);
+-	sync_buffers(dev, 0);
+ 	DQUOT_SYNC(dev);
++	sync_buffers(dev, 0);
+ 	/*
+ 	 * FIXME(eric) we need to sync the physical devices here.
+ 	 * This is because some (scsi) controllers have huge amounts of
+@@ -2364,6 +2365,7 @@
+ 		CHECK_EMERGENCY_SYNC
+ 
+ 		flush_dirty_buffers(0);
++		run_task_queue(&tq_disk);
+ 
+ 		/* If wakeup_bdflush will wakeup us
+ 		   after our bdflush_done wakeup, then
+--- linux-2.3.39-gendisk/fs/partitions/check.c.~1~	Mon Aug 30 18:24:14 1999
++++ linux-2.3.39-gendisk/fs/partitions/check.c	Thu Jan 13 17:00:21 2000
+@@ -37,6 +37,7 @@
+ extern void initrd_load(void);
+ 
+ struct gendisk *gendisk_head;
++struct gendisk *major_gendisk[MAX_BLKDEV] = {0,};
+ 
+ static int (*check_part[])(struct gendisk *hd, kdev_t dev, unsigned long first_sect, int first_minor) = {
+ #ifdef CONFIG_ACORN_PARTITION
+@@ -87,6 +88,9 @@
+ 	 * This requires special handling here.
+ 	 */
+ 	switch (hd->major) {
++		case MD_MAJOR:
++			unit = (minor >> hd->minor_shift) + '0';
++			break;
+ 		case IDE9_MAJOR:
+ 			unit += 2;
+ 		case IDE8_MAJOR:
+@@ -216,6 +220,7 @@
+ int get_partition_list(char * page)
+ {
+ 	struct gendisk *p;
++	struct hd_struct *hd;
+ 	char buf[40];
+ 	int n, len;
+ 
+@@ -223,10 +228,23 @@
+ 	for (p = gendisk_head; p; p = p->next) {
+ 		for (n=0; n < (p->nr_real << p->minor_shift); n++) {
+ 			if (p->part[n].nr_sects && len < PAGE_SIZE - 80) {
+-				len += sprintf(page+len,
+-					       "%4d  %4d %10d %s\n",
++				hd = &p->part[n];
++				disk_round_stats(hd);
++  				len += sprintf(page+len,
++					       "%4d  %4d %10d %s "
++					       "%d %d %d %d %d %d %d %d %d %d %d %lu\n",
+ 					       p->major, n, p->sizes[n],
+-					       disk_name(p, n, buf));
++					       disk_name(p, n, buf),
++					       hd->rd_ios, hd->rd_merges,
++					       hd->rd_sectors,
++					       hd->rd_ticks,
++					       hd->wr_ios, hd->wr_merges,
++					       hd->wr_sectors,
++					       hd->wr_ticks,
++					       hd->ios_in_flight,
++					       hd->io_ticks,
++					       hd->aveq,
++					       jiffies);
+ 			}
+ 		}
+ 	}
+--- linux-2.3.39-gendisk/include/linux/blkdev.h.~1~	Thu Jan 13 15:30:51 2000
++++ linux-2.3.39-gendisk/include/linux/blkdev.h	Thu Jan 13 16:08:30 2000
+@@ -23,6 +23,7 @@
+ 	kdev_t rq_dev;
+ 	int cmd;		/* READ or WRITE */
+ 	int errors;
++	unsigned long start_time;
+ 	unsigned long sector;
+ 	unsigned long nr_sectors;
+ 	unsigned long nr_segments;
+--- linux-2.3.39-gendisk/include/linux/genhd.h.~1~	Thu Jan 13 15:21:16 2000
++++ linux-2.3.39-gendisk/include/linux/genhd.h	Thu Jan 13 16:08:30 2000
+@@ -45,6 +45,22 @@
+ struct hd_struct {
+ 	long start_sect;
+ 	long nr_sects;
++
++	/* Performance stats: */
++	unsigned int ios_in_flight;
++	unsigned int io_ticks;
++	unsigned int last_idle_time;
++	unsigned int last_queue_change;
++	unsigned int aveq;
++	
++	unsigned int rd_ios;
++	unsigned int rd_merges;
++	unsigned int rd_ticks;
++	unsigned int rd_sectors;
++	unsigned int wr_ios;
++	unsigned int wr_merges;
++	unsigned int wr_ticks;
++	unsigned int wr_sectors;	
+ };
+ 
+ struct gendisk {
+@@ -64,6 +80,8 @@
+ 	struct gendisk *next;
+ };
+ 
++extern struct gendisk *major_gendisk[];
++
+ #ifdef CONFIG_SOLARIS_X86_PARTITION
+ 
+ #define SOLARIS_X86_NUMSLICE	8
+@@ -216,6 +234,19 @@
+ extern struct gendisk *gendisk_head;	/* linked list of disks */
+ 
+ char *disk_name (struct gendisk *hd, int minor, char *buf);
++
++/*
++ * disk_round_stats is used to round off the IO statistics for a disk
++ * for a complete clock tick.
++ */
++void disk_round_stats(struct hd_struct *hd);
++
++/* 
++ * Account for the completion of an IO request (used by drivers which 
++ * bypass the normal end_request processing) 
++ */
++struct request;
++void req_finished_io(struct request *);
+ 
+ int get_hardsect_size(kdev_t dev);
+ struct gendisk *get_gendisk(int major);
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

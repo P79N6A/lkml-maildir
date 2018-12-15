@@ -1,0 +1,610 @@
+Date: Fri, 7 May 1999 18:04:42 -0700
+From: Richard Henderson <>
+Subject: ev6 fixes for 2.2.7
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/5/7/205
+
+$ uname -a
+Linux castro.cygnus.com 2.2.7 #12 SMP Fri May 7 17:38:51 PDT 1999 alpha unknown
+$ tail -2 /proc/cpuinfo
+platform string         : AlphaPC 264DP 500 MHz
+CPUs probed 2 active 2 map 0x3 IPIs 76126
+Whee.
+Some problems:
+ - IEEE math didn't work so well.  In the case of the EV6, we should be
+   letting the hardware store the exception state rather than doing it
+   in software as we are forced to with the previous machines.
+   There's also a queer bit in which if you have FPCR_UNFD, but not
+   FPCR_UNDZ, the EV6 won't request software completion even if the
+   instruction asks for it.  I'd like someone to explain that to me.
+   My current workaround is to not trust (summary & 1) and always
+   try emulation.  Then if we still decide we need an exception we
+   can deliver it.
+ - The SMP tlb flush code assumed it had the global kernel lock.
+   From the end of do_wp_page it is clear this is not an assumption
+   that should have been made.  So invent a new spinlock and DTRT.
+r~
+diff -rup linux-2.2.7/arch/alpha/kernel/osf_sys.c linux-2.2.7-axp/arch/alpha/kernel/osf_sys.c
+--- linux-2.2.7/arch/alpha/kernel/osf_sys.c	Sun Mar 21 20:53:46 1999
++++ linux-2.2.7-axp/arch/alpha/kernel/osf_sys.c	Fri May  7 13:35:57 1999
+@@ -883,7 +883,13 @@ asmlinkage unsigned long osf_getsysinfo(
+ 	case GSI_IEEE_FP_CONTROL:
+ 		/* Return current software fp control & status bits.  */
+ 		/* Note that DU doesn't verify available space here.  */
+-		w = current->tss.flags & IEEE_SW_MASK;
++
++		/* 21264 implements all the bits in hardware.  */
++		if (implver() >= 2) {
++			w = ieee_fpcr_to_swcr(rdfpcr());
++		} else {
++			w = current->tss.flags & IEEE_SW_MASK;
++		}
+ 		if (put_user(w, (unsigned long *) buffer))
+ 			return -EFAULT;
+ 		return 0;
+@@ -948,11 +954,9 @@ asmlinkage unsigned long osf_setsysinfo(
+ 		current->tss.flags &= ~IEEE_SW_MASK;
+ 		current->tss.flags |= swcr & IEEE_SW_MASK;
+ 
+-		/* Update the real fpcr.  For exceptions that are disabled in
+-		   software but have not been seen, enable the exception in
+-		   hardware so that we can update our software status mask.  */
++		/* Update the real fpcr.  */
+ 		fpcr = rdfpcr() & (~FPCR_MASK | FPCR_DYN_MASK);
+-		fpcr |= ieee_swcr_to_fpcr(swcr | (~swcr & IEEE_STATUS_MASK)>>16);
++		fpcr |= ieee_swcr_to_fpcr(swcr);
+ 		wrfpcr(fpcr);
+ 		   
+ 		return 0;
+@@ -1405,18 +1409,19 @@ asmlinkage int sys_old_adjtimex(struct t
+ 	/* copy relevant bits of struct timex. */
+ 	if (copy_from_user(&txc, txc_p, offsetof(struct timex32, time)) ||
+ 	    copy_from_user(&txc.tick, &txc_p->tick, sizeof(struct timex32) - 
+-			   offsetof(struct timex32, time)))
+-	  return -EFAULT;
++			   offsetof(struct timex32, time)) ||
++	    get_tv32(&txc.time, &txc_p->time))
++		return -EFAULT;
+ 	
+-	if ((ret = do_adjtimex(&txc)))
+-	  return ret;
++	if ((ret = do_adjtimex(&txc)) < 0)
++		return ret;
+ 	
+ 	/* copy back to timex32 */
+ 	if (copy_to_user(txc_p, &txc, offsetof(struct timex32, time)) ||
+ 	    (copy_to_user(&txc_p->tick, &txc.tick, sizeof(struct timex32) - 
+ 			  offsetof(struct timex32, tick))) ||
+ 	    (put_tv32(&txc_p->time, &txc.time)))
+-	  return -EFAULT;
++		return -EFAULT;
+ 
+-	return 0;
++	return ret;
+ }
+diff -rup linux-2.2.7/arch/alpha/kernel/smp.c linux-2.2.7-axp/arch/alpha/kernel/smp.c
+--- linux-2.2.7/arch/alpha/kernel/smp.c	Sun Mar 28 22:36:32 1999
++++ linux-2.2.7-axp/arch/alpha/kernel/smp.c	Fri May  7 17:38:19 1999
+@@ -37,7 +37,18 @@
+ #define DBGS(args)
+ #endif
+ 
+-struct ipi_msg_flush_tb_struct ipi_msg_flush_tb __cacheline_aligned;
++struct ipi_msg_flush_tb_struct {
++	volatile unsigned int flush_tb_mask;
++	union {
++		struct mm_struct *	flush_mm;
++		struct vm_area_struct *	flush_vma;
++	} p;
++	unsigned long flush_addr;
++	unsigned long flush_end;
++};
++
++static struct ipi_msg_flush_tb_struct ipi_msg_flush_tb __cacheline_aligned;
++static spinlock_t flush_tb_lock = SPIN_LOCK_UNLOCKED;
+ 
+ struct cpuinfo_alpha cpu_data[NR_CPUS];
+ 
+@@ -786,7 +797,7 @@ flush_tlb_all(void)
+ 	unsigned long to_whom = cpu_present_map ^ (1 << smp_processor_id());
+ 	long timeout = 1000000;
+ 
+-	spin_lock_own(&kernel_flag, "flush_tlb_all");
++	spin_lock(&flush_tb_lock);
+ 
+ 	ipi_msg_flush_tb.flush_tb_mask = to_whom;
+ 	send_ipi_message(to_whom, IPI_TLB_ALL);
+@@ -803,6 +814,8 @@ flush_tlb_all(void)
+ 		       ipi_msg_flush_tb.flush_tb_mask);
+ 		ipi_msg_flush_tb.flush_tb_mask = 0;
+ 	}
++
++	spin_unlock(&flush_tb_lock);
+ }
+ 
+ void
+@@ -811,7 +824,7 @@ flush_tlb_mm(struct mm_struct *mm)
+ 	unsigned long to_whom = cpu_present_map ^ (1 << smp_processor_id());
+ 	long timeout = 1000000;
+ 
+-	spin_lock_own(&kernel_flag, "flush_tlb_mm");
++	spin_lock(&flush_tb_lock);
+ 
+ 	ipi_msg_flush_tb.flush_tb_mask = to_whom;
+ 	ipi_msg_flush_tb.p.flush_mm = mm;
+@@ -833,6 +846,8 @@ flush_tlb_mm(struct mm_struct *mm)
+ 		       ipi_msg_flush_tb.flush_tb_mask);
+ 		ipi_msg_flush_tb.flush_tb_mask = 0;
+ 	}
++
++	spin_unlock(&flush_tb_lock);
+ }
+ 
+ void
+@@ -843,7 +858,7 @@ flush_tlb_page(struct vm_area_struct *vm
+ 	struct mm_struct * mm = vma->vm_mm;
+ 	int timeout = 1000000;
+ 
+-	spin_lock_own(&kernel_flag, "flush_tlb_page");
++	spin_lock(&flush_tb_lock);
+ 
+ 	ipi_msg_flush_tb.flush_tb_mask = to_whom;
+ 	ipi_msg_flush_tb.p.flush_vma = vma;
+@@ -866,6 +881,8 @@ flush_tlb_page(struct vm_area_struct *vm
+ 		       ipi_msg_flush_tb.flush_tb_mask);
+ 		ipi_msg_flush_tb.flush_tb_mask = 0;
+ 	}
++
++	spin_unlock(&flush_tb_lock);
+ }
+ 
+ void
+diff -rup linux-2.2.7/arch/alpha/kernel/traps.c linux-2.2.7-axp/arch/alpha/kernel/traps.c
+--- linux-2.2.7/arch/alpha/kernel/traps.c	Mon Feb  1 10:41:47 1999
++++ linux-2.2.7-axp/arch/alpha/kernel/traps.c	Fri May  7 16:47:12 1999
+@@ -125,23 +125,26 @@ do_entArith(unsigned long summary, unsig
+ 	    unsigned long a2, unsigned long a3, unsigned long a4,
+ 	    unsigned long a5, struct pt_regs regs)
+ {
+-	if ((summary & 1)) {
+-		/*
+-		 * Software-completion summary bit is set, so try to
+-		 * emulate the instruction.
+-		 */
+-		if (alpha_fp_emul_imprecise(&regs, write_mask)) {
++	if (implver() == 2) {
++		/* 21264 doesn't seem to set the sw completion bit
++		   when faulting for underflow, but not to zero.  */
++		if (alpha_fp_emul(regs.pc - 4))
++			return;
++	}
++	else if (summary & 1) {
++		/* Software-completion summary bit is set, so try to
++		   emulate the instruction.  */
++		if (alpha_fp_emul_imprecise(&regs, write_mask))
+ 			return;		/* emulation was successful */
+-		}
+ 	}
+ 
+ 	lock_kernel();
+-#if 0
++#if 0
+ 	printk("%s: arithmetic trap at %016lx: %02lx %016lx\n",
+ 		current->comm, regs.pc, summary, write_mask);
+ #endif
+ 	die_if_kernel("Arithmetic fault", &regs, 0, 0);
+-	force_sig(SIGFPE, current);
++	send_sig(SIGFPE, current, 1);
+ 	unlock_kernel();
+ }
+ 
+@@ -157,7 +160,7 @@ do_entIF(unsigned long type, unsigned lo
+ 		if (ptrace_cancel_bpt(current)) {
+ 			regs.pc -= 4;	/* make pc point to former bpt */
+ 		}
+-		force_sig(SIGTRAP, current);
++		send_sig(SIGTRAP, current, 1);
+ 		break;
+ 
+ 	      case 2: /* gentrap */
+@@ -172,7 +175,7 @@ do_entIF(unsigned long type, unsigned lo
+ 		      case GEN_INTOVF: case GEN_INTDIV: case GEN_FLTOVF:
+ 		      case GEN_FLTDIV: case GEN_FLTUND: case GEN_FLTINV:
+ 		      case GEN_FLTINE:
+-			force_sig(SIGFPE, current);
++			send_sig(SIGFPE, current, 1);
+ 			break;
+ 
+ 		      case GEN_DECOVF:
+@@ -193,36 +196,23 @@ do_entIF(unsigned long type, unsigned lo
+ 		      case GEN_SUBRNG5:
+ 		      case GEN_SUBRNG6:
+ 		      case GEN_SUBRNG7:
+-			force_sig(SIGILL, current);
++			send_sig(SIGILL, current, 1);
+ 			break;
+ 		}
+ 		break;
+ 
+ 	      case 1: /* bugcheck */
+ 	      case 3: /* FEN fault */
+-		force_sig(SIGILL, current);
++		send_sig(SIGILL, current, 1);
+ 		break;
+ 
+ 	      case 4: /* opDEC */
+-#ifdef CONFIG_ALPHA_NEED_ROUNDING_EMULATION
+-		{
+-			unsigned int opcode;
+-
+-			/* get opcode of faulting instruction: */
+-			get_user(opcode, (__u32*)(regs.pc - 4));
+-			opcode >>= 26;
+-			if (opcode == 0x16) {
+-				/*
+-				 * It's a FLTI instruction, emulate it
+-				 * (we don't do no stinkin' VAX fp...)
+-				 */
+-				if (!alpha_fp_emul(regs.pc - 4))
+-					force_sig(SIGFPE, current);
+-				break;
+-			}
++		if (implver() == 0) {
++			if (!alpha_fp_emul(regs.pc - 4))
++				send_sig(SIGFPE, current, 1);
++			break;
+ 		}
+-#endif
+-		force_sig(SIGILL, current);
++		send_sig(SIGILL, current, 1);
+ 		break;
+ 
+ 	      default:
+@@ -877,14 +867,14 @@ do_entUnaUser(void * va, unsigned long o
+ give_sigsegv:
+ 	regs->pc -= 4;  /* make pc point to faulting insn */
+ 	lock_kernel();
+-	force_sig(SIGSEGV, current);
++	send_sig(SIGSEGV, current, 1);
+ 	unlock_kernel();
+ 	return;
+ 
+ give_sigbus:
+ 	regs->pc -= 4;
+ 	lock_kernel();
+-	force_sig(SIGBUS, current);
++	send_sig(SIGBUS, current, 1);
+ 	unlock_kernel();
+ 	return;
+ }
+diff -rup linux-2.2.7/arch/alpha/math-emu/fp-emul.c linux-2.2.7-axp/arch/alpha/math-emu/fp-emul.c
+--- linux-2.2.7/arch/alpha/math-emu/fp-emul.c	Sun Aug  9 12:09:06 1998
++++ linux-2.2.7-axp/arch/alpha/math-emu/fp-emul.c	Fri May  7 16:24:32 1999
+@@ -13,6 +13,7 @@
+ #define OPC_INTL	0x11
+ #define OPC_INTS	0x12
+ #define OPC_INTM	0x13
++#define OPC_FLTC	0x14
+ #define OPC_FLTV	0x15
+ #define OPC_FLTI	0x16
+ #define OPC_FLTL	0x17
+@@ -21,33 +22,37 @@
+ 
+ #define	OPC_JSR		0x1a
+ 
++#define OP_FUN(OP,FUN)	((OP << 26) | (FUN << 5))
++
+ /*
+- * "Base" function codes for the FLTI-class instructions.  These
+- * instructions all have opcode 0x16.  Note that in most cases these
+- * actually correspond to the "chopped" form of the instruction.  Not
+- * to worry---we extract the qualifier bits separately and deal with
+- * them separately.  Notice that base function code 0x2c is used for
+- * both CVTTS and CVTST.  The other bits in the function code are used
+- * to distinguish the two.
++ * "Base" function codes for the FLTI-class instructions.
++ * Note that in most cases these actually correspond to the "chopped"
++ * form of the instruction.  Not to worry---we extract the qualifier
++ * bits separately and deal with them separately.  Notice that base
++ * function code 0x2c is used for both CVTTS and CVTST.  The other bits
++ * in the function code are used to distinguish the two.
+  */
+-#define FLTI_FUNC_ADDS			0x000
+-#define FLTI_FUNC_ADDT			0x020
+-#define FLTI_FUNC_CMPTEQ		0x025
+-#define FLTI_FUNC_CMPTLT		0x026
+-#define FLTI_FUNC_CMPTLE		0x027
+-#define FLTI_FUNC_CMPTUN		0x024
+-#define FLTI_FUNC_CVTTS_or_CVTST	0x02c
+-#define FLTI_FUNC_CVTTQ			0x02f
+-#define FLTI_FUNC_CVTQS			0x03c
+-#define FLTI_FUNC_CVTQT			0x03e
+-#define FLTI_FUNC_DIVS			0x003
+-#define FLTI_FUNC_DIVT			0x023
+-#define FLTI_FUNC_MULS			0x002
+-#define FLTI_FUNC_MULT			0x022
+-#define FLTI_FUNC_SUBS			0x001
+-#define FLTI_FUNC_SUBT			0x021
++#define FLTI_FUNC_ADDS			OP_FUN(OPC_FLTI, 0x000)
++#define FLTI_FUNC_ADDT			OP_FUN(OPC_FLTI, 0x020)
++#define FLTI_FUNC_CMPTEQ		OP_FUN(OPC_FLTI, 0x025)
++#define FLTI_FUNC_CMPTLT		OP_FUN(OPC_FLTI, 0x026)
++#define FLTI_FUNC_CMPTLE		OP_FUN(OPC_FLTI, 0x027)
++#define FLTI_FUNC_CMPTUN		OP_FUN(OPC_FLTI, 0x024)
++#define FLTI_FUNC_CVTTS_or_CVTST	OP_FUN(OPC_FLTI, 0x02c)
++#define FLTI_FUNC_CVTTQ			OP_FUN(OPC_FLTI, 0x02f)
++#define FLTI_FUNC_CVTQS			OP_FUN(OPC_FLTI, 0x03c)
++#define FLTI_FUNC_CVTQT			OP_FUN(OPC_FLTI, 0x03e)
++#define FLTI_FUNC_DIVS			OP_FUN(OPC_FLTI, 0x003)
++#define FLTI_FUNC_DIVT			OP_FUN(OPC_FLTI, 0x023)
++#define FLTI_FUNC_MULS			OP_FUN(OPC_FLTI, 0x002)
++#define FLTI_FUNC_MULT			OP_FUN(OPC_FLTI, 0x022)
++#define FLTI_FUNC_SUBS			OP_FUN(OPC_FLTI, 0x001)
++#define FLTI_FUNC_SUBT			OP_FUN(OPC_FLTI, 0x021)
++
++#define FLTC_FUNC_SQRTS			OP_FUN(OPC_FLTC, 0x00B)
++#define FLTC_FUNC_SQRTT			OP_FUN(OPC_FLTC, 0x02B)
+ 
+-#define FLTI_FUNC_CVTQL			0x030	/* opcode 0x17 */
++#define FLTL_FUNC_CVTQL			OP_FUN(OPC_FLTL, 0x030)
+ 
+ #define MISC_TRAPB	0x0000
+ #define MISC_EXCB	0x0400
+@@ -101,7 +106,7 @@ void cleanup_module(void)
+ long
+ alpha_fp_emul (unsigned long pc)
+ {
+-	unsigned long opcode, fa, fb, fc, func, mode;
++	unsigned long op_fun, fa, fb, fc, func, mode;
+ 	unsigned long fpcw = current->tss.flags;
+ 	unsigned long va, vb, vc, res, fpcr;
+ 	__u32 insn;
+@@ -110,10 +115,11 @@ alpha_fp_emul (unsigned long pc)
+ 
+ 	get_user(insn, (__u32*)pc);
+ 	fc     = (insn >>  0) &  0x1f;	/* destination register */
+-	func   = (insn >>  5) & 0x7ff;
+ 	fb     = (insn >> 16) &  0x1f;
+ 	fa     = (insn >> 21) &  0x1f;
+-	opcode = insn >> 26;
++	func   = (insn >>  5) & 0x7ff;
++	mode   = (insn >>  5) & 0xc0;
++	op_fun = insn & OP_FUN(0x3f, 0x3f);
+ 	
+ 	va = alpha_read_fp_reg(fa);
+ 	vb = alpha_read_fp_reg(fb);
+@@ -123,7 +129,6 @@ alpha_fp_emul (unsigned long pc)
+ 	 * Try the operation in software.  First, obtain the rounding
+ 	 * mode...
+ 	 */
+-	mode = func & 0xc0;
+ 	if (mode == 0xc0) {
+ 	    /* dynamic---get rounding mode from fpcr: */
+ 	    mode = ((fpcr & FPCR_DYN_MASK) >> FPCR_DYN_SHIFT) << ROUND_SHIFT;
+@@ -135,8 +140,7 @@ alpha_fp_emul (unsigned long pc)
+ 		something_is_wrong();
+ 	}
+ 
+-	/* least 6 bits contain operation code: */
+-	switch (func & 0x3f) {
++	switch (op_fun) {
+ 	      case FLTI_FUNC_CMPTEQ:
+ 		res = ieee_CMPTEQ(va, vb, &vc);
+ 		break;
+@@ -153,7 +157,7 @@ alpha_fp_emul (unsigned long pc)
+ 		res = ieee_CMPTUN(va, vb, &vc);
+ 		break;
+ 
+-	      case FLTI_FUNC_CVTQL:
++	      case FLTL_FUNC_CVTQL:
+ 		/*
+ 		 * Notice: We can get here only due to an integer
+ 		 * overflow.  Such overflows are reported as invalid
+@@ -222,6 +226,14 @@ alpha_fp_emul (unsigned long pc)
+ 		res = ieee_CVTTQ(mode, vb, &vc);
+ 		break;
+ 
++	      case FLTC_FUNC_SQRTS:
++		res = ieee_SQRTS(mode, vb, &vc);
++		break;
++
++	      case FLTC_FUNC_SQRTT:
++		res = ieee_SQRTT(mode, vb, &vc);
++		break;
++
+ 	      default:
+ 		printk("alpha_fp_emul: unexpected function code %#lx at %#lx\n",
+ 		       func & 0x3f, pc);
+@@ -247,7 +259,7 @@ alpha_fp_emul (unsigned long pc)
+ 
+ 		/* Update hardware control register */
+ 		fpcr &= (~FPCR_MASK | FPCR_DYN_MASK);
+-		fpcr |= ieee_swcr_to_fpcr(fpcw | (~fpcw&IEEE_STATUS_MASK)>>16);
++		fpcr |= ieee_swcr_to_fpcr(fpcw);
+ 		wrfpcr(fpcr);
+ 
+ 		/* Do we generate a signal?  */
+@@ -319,6 +331,7 @@ alpha_fp_emul_imprecise (struct pt_regs 
+ 			write_mask &= ~(1UL << rc);
+ 			break;
+ 
++		      case OPC_FLTC:
+ 		      case OPC_FLTV:
+ 		      case OPC_FLTI:
+ 		      case OPC_FLTL:
+@@ -326,13 +339,11 @@ alpha_fp_emul_imprecise (struct pt_regs 
+ 			break;
+ 		}
+ 		if (!write_mask) {
+-			if ((opcode == OPC_FLTI || opcode == OPC_FLTL)
+-			    && alpha_fp_emul(trigger_pc))
+-			{
+-			    /* re-execute insns in trap-shadow: */
+-			    regs->pc = trigger_pc + 4;
+-			    MOD_DEC_USE_COUNT;
+-			    return 1;
++			if (alpha_fp_emul(trigger_pc)) {
++				/* re-execute insns in trap-shadow: */
++				regs->pc = trigger_pc + 4;
++				MOD_DEC_USE_COUNT;
++				return 1;
+ 			}
+ 			break;
+ 		}
+diff -rup linux-2.2.7/arch/alpha/math-emu/ieee-math.c linux-2.2.7-axp/arch/alpha/math-emu/ieee-math.c
+--- linux-2.2.7/arch/alpha/math-emu/ieee-math.c	Sun Sep  6 10:34:33 1998
++++ linux-2.2.7-axp/arch/alpha/math-emu/ieee-math.c	Fri May  7 13:00:14 1999
+@@ -22,6 +22,7 @@
+  * functions are used on exceptional numbers only (well, assuming you
+  * don't turn on the "trap on inexact"...).
+  */
++#include <linux/sched.h>
+ #include "ieee-math.h"
+ 
+ #define STICKY_S	0x20000000	/* both in longword 0 of fraction */
+@@ -1339,4 +1340,42 @@ ieee_DIVT (int f, unsigned long a, unsig
+ 	normalize(&op_c);
+ 	op_c.e -= 9;		/* remove excess exp from original shift */
+ 	return round_t_ieee(f, &op_c, c);
++}
++
++/*
++ * Sqrt a = b, where a and b are ieee s-floating numbers.  "f"
++ * contains the rounding mode etc.
++ */
++unsigned long
++ieee_SQRTS (int f, unsigned long a, unsigned long *b)
++{
++	fpclass_t a_type;
++	EXTENDED op_a, op_b;
++
++	*b = IEEE_QNaN;
++	a_type = extend_ieee(a, &op_a, SINGLE);
++	if (op_a.s == 0) {
++		/* FIXME -- handle positive denormals.  */
++		send_sig(SIGFPE, current, 1);
++	}
++	return FPCR_INV;
++}
++
++/*
++ * Sqrt a = b, where a and b are ieee t-floating numbers.  "f"
++ * contains the rounding mode etc.
++ */
++unsigned long
++ieee_SQRTT (int f, unsigned long a, unsigned long *b)
++{
++	fpclass_t a_type;
++	EXTENDED op_a, op_b;
++
++	*b = IEEE_QNaN;
++	a_type = extend_ieee(a, &op_a, DOUBLE);
++	if (op_a.s == 0) {
++		/* FIXME -- handle positive denormals.  */
++		send_sig(SIGFPE, current, 1);
++	}
++	return FPCR_INV;
+ }
+diff -rup linux-2.2.7/arch/alpha/math-emu/ieee-math.h linux-2.2.7-axp/arch/alpha/math-emu/ieee-math.h
+--- linux-2.2.7/arch/alpha/math-emu/ieee-math.h	Thu Dec 21 22:22:05 1995
++++ linux-2.2.7-axp/arch/alpha/math-emu/ieee-math.h	Fri May  7 13:51:09 1999
+@@ -48,5 +48,7 @@ extern unsigned long ieee_DIVS (int rm, 
+ 				unsigned long *c);
+ extern unsigned long ieee_DIVT (int rm, unsigned long a, unsigned long b,
+ 				unsigned long *c);
++extern unsigned long ieee_SQRTS (int rm, unsigned long a, unsigned long *b);
++extern unsigned long ieee_SQRTT (int rm, unsigned long a, unsigned long *b);
+ 
+ #endif /* __ieee_math_h__ */
+diff -rup linux-2.2.7/include/asm-alpha/fpu.h linux-2.2.7-axp/include/asm-alpha/fpu.h
+--- linux-2.2.7/include/asm-alpha/fpu.h	Sun Mar 15 09:57:33 1998
++++ linux-2.2.7-axp/include/asm-alpha/fpu.h	Fri May  7 13:41:09 1999
+@@ -81,6 +81,18 @@ ieee_swcr_to_fpcr(unsigned long sw)
+ 	return fp;
+ }
+ 
++static inline unsigned long
++ieee_fpcr_to_swcr(unsigned long fp)
++{
++	unsigned long sw;
++	sw = (fp >> 35) & IEEE_STATUS_MASK;
++	sw |= (~fp >> 48) & (IEEE_TRAP_ENABLE_INV
++			     | IEEE_TRAP_ENABLE_DZE
++			     | IEEE_TRAP_ENABLE_OVF);
++	sw |= (~fp >> 57) & (IEEE_TRAP_ENABLE_UNF | IEEE_TRAP_ENABLE_INE);
++	return sw;
++}
++
+ #ifdef __KERNEL__
+ 
+ /* The following two functions don't need trapb/excb instructions
+diff -rup linux-2.2.7/include/asm-alpha/pgtable.h linux-2.2.7-axp/include/asm-alpha/pgtable.h
+--- linux-2.2.7/include/asm-alpha/pgtable.h	Wed Mar 10 18:11:51 1999
++++ linux-2.2.7-axp/include/asm-alpha/pgtable.h	Fri May  7 17:36:20 1999
+@@ -167,19 +167,6 @@ static inline void flush_tlb_range(struc
+ 
+ #else /* __SMP__ */
+ 
+-/* ipi_msg_flush_tb is owned by the holder of the global kernel lock. */
+-struct ipi_msg_flush_tb_struct {
+-	volatile unsigned int flush_tb_mask;
+-	union {
+-		struct mm_struct *	flush_mm;
+-		struct vm_area_struct *	flush_vma;
+-	} p;
+-	unsigned long flush_addr;
+-	unsigned long flush_end;
+-};
+-
+-extern struct ipi_msg_flush_tb_struct ipi_msg_flush_tb;
+-
+ extern void flush_tlb_all(void);
+ extern void flush_tlb_mm(struct mm_struct *);
+ extern void flush_tlb_page(struct vm_area_struct *, unsigned long);
+diff -rup linux-2.2.7/include/asm-alpha/semaphore.h linux-2.2.7-axp/include/asm-alpha/semaphore.h
+--- linux-2.2.7/include/asm-alpha/semaphore.h	Sat Apr 24 17:54:08 1999
++++ linux-2.2.7-axp/include/asm-alpha/semaphore.h	Fri May  7 13:46:07 1999
+@@ -190,7 +190,7 @@ extern inline void up(struct semaphore *
+ 		"	stl_c	$28,%1\n"
+ 		"	beq	$28,2f\n"
+ 		"	mb\n"
+-		"	ble	$27,3f\n"
++		"	ble	$24,3f\n"
+ 		"4:\n"
+ 		".section .text2,\"ax\"\n"
+ 		"2:	br	1b\n"
+diff -rup linux-2.2.7/include/asm-alpha/system.h linux-2.2.7-axp/include/asm-alpha/system.h
+--- linux-2.2.7/include/asm-alpha/system.h	Sat Jan 16 17:02:51 1999
++++ linux-2.2.7-axp/include/asm-alpha/system.h	Fri May  7 13:45:12 1999
+@@ -119,6 +119,28 @@ __asm__ __volatile__ ("call_pal %0 #imb"
+ #define draina() \
+ __asm__ __volatile__ ("call_pal %0 #draina" : : "i" (PAL_draina) : "memory")
+ 
++#ifdef CONFIG_ALPHA_GENERIC
++#define implver()				\
++({ unsigned long __implver;			\
++   __asm__ ("implver %0" : "=r"(__implver));	\
++   __implver; })
++#else
++/* Try to eliminate some dead code.  */
++#ifdef CONFIG_ALPHA_EV4
++#define implver() 0
++#endif
++#ifdef CONFIG_ALPHA_EV5
++#define implver() 1
++#endif
++#ifdef CONFIG_ALPHA_EV6
++#define implver() 2
++#endif
++#endif
++
++#define amask(mask)						\
++({ unsigned long __amask, __input = (mask);			\
++   __asm__ ("amask %1,%0" : "=r"(__amask) : "rI"(__input));	\
++   __amask; })
+ 
+ static inline unsigned long 
+ wrperfmon(unsigned long perf_fun, unsigned long arg)

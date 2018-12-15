@@ -1,0 +1,287 @@
+Date: Tue, 29 Oct 2002 13:15:50 +0100 (CET)
+From: Steffen Persvold <>
+Subject: kernel BUG in page_alloc.c (rmqueue function)
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2002/10/29/61
+
+Hi all,
+Lately I've been struggeling with kernels Oopsing in page_alloc.c, 
+rmqueue() function. The line which triggers the Oops is actually in 
+expand() which is inlined from rmqueue() (and others). In my kernel source 
+(2.4.20-pre11), expand looks like this :
+#define MARK_USED(index, order, area) \
+        __change_bit((index) >> (1+(order)), (area)->map)
+static inline struct page * expand (zone_t *zone, struct page *page,
+         unsigned long index, int low, int high, free_area_t * area)
+{
+        unsigned long size = 1 << high;
+        while (high > low) {
+                if (BAD_RANGE(zone,page))
+                        BUG();
+                area--;
+                high--;
+                size >>= 1;
+                list_add(&(page)->list, &(area)->free_list);
+                MARK_USED(index, high, area);
+                index += size;
+                page += size;
+        }
+        if (BAD_RANGE(zone,page))
+                BUG();
+        return page;
+}
+The line that triggers the BUG is the last BAD_RANGE check. The module 
+that calls __alloc_pages() is doing it in the following way :
+addr = __get_free_page(GFP_KERNEL);
+and frees the page with free_page(addr);
+The machine configuration is RedHat 7.3 (gcc-2.96-110, 
+binutils-2.11.93.0.2-11), 2 Xeon processors @ 2.2 GHz and 2GB RAM.
+The module in question is not a part of the kernel tree, but the source is 
+available if someone is interested. However, I'm really interrested in 
+situations that could cause BAD_RANGE() to fail (since it is commented 
+with a "Temporary debugging check") because of the above usage (which 
+seems very straight forward to me).
+The really strange thing is that the problem seem to disappear if I apply 
+the per_cpu_pages patch by Ingo Molnar as found in the RedHat 
+2.4.18-17.7.x kernel with a few modifications to make it fit on 
+2.4.20-pre11 (attached).
+Any help greatly appreciated.
+Thanks,
+ -- 
+  Steffen Persvold   |       Scali AS      
+ mailto:sp@scali.com |  
+http://www.scali.com
+Tel: (+47) 2262 8950 |   Olaf Helsets vei 6
+Fax: (+47) 2262 8951 |   N0621 Oslo, NORWAY
+--- linux-2.4.20-pre11/include/linux/mmzone.h.old	Mon Oct 28 17:32:34 2002
++++ linux-2.4.20-pre11/include/linux/mmzone.h	Mon Oct 28 06:40:59 2002
+@@ -26,6 +26,14 @@
+ 
+ struct pglist_data;
+ 
++#define MAX_PER_CPU_PAGES 512
++
++typedef struct per_cpu_pages_s {
++	int nr_pages;
++	int max_nr_pages;
++	struct list_head head;
++} __attribute__((aligned(L1_CACHE_BYTES))) per_cpu_t;
++
+ /*
+  * On machines where it is needed (eg PCs) we divide physical memory
+  * into multiple physical zones. On a PC we have 3 zones:
+@@ -38,6 +46,7 @@
+ 	/*
+ 	 * Commonly accessed fields:
+ 	 */
++	per_cpu_t		cpu_pages [NR_CPUS];
+ 	spinlock_t		lock;
+ 	unsigned long		free_pages;
+ 	unsigned long		pages_min, pages_low, pages_high;
+--- linux-2.4.20-pre11/mm/page_alloc.c.old	Mon Oct 28 06:18:22 2002
++++ linux-2.4.20-pre11/mm/page_alloc.c	Mon Oct 28 06:35:24 2002
+@@ -10,6 +10,7 @@
+  *  Reshaped it to be a zoned allocator, Ingo Molnar, Red Hat, 1999
+  *  Discontiguous memory support, Kanoj Sarcar, SGI, Nov 1999
+  *  Zone balancing, Kanoj Sarcar, SGI, Jan 2000
++ *  Per-CPU page pool, Ingo Molnar, Red Hat, 2001, 2002
+  */
+ 
+ #include <linux/config.h>
+@@ -21,6 +22,7 @@
+ #include <linux/bootmem.h>
+ #include <linux/slab.h>
+ #include <linux/module.h>
++#include <linux/smp.h>
+ 
+ int nr_swap_pages;
+ int nr_active_pages;
+@@ -54,6 +56,73 @@
+ )
+ 
+ /*
++ * Inline functions to control some balancing in the VM.
++ *
++ * Note that we do both global and per-zone balancing, with
++ * most of the balancing done globally.
++ */
++#define PLENTY_FACTOR   2
++#define ALL_ZONES       NULL
++#define ANY_ZONE        (struct zone_struct *)(~0UL)
++#define INACTIVE_FACTOR 5
++
++#define VM_MIN  0
++#define VM_LOW  1
++#define VM_HIGH 2
++#define VM_PLENTY 3
++static inline int zone_free_limit(struct zone_struct * zone, int limit)
++{
++	int free, target, delta;
++
++	/* This is really nasty, but GCC should completely optimise it away. */
++	if (limit == VM_MIN)
++		target = zone->pages_min;
++	else if (limit == VM_LOW)
++		target = zone->pages_low;
++	else if (limit == VM_HIGH)
++		target = zone->pages_high;
++	else
++		target = zone->pages_high * PLENTY_FACTOR;
++
++	free = zone->free_pages;
++	delta = target - free;
++
++	return delta;
++}
++
++static inline int free_limit(struct zone_struct * zone, int limit)
++{
++	int shortage = 0, local;
++
++	if (zone == ALL_ZONES) {
++		for_each_zone(zone)
++			shortage += zone_free_limit(zone, limit);
++	} else if (zone == ANY_ZONE) {
++		for_each_zone(zone) {
++			local = zone_free_limit(zone, limit);
++			shortage += max(local, 0);
++		}
++	} else {
++		shortage = zone_free_limit(zone, limit);
++	}
++
++	return shortage;
++}
++
++/*
++ * free_high - test if amount of free pages is less than ideal
++ * @zone: zone to test, ALL_ZONES to test memory globally
++ *
++ * Returns a positive value if the number of free and clean
++ * pages is below kswapd's target, zero or negative if we
++ * have more than enough free and clean pages.
++ */
++static inline int free_high(struct zone_struct * zone)
++{
++	return free_limit(zone, VM_HIGH);
++}
++
++/*
+  * Freeing function for a buddy system allocator.
+  * Contrary to prior comments, this is *NOT* hairy, and there
+  * is no reason for anyone not to understand it.
+@@ -84,6 +153,7 @@
+ 	unsigned long index, page_idx, mask, flags;
+ 	free_area_t *area;
+ 	struct page *base;
++	per_cpu_t *per_cpu;
+ 	zone_t *zone;
+ 
+ 	/*
+@@ -96,6 +166,13 @@
+ 		lru_cache_del(page);
+ 	}
+ 
++	/*
++	 * This late check is safe because reserved pages do not
++	 * have a valid page->count. This trick avoids overhead
++	 * in __free_pages().
++	 */
++	if (PageReserved(page))
++		return;
+ 	if (page->buffers)
+ 		BUG();
+ 	if (page->mapping)
+@@ -123,8 +200,19 @@
+ 
+ 	area = zone->free_area + order;
+ 
+-	spin_lock_irqsave(&zone->lock, flags);
++	per_cpu = zone->cpu_pages + smp_processor_id();
++
++	__save_flags(flags);
++	__cli();
++	if (!order && (per_cpu->nr_pages < per_cpu->max_nr_pages) && (free_high(zone)<=0)) {
++		list_add(&page->list, &per_cpu->head);
++		per_cpu->nr_pages++;
++		__restore_flags(flags);
++		return;
++	}
+ 
++	spin_lock(&zone->lock);
++	
+ 	zone->free_pages -= mask;
+ 
+ 	while (mask + (1 << (MAX_ORDER-1))) {
+@@ -198,13 +286,31 @@
+ static FASTCALL(struct page * rmqueue(zone_t *zone, unsigned int order));
+ static struct page * rmqueue(zone_t *zone, unsigned int order)
+ {
++	per_cpu_t *per_cpu = zone->cpu_pages + smp_processor_id();
+ 	free_area_t * area = zone->free_area + order;
+ 	unsigned int curr_order = order;
+ 	struct list_head *head, *curr;
+ 	unsigned long flags;
+ 	struct page *page;
++	int threshold = 0;
++
++	if (!(current->flags & PF_MEMALLOC)) threshold = per_cpu->max_nr_pages/8;
++	__save_flags(flags);
++	__cli();
++
++	if (!order && (per_cpu->nr_pages>threshold)) {
++		if (list_empty(&per_cpu->head))
++			BUG();
++		page = list_entry(per_cpu->head.next, struct page, list);
++		list_del(&page->list);
++		per_cpu->nr_pages--;
++		__restore_flags(flags);
+ 
+-	spin_lock_irqsave(&zone->lock, flags);
++		set_page_count(page, 1);
++		return page;
++	}
++
++	spin_lock(&zone->lock);
+ 	do {
+ 		head = &area->free_list;
+ 		curr = head->next;
+@@ -450,7 +556,7 @@
+ 
+ void __free_pages(struct page *page, unsigned int order)
+ {
+-	if (!PageReserved(page) && put_page_testzero(page))
++	if (put_page_testzero(page))
+ 		__free_pages_ok(page, order);
+ }
+ 
+@@ -726,6 +832,7 @@
+ 
+ 	offset = lmem_map - mem_map;	
+ 	for (j = 0; j < MAX_NR_ZONES; j++) {
++		int k;
+ 		zone_t *zone = pgdat->node_zones + j;
+ 		unsigned long mask;
+ 		unsigned long size, realsize;
+@@ -738,6 +845,18 @@
+ 		printk("zone(%lu): %lu pages.\n", j, size);
+ 		zone->size = size;
+ 		zone->name = zone_names[j];
++
++		for (k = 0; k < NR_CPUS; k++) {
++			per_cpu_t *per_cpu = zone->cpu_pages + k;
++
++			INIT_LIST_HEAD(&per_cpu->head);
++			per_cpu->max_nr_pages = realsize / smp_num_cpus / 128;
++			if (per_cpu->max_nr_pages > MAX_PER_CPU_PAGES)
++				per_cpu->max_nr_pages = MAX_PER_CPU_PAGES;
++			else
++				if (!per_cpu->max_nr_pages)
++					per_cpu->max_nr_pages = 1;
++		}
+ 		zone->lock = SPIN_LOCK_UNLOCKED;
+ 		zone->zone_pgdat = pgdat;
+ 		zone->free_pages = 0;

@@ -1,0 +1,83 @@
+Date: Tue, 12 Nov 2002 00:50:46 -0800
+From: Andrew Morton <>
+Subject: Re: 2.[45] fixes for design locking bug in  wait_on_page/wait_on_buffer/get_request_wait
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2002/11/12/37
+
+Andrea Arcangeli wrote:
+> 
+> the race looks like this:
+> 
+>         CPU0                    CPU1
+>         -----------------       ------------------------
+>         reiserfs_writepage
+>         lock_buffer()
+>                                 fsync_buffers_list() under lock_super()
+>                                 wait_on_buffer()
+>                                 run_task_queue(&tq_disk) -> noop
+>                                 schedule() <- hang with lock_super acquired
+>         submit_bh()
+>         /* don't unplug here */
+> 
+Or, more simply:
+	lock_buffer()
+				while (buffer_locked()) {
+					blk_run_queues();	/* Nothing happens */
+					if (buffer_locked(bh))
+						schedule();
+	submit_bh();	/* No unplug */
+The fix seems reasonable to me.  It would perhaps be better to just do:
++       if (waitqueue_active(wqh))
++               blk_run_queues();
+in submit_bh().  To save the context switch.
+Moving the blk_run_queues() inside the TASK_UNINTERRUPTIBLE region
+is something which always worried me, because if something down
+there sets TASK_RUNNING, we end up in a busy wait.  But that's OK
+for 2.5 and may be OK for 2.4's run_task_queue() - I haven't checked...
+The multipage stuff in 2.5 does its own blk_run_queues() and looks to be
+OK, which I assume is why you didn't touch that.
+The little single-page reads like do_generic_mapping_read() look to be
+OK because the process whcih waits is the one which submitted the IO.
+wrt the get_request_wait changes: I never bothered about the barrier
+because we know that there are tons of requests outstanding, and if
+we don't do a wakeup the next guy will.  Plus *this* request has to
+be put back sometime too, which will deliver a wakeup.  But whatever;
+it's not exactly a fastpath.
+However the function is still not watertight:
+static struct request *get_request_wait(request_queue_t *q, int rw)
+{
+	DEFINE_WAIT(wait);
+	struct request_list *rl = &q->rq[rw];
+	struct request *rq;
+	spin_lock_prefetch(q->queue_lock);
+	generic_unplug_device(q);
+	do {
+		prepare_to_wait_exclusive(&rl->wait, &wait,
+					TASK_UNINTERRUPTIBLE);
+		if (!rl->count)
+			io_schedule();
+		finish_wait(&rl->wait, &wait);
+		spin_lock_irq(q->queue_lock);
+		rq = get_request(q, rw);
+		spin_unlock_irq(q->queue_lock);
+	} while (rq == NULL);
+	return rq;
+}
+If someone has taken *all* the requests and hasn't submitted any of them
+yet, there is nothing to unplug.   We go to sleep, all the requests are
+submitted (behind a plug) and it's game over.  Could happen if the device
+has a teeny queue...
+I dunno.  I bet there are still more holes, and I for one am heartily sick
+of unplug bugs.  Why not make the damn queue unplug itself after ten
+milliseconds or 16 requests?  I bet that would actually increase throughput,
+especially in the presence of kernel preemption and scheduling points.
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+More majordomo info at  
+http://vger.kernel.org/majordomo-info.html
+Please read the FAQ at  
+http://www.tux.org/lkml/

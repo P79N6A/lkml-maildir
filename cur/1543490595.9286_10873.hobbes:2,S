@@ -1,0 +1,204 @@
+Date: Mon, 22 Mar 1999 01:27:11 -0800
+From: Bruce Elliott <>
+Subject: Alpha Timekeeping Patches
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/3/22/40
+
+Two conficting patches follow.  The first "reverts" nearly all of my patch
+of late November.  The second stabilizes timekeeping for Uniprocessors only.
+I am certain that both the present (2.2.3) code, and that with the second
+patch will not behave well at all on SMP systems.  Since I do not have
+access to an SMP system, and the time to stable 2.2.x should be getting
+short, I suggest applying the first patch, and deferring this issue to 2.3.
+Some background may be useful.  While it may not be immediately obvious, my
+patch caused timing to be based on the cycle counter, rather than one of the
+"slow" clocks.  This may be controversial, although my measurements suggest
+that all three clocks are about equally stable.  Apparently at least some
+SMP Alphas have non-synchronized oscillators, i.e., the various cycle
+counters can drift relative to one another.  In this situation, using the
+cycle counter may cause errors of several seconds between processors.  Even
+if they are synchronized, there can be large fixed offsets, depending on
+when the various counters were reset during hardware initialization.
+Patch 1: Undo my changes from patch-2.1.131:
+Note that this leaves a one-line shift-count bugfix in do_gettimeofday().
+This should be correct against 2.2.3.  I believe that the patch in pre-4
+does not overlap with this.  This isn't correct at all for -ac4.
+======================================================================
+--- linux/arch/alpha/kernel/time.c.orig	Tue Jan 19 10:19:38 1999
++++ linux/arch/alpha/kernel/time.c	Sat Mar 20 22:46:12 1999
+@@ -57,8 +57,6 @@
+ 	unsigned long scaled_ticks_per_cycle;
+ 	/* last time the CMOS clock got updated */
+ 	time_t last_rtc_update;
+-	/* partial unused tick */
+-	unsigned long partial_tick;
+ } state;
+ 
+ unsigned long est_cycle_freq;
+@@ -78,6 +76,8 @@
+  */
+ void timer_interrupt(int irq, void *dev, struct pt_regs * regs)
+ {
++	const unsigned long half = 1UL << (FIX_SHIFT - 1);
++	const unsigned long mask = (1UL << (FIX_SHIFT + 1)) - 1;
+ 	unsigned long delta;
+ 	__u32 now;
+ 	long nticks;
+@@ -93,21 +93,22 @@
+ #endif
+ 
+ 	/*
+-	 * Calculate how many ticks have passed since the last update,
+-	 * including any previous partial leftover.  Save any resulting
+-	 * fraction for the next pass.
++	 * Estimate how many ticks have passed since the last update.
++	 * Round the result, .5 to even.  When we loose ticks due to
++	 * say using IDE, the clock has been seen to run up to 15% slow
++	 * if we truncate.
+ 	 */
+ 	now = rpcc();
+ 	delta = now - state.last_time;
+ 	state.last_time = now;
+-	delta = delta * state.scaled_ticks_per_cycle + state.partial_tick;
+-	state.partial_tick = delta & ((1UL << FIX_SHIFT) - 1); 
++	delta = delta * state.scaled_ticks_per_cycle;
++	if ((delta & mask) != half)
++		delta += half;
+ 	nticks = delta >> FIX_SHIFT;
+ 
+-	while (nticks > 0) {
++	do {
+ 		do_timer(regs);
+-		nticks--;
+-	}
++	} while (--nticks > 0);
+ 
+ 	/*
+ 	 * If we have an externally synchronized Linux clock, then update
+@@ -296,7 +297,6 @@
+ 	state.scaled_ticks_per_cycle
+ 		= ((unsigned long) HZ << FIX_SHIFT) / cycle_freq;
+ 	state.last_rtc_update = 0;
+-	state.partial_tick = 0L;
+ 
+ 	/* setup timer */ 
+ 	irq_handler = timer_interrupt;
+======================================================================
+Patch 2: Stabilize timekeeping for Uniprocessors only:
+======================================================================
+--- linux.rels/arch/alpha/kernel/time.c	Tue Jan 19 10:19:38 1999
++++ linux/arch/alpha/kernel/time.c	Wed Mar 10 01:05:18 1999
+@@ -62,6 +69,7 @@
+ } state;
+ 
+ unsigned long est_cycle_freq;
++extern volatile unsigned long lost_ticks;
+ 
+ 
+ static inline __u32 rpcc(void)
+@@ -95,14 +104,17 @@
+ 	/*
+ 	 * Calculate how many ticks have passed since the last update,
+ 	 * including any previous partial leftover.  Save any resulting
+-	 * fraction for the next pass.
++	 * fraction for the next pass.  Don't change anything unless
++	 * at least one tick has passed.
+ 	 */
+ 	now = rpcc();
+ 	delta = now - state.last_time;
+-	state.last_time = now;
+ 	delta = delta * state.scaled_ticks_per_cycle + state.partial_tick;
+-	state.partial_tick = delta & ((1UL << FIX_SHIFT) - 1); 
+ 	nticks = delta >> FIX_SHIFT;
++	if (nticks) {
++		state.last_time = now;
++		state.partial_tick = delta & ((1UL << FIX_SHIFT) - 1); 
++	}
+ 
+ 	while (nticks > 0) {
+ 		do_timer(regs);
+@@ -314,15 +371,20 @@
+ void
+ do_gettimeofday(struct timeval *tv)
+ {
+-	unsigned long flags, now, delta_cycles, delta_usec;
++	unsigned long flags, delta_cycles, delta_usec;
+ 	unsigned long sec, usec;
++	unsigned long partial_tick;
++	unsigned int now;
++	unsigned int lost;
+ 
++	read_lock_irqsave(&xtime_lock, flags);	/* really save_and_cli()... */
+ 	now = rpcc();
+-	save_and_cli(flags);
+ 	sec = xtime.tv_sec;
+ 	usec = xtime.tv_usec;
+ 	delta_cycles = now - state.last_time;
+-	restore_flags(flags);
++	partial_tick = state.partial_tick;
++	lost = lost_ticks;
++	read_unlock_irqrestore(&xtime_lock, flags);
+ 
+ 	/*
+ 	 * usec = cycles * ticks_per_cycle * 2**48 * 1e6 / (2**48 * ticks)
+@@ -337,8 +399,12 @@
+ 	 * with no clear gain.
+ 	 */
+ 
+-	delta_usec = delta_cycles * state.scaled_ticks_per_cycle * 15625;
++	delta_usec = delta_cycles * state.scaled_ticks_per_cycle + partial_tick;
++	delta_usec *= 15625;
+ 	delta_usec = ((delta_usec / ((1UL << (FIX_SHIFT-6-1)) * HZ)) + 1) / 2;
++	if (lost) {
++		delta_usec += (lost * (16000000 / HZ)) >> 4;
++	}
+ 
+ 	usec += delta_usec;
+ 	if (usec >= 1000000) {
+@@ -353,14 +419,33 @@
+ void
+ do_settimeofday(struct timeval *tv)
+ {
+-	cli();
++	unsigned long delta_usec;
++
++	/*
++	 * The offset that is added into time in do_gettimeofday above must
++	 * be subtracted here to keep a coherent view of the time.  Without
++	 * this, a full-tick error is possible.
++	 */
++	write_lock_irq(&xtime_lock);		/* really cli()... */
++	delta_usec = (rpcc() - state.last_time) * state.scaled_ticks_per_cycle +
++	    state.partial_tick;
++	delta_usec *= 15625;
++	delta_usec = ((delta_usec / ((1UL << (FIX_SHIFT-6-1)) * HZ)) + 1) / 2;
++	if (lost_ticks) {
++		delta_usec += (lost_ticks * (16000000 / HZ)) >> 4;
++	}
+ 	xtime = *tv;
++	xtime.tv_usec -= delta_usec;
++	if (xtime.tv_usec < 0) {
++		xtime.tv_usec += 1000000;
++		xtime.tv_sec--;
++	}
+ 	time_adjust = 0;		/* stop active adjtime() */
+ 	time_status |= STA_UNSYNC;
+ 	time_state = TIME_ERROR;	/* p. 24, (a) */
+ 	time_maxerror = NTP_PHASE_LIMIT;
+ 	time_esterror = NTP_PHASE_LIMIT;
+-	sti();
++	write_unlock_irq(&xtime_lock);
+ }
+ 
+ 
+======================================================================
+-- 
+B. D. Elliott   bde@nwlink.com   (Seattle)
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

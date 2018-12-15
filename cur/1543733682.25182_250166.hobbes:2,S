@@ -1,0 +1,266 @@
+Date: Wed, 8 Sep 2004 04:07:18 -0700
+From: William Lee Irwin III <>
+Subject: [test] pagetable OOM handling (again, but 64-bit this time)
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2004/9/8/95
+
+/*
+ * This appears to panic an Altix. An earlier version of this without
+ * the VSZ limiting appeared to panic a 4x logical x86-64 box, and yet
+ * another version panicked an E3K. panic string:
+ * "Kernel panic - not syncing: Out of memory and no killable processes..."
+ * The basic idea is to keep mm->total_vm low enough to evade VSZ rlimits
+ * and avoid the OOM killer long enough to get into a state where the
+ * SIGKILL will be ignored. mm->total_vm is kept low with the 1 pte per
+ * pmd trick. Getting into 'D' state is done by faulting in pte pages.
+ * It also relies on a race that clobbers PF_MEMDIE instead of getting
+ * stuck in a non-allocating codepath where it waits in 'D' state in
+ * order to ignore signals. "Normally" the task->flags setting works;
+ * however, the restoration of ->flags after the try_to_free_pages()
+ * call in __alloc_pages() causes tasks to honor OOM kills while they
+ * don't honor signals per se; the race means that if it's caught
+ * between the the load and the store of the restoration (x86 addressing
+ * modes make this either far less likely or impossible) PF_MEMDIE is
+ * lost. To do this more reliably on x86-64 finding another way to get
+ * into 'D' state outside the allocator for a sacrificial victim or
+ * something on that order is needed. Having little enough RAM to be
+ * able to use the VSZ of pid 1 as a limit would also work. Of course,
+ * I can't be 100% certain how it does what it does without more
+ * instrumentation, but these things are at least what motivated how I
+ * wrote it. Originally zeromap_page_range() on a large (ca. 512GB)
+ * virtual area and fork() of only a few processes was what triggered
+ * the panic() (and much faster than this does on ia64), but that
+ * didn't seem to do anything on x86-64. Altix' console log included.
+ * This test is useless on 32-bit architectures.
+ */
+#include <unistd.h>
+#include <fcntl.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <signal.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+extern char _end[];
+static int nr_signals;
+void ignore(int sig, siginfo_t *info, void *ucontext)
+{
+	(void)sig;
+	(void)info;
+	(void)ucontext;
+	++nr_signals;
+}
+int main(void)
+{
+	long page_size, pmd_size, physpages, pages, nr_children, max_fds,
+		init_vsz, total_vsz = 0;
+	char *start, *p, *end, *pos;
+	const int flags = MAP_ANONYMOUS|MAP_PRIVATE|MAP_FIXED,
+				prot = PROT_READ|PROT_WRITE;
+	int fd, *child_fds, child;
+	struct sigaction action = {
+		.sa_sigaction = ignore,
+		.sa_flags = SA_SIGINFO,
+	};
+	FILE *file;
+	file = fopen("/proc/1/status", "r");
+	if (!file) {
+		fprintf(stderr, "couldn't open /proc/1/status\n");
+		exit(EXIT_FAILURE);
+	} else {
+		char *buf = NULL;
+		size_t bufsz;
+		while (getline(&buf, &bufsz, file) > 0) {
+			if (sscanf(buf, "VmSize: %ld", &init_vsz) == 1) {
+				init_vsz <<= 17;
+				fclose(file);
+				goto self_vsz;
+			}
+		}
+		fprintf(stderr, "failed to parse /proc/1/status\n");
+		exit(EXIT_FAILURE);
+self_vsz:
+		if (!(file = fopen("/proc/self/status", "r"))) {
+			fprintf(stderr, "couldn't open /proc/self/status\n");
+			exit(EXIT_FAILURE);
+		}
+		while (getline(&buf, &bufsz, file) > 0) {
+			if (sscanf(buf, "VmSize: %ld", &total_vsz) == 1) {
+				total_vsz <<= 10;
+				fclose(file);
+				free(buf);
+				goto setup;
+			}
+		}
+		fprintf(stderr, "failed to parse /proc/self/status\n");
+		exit(EXIT_FAILURE);
+	}
+setup:
+	nr_signals = 0;
+	sigemptyset(&action.sa_mask);
+	sigaction(SIGSEGV, &action, NULL);
+	sigaction(SIGBUS, &action, NULL);
+	setvbuf(stdin, NULL, _IONBF, 0);
+	setvbuf(stdout, NULL, _IONBF, 0);
+	setvbuf(stderr, NULL, _IONBF, 0);
+	fd = open("/dev/zero", O_RDONLY|O_NOCTTY);
+	if ((page_size = sysconf(_SC_PAGE_SIZE)) < 0)
+		exit(EXIT_FAILURE);
+	pmd_size = (page_size*page_size)/sizeof(long);
+	start = (char *)(((long)_end + pmd_size - 1) & ~(pmd_size - 1));
+	if ((unsigned long)start < (unsigned long)_end + page_size)
+		start = start + pmd_size - page_size;
+	else
+		start -= page_size;
+	printf("pmd_size = 0x%lx\n", pmd_size);
+	printf("pgdir_size = 0x%lx\n", pmd_size*page_size/sizeof(long));
+	close(STDIN_FILENO);
+	close(STDOUT_FILENO);
+	/* close(STDERR_FILENO); */
+	if (fork())
+		exit(EXIT_SUCCESS);
+	setsid();
+	pos = start;
+	while ((p = mmap(pos, 2*page_size, prot, flags, 0, 0)) != MAP_FAILED &&
+			total_vsz < init_vsz) {
+		pos += 2*pmd_size;
+		total_vsz += 2*page_size;
+		if ((long)pos < 0) {
+			fprintf(stderr, "starting address wrapped\n");
+			break;
+		} else if (pos >= (char *)((long)&p & ~(pmd_size - 1))) {
+			fprintf(stderr, "starting address hit the stack\n");
+			break;
+		}
+	}
+	end = pos;
+	if ((physpages = sysconf(_SC_PHYS_PAGES)) < 0) {
+		FILE *file;
+		char *buf = NULL;
+		size_t bufsz;
+		fprintf(stderr, "sysconf(_SC_PHYS_PAGES) failed, ret = %ld\n",
+				physpages);
+		fprintf(stderr, "trying to parse /proc/meminfo\n");
+		file = fopen("/proc/meminfo", "r");
+		if (!file) {
+			fprintf(stderr, "failed to open /proc/meminfo\n");
+			exit(EXIT_FAILURE);
+		}
+		if (getline(&buf, &bufsz, file) <= 0) {
+			fprintf(stderr, "failed to read first line of /proc/meminfo\n");
+			exit(EXIT_FAILURE);
+		}
+		if (sscanf(buf, "MemTotal: %ld", &physpages) != 1) {
+			fprintf(stderr, "failed to parse first line of /proc/meminfo\n");
+			exit(EXIT_FAILURE);
+		}
+		if (physpages <= 0) {
+			fprintf(stderr, "parsed /proc/meminfo, but result was crap\n");
+			exit(EXIT_FAILURE);
+		}
+		fclose(file);
+		free(buf);
+	}
+	if ((max_fds = sysconf(_SC_OPEN_MAX)) < 0) {
+		fprintf(stderr, "sysconf(_SC_OPEN_MAX) failed\n");
+		exit(EXIT_FAILURE);
+	}
+	pages = (end - start)/pmd_size;
+	nr_children = (physpages + pages - 1)/pages;
+	fprintf(stderr, "blocking\n");
+	fprintf(stderr, "start = %p, end = %p\n", start, end);
+	fprintf(stderr, "%ld physical pages\n", physpages);
+	fprintf(stderr, "%ld pagetable pages per process\n", pages);
+	fprintf(stderr, "%ld children needed to exhaust RAM\n", nr_children);
+	fprintf(stderr, "%ld open files maximum\n", max_fds);
+	fprintf(stderr, "%ld KB VSZ per process\n", total_vsz >> 10);
+	nr_children *= 8;
+	if (nr_children*sizeof(int [2]) > (size_t)(2*page_size)) {
+		fprintf(stderr, "Either your kernel port or your arch sucks\n"
+				"You need more than two pages worth of "
+				"storage to hold the fd's to communicate "
+				"with the children\n"
+				"This thing wants %ld fd's, %zd bytes of "
+				"RAM to store them, and thinks the "
+				"page size on your box is %ld\n",
+				2*nr_children,
+				nr_children*sizeof(int [2]),
+				page_size);
+		exit(EXIT_FAILURE);
+	}
+	if (2*nr_children + 1 > max_fds) {
+		fprintf(stderr, "Either your rlimits are utterly retarded "
+				"or your arch sucks. You have an open fd "
+				"limit of %ld fd's per process and this "
+				"thing wants to spawn %ld processes, and "
+				"open 2 fd's for each for %ld total fd's.\n",
+				max_fds,
+				nr_children,
+				2*nr_children);
+	}
+	if ((child = fork()) < 0)
+		exit(EXIT_FAILURE);
+	else if (child)
+		exit(EXIT_SUCCESS);
+	else
+		setsid();
+	child_fds = (int *)start;
+	for (child = 0; child < nr_children; ++child) {
+		if (pipe(&child_fds[2*child])) {
+			fprintf(stderr, "pipe(2) failed, bailing out\n");
+			exit(EXIT_FAILURE);
+		}
+	}
+	for (child = 0; child < nr_children; ++child) {
+		pid_t pid = fork();
+		if (pid < 0)
+			fprintf(stderr, "fork() appears to have failed "
+					"for child %d\n",
+					child);
+		else if (!pid) {
+			char c;
+			read(child_fds[2*child], &c, 1);
+			action.sa_sigaction = ignore,
+			action.sa_flags = SA_SIGINFO,
+			sigemptyset(&action.sa_mask);
+			sigaction(SIGSEGV, &action, NULL);
+			sigaction(SIGBUS, &action, NULL);
+			sigfillset(&action.sa_mask);
+			sigprocmask(SIG_BLOCK, &action.sa_mask, NULL);
+			for (pos = start; pos < end; pos += 2*pmd_size) {
+				if (*pos && pos - start >= pmd_size)
+					fprintf(stderr, "bad kernel!\n"
+						"zeromapped memory appears to "
+						"be corrupted! (check 1)\n");
+				if (pos[page_size] && pos - start >= pmd_size)
+					fprintf(stderr, "bad kernel!\n"
+						"zeromapped memory appears to "
+						"be corrupted! (check 1)\n");
+			}
+			pause();
+			return EXIT_SUCCESS;
+		}
+	}
+	for (pos = start + pmd_size; pos < end; pos += pmd_size)
+		munmap(pos, 2*page_size);
+	for (child = 0; child < nr_children; ++child) {
+		char c = '\0';
+		fprintf(stderr, "pretending to wake child %d\n", child);
+		write(child_fds[2*child+1], &c, 1);
+	}
+	/*
+	 * The parent now offers itself as the sacrificial victim to be
+	 * OOM killed in the place of its children.
+	 */
+	start += pmd_size;
+	p = mmap(start, (((size_t)&child) & ~(pmd_size - 1)) - (size_t)start,
+			PROT_READ, MAP_PRIVATE|MAP_FIXED, fd, 0);
+	if (p == MAP_FAILED)
+		fprintf(stderr, "mmap in parent failed!\n");
+	close(fd);
+	pause();
+	return EXIT_SUCCESS;
+}
+[unhandled content-type:application/octet-stream]

@@ -1,0 +1,341 @@
+Date: Mon, 28 Aug 2000 17:58:45 +0200 (CEST)
+From: Ingo Molnar <>
+Subject: [patch] getting rid of the Big Kernel Spinlock, 2.4.0-test7
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/8/28/169
+
+during 2.3 we got rid of 99% of lock_kernel()s within the core kernel.
+IMHO the time has arrived to get rid of the big kernel spinlock forever -
+by changing it to a ordinary semaphore. Most lock_kernel() code paths are
+holding the kernel lock for a long time and they do it rarely - so a
+semaphore is more suited to do this than a spinlock. It's even a speedup
+(and a debugging help), because lock_kernel() will not spin wasting CPU
+cycles anymore.
+the attached biglock-2.4.0-test7-A6 patch implements this and does a
+couple of related cleanups:
+- the impact of the 'big IRQ lock' is smaller as well, thus schedule() now
+  enforces that it is to be called with IRQs turned on. sleep_on() enables
+  IRQs, and entry.S's reschedule as well. (the later is a code path taken
+  by returning IRQ handlers which might not always disable IRQs.)
+  As a result neither release_kernel_lock(), nor the tq_scheduler path
+  needs to do a sti() - which speeds up the common schedule() path. Nor
+  the performance, nor the semantics of sleep_on() are impacted.
+- new sema_locked() added to semaphore.h - similar to is_spin_locked().
+- got rid of asm/smp_lock.h - linux/smplock.h has the generic code, now
+  that no global-IRQ locking logic is present in schedule(). This
+  simplifies things.
+- irqs_enabled() added to asm/hardirq.h.
+the only place that still needs to spin actively is
+reacquire_kernel_lock() - because semaphore.c calls schedule() itself, so
+we cannot call down() at that point. Solving this is not impossible, but
+needs more changes than justified i think.
+the patch has the IMHO nice side-effect of 'speeding up races' - more
+processes can run when the kernel lock is taken because there is no active
+spinning - thus SMP, kernel-lock related races are triggered with higher
+probability.
+the patch compiles/boots/works just fine on SMP and UP x86 systems. Other
+architectures have to add the (trivial and generic) sema_locked() and
+irqs_enabled() functions. The patch should be an invariant and does not
+intend to change semantics of any kernel functionality otherwise.
+	Ingo
+--- linux/kernel/sched.c.orig	Mon Aug 28 15:54:37 2000
++++ linux/kernel/sched.c	Mon Aug 28 17:14:41 2000
+@@ -113,6 +113,9 @@
+ #define can_schedule(p,cpu) ((!(p)->has_cpu) && \
+ 				((p)->cpus_allowed & (1 << cpu)))
+ 
++/* The 'big kernel lock' */
++DECLARE_MUTEX(kernel_sem);
++
+ #else
+ 
+ #define idle_task(cpu) (&init_task)
+@@ -510,6 +513,7 @@
+ 	int this_cpu, c;
+ 
+ schedule_again:
++	if (!irqs_enabled()) BUG();
+ 	if (!current->active_mm) BUG();
+ 	if (tq_scheduler)
+ 		goto handle_tq_scheduler;
+@@ -684,11 +688,6 @@
+ 	goto handle_softirq_back;
+ 
+ handle_tq_scheduler:
+-	/*
+-	 * do not run the task queue with disabled interrupts,
+-	 * cli() wouldn't work on SMP
+-	 */
+-	sti();
+ 	run_task_queue(&tq_scheduler);
+ 	goto tq_scheduler_back;
+ 
+@@ -791,65 +790,46 @@
+ 	__wake_up_common(q, mode, 1);
+ }
+ 
+-#define	SLEEP_ON_VAR				\
+-	unsigned long flags;			\
+-	wait_queue_t wait;			\
+-	init_waitqueue_entry(&wait, current);
+-
+-#define	SLEEP_ON_HEAD					\
+-	wq_write_lock_irqsave(&q->lock,flags);		\
+-	__add_wait_queue(q, &wait);			\
+-	wq_write_unlock(&q->lock);
+-
+-#define	SLEEP_ON_TAIL						\
+-	wq_write_lock_irq(&q->lock);				\
+-	__remove_wait_queue(q, &wait);				\
+-	wq_write_unlock_irqrestore(&q->lock,flags);
+-
+ void interruptible_sleep_on(wait_queue_head_t *q)
+ {
+-	SLEEP_ON_VAR
++	DECLARE_WAITQUEUE(wait, current);
+ 
+ 	current->state = TASK_INTERRUPTIBLE;
+-
+-	SLEEP_ON_HEAD
++	add_wait_queue(q, &wait);
+ 	schedule();
+-	SLEEP_ON_TAIL
++	remove_wait_queue(q, &wait);
+ }
+ 
+ long interruptible_sleep_on_timeout(wait_queue_head_t *q, long timeout)
+ {
+-	SLEEP_ON_VAR
++	DECLARE_WAITQUEUE(wait, current);
+ 
+ 	current->state = TASK_INTERRUPTIBLE;
+-
+-	SLEEP_ON_HEAD
++	add_wait_queue(q, &wait);
+ 	timeout = schedule_timeout(timeout);
+-	SLEEP_ON_TAIL
++	remove_wait_queue(q, &wait);
+ 
+ 	return timeout;
+ }
+ 
+ void sleep_on(wait_queue_head_t *q)
+ {
+-	SLEEP_ON_VAR
+-	
+-	current->state = TASK_UNINTERRUPTIBLE;
++	DECLARE_WAITQUEUE(wait, current);
+ 
+-	SLEEP_ON_HEAD
++	current->state = TASK_UNINTERRUPTIBLE;
++	add_wait_queue(q, &wait);
+ 	schedule();
+-	SLEEP_ON_TAIL
++	remove_wait_queue(q, &wait);
+ }
+ 
+ long sleep_on_timeout(wait_queue_head_t *q, long timeout)
+ {
+-	SLEEP_ON_VAR
+-	
+-	current->state = TASK_UNINTERRUPTIBLE;
++	DECLARE_WAITQUEUE(wait, current);
+ 
+-	SLEEP_ON_HEAD
++	current->state = TASK_UNINTERRUPTIBLE;
++	add_wait_queue(q, &wait);
+ 	timeout = schedule_timeout(timeout);
+-	SLEEP_ON_TAIL
++	remove_wait_queue(q, &wait);
+ 
+ 	return timeout;
+ }
+--- linux/include/linux/smp_lock.h.orig	Mon Aug 28 15:48:15 2000
++++ linux/include/linux/smp_lock.h	Mon Aug 28 17:33:56 2000
+@@ -13,8 +13,53 @@
+ 
+ #else
+ 
+-#include <asm/smplock.h>
++#include <linux/interrupt.h>
++#include <linux/sched.h>
++#include <asm/current.h>
+ 
++extern struct semaphore kernel_sem;
++
++#define kernel_locked()		sema_locked(&kernel_sem)
++
++/*
++ * Release global kernel lock and global interrupt lock
++ */
++#define release_kernel_lock(task, cpu) \
++do { \
++	if (task->lock_depth >= 0) \
++		up(&kernel_sem); \
++} while (0)
++
++/*
++ * Re-acquire the kernel lock
++ */
++#define reacquire_kernel_lock(task) \
++do { \
++	if (task->lock_depth >= 0) \
++		while (down_trylock(&kernel_sem)) /* nothing */ ; \
++} while (0)
++
++
++/*
++ * Getting the big kernel lock.
++ *
++ * This cannot happen asynchronously,
++ * so we only need to worry about other
++ * CPU's.
++ */
++extern __inline__ void lock_kernel(void)
++{
++	if (!++current->lock_depth)
++		down(&kernel_sem);
++}
++
++extern __inline__ void unlock_kernel(void)
++{
++	if (current->lock_depth < 0)
++		BUG();
++	if (--current->lock_depth < 0)
++		up(&kernel_sem);
++}
+ #endif /* CONFIG_SMP */
+ 
+ #endif
+--- linux/include/asm-i386/smplock.h.orig	Mon Aug 28 15:50:51 2000
++++ linux/include/asm-i386/smplock.h	Mon Aug 28 17:02:43 2000
+@@ -1,75 +0,0 @@
+-/*
+- * <asm/smplock.h>
+- *
+- * i386 SMP lock implementation
+- */
+-#include <linux/interrupt.h>
+-#include <linux/spinlock.h>
+-#include <linux/sched.h>
+-#include <asm/current.h>
+-
+-extern spinlock_t kernel_flag;
+-
+-#define kernel_locked()		spin_is_locked(&kernel_flag)
+-
+-/*
+- * Release global kernel lock and global interrupt lock
+- */
+-#define release_kernel_lock(task, cpu) \
+-do { \
+-	if (task->lock_depth >= 0) \
+-		spin_unlock(&kernel_flag); \
+-	release_irqlock(cpu); \
+-	__sti(); \
+-} while (0)
+-
+-/*
+- * Re-acquire the kernel lock
+- */
+-#define reacquire_kernel_lock(task) \
+-do { \
+-	if (task->lock_depth >= 0) \
+-		spin_lock(&kernel_flag); \
+-} while (0)
+-
+-
+-/*
+- * Getting the big kernel lock.
+- *
+- * This cannot happen asynchronously,
+- * so we only need to worry about other
+- * CPU's.
+- */
+-extern __inline__ void lock_kernel(void)
+-{
+-#if 1
+-	if (!++current->lock_depth)
+-		spin_lock(&kernel_flag);
+-#else
+-	__asm__ __volatile__(
+-		"incl %1\n\t"
+-		"jne 9f"
+-		spin_lock_string
+-		"\n9:"
+-		:"=m" (__dummy_lock(&kernel_flag)),
+-		 "=m" (current->lock_depth));
+-#endif
+-}
+-
+-extern __inline__ void unlock_kernel(void)
+-{
+-	if (current->lock_depth < 0)
+-		BUG();
+-#if 1
+-	if (--current->lock_depth < 0)
+-		spin_unlock(&kernel_flag);
+-#else
+-	__asm__ __volatile__(
+-		"decl %1\n\t"
+-		"jns 9f\n\t"
+-		spin_unlock_string
+-		"\n9:"
+-		:"=m" (__dummy_lock(&kernel_flag)),
+-		 "=m" (current->lock_depth));
+-#endif
+-}
+--- linux/include/asm-i386/semaphore.h.orig	Mon Aug 28 15:52:16 2000
++++ linux/include/asm-i386/semaphore.h	Mon Aug 28 17:33:56 2000
+@@ -90,6 +90,8 @@
+ 	sema_init(sem, 0);
+ }
+ 
++#define sema_locked(sem) (atomic_read(&(sem)->count) == 0)
++
+ asmlinkage void __down_failed(void /* special register calling convention */);
+ asmlinkage int  __down_failed_interruptible(void  /* params in registers */);
+ asmlinkage int  __down_failed_trylock(void  /* params in registers */);
+--- linux/include/asm-i386/hardirq.h.orig	Mon Aug 28 15:55:45 2000
++++ linux/include/asm-i386/hardirq.h	Mon Aug 28 17:33:55 2000
+@@ -26,6 +26,15 @@
+ 
+ #define in_irq() (local_irq_count(smp_processor_id()) != 0)
+ 
++static inline int irqs_enabled (void)
++{
++	unsigned long flags;
++
++	__save_flags(flags);
++
++	return (flags & (1 << 9));
++}
++
+ #ifndef CONFIG_SMP
+ 
+ #define hardirq_trylock(cpu)	(local_irq_count(cpu) == 0)
+--- linux/arch/i386/kernel/smp.c.orig	Mon Aug 28 16:07:48 2000
++++ linux/arch/i386/kernel/smp.c	Mon Aug 28 17:14:11 2000
+@@ -100,9 +100,6 @@
+  *	about nothing of note with C stepping upwards.
+  */
+ 
+-/* The 'big kernel lock' */
+-spinlock_t kernel_flag = SPIN_LOCK_UNLOCKED;
+-
+ struct tlb_state cpu_tlbstate[NR_CPUS] = {[0 ... NR_CPUS-1] = { &init_mm, 0 }};
+ 
+ /*
+--- linux/arch/i386/kernel/entry.S.orig	Mon Aug 28 16:34:17 2000
++++ linux/arch/i386/kernel/entry.S	Mon Aug 28 16:34:51 2000
+@@ -285,6 +285,7 @@
+ 	
+ 	ALIGN
+ reschedule:
++	sti
+ 	call SYMBOL_NAME(schedule)    # test
+ 	jmp ret_from_sys_call
+ 

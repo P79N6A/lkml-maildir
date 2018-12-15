@@ -1,0 +1,128 @@
+Date: Mon, 22 Oct 2007 21:34:54 +0400
+From: Oleg Nesterov <>
+Subject: Re: [RFC/PATCH 3/3] rt: PI-workqueue: fix barriers
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2007/10/22/206
+
+On 10/22, Peter Zijlstra wrote:
+>
+> --- linux-2.6.orig/lib/plist.c
+> +++ linux-2.6/lib/plist.c
+> @@ -72,7 +72,7 @@ static void plist_check_head(struct plis
+>   * @node:	&struct plist_node pointer
+>   * @head:	&struct plist_head pointer
+>   */
+> -void plist_add(struct plist_node *node, struct plist_head *head)
+> +void __plist_add(struct plist_node *node, struct plist_head *head, int tail)
+>  {
+>  	struct plist_node *iter;
+> 
+> @@ -92,7 +92,13 @@ void plist_add(struct plist_node *node, 
+>  lt_prio:
+>  	list_add_tail(&node->plist.prio_list, &iter->plist.prio_list);
+>  eq_prio:
+> -	list_add_tail(&node->plist.node_list, &iter->plist.node_list);
+> +	if (likely(tail))
+> +		list_add_tail(&node->plist.node_list, &iter->plist.node_list);
+Ugh, I think this change is wrong in many ways. Just one example. Suppose
+we have plist with 2 nodes X1 and X2, both with ->prio == 10. Now we insert
+the new node N, N->prio = 5.
+at this point iter == &X1
+> +	else {
+> +		iter = list_entry(iter->plist.prio_list.prev,
+> +				struct plist_node, plist.prio_list);
+iter is _still_ &X1, its ->plist.prio_list is empty.
+> +		list_add(&node->plist.node_list, &iter->plist.node_list);
+Now, from the plist_for_each's pov, the nodes in the plist are ordered as
+X1, N, X2 - bug.
+There are other problems. For example the "eq_prio:" case needs additional
+attention if tail == 0, we must remove the old node from the prio_list and
+insert the new one.
+>  static void insert_work(struct cpu_workqueue_struct *cwq,
+> -				struct work_struct *work, int tail)
+> +		struct work_struct *work, int prio, int boost_prio, int tail)
+>  {
+> -	int prio = current->normal_prio;
+> -
+>  	set_wq_data(work, cwq);
+>  	/*
+>  	 * Ensure that we get the right work->data if we see the
+> @@ -136,10 +138,10 @@ static void insert_work(struct cpu_workq
+>  	 */
+>  	smp_wmb();
+>  	plist_node_init(&work->entry, prio);
+> -	plist_add(&work->entry, &cwq->worklist);
+> +	__plist_add(&work->entry, &cwq->worklist, tail);
+Hmm. Not sure we really need __plist_add() here. If tail == 0, we must
+insert this work (barrier) at the head of the list. Can't we do
+	work->entry->prio = tail ? prio : -1;
+	plist_add(&work->entry, &cwq->worklist);
+instead?
+>  static void run_workqueue(struct cpu_workqueue_struct *cwq)
+>  {
+> +	struct plist_head *worklist = &cwq->worklist;
+> +
+>  	spin_lock_irq(&cwq->lock);
+>  	cwq->run_depth++;
+>  	if (cwq->run_depth > 3) {
+> @@ -267,16 +280,25 @@ static void run_workqueue(struct cpu_wor
+>  			__FUNCTION__, cwq->run_depth);
+>  		dump_stack();
+>  	}
+> -	while (!plist_head_empty(&cwq->worklist)) {
+> -		struct work_struct *work = plist_first_entry(&cwq->worklist,
+> +
+> +again:
+> +	while (!plist_head_empty(worklist)) {
+> +		int prio;
+> +		struct work_struct *work = plist_first_entry(worklist,
+>  						struct work_struct, entry);
+>  		work_func_t f = work->func;
+> 
+> -		if (likely(cwq->thread->prio != work->entry.prio))
+> -			task_setprio(cwq->thread, work->entry.prio);
+> +		prio = work->entry.prio;
+> +		if (unlikely(worklist != &cwq->worklist)) {
+> +			prio = min(prio, cwq->barrier->prev_prio);
+> +			prio = min(prio, plist_first(&cwq->worklist)->prio);
+> +		}
+> +
+> +		if (likely(cwq->thread->prio != prio))
+> +			task_setprio(cwq->thread, prio);
+> 
+>  		cwq->current_work = work;
+> -		plist_del(&work->entry, &cwq->worklist);
+> +		plist_del(&work->entry, worklist);
+>  		plist_node_init(&work->entry, MAX_PRIO);
+>  		spin_unlock_irq(&cwq->lock);
+> 
+> @@ -289,7 +311,27 @@ static void run_workqueue(struct cpu_wor
+> 
+>  		spin_lock_irq(&cwq->lock);
+>  		cwq->current_work = NULL;
+> +
+> +		if (unlikely(cwq->barrier))
+> +			worklist = &cwq->barrier->worklist;
+> +	}
+At first glance this looks wrong, but I am not sure I get it right...
+So, now we iterate the local worklist, not cwq->worklist. Suppose it has
+the works w1 and w2.
+run_workqueue() starts w1->func().
+Another thread does cancel_work_sync(w1) under some LOCK. We insert the
+barrier at cwq->worklist and sleep.
+w1 completes, run_workqueue() fires w2, w2->func does lock(LOCK) ...
+Deadlock.
+(I'll try to read this patch carefully tomorrow, but it is a bit hard to
+ read this series, and the very first patch has rejects. Could you make
+ a single patch?)
+Oleg.
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+More majordomo info at  
+http://vger.kernel.org/majordomo-info.html
+Please read the FAQ at  
+http://www.tux.org/lkml/

@@ -1,0 +1,155 @@
+Date: Sat, 4 Mar 2000 20:40:15 +0100 (CET)
+From: Markus Schoder <>
+Subject: Re: [patch] updates for the pipe code
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/3/4/106
+
+Richard Gooch writes:
+> Hm. This is a problem with your patch, right? What about the problem I 
+> reported back on 16-FEB? It's still happening with 2.3.48. The problem 
+> does not occur with 2.2.14. 
+>
+> > Hi, all. I've been noticing odd behaviour with named pipes under 
+> > recent 2.3.x kernels (at least since 2.3.36 and possibly before). 
+> > 
+> > If you open a FIFO with O_RDONLY and then call read(2), and then 
+> > another process writes to the FIFO, the read(2) call doesn't return. A 
+> > subsequent writer process does wake up the reader, however. 
+> > 
+> > Has anybody else noticed this behaviour? 
+>
+> I've noticed this problem on UP and SMP systems. It doesn't always 
+> happen, but it *does* happen :-( 
+> 
+>                                 Regards, 
+>
+>                                         Richard.... 
+I have attached a mail that I send to the lkml on 26-DEC-1999.  It explains
+the exact behaviour you have reported and contains a fix for it.
+I have been applying this patch since kernel 2.3.32 it did still cleanly
+apply for 2.3.49.  I have also send the patch to Linus some time ago but
+it probably got lost in the noise.
+--
+Markus
+----- oldmail -----
+Hi,
+I think I've found a bug in the FIFO (named pipes) implementation of
+Linux 2.3.3[234] (probably older kernels too).  When doing the following
+Terminal 1:
+$ mkfifo /tmp/f
+$ cat /tmp/f
+Terminal 2:
+$ echo hello >/tmp/f
+I would have expected that the cat does now produce `hello' instead it
+just sits there (most of the time).  After several echo invocations the
+cat will output everything at once and then exit.
+I don't have the POSIX specs but this behaviour looks broken.
+The reason for this behaviour is a race condition in fifo_open which the
+following patch attempts to fix.  Note that this race condition is
+probably much more likely to trigger on an UP system.
+What happens is that between the interruptible_sleep_on call of the
+reader (line 63 in fs/fifo.c) and the down for the pipe semaphore
+(immediately afterwards), the writer does open the pipe writes to it and
+closes it.  The reader then checks the writer count, finds it to be zero
+and continues to sleep.
+This is my first (official) patch to the Linux kernel, so be careful it
+is possible that I got it all wrong (it works on my system but that's
+just a system for personal use that doesn't get much stress testing).
+The patch is against 2.3.33 but should apply to 2.3.34 too.
+Bye
+--
+Markus
+--- /tmp/linux/fs/fifo.c	Wed Dec 15 13:18:28 1999
++++ linux/fs/fifo.c	Thu Dec 23 03:07:46 1999
+@@ -41,6 +41,7 @@
+ 		PIPE_BASE(*inode) = (char *) page;
+ 		PIPE_START(*inode) = PIPE_LEN(*inode) = 0;
+ 		PIPE_READERS(*inode) = PIPE_WRITERS(*inode) = 0;
++		PIPE_CONNECT(*inode) = 0;
+ 	}
+ 
+ 	switch (filp->f_mode) {
+@@ -51,11 +52,13 @@
+ 	 *  opened, even when there is no process writing the FIFO.
+ 	 */
+ 		filp->f_op = &connecting_fifo_fops;
+-		if (PIPE_READERS(*inode)++ == 0)
++		if (PIPE_READERS(*inode)++ == 0 && PIPE_WRITERS(*inode)) {
++			PIPE_CONNECT(*inode) = 1;
+ 			wake_up_interruptible(PIPE_WAIT(*inode));
++		}
+ 
+ 		if (!(filp->f_flags & O_NONBLOCK)) {
+-			while (!PIPE_WRITERS(*inode)) {
++			while (!PIPE_CONNECT(*inode)) {
+ 				if (signal_pending(current))
+ 					goto err_rd;
+ 				up(PIPE_SEM(*inode));
+@@ -69,7 +72,7 @@
+ 			}
+ 		}
+ 
+-		if (PIPE_WRITERS(*inode))
++		if (PIPE_CONNECT(*inode))
+ 			filp->f_op = &read_fifo_fops;
+ 		break;
+ 	
+@@ -80,14 +83,17 @@
+ 	 *  errno=ENXIO when there is no process reading the FIFO.
+ 	 */
+ 		ret = -ENXIO;
+-		if ((filp->f_flags & O_NONBLOCK) && !PIPE_READERS(*inode))
++		if ((filp->f_flags & O_NONBLOCK) && !PIPE_READERS(*inode) &&
++			!PIPE_CONNECT(*inode))
+ 			goto err;
+ 
+ 		filp->f_op = &write_fifo_fops;
+-		if (!PIPE_WRITERS(*inode)++)
++		if (!PIPE_WRITERS(*inode)++ && PIPE_READERS(*inode)) {
++			PIPE_CONNECT(*inode) = 1;
+ 			wake_up_interruptible(PIPE_WAIT(*inode));
++		}
+ 
+-		while (!PIPE_READERS(*inode)) {
++		while (!PIPE_CONNECT(*inode)) {
+ 			if (signal_pending(current))
+ 				goto err_wr;
+ 			up(PIPE_SEM(*inode));
+@@ -107,8 +113,10 @@
+ 
+ 		PIPE_READERS(*inode)++;
+ 		PIPE_WRITERS(*inode)++;
+-		if (PIPE_READERS(*inode) == 1 || PIPE_WRITERS(*inode) == 1)
++		if (PIPE_READERS(*inode) == 1 || PIPE_WRITERS(*inode) == 1)	{
++			PIPE_CONNECT(*inode) = 1;
+ 			wake_up_interruptible(PIPE_WAIT(*inode));
++		}
+ 		break;
+ 
+ 	default:
+--- /tmp/linux/include/linux/pipe_fs_i.h	Wed Dec 15 13:18:18 1999
++++ linux/include/linux/pipe_fs_i.h	Thu Dec 23 01:43:02 1999
+@@ -9,6 +9,7 @@
+ 	unsigned int writers;
+ 	unsigned int waiting_readers;
+ 	unsigned int waiting_writers;
++	unsigned int connect;
+ };
+ 
+ /* Differs from PIPE_BUF in that PIPE_SIZE is the length of the actual
+@@ -24,6 +25,7 @@
+ #define PIPE_WRITERS(inode)	((inode).i_pipe->writers)
+ #define PIPE_WAITING_READERS(inode)	((inode).i_pipe->waiting_readers)
+ #define PIPE_WAITING_WRITERS(inode)	((inode).i_pipe->waiting_writers)
++#define PIPE_CONNECT(inode)	((inode).i_pipe->connect)
+ 
+ #define PIPE_EMPTY(inode)	(PIPE_LEN(inode) == 0)
+ #define PIPE_FULL(inode)	(PIPE_LEN(inode) == PIPE_SIZE)
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

@@ -1,0 +1,171 @@
+Date: Tue, 17 Jan 2006 19:36:25 -0800 (PST)
+From: Davide Libenzi <>
+Subject: [PATCH] pepoll_wait ...
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2006/1/17/459
+
+The attached patch implements the pepoll_wait system call, that extend the 
+event wait mechanism with the same logic ppoll and pselect do. The definition 
+of pepoll_wait is:
+int pepoll_wait(int epfd, struct epoll_event *events, int maxevents,
+                 int timeout, const sigset_t *sigmask, size_t sigsetsize);
+The difference between the vanilla epoll_wait and pepoll_wait is that the 
+latter allows the caller to specify a signal mask to be set while waiting for 
+events. Hence pepoll_wait will wait until either one monitored event, or an 
+unmasked signal happen. If sigmask is NULL, the pepoll_wait system call will 
+act exactly like epoll_wait. For the POSIX definition of pselect, information 
+is available here:
+http://www.opengroup.org/onlinepubs/009695399/functions/select.html
+This patch goes over 2.6.15-mm4 and depends on the TIF_RESTORE_SIGMASK bits.
+Signed-off-by: Davide Libenzi <davidel@xmailserver.org>
+- Davide
+arch/i386/kernel/syscall_table.S |    1
+fs/eventpoll.c                   |   58 ++++++++++++++++++++++++++++++++++-----
+include/asm-i386/unistd.h        |    3 +-
+include/linux/syscalls.h         |    3 ++
+4 files changed, 57 insertions(+), 8 deletions(-)
+diff -Nru linux-2.6.15/arch/i386/kernel/syscall_table.S linux-2.6.15.mod/arch/i386/kernel/syscall_table.S
+--- linux-2.6.15/arch/i386/kernel/syscall_table.S	2006-01-17 17:11:12.000000000 -0800
++++ linux-2.6.15.mod/arch/i386/kernel/syscall_table.S	2006-01-17 17:11:59.000000000 -0800
+@@ -310,3 +310,4 @@
+ 	.long sys_pselect6
+ 	.long sys_ppoll
+ 	.long sys_unshare		/* 310 */
++	.long sys_pepoll_wait
+diff -Nru linux-2.6.15/fs/eventpoll.c linux-2.6.15.mod/fs/eventpoll.c
+--- linux-2.6.15/fs/eventpoll.c	2006-01-17 17:11:14.000000000 -0800
++++ linux-2.6.15.mod/fs/eventpoll.c	2006-01-17 17:11:59.000000000 -0800
+@@ -105,6 +105,8 @@
+ /* Maximum msec timeout value storeable in a long int */
+ #define EP_MAX_MSTIMEO min(1000ULL * MAX_SCHEDULE_TIMEOUT / HZ, (LONG_MAX - 999ULL) / HZ)
+ 
++#define EP_MAX_EVENTS (INT_MAX / sizeof(struct epoll_event))
++
+ 
+ struct epoll_filefd {
+ 	struct file *file;
+@@ -649,24 +651,25 @@
+ 	return error;
+ }
+ 
+-#define MAX_EVENTS (INT_MAX / sizeof(struct epoll_event))
+ 
+ /*
+  * Implement the event wait interface for the eventpoll file. It is the kernel
+- * part of the user space epoll_wait(2).
++ * part of the user space pepoll_wait(2).
+  */
+-asmlinkage long sys_epoll_wait(int epfd, struct epoll_event __user *events,
+-			       int maxevents, int timeout)
++asmlinkage long sys_pepoll_wait(int epfd, struct epoll_event __user *events,
++				int maxevents, int timeout, const sigset_t __user *sigmask,
++				size_t sigsetsize)
+ {
+ 	int error;
++	sigset_t ksigmask, sigsaved;
+ 	struct file *file;
+ 	struct eventpoll *ep;
+ 
+-	DNPRINTK(3, (KERN_INFO "[%p] eventpoll: sys_epoll_wait(%d, %p, %d, %d)\n",
++	DNPRINTK(3, (KERN_INFO "[%p] eventpoll: sys_pepoll_wait(%d, %p, %d, %d)\n",
+ 		     current, epfd, events, maxevents, timeout));
+ 
+ 	/* The maximum number of event must be greater than zero */
+-	if (maxevents <= 0 || maxevents > MAX_EVENTS)
++	if (maxevents <= 0 || maxevents > EP_MAX_EVENTS)
+ 		return -EINVAL;
+ 
+ 	/* Verify that the area passed by the user is writeable */
+@@ -695,13 +698,41 @@
+ 	 */
+ 	ep = file->private_data;
+ 
++	/*
++	 * If the caller wants a certain signal mask to be set during the wait,
++	 * we apply it here.
++	 */
++	if (sigmask) {
++		if (sigsetsize != sizeof(sigset_t))
++			goto eexit_2;
++		error = -EFAULT;
++		if (copy_from_user(&ksigmask, sigmask, sizeof(ksigmask)))
++			goto eexit_2;
++		sigdelsetmask(&ksigmask, sigmask(SIGKILL) | sigmask(SIGSTOP));
++		sigprocmask(SIG_SETMASK, &ksigmask, &sigsaved);
++	}
++
+ 	/* Time to fish for events ... */
+ 	error = ep_poll(ep, events, maxevents, timeout);
+ 
++	/*
++	 * If we changed the signal mask, we need to restore the original one.
++	 * In case we've got a signal while waiting, we do not restore the signal
++	 * mask yet, and we allow do_signal() to deliver the signal on the way back
++	 * to userspace, before the signal mask is restored.
++	 */
++	if (error == -EINTR) {
++		if (sigmask) {
++			memcpy(&current->saved_sigmask, &sigsaved, sizeof(sigsaved));
++			set_thread_flag(TIF_RESTORE_SIGMASK);
++		}
++	} else if (sigmask)
++		sigprocmask(SIG_SETMASK, &sigsaved, NULL);
++
+ eexit_2:
+ 	fput(file);
+ eexit_1:
+-	DNPRINTK(3, (KERN_INFO "[%p] eventpoll: sys_epoll_wait(%d, %p, %d, %d) = %d\n",
++	DNPRINTK(3, (KERN_INFO "[%p] eventpoll: sys_pepoll_wait(%d, %p, %d, %d) = %d\n",
+ 		     current, epfd, events, maxevents, timeout, error));
+ 
+ 	return error;
+@@ -709,6 +740,19 @@
+ 
+ 
+ /*
++ * Implement the event wait interface for the eventpoll file. It is the kernel
++ * part of the user space epoll_wait(2). This just calls the super-sister
++ * sys_pepoll_wait() without signal parameters.
++ */
++asmlinkage long sys_epoll_wait(int epfd, struct epoll_event __user *events,
++			       int maxevents, int timeout)
++{
++
++	return sys_pepoll_wait(epfd, events, maxevents, timeout, NULL, 0);
++}
++
++
++/*
+  * Creates the file descriptor to be used by the epoll interface.
+  */
+ static int ep_getfd(int *efd, struct inode **einode, struct file **efile,
+diff -Nru linux-2.6.15/include/asm-i386/unistd.h linux-2.6.15.mod/include/asm-i386/unistd.h
+--- linux-2.6.15/include/asm-i386/unistd.h	2006-01-17 17:11:14.000000000 -0800
++++ linux-2.6.15.mod/include/asm-i386/unistd.h	2006-01-17 17:11:59.000000000 -0800
+@@ -316,8 +316,9 @@
+ #define __NR_pselect6		308
+ #define __NR_ppoll		309
+ #define __NR_unshare		310
++#define __NR_pepoll_wait	311
+ 
+-#define NR_syscalls 311
++#define NR_syscalls 312
+ 
+ /*
+  * user-visible error numbers are in the range -1 - -128: see
+diff -Nru linux-2.6.15/include/linux/syscalls.h linux-2.6.15.mod/include/linux/syscalls.h
+--- linux-2.6.15/include/linux/syscalls.h	2006-01-17 17:11:15.000000000 -0800
++++ linux-2.6.15.mod/include/linux/syscalls.h	2006-01-17 17:12:59.000000000 -0800
+@@ -428,6 +428,9 @@
+ 				struct epoll_event __user *event);
+ asmlinkage long sys_epoll_wait(int epfd, struct epoll_event __user *events,
+ 				int maxevents, int timeout);
++asmlinkage long sys_pepoll_wait(int epfd, struct epoll_event __user *events,
++				int maxevents, int timeout, const sigset_t __user *sigmask,
++				size_t sigsetsize);
+ asmlinkage long sys_gethostname(char __user *name, int len);
+ asmlinkage long sys_sethostname(char __user *name, int len);
+ asmlinkage long sys_setdomainname(char __user *name, int len);

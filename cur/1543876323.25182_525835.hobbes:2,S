@@ -1,0 +1,101 @@
+Date: Sun, 01 Apr 2007 11:05:41 +0200
+From: Thomas Gleixner <>
+Subject: Re: [patch 6/13] signal/timer/event fds v9 - timerfd core ...
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2007/4/1/38
+
+On Sat, 2007-03-31 at 13:09 -0700, Davide Libenzi wrote:
+> +/*
+> + * This gets called when the timer event triggers. We increment the
+> + * tick count and wake the possible waiters. If the timer in a
+> + * sequential one (->tintv.tv64 != 0), we re-arm it with hrtimer_forward().
+> + */
+> +static enum hrtimer_restart timerfd_tmrproc(struct hrtimer *htmr)
+> +{
+> +	struct timerfd_ctx *ctx = container_of(htmr, struct timerfd_ctx, tmr);
+> +	enum hrtimer_restart rval = HRTIMER_NORESTART;
+> +	unsigned long flags;
+> +
+> +	spin_lock_irqsave(&ctx->lock, flags);
+> +	ctx->ticks++;
+> +	wake_up_locked(&ctx->wqh);
+> +	if (ctx->tintv.tv64 != 0) {
+> +		hrtimer_forward(htmr, hrtimer_cb_get_time(htmr), ctx->tintv);
+> +		rval = HRTIMER_RESTART;
+> +	}
+> +	spin_unlock_irqrestore(&ctx->lock, flags);
+> +
+> +	return rval;
+> +}
+For periodic timers we probably want to know also about missed ticks,
+i.e. when the timer was delayed.
+I changed recently the rearm handling code of itimers to prevent DoS
+attacks. See commit 8bfd9a7a229b5f3d3eda5d7d45c2eebec5b4ba16. The posix
+timer code has a similar mechanism.
+Probably we should do the same here. That means that we defer the
+restart of the timer to the process context.
+	tglx
+static enum hrtimer_restart timerfd_tmrproc(struct hrtimer *htmr)
+{
+       struct timerfd_ctx *ctx = container_of(htmr, struct timerfd_ctx, tmr);
+       unsigned long flags;
+       spin_lock_irqsave(&ctx->lock, flags);
+       ctx->expired = 1;
+       wake_up_locked(&ctx->wqh);
+       spin_unlock_irqrestore(&ctx->lock, flags);
+       return HRTIMER_NORESTART;
+}
+static ssize_t timerfd_read(struct file *file, char __user *buf, size_t count,
+                           loff_t *ppos)
+{
+       struct timerfd_ctx *ctx = file->private_data;
+       ssize_t res;
+       u32 ticks = 0;
+       DECLARE_WAITQUEUE(wait, current);
+       if (count < sizeof(ticks))
+               return -EINVAL;
+       spin_lock_irq(&ctx->lock);
+       res = -EAGAIN;
+       if (!ctx->expired && !(file->f_flags & O_NONBLOCK)) {
+               __add_wait_queue(&ctx->wqh, &wait);
+               for (res = 0;;) {
+                       set_current_state(TASK_INTERRUPTIBLE);
+                       if (ctx->expired) {
+                               res = 0;
+                               break;
+                       }
+                       if (signal_pending(current)) {
+                               res = -ERESTARTSYS;
+                               break;
+                       }
+                       spin_unlock_irq(&ctx->lock);
+                       schedule();
+                       spin_lock_irq(&ctx->lock);
+               }
+               __remove_wait_queue(&ctx->wqh, &wait);
+               __set_current_state(TASK_RUNNING);
+       }
+       if (ctx->expired) {
+               	ctx->expired = 0;
+		if (ctx->tintv.tv64 != 0) {
+			ticks = hrtimer_forward(&ctx->tmr, ktime_get(),
+						ctx->tintv);
+			hrtimer_restart(&ctx->tmr);
+		} else
+			ticks = 1;
+	}
+       spin_unlock_irq(&ctx->lock);
+       if (ticks)
+               res = put_user(ticks, buf) ? -EFAULT: sizeof(ticks);
+       return res;
+}
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+More majordomo info at  
+http://vger.kernel.org/majordomo-info.html
+Please read the FAQ at  
+http://www.tux.org/lkml/

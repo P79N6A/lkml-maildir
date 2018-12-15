@@ -1,0 +1,316 @@
+Date: Thu, 2 Mar 2000 16:41:49 +0200 (EET)
+From: Julian Anastasov <>
+Subject: Changes in the sockets: SIGIO handling
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/3/2/69
+
+	Hello,
+	Here is a list of proposed changes in the SIGIO handling for
+sockets. This is a patch for 2.3.48. I have a patch for 2.2 too if
+someone is interested. I'm still wondering if there are working
+applications for 2.2 which expect si_code=SI_SIGIO!
+List of proposed changes:
+- Don't return POLL_HUP at EOF, return POLL_IN instead. We will use
+POLL_HUP as a marker. Or we can add another POLL_xxx event and not
+to change the POLL_HUP semantic? But this leads to changes in
+/usr/include ?
+- return POLL_HUP when:
+	- close(): sock->shutdown != SHUTDOWN_MASK (or may be always?)
+	- FASYNC off: send POLL_HUP. We can send POLL_HUP when needed,
+	i.e. not on each close() - this can help very much
+- tcp_reset() to send POLL_ERR/SIGIO on error
+- add SO_ACCEPT_FLAGS socket option. Now accept() can check flags in
+sock->accept_flags. One of these flags is SO_ACCEPT_F_ASYNC: inherit
+FASYNC, O_NONBLOCK/O_NDELAY, F_SETSIG and F_SETOWN values from the
+listening socket. Send POLL_IN/POLL_ERR according to the sock state.
+This fills the gap between receiving the data in sock and accepting
+the connection (creating the new fd). This saves the extra syscalls
+F_SETSIG, FASYNC, F_SETOWN and the read() needed to check for the
+first data. We can expect that there is data in the "sock" even
+before accept(), so accept() must generate the proper event if there
+is activity for the accepted sock before accept().
+SO_ACCEPT_FLAGS is included in i386 only for now.
+	I know, the flags can be renamed and stored in a better
+place. But this is a patch for beta testing.
+	We want to reduce the number of syscalls. More
+flags can be added for SO_ACCEPT_FLAGS sock ioctl. For now I
+added only the O_NONBLOCK/FASYNC/ownership inheritance but
+some TCP options can be inherited too. The other option is
+to create new acceptXXX() syscall but may be this is more difficult
+task.
+	For now, I think SO_ACCEPT_F_ASYNC is very useful because
+we save 4 syscalls needed after accept(). Using this flag we even
+receive notification if the accepted sock has data for us.
+Without this feature we have to put extra read() after accept(),
+F_SETSIG, F_SETOWN and FASYNC to detect the activity.
+	I'm still not sure if the POLL_HUP must be always send on
+close() or after some checks. We can't be sure if there are other
+unread events while we try to close(). May be we can't rely on
+sock->shutdown ? If sock->shutdown=SEND_SHUTDOWN on close() it
+is still possible some events for the fd to be in the rt queue,
+i.e. unread.
+	May be one solution can be instead of sending POLL_HUP
+on each close(), to send it when needed, i.e. using FASYNC=off
+ioctl and not to send POLL_HUP from close(). For example:
+	shutdown(fd,1)
+	timeout waiting for data from fd
+	fcntl FASYNC off (send POLL_HUP as last event for this fd)
+	close()
+	// reuse this fd safely without reading the long long rt queue
+	One example when we don't need to send POLL_HUP on close():
+	read(fd)=0
+	write(fd,last_our_data)=OK
+	// Here we don't expect more events, may be only POLL_ERR ?
+	close(fd)
+	With current behavior, when we receive POLL_HUP we know
+that the remote end closed its end of the connection. But what
+if we can't wait remote end to close the connection and we close()
+the socket, even after shutdown(fd,1). After our close() when the
+fd is released and can be reused again it is still possible unread
+events to stay in the rt queue (POLL_IN in this case). When we
+create/accept new file descriptor (with the same value) and continue
+to read the events (from the long long rt queue) using sigwaitinfo(),
+we can dequeue unexpected notifications for the old file descriptor.
+	For example:
+		<-- POLL_IN for fd
+	sigwaitinfo(): POLL_IN for fd
+	read(fd)=100
+	// We remember that we can write(), so we try to write()
+	write(fd)=100
+	shutdown(fd,1)
+	// We wait remote end to close
+	// Here we expect POLL_IN but it is not received (after some
+	// timeout)
+		<-- POLL_IN for the listener enqueue
+		<-- POLL_IN/POLL_ERR enqueued after our last check of
+		the rt queue
+	// We decide to close(fd)
+	close(fd)
+	sigwaitinfo(): POLL_IN for the listener
+	fd = accept()
+	set fd FASYNC, ... (or inherited from accept)
+	sigwaitinfo(): POLL_IN/POLL_ERR for the old fd but we think it
+	is for the new fd. Not fatal, one extra read()=EAGAIN
+	What if we receive POLL_ERR from old fd when the new fd is
+	in connecting state? We think the connection failed for the
+	new fd. FATAL!
+	So, in this patch the POLL_HUP notification from tcp_close()
+can be removed. It is there only for test purposes. Instead of
+receiving POLL_HUP from each close() we can try to remove the
+FASYNC flag before close(one syscall), i.e. we decide when the
+unexpected events are possible and put POLL_HUP marker at the end.
+Or may be the close() notification is always required if the sock
+is still in FASYNC mode? Is there any other way to put markers in
+the rt queue for a fd?
+	The patch is not tested for IPV6. I assume that locks
+used in this patch are not correct! Please, correct me :)
+	Are there any plans SIGIO to be supported for AF_UNIX?
+Regards
+--
+Julian Anastasov <uli@linux.tu-varna.acad.bg>
+--- linux/net/ipv4/tcp_input.c.orig	Wed Feb  9 04:35:27 2000
++++ linux/net/ipv4/tcp_input.c	Thu Mar  2 12:55:28 2000
+@@ -534,7 +534,12 @@
+ 			sk->err = ECONNRESET;
+ 	}
+ 
+-	tcp_done(sk);
++	if (sk->dead) {
++		tcp_done(sk);
++	} else {
++		tcp_done(sk);
++		sock_wake_async(sk->socket, 0, POLL_ERR);
++	}
+ }
+ 
+ /* This tags the retransmission queue when SACKs arrive. */
+@@ -1659,8 +1664,7 @@
+ 		tp->num_sacks = 0;
+ 
+ 	if (!sk->dead) {
+-		sk->state_change(sk);
+-		sock_wake_async(sk->socket, 1, POLL_HUP);
++		sk->data_ready(sk,0);
+ 	}
+ }
+ 
+--- linux/net/ipv4/tcp.c.orig	Wed Feb  9 04:35:27 2000
++++ linux/net/ipv4/tcp.c	Thu Mar  2 13:27:03 2000
+@@ -1693,9 +1693,17 @@
+ void tcp_close(struct sock *sk, long timeout)
+ {
+ 	struct sk_buff *skb;
++	int old_shutdown;
+ 	int data_was_unread = 0;
+ 
+ 	lock_sock(sk);
++	old_shutdown = sk->shutdown;
++	if (((old_shutdown & SHUTDOWN_MASK) != SHUTDOWN_MASK) &&
++		(sk->state != TCP_CLOSE)) {
++		read_lock(&sk->callback_lock);
++		sock_wake_async(sk->socket, 0, POLL_HUP);
++		read_unlock(&sk->callback_lock);
++	}
+ 	sk->shutdown = SHUTDOWN_MASK;
+ 
+ 	if(sk->state == TCP_LISTEN) {
+--- linux/net/socket.c.orig	Sat Feb 12 19:52:04 2000
++++ linux/net/socket.c	Thu Mar  2 13:45:22 2000
+@@ -98,6 +98,7 @@
+ 			      struct poll_table_struct *wait);
+ static int sock_ioctl(struct inode *inode, struct file *file,
+ 		      unsigned int cmd, unsigned long arg);
++int sock_fcntl(struct file *filp, unsigned int cmd, unsigned long arg);
+ static int sock_fasync(int fd, struct file *filp, int on);
+ static ssize_t sock_readv(struct file *file, const struct iovec *vector,
+ 			  unsigned long count, loff_t *ppos);
+@@ -375,11 +376,22 @@
+ 
+ void sock_release(struct socket *sock)
+ {
++struct sock *sk;
++struct fasync_struct *fa;
++
+ 	if (sock->ops) 
+ 		sock->ops->release(sock);
+ 
+-	if (sock->fasync_list)
+-		printk(KERN_ERR "sock_release: fasync list not empty!\n");
++	if ((sk = sock->sk) != NULL) {
++		lock_sock(sk);
++		write_lock_bh(&sk->callback_lock);
++		while ((fa = sock->fasync_list)) {
++			sock->fasync_list = fa->fa_next;
++			kfree_s(fa,sizeof(struct fasync_struct));
++		}
++		write_unlock_bh(&sk->callback_lock);
++		release_sock(sk);
++	}
+ 
+ 	sockets_in_use[smp_processor_id()].counter--;
+ 	if (!sock->file) {
+@@ -598,7 +610,7 @@
+ 		return 0;
+ 	}
+ 	unlock_kernel();
+-	sock_fasync(-1, filp, 0);
++	//sock_fasync(-1, filp, 0);
+ 	sock_release(socki_lookup(inode));
+ 	lock_kernel();
+ 	return 0;
+@@ -670,6 +682,7 @@
+ 		if (fa!=NULL)
+ 		{
+ 			write_lock_bh(&sk->callback_lock);
++			sock_wake_async(sock, 0, POLL_HUP);
+ 			*prev=fa->fa_next;
+ 			write_unlock_bh(&sk->callback_lock);
+ 			kfree_s(fa,sizeof(struct fasync_struct));
+@@ -919,6 +932,56 @@
+ 	return err;
+ }
+ 
++/*
++ *	Setup the accepted socket
++ */
++
++static void check_accept_flags(int fd, struct socket *sock, struct socket *newsock)
++{
++	struct sock *newsk = newsock->sk;
++	struct file *file1, *file2;
++
++	file1 = sock->file;
++	file2 = newsock->file;
++
++	if (newsk->accept_flags & SO_ACCEPT_F_ASYNC) {
++
++		/* Inherit F_SETSIG, F_SETOWN and FASYNC and	*/
++		/* send SIGIO if newsk is not in initial state	*/
++
++		file2->f_owner.signum = file1->f_owner.signum;
++		file2->f_owner.pid = file1->f_owner.pid;
++		file2->f_owner.uid = file1->f_owner.uid;
++		file2->f_owner.euid = file1->f_owner.euid;
++		sock_fcntl(file2, F_SETOWN, file2->f_owner.pid);
++		if (file1->f_flags & O_NONBLOCK) {
++			file2->f_flags |= O_NONBLOCK;
++			if (O_NONBLOCK != O_NDELAY) {
++				if (file1->f_flags & O_NDELAY) {
++					file2->f_flags |= O_NDELAY;
++				}
++			}
++		}
++		if (file1->f_flags & FASYNC) {
++			struct tcp_opt *tp = &(newsk->tp_pinfo.af_tcp);
++
++			file2->f_flags |= FASYNC;
++			if (file2->f_op && file2->f_op->fasync) {
++				file2->f_op->fasync(fd, file2, 1);
++			}
++			if (newsk->err) {
++				read_lock(&newsk->callback_lock);
++				sock_wake_async(newsock, 0, POLL_ERR);
++				read_unlock(&newsk->callback_lock);
++			} else if (after(tp->rcv_nxt, tp->copied_seq)) {
++				/* Notify for data and/or FIN */
++				read_lock(&newsk->callback_lock);
++				sock_wake_async(newsock, 1, POLL_IN);
++				read_unlock(&newsk->callback_lock);
++			}
++		}
++	}
++}
+ 
+ /*
+  *	For accept, we attempt to create a new socket, set up the link
+@@ -967,6 +1030,10 @@
+ 
+ 	if ((err = sock_map_fd(newsock)) < 0)
+ 		goto out_release;
++
++	/* We want to modify the accepted socket, so check accept_flags */
++	if (newsock->sk->accept_flags)
++		check_accept_flags(err, sock, newsock);
+ 
+ out_put:
+ 	sockfd_put(sock);
+--- linux/net/core/sock.c.orig	Sat Jan 22 21:54:57 2000
++++ linux/net/core/sock.c	Wed Mar  1 14:14:59 2000
+@@ -322,6 +322,12 @@
+ 			ret = sock_set_timeout(&sk->sndtimeo, optval, optlen);
+ 			break;
+ 
++#ifdef SO_ACCEPT_FLAGS
++		case SO_ACCEPT_FLAGS:
++			sk->accept_flags = val;
++			break;
++#endif
++
+ #ifdef CONFIG_NETDEVICES
+ 		case SO_BINDTODEVICE:
+ 		{
+--- linux/include/asm-i386/socket.h.orig	Mon Dec 22 03:41:24 1997
++++ linux/include/asm-i386/socket.h	Wed Mar  1 12:37:44 2000
+@@ -39,4 +39,9 @@
+ #define SO_ATTACH_FILTER        26
+ #define SO_DETACH_FILTER        27
+ 
++/* Flags for accept() */
++#define SO_ACCEPT_FLAGS 28
++	/* Inherit FASYNC, O_NONBLOCK, ownership and rt signal */
++#	define	SO_ACCEPT_F_ASYNC	0x01
++
+ #endif /* _ASM_SOCKET_H */
+--- linux/include/net/sock.h.orig	Wed Mar  1 11:17:55 2000
++++ linux/include/net/sock.h	Wed Mar  1 14:07:36 2000
+@@ -468,6 +468,7 @@
+ 	__u32			saddr;		/* Sending source			*/
+ 	unsigned int		allocation;	/* Allocation mode			*/
+ 	int			sndbuf;		/* Size of send buffer in bytes		*/
++	int			accept_flags;	/* Flags used from accept()		*/
+ 	struct sock		*prev;
+ 
+ 	/* Not all are volatile, but some are, so we might as well say they all are.

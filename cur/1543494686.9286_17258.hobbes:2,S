@@ -1,0 +1,796 @@
+Date: 05 May 1999 15:24:59 +0200
+From: Trond Myklebust <>
+Subject: Re: NFS - rpcauth_gc_credcache looping
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/5/5/122
+
+Ben Blakely <brb@webserve.net> writes:
+> Hi,
+> 
+> I've been having problems getting NFS to cooperate on the 2.2.x kernels.
+> Initially, we had an NFS mount that was locking up (and dumping a stack
+> trace to syslog) when we did a syscall "rename" to a file in an NFS
+> mounted directory. This behavior disappeared when we installed 2.2.6-ac2
+> (continued happening with 2.2.7, so we stayed with the 6-ac2). Now, I'm
+> seeing every minute several messages in syslog that say the following:
+> 
+>  smtp kernel: RPC: rpcauth_gc_credcache looping! 
+> 
+> The errors seem to be harmless, or at least nothing is obviously broken,
+> but it's dumping 6 of these messages in syslog every minute. Does anyone
+> know why these would be produced? I found the text of the message in
+> net/sunrpc/auth.c but I don't know C well enough to decipher it's
+> meaning. 
+I fixed that bug as part of a (fairly largish) patch series I sent to
+Linus yesterday. I have no idea as to whether he'll accept the full
+set of patches, so please don't consider the appended stuff as
+finalized, but since you're seeing the bug, I'll post it to
+Linux-kernel nevertheless.
+The following patch is against stock linux-2.2.7. An equivalent patch
+against 2.2.7-ac1 has already been sent to Alan, and is available upon
+request to me.
+Cheers,
+  Trond
+diff -u --recursive --new-file linux-2.2.7/fs/lockd/clntproc.c linux/fs/lockd/clntproc.c
+--- linux-2.2.7/fs/lockd/clntproc.c	Wed Feb 17 18:44:33 1999
++++ linux/fs/lockd/clntproc.c	Sun May  2 22:06:57 1999
+@@ -220,11 +220,16 @@
+ 	struct rpc_clnt	*clnt;
+ 	struct nlm_args	*argp = &req->a_args;
+ 	struct nlm_res	*resp = &req->a_res;
++	struct file	*filp = argp->lock.fl.fl_file;
++	struct rpc_cred	*cred = NULL;
+ 	int		status;
+ 
+ 	dprintk("lockd: call procedure %s on %s\n",
+ 			nlm_procname(proc), host->h_name);
+ 
++	if (filp)
++		cred = NFS_FILE_CRED(filp);
++
+ 	do {
+ 		if (host->h_reclaiming && !argp->reclaim) {
+ 			interruptible_sleep_on(&host->h_gracewait);
+@@ -236,7 +241,8 @@
+ 			return -ENOLCK;
+ 
+ 		/* Perform the RPC call. If an error occurs, try again */
+-		if ((status = rpc_call(clnt, proc, argp, resp, 0)) < 0) {
++		if ((status = rpc_do_call(clnt, cred, proc, argp, resp, 0,
++					  NULL, NULL)) < 0) {
+ 			dprintk("lockd: rpc_call returned error %d\n", -status);
+ 			switch (status) {
+ 			case -EPROTONOSUPPORT:
+@@ -295,6 +301,8 @@
+ 	struct rpc_clnt	*clnt;
+ 	struct nlm_args	*argp = &req->a_args;
+ 	struct nlm_res	*resp = &req->a_res;
++	struct file	*filp = argp->lock.fl.fl_file;
++	struct rpc_cred	*cred = NULL;
+ 	int		status;
+ 
+ 	dprintk("lockd: call procedure %s on %s (async)\n",
+@@ -304,8 +312,11 @@
+ 	if ((clnt = nlm_bind_host(host)) == NULL)
+ 		return -ENOLCK;
+ 
++	if (filp)
++		cred = NFS_FILE_CRED(filp);
++
+         /* bootstrap and kick off the async RPC call */
+-        status = rpc_do_call(clnt, proc, argp, resp, RPC_TASK_ASYNC,
++        status = rpc_do_call(clnt, cred, proc, argp, resp, RPC_TASK_ASYNC,
+ 					callback, req);
+ 
+ 	/* If the async call is proceeding, increment host refcount */
+diff -u --recursive --new-file linux-2.2.7/fs/nfs/dir.c linux/fs/nfs/dir.c
+--- linux-2.2.7/fs/nfs/dir.c	Sat Apr 24 21:45:37 1999
++++ linux/fs/nfs/dir.c	Sun May  2 22:25:51 1999
+@@ -26,6 +26,8 @@
+ #include <linux/mm.h>
+ #include <linux/sunrpc/types.h>
+ #include <linux/nfs_fs.h>
++#include <linux/sunrpc/auth.h>
++#include <linux/sunrpc/clnt.h>
+ 
+ #include <asm/segment.h>	/* for fs functions */
+ 
+@@ -51,6 +53,8 @@
+ 
+ static int nfs_safe_remove(struct dentry *);
+ 
++static int nfs_dir_open(struct inode *, struct file *);
++static int nfs_dir_release(struct inode *, struct file *);
+ static ssize_t nfs_dir_read(struct file *, char *, size_t, loff_t *);
+ static int nfs_readdir(struct file *, void *, filldir_t);
+ static struct dentry *nfs_lookup(struct inode *, struct dentry *);
+@@ -72,9 +76,9 @@
+ 	NULL,			/* select - default */
+ 	NULL,			/* ioctl - default */
+ 	NULL,			/* mmap */
+-	NULL,			/* no special open is needed */
++	nfs_dir_open,		/* open */
+ 	NULL,			/* flush */
+-	NULL,			/* no special release code */
++	nfs_dir_release,	/* release */
+ 	NULL			/* fsync */
+ };
+ 
+@@ -101,6 +105,27 @@
+ 	nfs_revalidate,		/* revalidate */
+ };
+ 
++static int
++nfs_dir_open(struct inode *inode, struct file *filp)
++{
++	struct rpc_auth		*auth = NFS_CLIENT(inode)->cl_auth;
++
++	NFS_FILE_CRED(filp) = rpcauth_lookupcred(auth, 0);
++	return 0;
++}
++
++static int
++nfs_dir_release(struct inode *inode, struct file *filp)
++{
++	struct rpc_auth		*auth = NFS_CLIENT(inode)->cl_auth;
++
++	if (NFS_FILE_CRED(filp)) {
++		rpcauth_releasecred(auth, NFS_FILE_CRED(filp));
++		NFS_FILE_CRED(filp) = NULL;
++	}
++	return 0;
++}
++
+ static ssize_t
+ nfs_dir_read(struct file *filp, char *buf, size_t count, loff_t *ppos)
+ {
+@@ -124,6 +149,7 @@
+ {
+ 	struct dentry 		*dentry = filp->f_dentry;
+ 	struct inode 		*inode = dentry->d_inode;
++	struct rpc_cred		*cred = NFS_FILE_CRED(filp);
+ 	static struct wait_queue *readdir_wait = NULL;
+ 	struct wait_queue	**waitp = NULL;
+ 	struct nfs_dirent	*cache, *free;
+@@ -239,7 +265,7 @@
+ 		}
+ 
+ 		result = nfs_proc_readdir(NFS_SERVER(inode), NFS_FH(dentry),
+-					cookie, PAGE_SIZE, cache->entry);
++					cred, cookie, PAGE_SIZE, cache->entry);
+ 		if (result <= 0)
+ 			goto done;
+ 		cache->size  = result;
+diff -u --recursive --new-file linux-2.2.7/fs/nfs/file.c linux/fs/nfs/file.c
+--- linux-2.2.7/fs/nfs/file.c	Sat Apr 24 21:45:37 1999
++++ linux/fs/nfs/file.c	Sun May  2 22:23:02 1999
+@@ -26,12 +26,16 @@
+ #include <linux/malloc.h>
+ #include <linux/pagemap.h>
+ #include <linux/lockd/bind.h>
++#include <linux/sunrpc/auth.h>
++#include <linux/sunrpc/clnt.h>
+ 
+ #include <asm/segment.h>
+ #include <asm/system.h>
+ 
+ #define NFSDBG_FACILITY		NFSDBG_FILE
+ 
++static int  nfs_file_open(struct inode *, struct file *);
++static int  nfs_file_release(struct inode *, struct file *);
+ static int  nfs_file_mmap(struct file *, struct vm_area_struct *);
+ static ssize_t nfs_file_read(struct file *, char *, size_t, loff_t *);
+ static ssize_t nfs_file_write(struct file *, const char *, size_t, loff_t *);
+@@ -46,9 +50,9 @@
+ 	NULL,			/* select - default */
+ 	NULL,			/* ioctl - default */
+ 	nfs_file_mmap,		/* mmap */
+-	NULL,			/* no special open is needed */
++	nfs_file_open,		/* open */
+ 	nfs_file_flush,		/* flush */
+-	NULL,			/* release */
++	nfs_file_release,	/* release */
+ 	nfs_fsync,		/* fsync */
+ 	NULL,			/* fasync */
+ 	NULL,			/* check_media_change */
+@@ -102,6 +106,27 @@
+ 		file->f_error = 0;
+ 	}
+ 	return status;
++}
++
++static int
++nfs_file_open(struct inode *inode, struct file *filp)
++{
++	struct rpc_auth		*auth = NFS_CLIENT(inode)->cl_auth;
++
++	NFS_FILE_CRED(filp) = rpcauth_lookupcred(auth, 0);
++	return 0;
++}
++
++static int
++nfs_file_release(struct inode *inode, struct file *filp)
++{
++	struct rpc_auth		*auth = NFS_CLIENT(inode)->cl_auth;
++
++	if (NFS_FILE_CRED(filp)) {
++		rpcauth_releasecred(auth, NFS_FILE_CRED(filp));
++		NFS_FILE_CRED(filp) = NULL;
++	}
++	return 0;
+ }
+ 
+ static ssize_t
+diff -u --recursive --new-file linux-2.2.7/fs/nfs/read.c linux/fs/nfs/read.c
+--- linux-2.2.7/fs/nfs/read.c	Tue Dec 22 18:37:43 1998
++++ linux/fs/nfs/read.c	Sun May  2 22:06:58 1999
+@@ -66,7 +66,8 @@
+  * Read a page synchronously.
+  */
+ static int
+-nfs_readpage_sync(struct dentry *dentry, struct inode *inode, struct page *page)
++nfs_readpage_sync(struct dentry *dentry, struct inode *inode, 
++		  struct rpc_cred *cred, struct page *page)
+ {
+ 	struct nfs_rreq	rqst;
+ 	unsigned long	offset = page->offset;
+@@ -90,8 +91,9 @@
+ 
+ 		/* Set up arguments and perform rpc call */
+ 		nfs_readreq_setup(&rqst, NFS_FH(dentry), offset, buffer, rsize);
+-		result = rpc_call(NFS_CLIENT(inode), NFSPROC_READ,
+-					&rqst.ra_args, &rqst.ra_res, flags);
++		result = rpc_do_call(NFS_CLIENT(inode), cred,
++				     NFSPROC_READ, &rqst.ra_args, &rqst.ra_res,
++				     flags, NULL, NULL);
+ 
+ 		/*
+ 		 * Even if we had a partial success we can't mark the page
+@@ -165,7 +167,7 @@
+ 
+ static inline int
+ nfs_readpage_async(struct dentry *dentry, struct inode *inode,
+-			struct page *page)
++			struct rpc_cred *cred, struct page *page)
+ {
+ 	unsigned long address = page_address(page);
+ 	struct nfs_rreq	*req;
+@@ -190,7 +192,7 @@
+ 
+ 	/* Start the async call */
+ 	dprintk("NFS: executing async READ request.\n");
+-	result = rpc_do_call(NFS_CLIENT(inode), NFSPROC_READ,
++	result = rpc_do_call(NFS_CLIENT(inode), cred, NFSPROC_READ,
+ 				&req->ra_args, &req->ra_res, flags,
+ 				nfs_readpage_result, req);
+ 	if (result < 0)
+@@ -223,8 +225,9 @@
+ int
+ nfs_readpage(struct file *file, struct page *page)
+ {
+-	struct dentry *dentry = file->f_dentry;
+-	struct inode *inode = dentry->d_inode;
++	struct dentry	*dentry = file->f_dentry;
++	struct inode	*inode = dentry->d_inode;
++	struct rpc_cred	*cred = NFS_FILE_CRED(file);
+ 	int		error;
+ 
+ 	dprintk("NFS: nfs_readpage (%p %ld@%ld)\n",
+@@ -246,11 +249,11 @@
+ 	error = -1;
+ 	if (!IS_SWAPFILE(inode) && !PageError(page) &&
+ 	    NFS_SERVER(inode)->rsize >= PAGE_SIZE)
+-		error = nfs_readpage_async(dentry, inode, page);
++		error = nfs_readpage_async(dentry, inode, cred, page);
+ 	if (error >= 0)
+ 		goto out;
+ 
+-	error = nfs_readpage_sync(dentry, inode, page);
++	error = nfs_readpage_sync(dentry, inode, cred, page);
+ 	if (error < 0 && IS_SWAPFILE(inode))
+ 		printk("Aiee.. nfs swap-in of page failed!\n");
+ 	goto out_free;
+diff -u --recursive --new-file linux-2.2.7/fs/nfs/write.c linux/fs/nfs/write.c
+--- linux-2.2.7/fs/nfs/write.c	Wed Mar  3 20:17:02 1999
++++ linux/fs/nfs/write.c	Sun May  2 22:24:52 1999
+@@ -86,6 +86,7 @@
+  */
+ static int
+ nfs_writepage_sync(struct dentry *dentry, struct inode *inode,
++		struct rpc_cred *cred,
+ 		struct page *page, unsigned long offset, unsigned int count)
+ {
+ 	unsigned int	wsize = NFS_SERVER(inode)->wsize;
+@@ -105,6 +106,7 @@
+ 			wsize = count;
+ 
+ 		result = nfs_proc_write(NFS_DSERVER(dentry), NFS_FH(dentry),
++					cred,
+ 					IS_SWAPFILE(inode), offset, wsize,
+ 					buffer, &fattr);
+ 
+@@ -284,7 +286,15 @@
+ 	task->tk_calldata = wreq;
+ 	task->tk_action = nfs_wback_begin;
+ 
+-	rpcauth_lookupcred(task);	/* Obtain user creds */
++	if (task->tk_status < 0)
++		goto out_req;
++
++	task->tk_cred = NFS_FILE_CRED(file);
++	if (task->tk_cred)
++		rpcauth_holdcred(task);
++	else
++		rpcauth_bindcred(task);	/* Obtain user creds */
++
+ 	if (task->tk_status < 0)
+ 		goto out_req;
+ 
+@@ -397,7 +407,9 @@
+ nfs_writepage(struct file * file, struct page *page)
+ {
+ 	struct dentry *dentry = file->f_dentry;
+-	return nfs_writepage_sync(dentry, dentry->d_inode, page, 0, PAGE_SIZE);
++	struct rpc_cred *cred = NFS_FILE_CRED(file);
++	return nfs_writepage_sync(dentry, dentry->d_inode, cred,
++				  page, 0, PAGE_SIZE);
+ }
+ 
+ /*
+@@ -438,7 +450,8 @@
+ 	 * page synchronously.
+ 	 */
+ 	if (NFS_SERVER(inode)->wsize < PAGE_SIZE)
+-		return nfs_writepage_sync(dentry, inode, page, offset, count);
++		return nfs_writepage_sync(dentry, inode, NFS_FILE_CRED(file),
++					  page, offset, count);
+ 
+ 	/* Create the write request. */
+ 	req = create_write_request(file, page, offset, count);
+diff -u --recursive --new-file linux-2.2.7/include/linux/nfs_fs.h linux/include/linux/nfs_fs.h
+--- linux-2.2.7/include/linux/nfs_fs.h	Tue Apr 27 18:56:22 1999
++++ linux/include/linux/nfs_fs.h	Sun May  2 22:34:43 1999
+@@ -80,6 +80,8 @@
+ #define NFS_REVALIDATING(inode)		(NFS_FLAGS(inode) & NFS_INO_REVALIDATE)
+ #define NFS_WRITEBACK(inode)		((inode)->u.nfs_i.writeback)
+ 
++#define NFS_FILE_CRED(filp)	((struct rpc_cred*)((filp)->private_data))
++
+ /*
+  * These are the default flags for swap requests
+  */
+@@ -143,9 +145,11 @@
+ 			void **p0, char **string, unsigned int *len,
+ 			unsigned int maxlen);
+ extern int nfs_proc_read(struct nfs_server *server, struct nfs_fh *fhandle,
++			struct rpc_cred *cred,
+ 			int swap, unsigned long offset, unsigned int count,
+ 			void *buffer, struct nfs_fattr *fattr);
+ extern int nfs_proc_write(struct nfs_server *server, struct nfs_fh *fhandle,
++			struct rpc_cred *cred,
+ 			int swap, unsigned long offset, unsigned int count,
+ 			const void *buffer, struct nfs_fattr *fattr);
+ extern int nfs_proc_create(struct nfs_server *server, struct nfs_fh *dir,
+@@ -167,6 +171,7 @@
+ extern int nfs_proc_rmdir(struct nfs_server *server, struct nfs_fh *dir,
+ 			const char *name);
+ extern int nfs_proc_readdir(struct nfs_server *server, struct nfs_fh *fhandle,
++			struct rpc_cred *cred,
+ 			u32 cookie, unsigned int size, __u32 *entry);
+ extern int nfs_proc_statfs(struct nfs_server *server, struct nfs_fh *fhandle,
+ 			struct nfs_fsinfo *res);
+diff -u --recursive --new-file linux-2.2.7/include/linux/sunrpc/auth.h linux/include/linux/sunrpc/auth.h
+--- linux-2.2.7/include/linux/sunrpc/auth.h	Tue Apr 27 18:56:43 1999
++++ linux/include/linux/sunrpc/auth.h	Sun May  2 22:43:18 1999
+@@ -64,10 +64,10 @@
+ 	struct rpc_auth *	(*create)(struct rpc_clnt *);
+ 	void			(*destroy)(struct rpc_auth *);
+ 
+-	struct rpc_cred *	(*crcreate)(struct rpc_task *);
++	struct rpc_cred *	(*crcreate)(int);
+ 	void			(*crdestroy)(struct rpc_cred *);
+ 
+-	int			(*crmatch)(struct rpc_task *, struct rpc_cred*);
++	int			(*crmatch)(struct rpc_cred *, int);
+ 	u32 *			(*crmarshal)(struct rpc_task *, u32 *, int);
+ 	int			(*crrefresh)(struct rpc_task *);
+ 	u32 *			(*crvalidate)(struct rpc_task *, u32 *);
+@@ -83,10 +83,14 @@
+ int			rpcauth_unregister(struct rpc_authops *);
+ struct rpc_auth *	rpcauth_create(unsigned int, struct rpc_clnt *);
+ void			rpcauth_destroy(struct rpc_auth *);
+-struct rpc_cred *	rpcauth_lookupcred(struct rpc_task *);
++struct rpc_cred *	rpcauth_lookupcred(struct rpc_auth *, int);
++struct rpc_cred *	rpcauth_bindcred(struct rpc_task *);
+ void			rpcauth_holdcred(struct rpc_task *);
+-void			rpcauth_releasecred(struct rpc_task *);
+-int			rpcauth_matchcred(struct rpc_task *, struct rpc_cred *);
++void			rpcauth_releasecred(struct rpc_auth *,
++					    struct rpc_cred *);
++void			rpcauth_unbindcred(struct rpc_task *);
++int			rpcauth_matchcred(struct rpc_auth *,
++					  struct rpc_cred *, int);
+ u32 *			rpcauth_marshcred(struct rpc_task *, u32 *);
+ u32 *			rpcauth_checkverf(struct rpc_task *, u32 *);
+ int			rpcauth_refreshcred(struct rpc_task *);
+diff -u --recursive --new-file linux-2.2.7/include/linux/sunrpc/clnt.h linux/include/linux/sunrpc/clnt.h
+--- linux-2.2.7/include/linux/sunrpc/clnt.h	Tue Apr 27 18:56:46 1999
++++ linux/include/linux/sunrpc/clnt.h	Sun May  2 22:43:18 1999
+@@ -117,15 +117,15 @@
+ 				void *argp, void *resp, int flags);
+ void		rpc_call_setup(struct rpc_task *task, u32 proc,
+ 				void *argp, void *resp, int flags);
+-int		rpc_do_call(struct rpc_clnt *clnt, u32 proc,
+-				void *argp, void *resp, int flags,
++int		rpc_do_call(struct rpc_clnt *clnt, struct rpc_cred *cred,
++				u32 proc, void *argp, void *resp, int flags,
+ 				rpc_action callback, void *clntdata);
+ void		rpc_restart_call(struct rpc_task *);
+ void		rpc_clnt_sigmask(struct rpc_clnt *clnt, sigset_t *oldset);
+ void		rpc_clnt_sigunmask(struct rpc_clnt *clnt, sigset_t *oldset);
+ 
+ #define rpc_call(clnt, proc, argp, resp, flags)	\
+-		rpc_do_call(clnt, proc, argp, resp, flags, NULL, NULL)
++		rpc_do_call(clnt, NULL, proc, argp, resp, flags, NULL, NULL)
+ 
+ extern __inline__ void
+ rpc_set_timeout(struct rpc_clnt *clnt, unsigned int retr, unsigned long incr)
+diff -u --recursive --new-file linux-2.2.7/net/sunrpc/auth.c linux/net/sunrpc/auth.c
+--- linux-2.2.7/net/sunrpc/auth.c	Mon Mar 22 17:00:15 1999
++++ linux/net/sunrpc/auth.c	Sun May  2 22:06:58 1999
+@@ -78,6 +78,15 @@
+ 	auth->au_nextgc = jiffies + (auth->au_expire >> 1);
+ }
+ 
++static inline void
++rpcauth_crdestroy(struct rpc_auth *auth, struct rpc_cred *cred)
++{
++	if (auth->au_ops->crdestroy)
++		auth->au_ops->crdestroy(cred);
++	else
++		rpc_free(cred);
++}
++
+ /*
+  * Clear the RPC credential cache
+  */
+@@ -107,17 +116,14 @@
+ rpcauth_gc_credcache(struct rpc_auth *auth)
+ {
+ 	struct rpc_cred	**q, *cred, *free = NULL;
+-	int		i, safe = 0;
++	int		i;
+ 
+ 	dprintk("RPC: gc'ing RPC credentials for auth %p\n", auth);
+ 	for (i = 0; i < RPC_CREDCACHE_NR; i++) {
+ 		q = &auth->au_credcache[i];
+ 		while ((cred = *q) != NULL) {
+-			if (++safe > 500) {
+-				printk("RPC: rpcauth_gc_credcache looping!\n");
+-				break;
+-			}
+-			if (!cred->cr_count && time_before(cred->cr_expire, jiffies)) {
++			if (!cred->cr_count &&
++			    time_before(cred->cr_expire, jiffies)) {
+ 				*q = cred->cr_next;
+ 				cred->cr_next = free;
+ 				free = cred;
+@@ -128,7 +134,7 @@
+ 	}
+ 	while ((cred = free) != NULL) {
+ 		free = cred->cr_next;
+-		rpc_free(cred);
++		rpcauth_crdestroy(auth, cred);
+ 	}
+ 	auth->au_nextgc = jiffies + auth->au_expire;
+ }
+@@ -136,7 +142,7 @@
+ /*
+  * Insert credential into cache
+  */
+-inline void
++void
+ rpcauth_insert_credcache(struct rpc_auth *auth, struct rpc_cred *cred)
+ {
+ 	int		nr;
+@@ -144,39 +150,43 @@
+ 	nr = (cred->cr_uid % RPC_CREDCACHE_NR);
+ 	cred->cr_next = auth->au_credcache[nr];
+ 	auth->au_credcache[nr] = cred;
+-	cred->cr_expire = jiffies + auth->au_expire;
+-	cred->cr_count++;
+ }
+ 
+ /*
+  * Look up a process' credentials in the authentication cache
+  */
+ static struct rpc_cred *
+-rpcauth_lookup_credcache(struct rpc_task *task)
++rpcauth_lookup_credcache(struct rpc_auth *auth, int taskflags)
+ {
+-	struct rpc_auth	*auth = task->tk_auth;
+ 	struct rpc_cred	**q, *cred = NULL;
+-	int		nr;
++	int		nr = 0;
+ 
+-	nr = RPC_DO_ROOTOVERRIDE(task)? 0 : (current->uid % RPC_CREDCACHE_NR);
++	if (!(taskflags & RPC_TASK_ROOTCREDS))
++		nr = current->uid % RPC_CREDCACHE_NR;
+ 
+ 	if (time_before(auth->au_nextgc, jiffies))
+ 		rpcauth_gc_credcache(auth);
+ 
+ 	q = &auth->au_credcache[nr];
+ 	while ((cred = *q) != NULL) {
+-		if (auth->au_ops->crmatch(task, cred)) {
++		if (!(cred->cr_flags & RPCAUTH_CRED_DEAD) &&
++		    auth->au_ops->crmatch(cred, taskflags)) {
+ 			*q = cred->cr_next;
+ 			break;
+ 		}
+ 		q = &cred->cr_next;
+ 	}
+ 
+-	if (!cred)
+-		cred = auth->au_ops->crcreate(task);
++	if (!cred) {
++		cred = auth->au_ops->crcreate(taskflags);
++		if (cred)
++			rpcauth_insert_credcache(auth, cred);
++	}
+ 
+-	if (cred)
+-		rpcauth_insert_credcache(auth, cred);
++	if (cred) {
++		cred->cr_count++;
++		cred->cr_expire = jiffies + auth->au_expire;
++	}
+ 
+ 	return (struct rpc_cred *) cred;
+ }
+@@ -184,7 +194,7 @@
+ /*
+  * Remove cred handle from cache
+  */
+-static inline void
++static void
+ rpcauth_remove_credcache(struct rpc_auth *auth, struct rpc_cred *cred)
+ {
+ 	struct rpc_cred	**q, *cr;
+@@ -195,6 +205,7 @@
+ 	while ((cr = *q) != NULL) {
+ 		if (cred == cr) {
+ 			*q = cred->cr_next;
++			cred->cr_next = NULL;
+ 			return;
+ 		}
+ 		q = &cred->cr_next;
+@@ -202,21 +213,32 @@
+ }
+ 
+ struct rpc_cred *
+-rpcauth_lookupcred(struct rpc_task *task)
++rpcauth_lookupcred(struct rpc_auth *auth, int taskflags)
++{
++	dprintk("RPC:     looking up %s cred\n",
++		auth->au_ops->au_name);
++	return rpcauth_lookup_credcache(auth, taskflags);
++}
++
++struct rpc_cred *
++rpcauth_bindcred(struct rpc_task *task)
+ {
++	struct rpc_auth *auth = task->tk_auth;
++
+ 	dprintk("RPC: %4d looking up %s cred\n",
+ 		task->tk_pid, task->tk_auth->au_ops->au_name);
+-	return task->tk_cred = rpcauth_lookup_credcache(task);
++	task->tk_cred = rpcauth_lookup_credcache(auth, task->tk_flags);
++	if (task->tk_cred == 0)
++		task->tk_status = -ENOMEM;
++	return task->tk_cred;
+ }
+ 
+ int
+-rpcauth_matchcred(struct rpc_task *task, struct rpc_cred *cred)
++rpcauth_matchcred(struct rpc_auth *auth, struct rpc_cred *cred, int taskflags)
+ {
+-	struct rpc_auth	*auth = task->tk_auth;
+-
+-	dprintk("RPC: %4d matching %s cred %p\n",
+-		task->tk_pid, auth->au_ops->au_name, task->tk_cred);
+-	return auth->au_ops->crmatch(task, cred);
++	dprintk("RPC:     matching %s cred %d\n",
++		auth->au_ops->au_name, taskflags);
++	return auth->au_ops->crmatch(cred, taskflags);
+ }
+ 
+ void
+@@ -224,27 +246,36 @@
+ {
+ 	dprintk("RPC: %4d holding %s cred %p\n",
+ 		task->tk_pid, task->tk_auth->au_ops->au_name, task->tk_cred);
+-	if (task->tk_cred)
++	if (task->tk_cred) {
+ 		task->tk_cred->cr_count++;
++		task->tk_cred->cr_expire = jiffies + task->tk_auth->au_expire;
++	}
+ }
+ 
+ void
+-rpcauth_releasecred(struct rpc_task *task)
++rpcauth_releasecred(struct rpc_auth *auth, struct rpc_cred *cred)
+ {
+-	struct rpc_auth	*auth = task->tk_auth;
+-	struct rpc_cred	*cred;
+-
+-	dprintk("RPC: %4d releasing %s cred %p\n",
+-		task->tk_pid, auth->au_ops->au_name, task->tk_cred);
+-	if ((cred = task->tk_cred) != NULL) {
++	if (cred != NULL) {
+ 		cred->cr_count--;
+ 		if (cred->cr_flags & RPCAUTH_CRED_DEAD) {
+ 			rpcauth_remove_credcache(auth, cred);
+ 			if (!cred->cr_count)
+-				auth->au_ops->crdestroy(cred);
++				rpcauth_crdestroy(auth, cred);
+ 		}
+-		task->tk_cred = NULL;
+ 	}
++}
++
++void
++rpcauth_unbindcred(struct rpc_task *task)
++{
++	struct rpc_auth	*auth = task->tk_auth;
++	struct rpc_cred	*cred = task->tk_cred;
++
++	dprintk("RPC: %4d releasing %s cred %p\n",
++		task->tk_pid, auth->au_ops->au_name, cred);
++
++	rpcauth_releasecred(auth, cred);
++	task->tk_cred = NULL;
+ }
+ 
+ u32 *
+diff -u --recursive --new-file linux-2.2.7/net/sunrpc/auth_null.c linux/net/sunrpc/auth_null.c
+--- linux-2.2.7/net/sunrpc/auth_null.c	Mon Mar 22 17:00:15 1999
++++ linux/net/sunrpc/auth_null.c	Sun May  2 22:06:58 1999
+@@ -45,15 +45,12 @@
+  * Create NULL creds for current process
+  */
+ static struct rpc_cred *
+-nul_create_cred(struct rpc_task *task)
++nul_create_cred(int flags)
+ {
+ 	struct rpc_cred	*cred;
+ 
+-	if (!(cred = (struct rpc_cred *) rpc_malloc(task, sizeof(*cred)))) {
+-		task->tk_status = -ENOMEM;
++	if (!(cred = (struct rpc_cred *) rpc_allocate(flags, sizeof(*cred))))
+ 		return NULL;
+-	}
+-
+ 	cred->cr_count = 0;
+ 	cred->cr_flags = RPCAUTH_CRED_UPTODATE;
+ 
+@@ -73,7 +70,7 @@
+  * Match cred handle against current process
+  */
+ static int
+-nul_match(struct rpc_task *task, struct rpc_cred *cred)
++nul_match(struct rpc_cred *cred, int taskflags)
+ {
+ 	return 1;
+ }
+diff -u --recursive --new-file linux-2.2.7/net/sunrpc/auth_unix.c linux/net/sunrpc/auth_unix.c
+--- linux-2.2.7/net/sunrpc/auth_unix.c	Mon Mar 22 17:00:15 1999
++++ linux/net/sunrpc/auth_unix.c	Sun May  2 22:06:58 1999
+@@ -60,7 +60,7 @@
+ }
+ 
+ static struct rpc_cred *
+-unx_create_cred(struct rpc_task *task)
++unx_create_cred(int flags)
+ {
+ 	struct unx_cred	*cred;
+ 	int		i;
+@@ -68,14 +68,12 @@
+ 	dprintk("RPC:      allocating UNIX cred for uid %d gid %d\n",
+ 				current->uid, current->gid);
+ 
+-	if (!(cred = (struct unx_cred *) rpc_malloc(task, sizeof(*cred)))) {
+-		task->tk_status = -ENOMEM;
++	if (!(cred = (struct unx_cred *) rpc_allocate(flags, sizeof(*cred))))
+ 		return NULL;
+-	}
+ 
+ 	cred->uc_count = 0;
+ 	cred->uc_flags = RPCAUTH_CRED_UPTODATE;
+-	if (RPC_DO_ROOTOVERRIDE(task)) {
++	if (flags & RPC_TASK_ROOTCREDS) {
+ 		cred->uc_uid = cred->uc_fsuid = 0;
+ 		cred->uc_gid = cred->uc_fsgid = 0;
+ 		cred->uc_gids[0] = NOGROUP;
+@@ -131,12 +129,12 @@
+  * request root creds (e.g. for NFS swapping).
+  */
+ static int
+-unx_match(struct rpc_task * task, struct rpc_cred *rcred)
++unx_match(struct rpc_cred *rcred, int taskflags)
+ {
+ 	struct unx_cred	*cred = (struct unx_cred *) rcred;
+ 	int		i;
+ 
+-	if (!RPC_DO_ROOTOVERRIDE(task)) {
++	if (!(taskflags & RPC_TASK_ROOTCREDS)) {
+ 		int groups;
+ 
+ 		if (cred->uc_uid != current->uid
+diff -u --recursive --new-file linux-2.2.7/net/sunrpc/clnt.c linux/net/sunrpc/clnt.c
+--- linux-2.2.7/net/sunrpc/clnt.c	Tue Oct  6 18:39:44 1998
++++ linux/net/sunrpc/clnt.c	Sun May  2 22:06:58 1999
+@@ -237,8 +237,9 @@
+  * New rpc_call implementation
+  */
+ int
+-rpc_do_call(struct rpc_clnt *clnt, u32 proc, void *argp, void *resp,
+-				int flags, rpc_action func, void *data)
++rpc_do_call(struct rpc_clnt *clnt, struct rpc_cred *cred,
++	    u32 proc, void *argp, void *resp,
++	    int flags, rpc_action func, void *data)
+ {
+ 	struct rpc_task	my_task, *task = &my_task;
+ 	sigset_t	oldset;
+@@ -262,9 +263,15 @@
+ 		rpc_init_task(task, clnt, NULL, flags);
+ 	}
+ 
+-	/* Bind the user cred, set up the call info struct and
+-	 * execute the task */
+-	if (rpcauth_lookupcred(task) != NULL) {
++	/* Bind the user cred */
++	if (cred != NULL) {
++		task->tk_cred = cred;
++		rpcauth_holdcred(task);
++	} else
++		cred = rpcauth_bindcred(task);
++
++	/* Set up the call info struct and execute the task */
++	if (cred != NULL) {
+ 		rpc_call_setup(task, proc, argp, resp, 0);
+ 		rpc_execute(task);
+ 	} else
+diff -u --recursive --new-file linux-2.2.7/net/sunrpc/sched.c linux/net/sunrpc/sched.c
+--- linux-2.2.7/net/sunrpc/sched.c	Wed Feb 24 02:11:26 1999
++++ linux/net/sunrpc/sched.c	Sun May  2 22:06:58 1999
+@@ -692,7 +692,7 @@
+ 	if (task->tk_rqstp)
+ 		xprt_release(task);
+ 	if (task->tk_cred)
+-		rpcauth_releasecred(task);
++		rpcauth_unbindcred(task);
+ 	if (task->tk_buffer) {
+ 		rpc_free(task->tk_buffer);
+ 		task->tk_buffer = NULL;
+diff -u --recursive --new-file linux-2.2.7/net/sunrpc/sunrpc_syms.c linux/net/sunrpc/sunrpc_syms.c
+--- linux-2.2.7/net/sunrpc/sunrpc_syms.c	Thu Aug 20 01:16:04 1998
++++ linux/net/sunrpc/sunrpc_syms.c	Sun May  2 23:00:07 1999
+@@ -60,7 +60,9 @@
+ EXPORT_SYMBOL(rpcauth_free_credcache);
+ EXPORT_SYMBOL(rpcauth_insert_credcache);
+ EXPORT_SYMBOL(rpcauth_lookupcred);
++EXPORT_SYMBOL(rpcauth_bindcred);
+ EXPORT_SYMBOL(rpcauth_matchcred);
++EXPORT_SYMBOL(rpcauth_holdcred);
+ EXPORT_SYMBOL(rpcauth_releasecred);
+ 
+ /* RPC server stuff */
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

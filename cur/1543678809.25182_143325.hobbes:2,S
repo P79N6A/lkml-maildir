@@ -1,0 +1,628 @@
+Date: Wed, 25 Jun 2003 23:38:40 +0300
+From: Muli Ben-Yehuda <>
+Subject: [PATCH] intermezzo stack lossage (was Re: top stack users for 2.5.73)
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2003/6/25/198
+
+On Wed, Jun 25, 2003 at 06:33:22PM +0200, J?rn Engel wrote:
+> 0xc0204c1b presto_get_fileid:                            sub    $0x116c,%esp
+> 0xc020378b presto_copy_kml_tail:                         sub    $0x1018,%esp
+> 0xc01fb563 presto_ioctl:                                 sub    $0x4cc,%esp
+Here's a patch for these three. Compiled, but not tested, as I don't
+have intermezzo set up. No fancy games, just replace humongous stack
+allocation with dynamic allocation. This isn't as clean as it could
+be, but I went for minimal changes to core intermezzo code. Before
+embarking on any major cleanups, I'd like to hear from the intermezzo
+maintainers what are their plans wrt 2.5 first. For the time being,
+here are a couple of issues that I noticed with the code now: 
+1. presto_finish_kml_truncate does not appear to be called from
+anywhere? if it is, and is indeed called with the
+fset->fset_kml.fd_lock taken, as the comment above it says, it mustn't
+call anything that does non-atomic allocations, such as
+izo_mak_path(). 
+2. In presto_ioctl(), there the code calls a function which can return
+0, treats that 0 as an error, and then returns 0 itself. Is this
+intentional or a bug? 
+diff -Naur --exclude-from=/home/mulix/dontdiff linux-2.5/fs/intermezzo/dir.c linux-2.5.73-stack-lusers/fs/intermezzo/dir.c
+--- linux-2.5/fs/intermezzo/dir.c	2003-03-22 04:25:29.000000000 +0200
++++ linux-2.5.73-stack-lusers/fs/intermezzo/dir.c	2003-06-25 23:02:34.000000000 +0300
+@@ -877,17 +877,19 @@
+ int presto_ioctl(struct inode *inode, struct file *file,
+                         unsigned int cmd, unsigned long arg)
+ {
+-        char buf[1024];
+         struct izo_ioctl_data *data = NULL;
+         struct presto_dentry_data *dd;
+         int rc;
++        char* buf; 
++        static const size_t bufsz = 1024; 
+ 
+         ENTRY;
+ 
+         /* Try the filesystem's ioctl first, and return if it succeeded. */
+         dd = presto_d2d(file->f_dentry); 
+         if (dd && dd->dd_fset) { 
+-                int (*cache_ioctl)(struct inode *, struct file *, unsigned int, unsigned long ) = filter_c2cdfops(dd->dd_fset->fset_cache->cache_filter)->ioctl;
++                int (*cache_ioctl)(struct inode *, struct file *, unsigned int, unsigned long); 
++                cache_ioctl = filter_c2cdfops(dd->dd_fset->fset_cache->cache_filter)->ioctl;
+                 rc = -ENOTTY;
+                 if (cache_ioctl)
+                         rc = cache_ioctl(inode, file, cmd, arg);
+@@ -902,47 +904,49 @@
+                 return -EPERM;
+         }
+ 
+-        memset(buf, 0, sizeof(buf));
+-        
+-        if (izo_ioctl_getdata(buf, buf + 1024, (void *)arg)) { 
++        /* allocate a zero'd buffer for data */ 
++        PRESTO_ALLOC(buf, bufsz); 
++        if (!buf) { 
++                EXIT; 
++                return -ENOMEM; 
++        } 
++
++        if (izo_ioctl_getdata(buf, buf + bufsz, (void *)arg)) { 
+                 CERROR("intermezzo ioctl: data error\n");
+-                return -EINVAL;
++                rc = -EINVAL; 
++                goto done; 
+         }
+         data = (struct izo_ioctl_data *)buf;
+         
+         switch(cmd) {
+         case IZO_IOC_REINTKML: { 
+-                int rc;
+                 int cperr;
+                 rc = kml_reint_rec(file, data);
+ 
+-                EXIT;
+                 cperr = copy_to_user((char *)arg, data, sizeof(*data));
+                 if (cperr) { 
+                         CERROR("WARNING: cperr %d\n", cperr); 
+                         rc = -EFAULT;
+                 }
+-                return rc;
++                goto done; 
+         }
+ 
+         case IZO_IOC_GET_RCVD: {
+                 struct izo_rcvd_rec rec;
+                 struct presto_file_set *fset;
+-                int rc;
+ 
+                 fset = presto_fset(file->f_dentry);
+                 if (fset == NULL) {
+-                        EXIT;
+-                        return -ENODEV;
+-                }
++                        rc = -ENODEV; 
++                        goto done; 
++                } 
++
+                 rc = izo_rcvd_get(&rec, fset, data->ioc_uuid);
+-                if (rc < 0) {
+-                        EXIT;
+-                        return rc;
+-                }
++                if (rc < 0) 
++                        goto done; 
+ 
+-                EXIT;
+-                return copy_to_user((char *)arg, &rec, sizeof(rec))? -EFAULT : 0;
++                rc = copy_to_user((char *)arg, &rec, sizeof(rec))? -EFAULT : 0;
++                goto done; 
+         }
+ 
+         case IZO_IOC_REPSTATUS: {
+@@ -951,12 +955,11 @@
+                 struct izo_rcvd_rec rec;
+                 struct presto_file_set *fset;
+                 int minor;
+-                int rc;
+ 
+                 fset = presto_fset(file->f_dentry);
+                 if (fset == NULL) {
+-                        EXIT;
+-                        return -ENODEV;
++                        rc = -ENODEV; 
++                        goto done; 
+                 }
+                 minor = presto_f2m(fset);
+ 
+@@ -965,13 +968,11 @@
+ 
+                 rc = izo_repstatus(fset, client_kmlsize, 
+                                        lr_client, &rec);
+-                if (rc < 0) {
+-                        EXIT;
+-                        return rc;
+-                }
++                if (rc < 0) 
++                        goto done; 
+ 
+-                EXIT;
+-                return copy_to_user((char *)arg, &rec, sizeof(rec))? -EFAULT : 0;
++                rc = copy_to_user((char *)arg, &rec, sizeof(rec))? -EFAULT : 0;
++                goto done; 
+         }
+ 
+         case IZO_IOC_GET_CHANNEL: {
+@@ -979,30 +980,28 @@
+ 
+                 fset = presto_fset(file->f_dentry);
+                 if (fset == NULL) {
+-                        EXIT;
+-                        return -ENODEV;
++                        rc = -ENODEV; 
++                        goto done; 
+                 }
+                 
+                 data->ioc_dev = fset->fset_cache->cache_psdev->uc_minor;
+                 CDEBUG(D_PSDEV, "CHANNEL %d\n", data->ioc_dev); 
+-                EXIT;
+-                return copy_to_user((char *)arg, data, sizeof(*data))? -EFAULT : 0;
++                rc = copy_to_user((char *)arg, data, sizeof(*data))? -EFAULT : 0;
++                goto done; 
+         }
+ 
+         case IZO_IOC_SET_IOCTL_UID:
+                 izo_authorized_uid = data->ioc_uid;
+-                EXIT;
+-                return 0;
++                rc = 0; 
++                goto done; 
+ 
+         case IZO_IOC_SET_PID:
+                 rc = izo_psdev_setpid(data->ioc_dev);
+-                EXIT;
+-                return rc;
++                goto done; 
+ 
+         case IZO_IOC_SET_CHANNEL:
+                 rc = izo_psdev_setchannel(file, data->ioc_dev);
+-                EXIT;
+-                return rc;
++                goto done; 
+ 
+         case IZO_IOC_GET_KML_SIZE: {
+                 struct presto_file_set *fset;
+@@ -1010,14 +1009,14 @@
+ 
+                 fset = presto_fset(file->f_dentry);
+                 if (fset == NULL) {
+-                        EXIT;
+-                        return -ENODEV;
++                        rc = -ENODEV; 
++                        goto done; 
+                 }
+ 
+                 kmlsize = presto_kml_offset(fset) + fset->fset_kml_logical_off;
+ 
+-                EXIT;
+-                return copy_to_user((char *)arg, &kmlsize, sizeof(kmlsize))?-EFAULT : 0;
++                rc = copy_to_user((char *)arg, &kmlsize, sizeof(kmlsize))?-EFAULT : 0;
++                goto done; 
+         }
+ 
+         case IZO_IOC_PURGE_FILE_DATA: {
+@@ -1025,37 +1024,37 @@
+ 
+                 fset = presto_fset(file->f_dentry);
+                 if (fset == NULL) {
+-                        EXIT;
+-                        return -ENODEV;
++                        rc = -ENODEV; 
++                        goto done; 
+                 }
+ 
+                 rc = izo_purge_file(fset, data->ioc_inlbuf1);
+-                EXIT;
+-                return rc;
++                goto done; 
+         }
+ 
+         case IZO_IOC_GET_FILEID: {
+                 rc = izo_get_fileid(file, data);
+-                EXIT;
+                 if (rc)
+-                        return rc;
+-                return copy_to_user((char *)arg, data, sizeof(*data))? -EFAULT : 0;
++                        goto done; 
++
++                rc = copy_to_user((char *)arg, data, sizeof(*data))? -EFAULT : 0;
++                goto done; 
+         }
+ 
+         case IZO_IOC_SET_FILEID: {
+                 rc = izo_set_fileid(file, data);
+-                EXIT;
+                 if (rc)
+-                        return rc;
+-                return copy_to_user((char *)arg, data, sizeof(*data))? -EFAULT  : 0;
++                        goto done; 
++                        
++                rc = copy_to_user((char *)arg, data, sizeof(*data))? -EFAULT  : 0;
++                goto done; 
+         }
+ 
+         case IZO_IOC_ADJUST_LML: { 
+                 struct lento_vfs_context *info; 
+                 info = (struct lento_vfs_context *)data->ioc_inlbuf1;
+                 rc = presto_adjust_lml(file, info); 
+-                EXIT;
+-                return rc;
++                goto done; 
+         }
+ 
+         case IZO_IOC_CONNECT: {
+@@ -1064,16 +1063,15 @@
+ 
+                 fset = presto_fset(file->f_dentry);
+                 if (fset == NULL) {
+-                        EXIT;
+-                        return -ENODEV;
++                        rc = -ENODEV;
++                        goto done; 
+                 }
+                 minor = presto_f2m(fset);
+ 
+                 rc = izo_upc_connect(minor, data->ioc_ino,
+                                      data->ioc_generation, data->ioc_uuid,
+                                      data->ioc_flags);
+-                EXIT;
+-                return rc;
++                goto done; 
+         }
+ 
+         case IZO_IOC_GO_FETCH_KML: {
+@@ -1082,15 +1080,14 @@
+ 
+                 fset = presto_fset(file->f_dentry);
+                 if (fset == NULL) {
+-                        EXIT;
+-                        return -ENODEV;
++                        rc = -ENODEV;
++                        goto done; 
+                 }
+                 minor = presto_f2m(fset);
+ 
+                 rc = izo_upc_go_fetch_kml(minor, fset->fset_name,
+                                           data->ioc_uuid, data->ioc_kmlsize);
+-                EXIT;
+-                return rc;
++                goto done; 
+         }
+ 
+         case IZO_IOC_REVOKE_PERMIT:
+@@ -1098,26 +1095,23 @@
+                         rc = izo_revoke_permit(file->f_dentry, data->ioc_uuid);
+                 else
+                         rc = izo_revoke_permit(file->f_dentry, NULL);
+-                EXIT;
+-                return rc;
++                goto done; 
+ 
+         case IZO_IOC_CLEAR_FSET:
+                 rc = izo_clear_fsetroot(file->f_dentry);
+-                EXIT;
+-                return rc;
++                goto done; 
+ 
+         case IZO_IOC_CLEAR_ALL_FSETS: { 
+                 struct presto_file_set *fset;
+ 
+                 fset = presto_fset(file->f_dentry);
+                 if (fset == NULL) {
+-                        EXIT;
+-                        return -ENODEV;
++                        rc = -ENODEV;
++                        goto done; 
+                 }
+ 
+                 rc = izo_clear_all_fsetroots(fset->fset_cache);
+-                EXIT;
+-                return rc;
++                goto done; 
+         }
+ 
+         case IZO_IOC_SET_FSET:
+@@ -1127,9 +1121,7 @@
+                 rc = presto_set_fsetroot_from_ioc(file->f_dentry, 
+                                                   data->ioc_inlbuf1,
+                                                   data->ioc_flags);
+-                EXIT;
+-                return rc;
+-
++                goto done; 
+ 
+         case IZO_IOC_MARK: {
+                 int res = 0;  /* resulting flags - returned to user */
+@@ -1185,16 +1177,16 @@
+                 }
+ 
+                 if (error) { 
+-                        EXIT;
+-                        return error;
++                        rc = error; 
++                        goto done; 
+                 }
+                 data->ioc_mark_what = res;
+                 CDEBUG(D_DOWNCALL, "mark inode: %ld, and: %x, or: %x, what %x\n",
+                        file->f_dentry->d_inode->i_ino, data->ioc_and_flag,
+                        data->ioc_or_flag, data->ioc_mark_what);
+ 
+-                EXIT;
+-                return copy_to_user((char *)arg, data, sizeof(*data))? -EFAULT : 0;
++                rc = copy_to_user((char *)arg, data, sizeof(*data))? -EFAULT : 0;
++                goto done; 
+         }
+ #if 0
+         case IZO_IOC_CLIENT_MAKE_BRANCH: {
+@@ -1203,16 +1195,15 @@
+ 
+                 fset = presto_fset(file->f_dentry);
+                 if (fset == NULL) {
+-                        EXIT;
+-                        return -ENODEV;
++                        rc = -ENODEV;
++                        goto done; 
+                 }
+                 minor = presto_f2m(fset);
+ 
+                 rc = izo_upc_client_make_branch(minor, fset->fset_name,
+                                                 data->ioc_inlbuf1,
+                                                 data->ioc_inlbuf2);
+-                EXIT;
+-                return rc;
++                goto done; 
+         }
+ #endif
+         case IZO_IOC_SERVER_MAKE_BRANCH: {
+@@ -1221,14 +1212,14 @@
+ 
+                 fset = presto_fset(file->f_dentry);
+                 if (fset == NULL) {
+-                        EXIT;
+-                        return -ENODEV;
++                        rc = -ENODEV;
++                        goto done; 
+                 }
+                 minor = presto_f2m(fset);
+ 
+                 izo_upc_server_make_branch(minor, data->ioc_inlbuf1);
+-                EXIT;
+-                return 0;
++                rc = 0; 
++                goto done; 
+         }
+         case IZO_IOC_SET_KMLSIZE: {
+                 struct presto_file_set *fset;
+@@ -1237,38 +1228,33 @@
+ 
+                 fset = presto_fset(file->f_dentry);
+                 if (fset == NULL) {
+-                        EXIT;
+-                        return -ENODEV;
++                        rc = -ENODEV; 
++                        goto done; 
+                 }
+                 minor = presto_f2m(fset);
+ 
+                 rc = izo_upc_set_kmlsize(minor, fset->fset_name, data->ioc_uuid,
+                                          data->ioc_kmlsize);
+ 
+-                if (rc != 0) {
+-                        EXIT;
+-                        return rc;
+-                }
++                if (rc != 0) 
++                        goto done; 
+ 
+                 rc = izo_rcvd_get(&rec, fset, data->ioc_uuid);
+                 if (rc == -EINVAL) {
+                         /* We don't know anything about this uuid yet; no
+                          * worries. */
+                         memset(&rec, 0, sizeof(rec));
+-                } else if (rc <= 0) {
++                } else if (rc <= 0) { /* do we really want to return 0 if rc == 0 here? */ 
+                         CERROR("InterMezzo: error reading last_rcvd: %d\n", rc);
+-                        EXIT;
+-                        return rc;
++                        goto done; 
+                 }
+                 rec.lr_remote_offset = data->ioc_kmlsize;
+                 rc = izo_rcvd_write(fset, &rec);
+                 if (rc <= 0) {
+                         CERROR("InterMezzo: error writing last_rcvd: %d\n", rc);
+-                        EXIT;
+-                        return rc;
++                        goto done; 
+                 }
+-                EXIT;
+-                return rc;
++                goto done; 
+         }
+         case IZO_IOC_BRANCH_UNDO: {
+                 struct presto_file_set *fset;
+@@ -1276,15 +1262,14 @@
+ 
+                 fset = presto_fset(file->f_dentry);
+                 if (fset == NULL) {
+-                        EXIT;
+-                        return -ENODEV;
++                        rc = -ENODEV;
++                        goto done; 
+                 }
+                 minor = presto_f2m(fset);
+ 
+                 rc = izo_upc_branch_undo(minor, fset->fset_name,
+                                          data->ioc_inlbuf1);
+-                EXIT;
+-                return rc;
++                goto done; 
+         }
+         case IZO_IOC_BRANCH_REDO: {
+                 struct presto_file_set *fset;
+@@ -1292,28 +1277,33 @@
+ 
+                 fset = presto_fset(file->f_dentry);
+                 if (fset == NULL) {
+-                        EXIT;
+-                        return -ENODEV;
++                        rc = -ENODEV;
++                        goto done; 
+                 }
+                 minor = presto_f2m(fset);
+ 
+                 rc = izo_upc_branch_redo(minor, fset->fset_name,
+                                          data->ioc_inlbuf1);
+-                EXIT;
+-                return rc;
++                goto done; 
+         }
+ 
+         case TCGETS:
+-                EXIT;
+-                return -EINVAL;
++                rc = -EINVAL; 
++                goto done; 
+ 
+         default:
+                 EXIT;
+-                return -EINVAL;
+-                
++                rc = -EINVAL; 
++                goto done; 
++
+         }
++
++        rc = 0; 
++
++ done: 
++        PRESTO_FREE(buf, bufsz); 
+         EXIT;
+-        return 0;
++        return rc;
+ }
+ 
+ struct file_operations presto_dir_fops = {
+diff -Naur --exclude-from=/home/mulix/dontdiff linux-2.5/fs/intermezzo/journal.c linux-2.5.73-stack-lusers/fs/intermezzo/journal.c
+--- linux-2.5/fs/intermezzo/journal.c	2002-12-14 03:57:54.000000000 +0200
++++ linux-2.5.73-stack-lusers/fs/intermezzo/journal.c	2003-06-25 23:32:50.000000000 +0300
+@@ -1239,12 +1239,16 @@
+         return izo_rcvd_write(fset, &rec);
+ }
+ 
++/* we are called from presto_finish_kml_truncate, which is called */ 
++/* with fset->fset_kml.fd_lock held. Allocations must be GFP_ATOMIC */ 
+ struct file * presto_copy_kml_tail(struct presto_file_set *fset,
+                                    unsigned long int start)
+ {
+         struct file *f;
+         int len;
+         loff_t read_off, write_off, bytes;
++        char* buf; 
++        size_t bufsz; 
+ 
+         ENTRY;
+ 
+@@ -1258,21 +1262,31 @@
+         write_off = 0;
+         read_off = start;
+         bytes = fset->fset_kml.fd_offset - start;
+-        while (bytes > 0) {
+-                char buf[4096];
+-                int toread;
+ 
+-                if (bytes > sizeof(buf))
+-                        toread = sizeof(buf);
+-                else
+-                        toread = bytes;
++        bufsz = bytes; 
++        /* can't use PRESTO_ALLOC - alloction must be atomic */ 
++        buf = kmalloc(bufsz, GFP_ATOMIC);
++        if (!buf) {
++                CERROR("IZO: out of memory at %s:%d (trying to "
++                       "allocate %d)\n", __FILE__, __LINE__, 
++                       bufsz);
++                filp_close(f, NULL); 
++                EXIT; 
++                return ERR_PTR(-ENOMEM); 
++        }
++
++        presto_kmem_inc(buf, bufsz);
++        memset(buf, 0, bufsz);
+ 
+-                len = presto_fread(fset->fset_kml.fd_file, buf, toread,
++        while (bytes > 0) {
++                len = presto_fread(fset->fset_kml.fd_file, buf, bufsz,
+                                    &read_off);
+                 if (len <= 0)
+                         break;
+ 
+                 if (presto_fwrite(f, buf, len, &write_off) != len) {
++                        kfree(buf);
++                        presto_kmem_dec(buf, bufsz);
+                         filp_close(f, NULL);
+                         EXIT;
+                         return ERR_PTR(-EIO);
+@@ -1280,7 +1294,9 @@
+ 
+                 bytes -= len;
+         }
+-
++        
++        kfree(buf);
++        presto_kmem_dec(buf, bufsz);
+         EXIT;
+         return f;
+ }
+@@ -1589,11 +1605,12 @@
+ {
+         int opcode = KML_OPCODE_GET_FILEID;
+         struct rec_info rec;
+-        char *buffer, *path, *logrecord, record[4096]; /*include path*/
++        char *buffer, *path, *logrecord, *record; /*include path*/
+         struct dentry *root;
+         __u32 uid, gid, pathlen;
+         int error, size;
+         struct kml_suffix *suffix;
++        size_t record_size; 
+ 
+         ENTRY;
+ 
+@@ -1609,9 +1626,13 @@
+                 size_round(le32_to_cpu(pathlen)) +
+                 sizeof(struct kml_suffix);
+ 
++        record_size = max(4096, size); 
++        error = -ENOMEM; 
++        PRESTO_ALLOC(record, record_size); 
++        if (!record) 
++                goto free_buffer; 
++
+         CDEBUG(D_FILE, "kml size: %d\n", size);
+-        if ( size > sizeof(record) )
+-                CERROR("InterMezzo: BUFFER OVERFLOW in %s!\n", __FUNCTION__);
+ 
+         memset(&rec, 0, sizeof(rec));
+         rec.is_kml = 1;
+@@ -1632,6 +1653,9 @@
+                                    size_round(le32_to_cpu(pathlen)), path,
+                                    fset->fset_name);
+ 
++        PRESTO_FREE(record, record_size); 
++
++ free_buffer: 
+         BUFF_FREE(buffer);
+         EXIT;
+         return error;
+-- 
+Muli Ben-Yehuda
+http://www.mulix.org
+http://www.livejournal.com/~mulix/
+[unhandled content-type:application/pgp-signature]

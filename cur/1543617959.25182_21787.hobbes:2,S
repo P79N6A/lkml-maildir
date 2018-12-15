@@ -1,0 +1,205 @@
+Date: Sun, 20 Jan 2002 14:36:55 +0100 (CET)
+From: Ingo Molnar <>
+Subject: [sched] [patch] migration-fixes-2.5.3-pre2-A1
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2002/1/20/9
+
+the attached patch solves an SMP task migration bug in the O(1) scheduler.
+the bug is triggered all the time on an 8-way CPU i tested, and there are
+some bugreports from dual boxes as well that lock up during bootups.
+task migration is a subtle issue. The basic task is to 'send' the
+currently executing task over to another CPU, where it continues
+execution. The current code in 2.5.3-pre2 is broken, as it has a window in
+which it's possible for a ksoftirqd thread to run on two CPUs at once -
+causing a lockup.
+my solution is to send the task to the other CPU using the
+smp_migrate_task() lowlevel-SMP method defined by the SMP architecture,
+where it will call back the scheduler via sched_task_migrated(new_task).
+it's also possible to move a task from one runqueue to another one without
+using cross-CPU messaging, but this increases the overhead of the
+scheduler hot-path, schedule_tail() needs to check for some sort of
+prev->state == TASK_MIGRATED flag, at least. The patch solves this without
+adding overhead to the hot-path.
+the patch is also an optimization: the set_cpus_allowed() function used to
+switch the current idle thread manually, to initiate a reschedule (due to
+locking issues). This 'manual context switching' code is gone now, and
+set_cpus_allowed() calls schedule() directly now. This simplifies
+set_cpus_allowed() greatly, reducing sched.c's line count by 10.
+	Ingo
+--- linux/kernel/sched.c.orig	Sun Jan 20 11:38:59 2002
++++ linux/kernel/sched.c	Sun Jan 20 11:39:16 2002
+@@ -191,6 +191,20 @@
+ }
+ 
+ /*
++ * The SMP message passing code calls this function whenever
++ * the new task has arrived at the target CPU. We move the
++ * new task into the local runqueue.
++ *
++ * This function must be called with interrupts disabled.
++ */
++void sched_task_migrated(task_t *new_task)
++{
++	wait_task_inactive(new_task);
++	new_task->cpu = smp_processor_id();
++	wake_up_process(new_task);
++}
++
++/*
+  * Kick the remote CPU if the task is running currently,
+  * this code is used by the signal code to signal tasks
+  * which are in user-mode as quickly as possible.
+@@ -611,7 +625,6 @@
+ 	if (likely(prev != next)) {
+ 		rq->nr_switches++;
+ 		rq->curr = next;
+-		next->cpu = prev->cpu;
+ 		context_switch(prev, next);
+ 		/*
+ 		 * The runqueue pointer might be from another CPU
+@@ -778,47 +791,23 @@
+  */
+ void set_cpus_allowed(task_t *p, unsigned long new_mask)
+ {
+-	runqueue_t *this_rq = this_rq(), *target_rq;
+-	unsigned long this_mask = 1UL << smp_processor_id();
+-	int target_cpu;
+-
+ 	new_mask &= cpu_online_map;
+ 	if (!new_mask)
+ 		BUG();
++
+ 	p->cpus_allowed = new_mask;
+ 	/*
+ 	 * Can the task run on the current CPU? If not then
+ 	 * migrate the process off to a proper CPU.
+ 	 */
+-	if (new_mask & this_mask)
++	if (new_mask & (1UL << smp_processor_id()))
+ 		return;
+-	target_cpu = ffz(~new_mask);
+-	target_rq = cpu_rq(target_cpu);
+-	if (target_cpu < smp_processor_id()) {
+-		spin_lock_irq(&target_rq->lock);
+-		spin_lock(&this_rq->lock);
+-	} else {
+-		spin_lock_irq(&this_rq->lock);
+-		spin_lock(&target_rq->lock);
+-	}
+-	dequeue_task(p, p->array);
+-	this_rq->nr_running--;
+-	target_rq->nr_running++;
+-	enqueue_task(p, target_rq->active);
+-	target_rq->curr->need_resched = 1;
+-	spin_unlock(&target_rq->lock);
++#if CONFIG_SMP
++	smp_migrate_task(ffz(~new_mask), current);
+ 
+-	/*
+-	 * The easiest solution is to context switch into
+-	 * the idle thread - which will pick the best task
+-	 * afterwards:
+-	 */
+-	this_rq->nr_switches++;
+-	this_rq->curr = this_rq->idle;
+-	this_rq->idle->need_resched = 1;
+-	context_switch(current, this_rq->idle);
+-	barrier();
+-	spin_unlock_irq(&this_rq()->lock);
++	current->state = TASK_UNINTERRUPTIBLE;
++	schedule();
++#endif
+ }
+ 
+ void scheduling_functions_end_here(void) { }
+--- linux/include/linux/sched.h.orig	Sun Jan 20 11:38:59 2002
++++ linux/include/linux/sched.h	Sun Jan 20 11:39:16 2002
+@@ -149,6 +149,8 @@
+ extern void update_one_process(struct task_struct *p, unsigned long user,
+ 			       unsigned long system, int cpu);
+ extern void scheduler_tick(struct task_struct *p);
++extern void sched_task_migrated(struct task_struct *p);
++extern void smp_migrate_task(int cpu, task_t *task);
+ 
+ #define	MAX_SCHEDULE_TIMEOUT	LONG_MAX
+ extern signed long FASTCALL(schedule_timeout(signed long timeout));
+--- linux/include/asm-i386/hw_irq.h.orig	Thu Nov 22 20:46:18 2001
++++ linux/include/asm-i386/hw_irq.h	Sun Jan 20 11:39:16 2002
+@@ -35,13 +35,14 @@
+  *  into a single vector (CALL_FUNCTION_VECTOR) to save vector space.
+  *  TLB, reschedule and local APIC vectors are performance-critical.
+  *
+- *  Vectors 0xf0-0xfa are free (reserved for future Linux use).
++ *  Vectors 0xf0-0xf9 are free (reserved for future Linux use).
+  */
+ #define SPURIOUS_APIC_VECTOR	0xff
+ #define ERROR_APIC_VECTOR	0xfe
+ #define INVALIDATE_TLB_VECTOR	0xfd
+ #define RESCHEDULE_VECTOR	0xfc
+-#define CALL_FUNCTION_VECTOR	0xfb
++#define TASK_MIGRATION_VECTOR	0xfb
++#define CALL_FUNCTION_VECTOR	0xfa
+ 
+ /*
+  * Local APIC timer IRQ vector is on a different priority level,
+--- linux/arch/i386/kernel/i8259.c.orig	Tue Sep 18 08:03:09 2001
++++ linux/arch/i386/kernel/i8259.c	Sun Jan 20 11:39:16 2002
+@@ -79,6 +79,7 @@
+  * through the ICC by us (IPIs)
+  */
+ #ifdef CONFIG_SMP
++BUILD_SMP_INTERRUPT(task_migration_interrupt,TASK_MIGRATION_VECTOR)
+ BUILD_SMP_INTERRUPT(reschedule_interrupt,RESCHEDULE_VECTOR)
+ BUILD_SMP_INTERRUPT(invalidate_interrupt,INVALIDATE_TLB_VECTOR)
+ BUILD_SMP_INTERRUPT(call_function_interrupt,CALL_FUNCTION_VECTOR)
+@@ -472,6 +473,9 @@
+ 	 * IPI, driven by wakeup.
+ 	 */
+ 	set_intr_gate(RESCHEDULE_VECTOR, reschedule_interrupt);
++
++	/* IPI for task migration */
++	set_intr_gate(TASK_MIGRATION_VECTOR, task_migration_interrupt);
+ 
+ 	/* IPI for invalidation */
+ 	set_intr_gate(INVALIDATE_TLB_VECTOR, invalidate_interrupt);
+--- linux/arch/i386/kernel/smp.c.orig	Sun Jan 20 11:36:02 2002
++++ linux/arch/i386/kernel/smp.c	Sun Jan 20 11:39:16 2002
+@@ -485,6 +485,35 @@
+ 	do_flush_tlb_all_local();
+ }
+ 
++static spinlock_t migration_lock = SPIN_LOCK_UNLOCKED;
++static task_t *new_task;
++
++/*
++ * This function sends a 'task migration' IPI to another CPU.
++ * Must be called from syscall contexts, with interrupts *enabled*.
++ */
++void smp_migrate_task(int cpu, task_t *p)
++{
++	/*
++	 * The target CPU will unlock the migration spinlock:
++	 */
++	spin_lock(&migration_lock);
++	new_task = p;
++	send_IPI_mask(1 << cpu, TASK_MIGRATION_VECTOR);
++}
++
++/*
++ * Task migration callback.
++ */
++asmlinkage void smp_task_migration_interrupt(void)
++{
++	task_t *p;
++
++	ack_APIC_irq();
++	p = new_task;
++	spin_unlock(&migration_lock);
++	sched_task_migrated(p);
++}
+ /*
+  * this function sends a 'reschedule' IPI to another CPU.
+  * it goes straight through and wastes no time serializing

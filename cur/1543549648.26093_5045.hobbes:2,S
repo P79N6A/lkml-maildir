@@ -1,0 +1,165 @@
+Date: Sun, 24 Sep 2000 23:39:13 -0300 (BRT)
+From: Marcelo Tosatti <>
+Subject: Re: [patch] vmfixes-2.4.0-test9-B2
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/9/24/90
+
+On Mon, 25 Sep 2000, Andrea Arcangeli wrote:
+<snip>
+> kmem_cache_reap shrinks the slabs at _very_ low frequency. It's worthless to
+> keep lots of dentries and icache into the slab internal queues until
+> kmem_cache_reap kicks in again, if we free them such memory immediatly instead
+> we'll run kmem_cache_reap later and for something more appropraite for what's
+> been designed. The [id]cache shrink could release lots of memory.
+I see.
+Since we have code which is using GFP_BUFFER allocations to not block but
+only shrink the cache (1), I've done a patch to:
+- Change kmem_cache_shrink to return the number of freed pages. 
+- Move __GFP_IO checking from do_try_to_free_pages/refill_inactive to
+{i,d}cache shrink functions (Linus already did this in his tree)
+- On the {i,d}cache shrink functions, return the value of
+kmem_cache_shrink() (no need of __GFP_IO for that)
+There was a comment on the shrink functions about making
+kmem_cache_shrink() work on a GFP_DMA/GFP_HIGHMEM basis to free only the
+wanted pages by the current allocation. 
+GFP_DMA allocations will never reach this code (do_try_to_free_pages is
+only called if __GFP_WAIT is set) and GFP_HIGHMEM pages will never be used
+as SLAB obj's memory. (please correct me if I'm wrong)
+Comments?
+(1) Using GPF_BUFFER is wrong, but its a separate issue. 
+diff --exclude-from=exclude -Nur linux.orig/fs/dcache.c linux/fs/dcache.c
+--- linux.orig/fs/dcache.c	Sun Sep 24 18:14:24 2000
++++ linux/fs/dcache.c	Sun Sep 24 22:49:16 2000
+@@ -556,15 +556,11 @@
+ 	int count = 0;
+ 	if (priority)
+ 		count = dentry_stat.nr_unused / priority;
+-	prune_dcache(count);
+-	/* FIXME: kmem_cache_shrink here should tell us
+-	   the number of pages freed, and it should
+-	   work in a __GFP_DMA/__GFP_HIGHMEM behaviour
+-	   to free only the interesting pages in
+-	   function of the needs of the current allocation. */
+-	kmem_cache_shrink(dentry_cache);
+ 
+-	return 0;
++	if(gfp_mask & __GFP_IO)
++		prune_dcache(count);
++
++	return kmem_cache_shrink(dentry_cache);
+ }
+ 
+ #define NAME_ALLOC_LEN(len)	((len+16) & ~15)
+diff --exclude-from=exclude -Nur linux.orig/fs/inode.c linux/fs/inode.c
+--- linux.orig/fs/inode.c	Sun Sep 24 18:14:25 2000
++++ linux/fs/inode.c	Sun Sep 24 22:47:30 2000
+@@ -460,15 +460,11 @@
+ 		
+ 	if (priority)
+ 		count = inodes_stat.nr_unused / priority;
+-	prune_icache(count);
+-	/* FIXME: kmem_cache_shrink here should tell us
+-	   the number of pages freed, and it should
+-	   work in a __GFP_DMA/__GFP_HIGHMEM behaviour
+-	   to free only the interesting pages in
+-	   function of the needs of the current allocation. */
+-	kmem_cache_shrink(inode_cachep);
+ 
+-	return 0;
++	if(gfp_mask & __GFP_IO) 
++		prune_icache(count);
++
++	return kmem_cache_shrink(inode_cachep);
+ }
+ 
+ /*
+diff --exclude-from=exclude -Nur linux.orig/mm/slab.c linux/mm/slab.c
+--- linux.orig/mm/slab.c	Sun Sep 24 18:14:04 2000
++++ linux/mm/slab.c	Sun Sep 24 22:46:11 2000
+@@ -887,7 +887,7 @@
+ static int __kmem_cache_shrink(kmem_cache_t *cachep)
+ {
+ 	slab_t *slabp;
+-	int ret;
++	int ret, freed = 0;
+ 
+ 	drain_cpu_caches(cachep);
+ 
+@@ -912,8 +912,11 @@
+ 		spin_unlock_irq(&cachep->spinlock);
+ 		kmem_slab_destroy(cachep, slabp);
+ 		spin_lock_irq(&cachep->spinlock);
++
++		freed++;
+ 	}
+-	ret = !list_empty(&cachep->slabs);
++
++	ret = ((1 << cachep->gfporder) * freed);
+ 	spin_unlock_irq(&cachep->spinlock);
+ 	return ret;
+ }
+@@ -923,7 +926,8 @@
+  * @cachep: The cache to shrink.
+  *
+  * Releases as many slabs as possible for a cache.
+- * To help debugging, a zero exit status indicates all slabs were released.
++ *
++ * Returns the amount of freed pages.
+  */
+ int kmem_cache_shrink(kmem_cache_t *cachep)
+ {
+@@ -962,7 +966,9 @@
+ 	list_del(&cachep->next);
+ 	up(&cache_chain_sem);
+ 
+-	if (__kmem_cache_shrink(cachep)) {
++	__kmem_cache_shrink(cachep); 
++	
++	if (!list_empty(&cachep->slabs)) {
+ 		printk(KERN_ERR "kmem_cache_destroy: Can't free all objects %p\n",
+ 		       cachep);
+ 		down(&cache_chain_sem);
+diff --exclude-from=exclude -Nur linux.orig/mm/vmscan.c linux/mm/vmscan.c
+--- linux.orig/mm/vmscan.c	Sun Sep 24 18:14:04 2000
++++ linux/mm/vmscan.c	Sun Sep 24 23:09:01 2000
+@@ -904,14 +904,16 @@
+ 		}
+ 
+ 		/* Try to get rid of some shared memory pages.. */
+-		if (gfp_mask & __GFP_IO) {
+-			/*
+-			 * don't be too light against the d/i cache since
+-		   	 * shrink_mmap() almost never fail when there's
+-		   	 * really plenty of memory free. 
+-			 */
+-			count -= shrink_dcache_memory(priority, gfp_mask);
+-			count -= shrink_icache_memory(priority, gfp_mask);
++
++		/*
++		 * don't be too light against the d/i cache since
++	   	 * shrink_mmap() almost never fail when there's
++	   	 * really plenty of memory free. 
++		 */
++		count -= shrink_dcache_memory(priority, gfp_mask);
++		count -= shrink_icache_memory(priority, gfp_mask);
++
++		if(gfp_mask & __GFP_IO) {
+ 			/*
+ 			 * Not currently working, see fixme in shrink_?cache_memory
+ 			 * In the inner funtions there is a comment:
+@@ -992,10 +994,8 @@
+ 	 * the inode and dentry cache whenever we do this.
+ 	 */
+ 	if (free_shortage() || inactive_shortage()) {
+-		if (gfp_mask & __GFP_IO) {
+-			ret += shrink_dcache_memory(6, gfp_mask);
+-			ret += shrink_icache_memory(6, gfp_mask);
+-		}
++		ret += shrink_dcache_memory(6, gfp_mask);
++		ret += shrink_icache_memory(6, gfp_mask);
+ 
+ 		ret += refill_inactive(gfp_mask, user);
+ 	} else {

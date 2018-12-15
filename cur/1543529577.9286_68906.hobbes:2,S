@@ -1,0 +1,1427 @@
+Date: Sun, 12 Mar 2000 15:16:02 -0800
+From: Miles Lane <>
+Subject: Re: Partial fix for keyboard timeout and cardbus hangs on 2.3.39-2.3.48
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/3/12/164
+
+Ed and David, have you gotten any further with figuring out the
+nature of the keyboard lockup problem (specifically, the one
+that occurs when a 3c575 in present during the boot sequence on
+2.3.[38-51])?  Linus had an idea about it being caused by a
+pc_keyb.c problem, but the proposed fix did not help on my 
+machine.
+Christoph, sorry for attributing Ed's research to you, I got 
+the the folks working on the keyboard/mouse lockup and cs4232/sound 
+problems mixed up.
+Thanks,
+	Miles
+Ed Millard wrote:
+> 
+> I've tracked down the origin of the problem with keyboard timeouts
+> and Cardbus cards that don't initialize properly if plugged in during
+> boot on 2.3.39 through 2.3.48.  This is on a Dell I7K laptop in my case.
+> This is probably the same problem Miles Lane has previously described
+> on linux-kernel.  I can't spend any more time on this today but
+> hopefully will nail the rest of this tomorrow unless one of you has
+> the proper fix first.
+> 
+> The fundamental problem is in the socket_state_t structure being
+> passed to yenta_set_socket() when you have the 3c575 installed
+> at boot.  The fields state->Vcc and state->Vpp are set to 50 or
+> 5 volts though this card looks to be 3 volts.  As a result an
+> attempt is made to set the socket power level to 5 volts.   This
+> results in a BADVCCREQ status in the Cardbus socket state register
+> followed by a time-out on the reset command sent to the Cardbus
+> as as part of the socket initialization.
+> 
+> If you don't plug in the 3c575 at boot, and plug it in later. the power
+> levels are properly set to 3 volts and the card initializes properly
+> with the current kernel.
+> 
+> A hack workaround, for cards you are sure are 3 volts, is to force
+> state->Vcc and state->Vpp to 33 in yenta_set_power().
+> 
+> The keyboard time-out appears to just be a side effect of the fact
+> that no interrupt initialization is done on the socket due to the
+> failed initialization so its in an undefined state.   I have a
+> hack workaround where I call the default i365 interrupt
+> initialization when each socket is opened.  If the cardbus
+> initialization fails later this prevent the keyboard from hanging.
+> 
+> At this point two things need to be done:
+> 
+>     - figure out why the voltage values in the socket state are
+>       wrong first thing after bootup but are correct if the card
+>       is plugged in after boot. Then implement a proper fix.
+>     - insure interrupts are properly initialized if a catastrophic
+>       error happens during cardbus initialization so the keyboard
+>       and mouse don't hang
+> 
+> I would also suggest we add better level 1 debug code in yenta.c.
+> The DEBUG prints in there now generate way too much noise, and are
+> very hard to read.  It basically dumps every register read and write
+> with just the register address and value.  Perhaps this could remain
+> as level 2 debug code.
+> 
+> I've attached two things.  My hacked up version of yenta.c with:
+> 
+>     - My easier to understand level 1 debug prints.  I will clean these
+>       up and submit them for review and checkin later.  They are
+>       functional but not pretty in this version.  I will make it so
+>       they don't add much clutter.
+>     - The hack to initialize interrupts when the socket is opened which
+>       prevents the keyboard time-out.  This is not a change suitable for
+>       checkin but is food for thought.
+>     - The hack to force the socket to 3 volts though this is ifdef 0'ed
+>       and only to show this is the problem, at least on my system.  Use
+>       this at your own risk and only on cards you sure are 3V.
+> 
+> The second attachment is the dmesg output with my level 1 debug prints
+> showing the bad 5 volt command followed by the bad voltage error.
+> 
+> -- Ed Millard
+> 
+>   ------------------------------------------------------------------------
+> /*
+>  * Regular lowlevel cardbus driver ("yenta")
+>  *
+>  * (C) Copyright 1999, 2000 Linus Torvalds
+>  */
+> #include <linux/init.h>
+> #include <linux/pci.h>
+> #include <linux/sched.h>
+> #include <linux/interrupt.h>
+> #include <linux/delay.h>
+> #include <linux/module.h>
+> 
+> #include <pcmcia/ss.h>
+> 
+> #include <asm/io.h>
+> 
+> #include "yenta.h"
+> #include "i82365.h"
+> 
+> #define DEBUG_LEVEL1
+> #ifdef DEBUG_LEVEL1
+> static int yenta_init_flag = 0;
+> static int edebug = 1;
+> #define DEBUG(x,args...) if(edebug) { \
+>          printk("  "); \
+>          printk(__FUNCTION__ ": " x,##args); }
+> #else
+> #define DEBUG(x,args...)
+> #endif
+> 
+> /* Don't ask.. */
+> #define to_cycles(ns)   ((ns)/120)
+> #define to_ns(cycles)   ((cycles)*120)
+> 
+> /*
+>  * Generate easy-to-use ways of reading a cardbus sockets
+>  * regular memory space ("cb_xxx"), configuration space
+>  * ("config_xxx") and compatibility space ("exca_xxxx")
+>  */
+> static inline u32 cb_readl(pci_socket_t *socket, unsigned reg)
+> {
+>         u32 val = readl(socket->base + reg);
+>         DEBUG("%p %04x %08x\n", socket, reg, val);
+>         return val;
+> }
+> 
+> static inline void cb_writel(pci_socket_t *socket, unsigned reg, u32 val)
+> {
+>         DEBUG("%p %04x %08x\n", socket, reg, val);
+>         writel(val, socket->base + reg);
+> }
+> 
+> static inline u8 config_readb(pci_socket_t *socket, unsigned offset)
+> {
+>         u8 val;
+>         pci_read_config_byte(socket->dev, offset, &val);
+>         DEBUG("%p %04x %02x\n", socket, offset, val);
+>         return val;
+> }
+> 
+> static inline u16 config_readw(pci_socket_t *socket, unsigned offset)
+> {
+>         u16 val;
+>         pci_read_config_word(socket->dev, offset, &val);
+>         DEBUG("%p %04x %04x\n", socket, offset, val);
+>         return val;
+> }
+> 
+> static inline u32 config_readl(pci_socket_t *socket, unsigned offset)
+> {
+>         u32 val;
+>         pci_read_config_dword(socket->dev, offset, &val);
+>         DEBUG("%p %04x %08x\n", socket, offset, val);
+>         return val;
+> }
+> 
+> static inline void config_writeb(pci_socket_t *socket, unsigned offset, u8 val)
+> {
+>         DEBUG("%p %04x %02x\n", socket, offset, val);
+>         pci_write_config_byte(socket->dev, offset, val);
+> }
+> 
+> static inline void config_writew(pci_socket_t *socket, unsigned offset, u16 val)
+> {
+>         DEBUG("%p %04x %04x\n", socket, offset, val);
+>         pci_write_config_word(socket->dev, offset, val);
+> }
+> 
+> static inline void config_writel(pci_socket_t *socket, unsigned offset, u32 val)
+> {
+>         DEBUG("%p %04x %08x\n", socket, offset, val);
+>         pci_write_config_dword(socket->dev, offset, val);
+> }
+> 
+> static inline u8 exca_readb(pci_socket_t *socket, unsigned reg)
+> {
+>         u8 val = readb(socket->base + 0x800 + reg);
+>         DEBUG("%p %04x %02x\n", socket, reg, val);
+>         return val;
+> }
+> 
+> static inline u8 exca_readw(pci_socket_t *socket, unsigned reg)
+> {
+>         u16 val;
+>         val = readb(socket->base + 0x800 + reg);
+>         val |= readb(socket->base + 0x800 + reg + 1) << 8;
+>         DEBUG("%p %04x %04x\n", socket, reg, val);
+>         return val;
+> }
+> 
+> static inline void exca_writeb(pci_socket_t *socket, unsigned reg, u8 val)
+> {
+>         DEBUG("%p %04x %02x\n", socket, reg, val);
+>         writeb(val, socket->base + 0x800 + reg);
+> }
+> 
+> static void exca_writew(pci_socket_t *socket, unsigned reg, u16 val)
+> {
+>         DEBUG("%p %04x %04x\n", socket, reg, val);
+>         writeb(val, socket->base + 0x800 + reg);
+>         writeb(val >> 8, socket->base + 0x800 + reg + 1);
+> }
+> 
+> static u32 cardbus_socket_state(pci_socket_t *socket)
+> {
+> #ifdef DEBUG_LEVEL1
+>         static u32 previous_state = 0;
+> #endif
+>         u32 state = cb_readl(socket, CB_SOCKET_STATE);
+> 
+> #ifdef DEBUG_LEVEL1
+>         if(state != previous_state) {
+>                 previous_state = state;
+>                 printk("Cardbus socket state: %08x : ",state);
+>                 if(state & CB_YVSOCKET)  printk("YVSOCKET ");
+>                 if(state & CB_XVSOCKET)  printk("XVSOCKET ");
+>                 if(state & CB_3VSOCKET)  printk("3VSOCKET ");
+>                 if(state & CB_5VSOCKET)  printk("5VSOCKET ");
+>                 if(state & CB_YVCARD)    printk("YVCARD ");
+>                 if(state & CB_XVCARD)    printk("XVCARD ");
+>                 if(state & CB_3VCARD)    printk("3VCARD ");
+>                 if(state & CB_5VCARD)    printk("5VCARD ");
+>                 if(state & CB_BADVCCREQ) printk("BADVCCREQ ");
+>                 if(state & CB_DATALOST)  printk("DATALOST ");
+>                 if(state & CB_NOTACARD)  printk("NOTACARD ");
+>                 if(state & CB_IREQCINT)  printk("IREQCINT ");
+>                 if(state & CB_CBCARD)    printk("CBCARD ");
+>                 if(state & CB_16BITCARD) printk("16BITCARD ");
+>                 if(state & CB_PWRCYCLE)  printk("PWRCYCLE ");
+>                 if(state & CB_CDETECT2)  printk("CDETECT2 ");
+>                 if(state & CB_CDETECT1)  printk("CDETECT1 ");
+>                 if(state & CB_CARDSTS)   printk("CARDSTS ");
+>                 printk("\n");
+>         }
+> #endif
+>         return state;
+> }
+> 
+> #ifdef DEBUG_LEVEL1
+> static void cardbus_bridge_debug(u32 state, int isWrite)
+> {
+>         printk("Cardbus bridge ");
+>         if(isWrite) {
+>                 printk("write : %08x :", state);
+>         }else{
+>                 printk("read  : %08x :", state);
+>         }
+>         if(state & CB_BRIDGE_POSTEN)    printk("POSTEN ");
+>         if(state & CB_BRIDGE_PREFETCH1) printk("PREFETCH1 ");
+>         if(state & CB_BRIDGE_PREFETCH0) printk("PREFETCH0 ");
+>         if(state & CB_BRIDGE_INTR)      printk("INTR ");
+>         if(state & CB_BRIDGE_CRST)      printk("CRST ");
+>         if(state & CB_BRIDGE_MABTMODE)  printk("MABTMODE ");
+>         if(state & CB_BRIDGE_VGAEN)     printk("VGAEN ");
+>         if(state & CB_BRIDGE_ISAEN)     printk("ISAEN ");
+>         if(state & CB_BRIDGE_CSERREN)   printk("CSERREN ");
+>         if(state & CB_BRIDGE_CPERREN)   printk("CPERREN ");
+>         printk("\n");
+> }
+> 
+> static void cardbus_socket_control_debug(u32 state, int isWrite)
+> {
+>         u32 vpp, vcc;
+> 
+>         printk("Cardbus socket control ");
+>         if(isWrite) {
+>                 printk("write : %08x :", state);
+>         }else{
+>                 printk("read  : %08x :", state);
+>         }
+>         vpp = state & CB_SC_VPP_MASK;
+>         switch(vpp) {
+>         case CB_SC_VPP_OFF:
+>                 printk("VPP_OFF "); break;
+>         case CB_SC_VPP_12V:
+>                 printk("VPP_12V "); break;
+>         case CB_SC_VPP_5V:
+>                 printk("VPP_5V "); break;
+>         case CB_SC_VPP_3V:
+>                 printk("VPP_3V "); break;
+>         case CB_SC_VPP_XV:
+>                 printk("VPP_XV "); break;
+>         case CB_SC_VPP_YV:
+>                 printk("VPP_YV "); break;
+>         }
+>         vcc = state & CB_SC_VCC_MASK;
+>         switch(vcc) {
+>         case CB_SC_VCC_OFF:
+>                 printk("VCC_OFF "); break;
+>         case CB_SC_VCC_5V:
+>                 printk("VCC_5V "); break;
+>         case CB_SC_VCC_3V:
+>                 printk("VCC_3V "); break;
+>         case CB_SC_VCC_XV:
+>                 printk("VCC_XV "); break;
+>         case CB_SC_VCC_YV:
+>                 printk("VCC_YV "); break;
+>         }
+>         if(state & CB_SC_CCLK_STOP) {
+>                 printk("CLOCK_STOP ");
+>         }
+>         printk("\n");
+> }
+> 
+> static u8 i365_status(pci_socket_t *socket)
+> {
+>         u8 status = exca_readb(socket, I365_STATUS);
+> #ifdef DEBUG_LEVEL1
+>         printk("i365 status : %x : ", status);
+>         if(status & I365_CS_READY)   printk("READY ");
+>         if(status & I365_CS_BVD1)    printk("BATDEAD ");
+>         if(status & I365_CS_BVD2)    printk("BATWARN ");
+>         if(status & I365_CS_WRPROT)  printk("WRPROT ");
+>         if(status & I365_CS_POWERON) printk("POWERON ");
+>         if(status & I365_CS_STSCHG)  printk("STSCHG ");
+>         if(status & I365_CS_STSCHG)  printk("STSCHG ");
+>         printk("\n");
+> #endif
+>         return status;
+> }
+> 
+> static void i365_intctl_debug(u8 state, int isWrite)
+> {
+>         printk("i365 intctl: ");
+>         if(isWrite) {
+>                 printk("write : %08x :", state);
+>         }else{
+>                 printk("read  : %08x :", state);
+>         }
+> 
+>         if(state & I365_IRQ_MASK)   printk("IRQ_MASK ");
+>         if(state & I365_INTR_ENA)   printk("INTR_ENA ");
+>         if(state & I365_PC_IOCARD)  printk("PC_IOCARD ");
+>         if(state & I365_PC_RESET)   printk("PC_RESET ");
+>         if(state & I365_RING_ENA)   printk("RING_ENA ");
+>         printk("\n");
+> }
+> #endif
+> 
+> /*
+>  * Ugh, mixed-mode cardbus and 16-bit pccard state: things depend
+>  * on what kind of card is inserted..
+>  */
+> static int yenta_get_status(pci_socket_t *socket, unsigned int *value)
+> {
+>         unsigned int val;
+>         u8 intr;
+>         u32 state;
+> 
+> #ifdef DEBUG_LEVEL1
+>         int edebugold = edebug;
+>         edebug = 0;
+> #endif
+>         state = cardbus_socket_state(socket);
+> 
+>         val  = (state & CB_3VCARD) ? SS_3VCARD : 0;
+>         val |= (state & CB_XVCARD) ? SS_XVCARD : 0;
+> 
+>         if (state & CB_CBCARD) {
+>                 val |= SS_CARDBUS;
+>                 val |= (state & CB_CARDSTS) ? SS_STSCHG : 0;
+>                 val |= (state & (CB_CDETECT1 | CB_CDETECT2)) ? 0 : SS_DETECT;
+>                 val |= (state & CB_PWRCYCLE) ? SS_POWERON | SS_READY : 0;
+>         } else {
+>                 u8 status = i365_status(socket);
+>                 val |= ((status & I365_CS_DETECT) == I365_CS_DETECT) ? SS_DETECT : 0;
+>                 intr = exca_readb(socket, I365_INTCTL);
+> #ifdef DEBUG_LEVEL1
+>                 i365_intctl_debug(intr, 0);
+> #endif
+>                 if (intr & I365_PC_IOCARD) {
+>                         val |= (status & I365_CS_STSCHG) ? 0 : SS_STSCHG;
+>                 } else {
+>                         val |= (status & I365_CS_BVD1) ? 0 : SS_BATDEAD;
+>                         val |= (status & I365_CS_BVD2) ? 0 : SS_BATWARN;
+>                 }
+>                 val |= (status & I365_CS_WRPROT) ? SS_WRPROT : 0;
+>                 val |= (status & I365_CS_READY) ? SS_READY : 0;
+>                 val |= (status & I365_CS_POWERON) ? SS_POWERON : 0;
+>         }
+> 
+>         *value = val;
+> #ifdef DEBUG_LEVEL1
+>         edebug = edebugold;
+> #endif
+>         return 0;
+> }
+> 
+> static int yenta_Vcc_power(u32 control)
+> {
+>         switch (control & CB_SC_VCC_MASK) {
+>         case CB_SC_VCC_5V: return 50;
+>         case CB_SC_VCC_3V: return 33;
+>         default: return 0;
+>         }
+> }
+> 
+> static int yenta_Vpp_power(u32 control)
+> {
+>         switch (control & CB_SC_VPP_MASK) {
+>         case CB_SC_VPP_12V: return 120;
+>         case CB_SC_VPP_5V: return 50;
+>         case CB_SC_VPP_3V: return 33;
+>         default: return 0;
+>         }
+> }
+> 
+> static int yenta_get_socket(pci_socket_t *socket, socket_state_t *state)
+> {
+>         u8 reg;
+>         u32 control;
+>         int socket_state;
+> 
+> #ifdef DEBUG_LEVEL1
+>         int edebugold = edebug;
+>         edebug = 0;
+>         printk("yenta get socket\n");
+> #endif
+>         control = cb_readl(socket, CB_SOCKET_CONTROL);
+> #ifdef DEBUG_LEVEL1
+>         cardbus_socket_control_debug(control, 0);
+> #endif
+> 
+>         state->Vcc = yenta_Vcc_power(control);
+>         state->Vpp = yenta_Vpp_power(control);
+>         state->io_irq = socket->io_irq;
+> 
+>         socket_state = cardbus_socket_state(socket);
+>         if (socket_state & CB_CBCARD) {
+>                 u16 bridge = config_readw(socket, CB_BRIDGE_CONTROL);
+> #ifdef DEBUG_LEVEL1
+>                 cardbus_bridge_debug(bridge, 0);
+> #endif
+>                 if (bridge & CB_BRIDGE_CRST)
+>                         state->flags |= SS_RESET;
+>                 return 0;
+>         }
+> 
+>         /* 16-bit card state.. */
+>         reg = exca_readb(socket, I365_POWER);
+>         state->flags = (reg & I365_PWR_AUTO) ? SS_PWR_AUTO : 0;
+>         state->flags |= (reg & I365_PWR_OUT) ? SS_OUTPUT_ENA : 0;
+> 
+>         reg = exca_readb(socket, I365_INTCTL);
+> #ifdef DEBUG_LEVEL1
+>         i365_intctl_debug(reg, 0);
+> #endif
+>         state->flags |= (reg & I365_PC_RESET) ? 0 : SS_RESET;
+>         state->flags |= (reg & I365_PC_IOCARD) ? SS_IOCARD : 0;
+> 
+>         reg = exca_readb(socket, I365_CSCINT);
+>         state->csc_mask = (reg & I365_CSC_DETECT) ? SS_DETECT : 0;
+>         if (state->flags & SS_IOCARD) {
+>                 state->csc_mask |= (reg & I365_CSC_STSCHG) ? SS_STSCHG : 0;
+>         } else {
+>                 state->csc_mask |= (reg & I365_CSC_BVD1) ? SS_BATDEAD : 0;
+>                 state->csc_mask |= (reg & I365_CSC_BVD2) ? SS_BATWARN : 0;
+>                 state->csc_mask |= (reg & I365_CSC_READY) ? SS_READY : 0;
+>         }
+> #ifdef DEBUG_LEVEL1
+>         edebug = edebugold;
+> #endif
+> 
+>         return 0;
+> }
+> 
+> static void yenta_set_power(pci_socket_t *socket, socket_state_t *state)
+> {
+>         u32 reg = 0;    /* CB_SC_STPCLK? */
+> 
+> #ifdef DEBUG_LEVEL1
+>         int edebugold = edebug;
+>         edebug = 0;
+>         printk("%s\n", "yenta set power");
+> #if 0
+>         state->Vcc = 33;
+>         state->Vpp = 50;
+> #endif
+> #endif
+>         switch (state->Vcc) {
+>         case 33: reg = CB_SC_VCC_3V; break;
+>         case 50: reg = CB_SC_VCC_5V; break;
+>         default: reg = 0; break;
+>         }
+>         switch (state->Vpp) {
+>         case 33:  reg |= CB_SC_VPP_3V; break;
+>         case 50:  reg |= CB_SC_VPP_5V; break;
+>         case 120: reg |= CB_SC_VPP_12V; break;
+>         }
+>         if (reg != cb_readl(socket, CB_SOCKET_CONTROL)) {
+>                 cb_writel(socket, CB_SOCKET_CONTROL, reg);
+> #ifdef DEBUG_LEVEL1
+>                 cardbus_socket_control_debug(reg, 1);
+> #endif
+>         }
+> 
+> #ifdef DEBUG_LEVEL1
+>         edebug = edebugold;
+> #endif
+> }
+> 
+> static u32 yenta_isa_init(pci_socket_t *socket, socket_state_t *state, u32 bridge)
+> {
+>         u8 reg;
+>         u8 intr;
+> 
+>         bridge |= CB_BRIDGE_INTR;
+>         intr = exca_readb(socket, I365_INTCTL);
+> #ifdef DEBUG_LEVEL1
+>         i365_intctl_debug(intr, 0);
+> #endif
+>         reg = intr & (I365_RING_ENA | I365_INTR_ENA);
+>         reg |= (state->flags & SS_RESET) ? 0 : I365_PC_RESET;
+>         reg |= (state->flags & SS_IOCARD) ? I365_PC_IOCARD : 0;
+>         reg |= state->io_irq;
+> 
+>         exca_writeb(socket, I365_INTCTL, reg);
+> #ifdef DEBUG_LEVEL1
+>         i365_intctl_debug(reg, 1);
+> #endif
+> 
+>         reg = exca_readb(socket, I365_POWER) & (I365_VCC_MASK|I365_VPP1_MASK);
+>         reg |= I365_PWR_NORESET;
+>         if (state->flags & SS_PWR_AUTO) reg |= I365_PWR_AUTO;
+>         if (state->flags & SS_OUTPUT_ENA) reg |= I365_PWR_OUT;
+>         if (exca_readb(socket, I365_POWER) != reg)
+>                 exca_writeb(socket, I365_POWER, reg);
+> 
+>         /* CSC interrupt: no ISA irq for CSC */
+>         reg = I365_CSC_DETECT;
+>         if (state->flags & SS_IOCARD) {
+>                 if (state->csc_mask & SS_STSCHG) reg |= I365_CSC_STSCHG;
+>         } else {
+>                 if (state->csc_mask & SS_BATDEAD) reg |= I365_CSC_BVD1;
+>                 if (state->csc_mask & SS_BATWARN) reg |= I365_CSC_BVD2;
+>                 if (state->csc_mask & SS_READY) reg |= I365_CSC_READY;
+>         }
+>         exca_writeb(socket, I365_CSCINT, reg);
+>         exca_readb(socket, I365_CSC);
+> 
+>         return bridge;
+> }
+> 
+> static int yenta_set_socket(pci_socket_t *socket, socket_state_t *state)
+> {
+>         u16 bridge;
+>         u32 socket_state;
+> 
+> #ifdef DEBUG_LEVEL1
+>         int edebugold = edebug;
+>         edebug = 0;
+>         printk("yenta set socket: \n");
+> #endif
+>         yenta_set_power(socket, state);
+>         socket->io_irq = state->io_irq;
+>         bridge = config_readw(socket, CB_BRIDGE_CONTROL) & ~(CB_BRIDGE_CRST | CB_BRIDGE_INTR);
+> 
+> #ifdef DEBUG_LEVEL1
+>         cardbus_bridge_debug(bridge, 0);
+> #endif
+>         socket_state = cardbus_socket_state(socket);
+>         if(yenta_init_flag) {
+>                 bridge = yenta_isa_init(socket, state, bridge);
+>         }else if(socket_state & CB_CBCARD) {
+>                 bridge |= (state->flags & SS_RESET) ? CB_BRIDGE_CRST : 0;
+> 
+>                 /* ISA interrupt control? */
+>                 if (!socket->cb_irq) {
+>                         u8 intr = exca_readb(socket, I365_INTCTL);
+> #ifdef DEBUG_LEVEL1
+>                         i365_intctl_debug(intr, 0);
+> #endif
+>                         intr = (intr & ~0xf) | state->io_irq;
+>                         exca_writeb(socket, I365_INTCTL, intr);
+> #ifdef DEBUG_LEVEL1
+>                         i365_intctl_debug(intr, 1);
+> #endif
+>                         bridge |= CB_BRIDGE_INTR;
+>                 }
+>         } else {
+>                 bridge = yenta_isa_init(socket, state, bridge);
+>         }
+> #ifdef DEBUG_LEVEL1
+>         cardbus_bridge_debug(bridge, 1);
+> #endif
+>         config_writew(socket, CB_BRIDGE_CONTROL, bridge);
+>         /* Socket event mask: get card insert/remove events.. */
+>         cb_writel(socket, CB_SOCKET_EVENT, -1);
+>         cb_writel(socket, CB_SOCKET_MASK, CB_CDMASK);
+> 
+> #ifdef DEBUG_LEVEL1
+>         edebug = edebugold;
+> #endif
+>         return 0;
+> }
+> 
+> static int yenta_get_io_map(pci_socket_t *socket, struct pccard_io_map *io)
+> {
+>         int map;
+>         unsigned char ioctl, addr;
+> 
+> #ifdef DEBUG_LEVEL1
+>         int edebugold = edebug;
+>         edebug = 0;
+>         printk("%s\n", "yenta get io map");
+> #endif
+>         map = io->map;
+>         if (map > 1)
+>                 return -EINVAL;
+> 
+>         io->start = exca_readw(socket, I365_IO(map)+I365_W_START);
+>         io->stop = exca_readw(socket, I365_IO(map)+I365_W_STOP);
+> 
+>         ioctl = exca_readb(socket, I365_IOCTL);
+>         addr = exca_readb(socket, I365_ADDRWIN);
+>         io->speed = to_ns(ioctl & I365_IOCTL_WAIT(map)) ? 1 : 0;
+>         io->flags  = (addr & I365_ENA_IO(map)) ? MAP_ACTIVE : 0;
+>         io->flags |= (ioctl & I365_IOCTL_0WS(map)) ? MAP_0WS : 0;
+>         io->flags |= (ioctl & I365_IOCTL_16BIT(map)) ? MAP_16BIT : 0;
+>         io->flags |= (ioctl & I365_IOCTL_IOCS16(map)) ? MAP_AUTOSZ : 0;
+> 
+> #ifdef DEBUG_LEVEL1
+>         edebug = edebugold;
+> #endif
+> 
+>         return 0;
+> }
+> 
+> static int yenta_set_io_map(pci_socket_t *socket, struct pccard_io_map *io)
+> {
+>         int map;
+>         unsigned char ioctl, addr, enable;
+> 
+> #ifdef DEBUG_LEVEL1
+>         int edebugold = edebug;
+>         edebug = 0;
+>         printk("%s\n", "yenta get io map");
+> #endif
+> 
+>         map = io->map;
+> 
+>         if (map > 1)
+>                 return -EINVAL;
+> 
+>         enable = I365_ENA_IO(map);
+>         addr = exca_readb(socket, I365_ADDRWIN);
+> 
+>         /* Disable the window before changing it.. */
+>         if (addr & enable) {
+>                 addr &= ~enable;
+>                 exca_writeb(socket, I365_ADDRWIN, addr);
+>         }
+> 
+>         exca_writew(socket, I365_IO(map)+I365_W_START, io->start);
+>         exca_writew(socket, I365_IO(map)+I365_W_STOP, io->stop);
+> 
+>         ioctl = exca_readb(socket, I365_IOCTL) & ~I365_IOCTL_MASK(map);
+>         if (io->flags & MAP_0WS) ioctl |= I365_IOCTL_0WS(map);
+>         if (io->flags & MAP_16BIT) ioctl |= I365_IOCTL_16BIT(map);
+>         if (io->flags & MAP_AUTOSZ) ioctl |= I365_IOCTL_IOCS16(map);
+>         exca_writeb(socket, I365_IOCTL, ioctl);
+> 
+>         if (io->flags & MAP_ACTIVE)
+>                 exca_writeb(socket, I365_ADDRWIN, addr | enable);
+> 
+> #ifdef DEBUG_LEVEL1
+>         edebug = edebugold;
+> #endif
+>         return 0;
+> }
+> 
+> static int yenta_get_mem_map(pci_socket_t *socket, struct pccard_mem_map *mem)
+> {
+>         int map;
+>         unsigned char addr;
+>         unsigned int start, stop, page, offset;
+> 
+> #ifdef DEBUG_LEVEL1
+>         int edebugold = edebug;
+>         edebug = 0;
+>         printk("%s\n", "yenta get mem map");
+> #endif
+> 
+>         map = mem->map;
+>         if (map > 4)
+>                 return -EINVAL;
+> 
+>         addr = exca_readb(socket, I365_ADDRWIN);
+>         mem->flags = (addr & I365_ENA_MEM(map)) ? MAP_ACTIVE : 0;
+> 
+>         start = exca_readw(socket, I365_MEM(map) + I365_W_START);
+>         mem->flags |= (start & I365_MEM_16BIT) ? MAP_16BIT : 0;
+>         mem->flags |= (start & I365_MEM_0WS) ? MAP_0WS : 0;
+>         start = (start & 0x0fff) << 12;
+> 
+>         stop = exca_readw(socket, I365_MEM(map) + I365_W_STOP);
+>         mem->speed = to_ns(stop >> 14);
+>         stop = ((stop & 0x0fff) << 12) + 0x0fff;
+> 
+>         offset = exca_readw(socket, I365_MEM(map) + I365_W_OFF);
+>         mem->flags |= (offset & I365_MEM_WRPROT) ? MAP_WRPROT : 0;
+>         mem->flags |= (offset & I365_MEM_REG) ? MAP_ATTRIB : 0;
+>         offset = ((offset & 0x3fff) << 12) + start;
+>         mem->card_start = offset & 0x3ffffff;
+> 
+>         page = exca_readb(socket, CB_MEM_PAGE(map)) << 24;
+>         mem->sys_start = start + page;
+>         mem->sys_stop = start + page;
+> 
+> #ifdef DEBUG_LEVEL1
+>         edebug = edebugold;
+> #endif
+> 
+>         return 0;
+> }
+> 
+> static int yenta_set_mem_map(pci_socket_t *socket, struct pccard_mem_map *mem)
+> {
+>         int map;
+>         unsigned char addr, enable;
+>         unsigned int start, stop, card_start;
+>         unsigned short word;
+> 
+> #ifdef DEBUG_LEVEL1
+>         int edebugold = edebug;
+>         edebug = 0;
+>         printk("%s\n", "yenta set mem map");
+> #endif
+> 
+>         map = mem->map;
+>         start = mem->sys_start;
+>         stop = mem->sys_stop;
+>         card_start = mem->card_start;
+> 
+>         if (map > 4 || start > stop || ((start ^ stop) >> 24) ||
+>             (card_start >> 26) || mem->speed > 1000)
+>                 return -EINVAL;
+> 
+>         enable = I365_ENA_MEM(map);
+>         addr = exca_readb(socket, I365_ADDRWIN);
+>         if (addr & enable) {
+>                 addr &= ~enable;
+>                 exca_writeb(socket, I365_ADDRWIN, addr);
+>         }
+> 
+>         exca_writeb(socket, CB_MEM_PAGE(map), start >> 24);
+> 
+>         word = (start >> 12) & 0x0fff;
+>         if (mem->flags & MAP_16BIT)
+>                 word |= I365_MEM_16BIT;
+>         if (mem->flags & MAP_0WS)
+>                 word |= I365_MEM_0WS;
+>         exca_writew(socket, I365_MEM(map) + I365_W_START, word);
+> 
+>         word = (stop >> 12) & 0x0fff;
+>         switch (to_cycles(mem->speed)) {
+>                 case 0: break;
+>                 case 1:  word |= I365_MEM_WS0; break;
+>                 case 2:  word |= I365_MEM_WS1; break;
+>                 default: word |= I365_MEM_WS1 | I365_MEM_WS0; break;
+>         }
+>         exca_writew(socket, I365_MEM(map) + I365_W_STOP, word);
+> 
+>         word = ((card_start - start) >> 12) & 0x3fff;
+>         if (mem->flags & MAP_WRPROT)
+>                 word |= I365_MEM_WRPROT;
+>         if (mem->flags & MAP_ATTRIB)
+>                 word |= I365_MEM_REG;
+>         exca_writew(socket, I365_MEM(map) + I365_W_OFF, word);
+> 
+>         if (mem->flags & MAP_ACTIVE)
+>                 exca_writeb(socket, I365_ADDRWIN, addr | enable);
+> 
+> #ifdef DEBUG_LEVEL1
+>         edebug = edebugold;
+> #endif
+>         return 0;
+> }
+> 
+> static void yenta_proc_setup(pci_socket_t *socket, struct proc_dir_entry *base)
+> {
+>         /* Not done yet */
+> }
+> 
+> static unsigned int yenta_events(pci_socket_t *socket)
+> {
+>         u8 csc, intr;
+>         u32 cb_event;
+>         unsigned int events;
+> 
+> #ifdef DEBUG_LEVEL1
+>         int edebugold = edebug;
+>         edebug = 0;
+> #endif
+> 
+>         /* Clear interrupt status for the event */
+>         cb_event = cb_readl(socket, CB_SOCKET_EVENT);
+>         cb_writel(socket, CB_SOCKET_EVENT, cb_event);
+> 
+>         csc = exca_readb(socket, I365_CSC);
+> 
+>         events = (cb_event & (CB_CD1EVENT | CB_CD2EVENT)) ? SS_DETECT : 0 ;
+>         events |= (csc & I365_CSC_DETECT) ? SS_DETECT : 0;
+>         intr = exca_readb(socket, I365_INTCTL);
+>         if (intr & I365_PC_IOCARD) {
+>                 events |= (csc & I365_CSC_STSCHG) ? SS_STSCHG : 0;
+>         } else {
+>                 events |= (csc & I365_CSC_BVD1) ? SS_BATDEAD : 0;
+>                 events |= (csc & I365_CSC_BVD2) ? SS_BATWARN : 0;
+>                 events |= (csc & I365_CSC_READY) ? SS_READY : 0;
+>         }
+> #ifdef DEBUG_LEVEL1
+>         if(csc & I365_CSC_READY) {
+>                 printk("%s", "Yenta Event Ready\n");
+>         }else if(cb_event & CB_CD1EVENT) {
+>                 printk("%s", "Yenta Event Detect 1\n");
+>         }else if(cb_event & CB_CD2EVENT) {
+>                 printk("%s", "Yenta Event Detect 2\n");
+>         }else if(csc & I365_CSC_DETECT) {
+>                 printk("%s", "Yenta Event Detect\n");
+>         }else if(csc & I365_CSC_STSCHG) {
+>                 printk("%s", "Yenta Event Status Change\n");
+>         }else if(csc & I365_CSC_BVD1) {
+>                 printk("%s", "Yenta Event Battery Dead\n");
+>         }else if(csc & I365_CSC_BVD2) {
+>                 printk("%s", "Yenta Event Battery Warn\n");
+>         }else{
+>                 /*printk("%s", "*");*/
+>         }
+>         edebug = edebugold;
+> #endif
+>         return events;
+> }
+> 
+> static void yenta_interrupt(int irq, void *dev_id, struct pt_regs *regs)
+> {
+>         unsigned int events;
+>         pci_socket_t *socket = (pci_socket_t *) dev_id;
+> 
+>         events = yenta_events(socket);
+>         if (events) {
+>                 socket->events |= events;
+>                 wake_up_interruptible(&socket->wait);
+>         }
+> }
+> 
+> /*
+>  * Watch a socket every second (and possibly in a
+>  * more timely manner if the state change interrupt
+>  * works..)
+>  */
+> static int yenta_socket_thread(void * data)
+> {
+>         pci_socket_t * socket = (pci_socket_t *) data;
+>         DECLARE_WAITQUEUE(wait, current);
+> 
+>         daemonize();
+>         strcpy(current->comm, "CardBus Watcher");
+> 
+>         do {
+>                 unsigned int events = socket->events | yenta_events(socket);
+> 
+>                 if (events) {
+>                         socket->events = 0;
+>                         if (socket->handler)
+>                                 socket->handler(socket->info, events);
+>                 }
+> 
+>                 current->state = TASK_INTERRUPTIBLE;
+>                 add_wait_queue(&socket->wait, &wait);
+>                 if (!socket->events)
+>                         schedule_timeout(HZ);
+>                 remove_wait_queue(&socket->wait, &wait);
+>         } while (!signal_pending(current));
+>         return 0;
+> }
+> 
+> static unsigned int yenta_probe_irq(pci_socket_t *socket)
+> {
+>         int i;
+>         unsigned long val;
+>         u16 bridge_ctrl;
+>         u32 mask;
+> 
+> #ifdef DEBUG_LEVEL1
+>         int edebugold = edebug;
+>         edebug = 0;
+>         printk("%s\n", "yenta probe IRQ");
+> #endif
+> 
+>         /* Set up ISA irq routing to probe the ISA irqs.. */
+>         bridge_ctrl = config_readw(socket, CB_BRIDGE_CONTROL);
+>         if (!(bridge_ctrl & CB_BRIDGE_INTR)) {
+>                 bridge_ctrl |= CB_BRIDGE_INTR;
+>                 config_writew(socket, CB_BRIDGE_CONTROL, bridge_ctrl);
+>         }
+> 
+>         /*
+>          * Probe for usable interrupts using the force
+>          * register to generate bogus card status events.
+>          */
+>         cb_writel(socket, CB_SOCKET_EVENT, -1);
+>         cb_writel(socket, CB_SOCKET_MASK, CB_CSTSMASK);
+>         val = probe_irq_on();
+>         for (i = 1; i < 16; i++) {
+>                 if (!((val >> i) & 1))
+>                         continue;
+>                 exca_writeb(socket, I365_CSCINT, I365_CSC_STSCHG | (i << 4));
+>                 cb_writel(socket, CB_SOCKET_FORCE, CB_FCARDSTS);
+>                 udelay(100);
+>                 cb_writel(socket, CB_SOCKET_EVENT, -1);
+>         }
+>         cb_writel(socket, CB_SOCKET_MASK, 0);
+> 
+>         mask = probe_irq_mask(val) & 0xffff;
+> 
+>         bridge_ctrl &= ~CB_BRIDGE_INTR;
+>         config_writew(socket, CB_BRIDGE_CONTROL, bridge_ctrl);
+> 
+> #ifdef DEBUG_LEVEL1
+>         edebug = edebugold;
+> #endif
+> 
+>         return mask;
+> }
+> 
+> static void yenta_clear_maps(pci_socket_t *socket)
+> {
+>         int i;
+>         pccard_io_map io = { 0, 0, 0, 0, 1 };
+>         pccard_mem_map mem = { 0, 0, 0, 0, 0, 0 };
+> 
+>         mem.sys_stop = 0x0fff;
+> #ifdef DEBUG_LEVEL1
+>         yenta_init_flag = 1;
+> #endif
+>         yenta_set_socket(socket, &dead_socket);
+> #ifdef DEBUG_LEVEL1
+>         yenta_init_flag = 0;
+> #endif
+>         for (i = 0; i < 2; i++) {
+>                 io.map = i;
+>                 yenta_set_io_map(socket, &io);
+>         }
+>         for (i = 0; i < 5; i++) {
+>                 mem.map = i;
+>                 yenta_set_mem_map(socket, &mem);
+>         }
+> }
+> 
+> /* Called at resume and initialization events */
+> static int yenta_init(pci_socket_t *socket)
+> {
+>         u16 bridge;
+>         struct pci_dev *dev = socket->dev;
+> 
+> #ifdef DEBUG_LEVEL1
+>         int edebugold = edebug;
+>         edebug = 0;
+>         printk("%s\n", "yenta init");
+> #endif
+> 
+>         pci_set_power_state(socket->dev, 0);
+> 
+>         config_writel(socket, CB_LEGACY_MODE_BASE, 0);
+>         config_writel(socket, PCI_BASE_ADDRESS_0, dev->resource[0].start);
+>         config_writew(socket, PCI_COMMAND,
+>                         PCI_COMMAND_IO |
+>                         PCI_COMMAND_MEMORY |
+>                         PCI_COMMAND_MASTER |
+>                         PCI_COMMAND_WAIT);
+> 
+>         /* MAGIC NUMBERS! Fixme */
+>         config_writeb(socket, PCI_CACHE_LINE_SIZE, 32);
+>         config_writeb(socket, PCI_LATENCY_TIMER, 168);
+>         config_writeb(socket, PCI_SEC_LATENCY_TIMER, 176);
+>         config_writeb(socket, PCI_PRIMARY_BUS, dev->bus->number);
+>         config_writeb(socket, PCI_SECONDARY_BUS, dev->subordinate->number);
+>         config_writeb(socket, PCI_SUBORDINATE_BUS, dev->subordinate->number);
+> 
+>         /*
+>          * Set up the bridging state:
+>          *  - enable write posting.
+>          *  - memory window 0 prefetchable, window 1 non-prefetchable
+>          *  - PCI interrupts enabled if a PCI interrupt exists..
+>          */
+>         bridge = config_readw(socket, CB_BRIDGE_CONTROL);
+>         bridge &= ~(CB_BRIDGE_CRST | CB_BRIDGE_PREFETCH1 | CB_BRIDGE_INTR | CB_BRIDGE_ISAEN | CB_BRIDGE_VGAEN);
+>         bridge |= CB_BRIDGE_PREFETCH0 | CB_BRIDGE_POSTEN;
+>         if (!socket->cb_irq)
+>                 bridge |= CB_BRIDGE_INTR;
+>         config_writew(socket, CB_BRIDGE_CONTROL, bridge);
+> 
+>         exca_writeb(socket, I365_GBLCTL, 0x00);
+>         exca_writeb(socket, I365_GENCTL, 0x00);
+> 
+>         yenta_clear_maps(socket);
+> 
+> #ifdef DEBUG_LEVEL1
+>         edebug = edebugold;
+>         printk("%s\n", "yenta init complete");
+> #endif
+>         return 0;
+> }
+> 
+> static int yenta_suspend(pci_socket_t *socket)
+> {
+>         yenta_set_socket(socket, &dead_socket);
+>         pci_set_power_state(socket->dev, 3);
+>         return 0;
+> }
+> 
+> /*
+>  * Set static data that doesn't need re-initializing..
+>  */
+> static void yenta_get_socket_capabilities(pci_socket_t *socket)
+> {
+>         socket->cap.features |= SS_CAP_PAGE_REGS | SS_CAP_PCCARD | SS_CAP_CARDBUS;
+>         socket->cap.map_size = 0x1000;
+>         socket->cap.pci_irq = socket->cb_irq;
+>         socket->cap.irq_mask = yenta_probe_irq(socket);
+>         socket->cap.cb_dev = socket->dev;
+>         socket->cap.bus = NULL;
+> 
+>         printk("Yenta IRQ list %04x, PCI irq%d\n", socket->cap.irq_mask, socket->cb_irq);
+> }
+> 
+> static void yenta_allocate_res(pci_socket_t *socket, int nr, unsigned type)
+> {
+>         struct pci_bus *bus;
+>         struct resource *root, *res;
+>         u32 start, end;
+>         u32 align, size, min, max;
+>         unsigned offset;
+> 
+>         offset = 0x1c + 8*nr;
+>         bus = socket->dev->subordinate;
+>         res = socket->dev->resource + PCI_BRIDGE_RESOURCES + nr;
+>         res->name = bus->name;
+>         res->flags = type;
+>         res->start = 0;
+>         res->end = 0;
+>         root = pci_find_parent_resource(socket->dev, res);
+> 
+>         if (!root)
+>                 return;
+> 
+>         start = config_readl(socket, offset);
+>         end = config_readl(socket, offset+4) | 0xfff;
+>         if (start && end > start) {
+>                 res->start = start;
+>                 res->end = end;
+>                 request_resource(root, res);
+>                 return;
+>         }
+> 
+>         align = size = 4*1024*1024;
+>         min = PCIBIOS_MIN_MEM; max = ~0U;
+>         if (type & IORESOURCE_IO) {
+>                 align = 1024;
+>                 size = 256;
+>                 min = PCIBIOS_MIN_IO;
+>                 max = 0xffff;
+>         }
+> 
+>         if (allocate_resource(root, res, size, min, max, align, NULL, NULL) < 0)
+>                 return;
+> 
+>         config_writel(socket, offset, res->start);
+>         config_writel(socket, offset+4, res->end);
+> }
+> 
+> /*
+>  * Allocate the bridge mappings for the device..
+>  */
+> static void yenta_allocate_resources(pci_socket_t *socket)
+> {
+>         yenta_allocate_res(socket, 0, IORESOURCE_MEM|IORESOURCE_PREFETCH);
+>         yenta_allocate_res(socket, 1, IORESOURCE_MEM);
+>         yenta_allocate_res(socket, 2, IORESOURCE_IO);
+> }
+> 
+> /*
+>  * Close it down - release our resources and go home..
+>  */
+> static void yenta_close(pci_socket_t *sock)
+> {
+>         if (sock->cb_irq)
+>                 free_irq(sock->cb_irq, sock);
+>         if (sock->base)
+>                 iounmap(sock->base);
+> }
+> 
+> #include "ti113x.h"
+> #include "ricoh.h"
+> 
+> /*
+>  * Different cardbus controllers have slightly different
+>  * initialization sequences etc details. List them here..
+>  */
+> #define PD(x,y) PCI_VENDOR_ID_##x, PCI_DEVICE_ID_##x##_##y
+> static struct cardbus_override_struct {
+>         unsigned short vendor;
+>         unsigned short device;
+>         struct pci_socket_ops *op;
+> } cardbus_override[] = {
+>         { PD(TI,1130),  &ti113x_ops },
+>         { PD(TI,1131),  &ti113x_ops },
+>         { PD(TI,1250),  &ti1250_ops },
+> 
+>         { PD(RICOH,RL5C465), &ricoh_ops },
+>         { PD(RICOH,RL5C466), &ricoh_ops },
+>         { PD(RICOH,RL5C475), &ricoh_ops },
+>         { PD(RICOH,RL5C476), &ricoh_ops },
+>         { PD(RICOH,RL5C478), &ricoh_ops }
+> };
+> 
+> #define NR_OVERRIDES (sizeof(cardbus_override)/sizeof(struct cardbus_override_struct))
+> 
+> /*
+>  * Initialize a cardbus controller. Make sure we have a usable
+>  * interrupt, and that we can map the cardbus area. Fill in the
+>  * socket information structure..
+>  */
+> static int yenta_open(pci_socket_t *socket)
+> {
+>         int i;
+>         struct pci_dev *dev = socket->dev;
+> 
+>         /*
+>          * Do some basic sanity checking..
+>          */
+>         if (pci_enable_device(dev)) {
+>                 printk("Unable to enable device\n");
+>                 return -1;
+>         }
+>         if (!dev->resource[0].start) {
+>                 printk("No cardbus resource!\n");
+>                 return -1;
+>         }
+> 
+>         /*
+>          * Ok, start setup.. Map the cardbus registers,
+>          * and request the IRQ.
+>          */
+>         socket->base = ioremap(dev->resource[0].start, 0x1000);
+>         if (!socket->base)
+>                 return -1;
+> 
+>         /* Disable all events */
+>         cb_writel(socket, CB_SOCKET_MASK, 0x0);
+> 
+>         /* Set up the bridge regions.. */
+>         yenta_allocate_resources(socket);
+> 
+>         if (dev->irq && !request_irq(dev->irq, yenta_interrupt, SA_SHIRQ, dev->name, socket))
+>                 socket->cb_irq = dev->irq;
+> 
+>         /* And figure out what the dang thing can do for the PCMCIA layer... */
+>         yenta_get_socket_capabilities(socket);
+> 
+>         /* Do we have special options for the device? */
+>         for (i = 0; i < NR_OVERRIDES; i++) {
+>                 struct cardbus_override_struct *d = cardbus_override+i;
+>                 if (dev->vendor == d->vendor && dev->device == d->device) {
+>                         socket->op = d->op;
+>                         if (d->op->open) {
+>                                 int retval = d->op->open(socket);
+>                                 if (retval < 0)
+>                                         return retval;
+>                         }
+>                 }
+>         }
+> 
+>         kernel_thread(yenta_socket_thread, socket, CLONE_FS | CLONE_FILES | CLONE_SIGHAND);
+>         return 0;
+> }
+> 
+> /*
+>  * Standard plain cardbus - no frills, no extensions
+>  */
+> struct pci_socket_ops yenta_operations = {
+>         yenta_open,
+>         yenta_close,
+>         yenta_init,
+>         yenta_suspend,
+>         yenta_get_status,
+>         yenta_get_socket,
+>         yenta_set_socket,
+>         yenta_get_io_map,
+>         yenta_set_io_map,
+>         yenta_get_mem_map,
+>         yenta_set_mem_map,
+>         yenta_proc_setup
+> };
+> EXPORT_SYMBOL(yenta_operations);
+> 
+> /*
+>  * Ricoh cardbus bridge: standard cardbus, except it needs
+>  * some extra init code to set timings etc.
+>  */
+> struct pci_socket_ops ricoh_operations = {
+>         yenta_open,
+>         yenta_close,
+>         ricoh_init,
+>         yenta_suspend,
+>         yenta_get_status,
+>         yenta_get_socket,
+>         yenta_set_socket,
+>         yenta_get_io_map,
+>         yenta_set_io_map,
+>         yenta_get_mem_map,
+>         yenta_set_mem_map,
+>         yenta_proc_setup
+> };
+> 
+>   ------------------------------------------------------------------------
+> 
+> PCI: Using configuration type 1
+> PCI: Probing PCI hardware
+> PCI: Interrupt Routing Table found at 0xc00fdf60 [router type 8086/122e]
+> PCI: Found IRQ 11 for device 00:04.0 [PIIX]
+> PCI: Found IRQ 11 for device 00:04.1 [PIIX]
+> Limiting direct PCI/PCI transfers.
+> Linux NET4.0 for Linux 2.3
+> Based upon Swansea University Computer Society NET3.039
+> NET4: Unix domain sockets 1.0/SMP for Linux NET4.0.
+> NET4: Linux TCP/IP 1.0 for NET4.0
+> IP Protocols: ICMP, UDP, TCP
+> IP: routing cache hash table of 1024 buckets, 8Kbytes
+> TCP: Hash tables configured (established 8192 bind 8192)
+> apm: BIOS version 1.2 Flags 0x03 (Driver version 1.13)
+> Starting kswapd v1.6
+> ======== initialize_kbd
+> ======== keyboard has IRQ
+> Serial driver version 4.92 (2000-1-27) with MANY_PORTS SHARE_IRQ SERIAL_PCI enabled
+> ttyS00 at 0x03f8 (irq = 4) is a 16550A
+> pty: 256 Unix98 ptys configured
+> Uniform Multi-Platform E-IDE driver Revision: 6.30
+> PIIX4: IDE controller on PCI bus 00 dev 39
+> PIIX4: not 100% native mode: will probe irqs later
+> hda: IBM-DYLA-28100, ATA DISK drive
+> hdc: CD-ROM CDR_U241, ATAPI CDROM drive
+> ide0 at 0x1f0-0x1f7,0x3f6 on irq 14
+> ide1 at 0x170-0x177,0x376 on irq 15
+> hda: IBM-DYLA-28100, 7815MB w/459kB Cache, CHS=1058/240/63
+> hdc: ATAPI 24X CD-ROM drive, 128kB Cache
+> Uniform CD-ROM driver Revision: 3.06
+> Partition check:
+>  hda: hda1 hda2 < hda5 hda6 >
+> Floppy drive(s): fd0 is 1.44M
+> FDC 0 is a post-1991 82077
+> PPP generic driver version 2.4.0
+> Linux agpgart interface v0.99 (c) Jeff Hartmann
+> agpgart: Maximum main memory to use for agp memory: 96M
+> agpgart: Detected Intel 440BX chipset
+> agpgart: AGP aperture is 64M @ 0xe0000000
+> Linux PCMCIA Card Services 3.1.11
+>   options:  [pci] [cardbus] [apm]
+> cs.c 1.249 2000/02/10 23:26:11 (David Hinds)
+> Adding cardbus controller 0: PCI device 104c:ac17
+>   cb_writel: c029a480 0004 00000000
+>   config_readl: c029a480 001c 00000000
+>   config_readl: c029a480 0020 00000000
+>   config_writel: c029a480 001c 10400000
+>   config_writel: c029a480 0020 107fffff
+>   config_readl: c029a480 0024 00000000
+>   config_readl: c029a480 0028 00000000
+>   config_writel: c029a480 0024 10800000
+>   config_writel: c029a480 0028 10bfffff
+>   config_readl: c029a480 002c 00000000
+>   config_readl: c029a480 0030 00000000
+>   config_writel: c029a480 002c 00001000
+>   config_writel: c029a480 0030 000010ff
+> yenta probe IRQ
+> Yenta IRQ list 0698, PCI irq11
+>   cb_readl: c029a480 0008 30000006
+> Cardbus socket state : 30000006 : 3VSOCKET 5VSOCKET CDETECT2 CDETECT1
+> Adding cardbus controller 1: PCI device 104c:ac17
+>   cb_writel: c029a4ec 0004 00000000
+>   config_readl: c029a4ec 001c 00000000
+>   config_readl: c029a4ec 0020 00000000
+>   config_writel: c029a4ec 001c 10c00000
+>   config_writel: c029a4ec 0020 10ffffff
+>   config_readl: c029a4ec 0024 00000000
+>   config_readl: c029a4ec 0028 00000000
+>   config_writel: c029a4ec 0024 11000000
+>   config_writel: c029a4ec 0028 113fffff
+>   config_readl: c029a4ec 002c 00000000
+>   config_readl: c029a4ec 0030 00000000
+>   config_writel: c029a4ec 002c 00001400
+>   config_writel: c029a4ec 0030 000014ff
+> yenta probe IRQ
+> Yenta IRQ list 0698, PCI irq11
+>   cb_readl: c029a4ec 0008 30000068
+> Cardbus socket state : 30000068 : 3VSOCKET 5VSOCKET IREQCINT CBCARD PWRCYCLE
+> cs: register_ss_entry(2, 0xc0228240)
+> yenta init
+> yenta set socket:
+> yenta set power
+> Cardbus bridge read  : 00000500 :POSTEN PREFETCH0
+> Cardbus socket state : 30000006 : 3VSOCKET 5VSOCKET CDETECT2 CDETECT1
+> i365 intctl: read  : 00000040 :PC_RESET
+> i365 intctl: write : 00000040 :PC_RESET
+> Cardbus bridge write : 00000580 :POSTEN PREFETCH0 INTR
+> yenta get io map
+> yenta get io map
+> yenta set mem map
+> yenta set mem map
+> yenta set mem map
+> yenta set mem map
+> yenta set mem map
+> yenta init complete
+> yenta init
+> yenta set socket:
+> yenta set power
+> Cardbus socket control write : 00000000 :VPP_OFF VCC_OFF
+> Cardbus bridge read  : 00000500 :POSTEN PREFETCH0
+> Cardbus socket state : 30000068 : 3VSOCKET 5VSOCKET IREQCINT CBCARD PWRCYCLE
+> i365 intctl: read  : 00000040 :PC_RESET
+> i365 intctl: write : 00000040 :PC_RESET
+> Cardbus bridge write : 00000580 :POSTEN PREFETCH0 INTR
+> yenta get io map
+> yenta get io map
+> yenta set mem map
+> yenta set mem map
+> yenta set mem map
+> yenta set mem map
+> yenta set mem map
+> yenta init complete
+> Intel PCIC probe: not found.
+> Cardbus socket state : 30000006 : 3VSOCKET 5VSOCKET CDETECT2 CDETECT1
+> i365 status : 0 :
+> i365 intctl: read  : 00000040 :PC_RESET
+> Cardbus socket state : 30000068 : 3VSOCKET 5VSOCKET IREQCINT CBCARD PWRCYCLE
+> yenta set socket:
+> yenta set power
+> Cardbus socket control write : 00000022 :VPP_5V VCC_5V
+> Cardbus bridge read  : 00000500 :POSTEN PREFETCH0
+> Cardbus socket state : 30000268 : 3VSOCKET 5VSOCKET BADVCCREQ IREQCINT CBCARD PWRCYCLE
+> Cardbus bridge write : 00000500 :POSTEN PREFETCH0
+> VFS: Mounted root (ext2 filesystem) readonly.
+> Freeing unused kernel memory: 84k freed
+> yenta set socket:
+> yenta set power
+> Cardbus bridge read  : 00000500 :POSTEN PREFETCH0
+> Cardbus socket state : 30000220 : 3VSOCKET 5VSOCKET BADVCCREQ CBCARD
+> Cardbus bridge write : 00000540 :POSTEN PREFETCH0 CRST
+> yenta set socket:
+> yenta set power
+> Cardbus bridge read  : 00000500 :POSTEN PREFETCH0
+> Cardbus bridge write : 00000500 :POSTEN PREFETCH0
+> cs: socket 1 timed out during reset
+> Adding Swap: 128484k swap-space (priority -1)
+> cs: IO port probe 0x1000-0x17ff: clean.
+> cs: IO port probe 0x0100-0x04ff: excluding 0x378-0x37f 0x3c0-0x3df 0x4d0-0x4d7
+> cs: IO port probe 0x0a00-0x0aff: clean.
+> maestro: version 0.13 time 10:36:51 Mar  1 2000
+> maestro: Configuring ESS Maestro 2 found at IO 0xF800 IRQ 5
+> maestro:  subvendor id: 0x00851028
+> maestro: AC97 Codec detected: v: 0x41445303 caps: 0x400 pwr: 0xf
+> maestro: 1 channels configured.
+> Yenta Event Detect 1
+> Cardbus socket state : 30000326 : 3VSOCKET 5VSOCKET BADVCCREQ DATALOST CBCARD CDETECT2 CDETECT1
+> yenta init
+> yenta set socket:
+> yenta set power
+> Cardbus socket control write : 00000000 :VPP_OFF VCC_OFF
+> Cardbus bridge read  : 00000500 :POSTEN PREFETCH0
+> i365 intctl: read  : 00000040 :PC_RESET
+> i365 intctl: write : 00000040 :PC_RESET
+> Cardbus bridge write : 00000580 :POSTEN PREFETCH0 INTR
+> yenta get io map
+> yenta get io map
+> yenta set mem map
+> yenta set mem map
+> yenta set mem map
+> yenta set mem map
+> yenta set mem map
+> yenta init complete
+> Yenta Event Detect 1
+> Cardbus socket state : 30000b20 : 3VSOCKET 5VSOCKET 3VCARD BADVCCREQ DATALOST CBCARD
+> yenta set socket:
+> yenta set power
+> Cardbus socket control write : 00000033 :VPP_3V VCC_3V
+> Cardbus bridge read  : 00000500 :POSTEN PREFETCH0
+> Cardbus bridge write : 00000500 :POSTEN PREFETCH0
+> yenta set socket:
+> yenta set power
+> Cardbus bridge read  : 00000500 :POSTEN PREFETCH0
+> Cardbus socket state : 30000b68 : 3VSOCKET 5VSOCKET 3VCARD BADVCCREQ DATALOST IREQCINT CBCARD PWRCYCLE
+> Cardbus bridge write : 00000540 :POSTEN PREFETCH0 CRST
+> yenta set socket:
+> yenta set power
+> Cardbus bridge read  : 00000500 :POSTEN PREFETCH0
+> Cardbus bridge write : 00000500 :POSTEN PREFETCH0
+> cs: cb_alloc(bus 4): vendor 0x10b7, device 0x5157
+> PCI: Enabling device 04:00.0 (0000 -> 0003)
+> PCI: Assigned IRQ 0 to device 04:00.0 [PIIX]
+> ==========init 3c575 module
+> 3c59x.c:v0.99L 5/28/99 Donald Becker 
+http://cesdis.gsfc.nasa.gov/linux/drivers/vortex.html
+> cs: cb_enable(bus 4)
+> yenta set socket:
+> yenta set power
+> Cardbus bridge read  : 00000500 :POSTEN PREFETCH0
+> Cardbus bridge write : 00000500 :POSTEN PREFETCH0
+> vortex_reap()
+> vortex_attach(bus 4, function 0, device 5157)
+> eth0: 3Com 3CCFE575 Cyclone CardBus at 0x1400,  00:50:04:5b:94:0e, IRQ 11
+> eth0: CardBus functions mapped 11000080->c884a080
+>   8K byte-wide RAM 5:3 Rx:Tx split, MII interface.
+>   MII transceiver found at address 0, status 7809.
+>   Enabling bus-master transmits and whole-frame receives.
+> pppoe uses obsolete (PF_INET,SOCK_PACKET)
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

@@ -1,0 +1,558 @@
+Date: Fri, 10 Dec 1999 08:01:48 +0100
+From: Artur Skawina <>
+Subject: [RFC] Working PII SYSENTER patch
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/12/10/10
+
+I'm not even going to guess what intel was thinking about while adding
+sysenter/sysexit [1], but it certainly wasn't linux.
+[1] well, i did remove a few comments from the source before posting.. :)
+First, some background info, so it's clear why i did it the way i did.
+While there has been some talk about SYSENTER (quite a few months ago),
+i never saw anything concrete coming out of it (with the exception of a
+patch by Ingo Molnar, which did prove it could be done, but was lacking
+several necessary features). So when i a few days ago finally gave up
+waiting and started implementing the sysenter support one of the main
+goals were (1) 100% correctness, (2) compactness and (3) performance.
+In that order. The reasons for (1) are obvious, (2) is because even
+while i could save a few more cycles it would mean significantly more
+changes to many other parts (potentially a redesign of the whole ia32
+int80, ptrace and signal handling etc), and the cost of maintaining
+such a patch simply wouldn't be justified.
+The required changes ended up being very small (and more importantly
+very contained).
+The new instructions cannot be used in place of int/iret in general,
+only a few special cases will work. Right now that is just the system
+call fast path (signal handling might eventually benefit too, see below).
+Even with this minimalistic approach several problems surfaced...
+[Ingo, i believe most of the issues mentioned below aren't handled by
+ your patch, hence the cc.]
+PTRACE
+ptrace accesses the registers saved on the stack at fixed offsets and
+therefore either needs to be tought about the new entry point, or we
+have to emulate the stack layout. I tried a few different solutions, but
+ended up using the int80 slowpath. This means absolutely no changes to
+ptrace internals are required; it simply works. Yes, you can even strace
+a process using SYSENTER with an int80 based strace and v/v. The cost of
+always setting up the int80 stack is iirc over a dozen cycles, but as
+it's also necessary for other things (listed below), it seems acceptable.
+RESTORING EFLAGS
+With int80/iret the cpu handled eflags for us, with systenter/exit
+this is no longer the case. While we can drop the condition codes, we
+cannot do this for the other special flags. As the cpu might have been
+rescheduled, we could be returning to userspace with a different IOPL.
+Trust me, you really don't want that. :)
+SIGNAL HANDLING
+SYSCALL RESTARTING
+These two are related, but not identical. Basically do_signal()
+can end up modifying the registers on the stack, and then you
+need to handle it differently. syscall restarting is even more
+interesting -- even if we were picking up the new EIP (and it
+would be correct, because both int80 and sysenter are two bytes)
+sysexit would clobber two registers which contains the syscall
+arguments. Right now we unconditionally fallback to IRET,
+though with small changes to the signal code, it may very well
+be possible to use the fast path more aggressively.
+EXEC
+execve(2) needs to return to userpace with some registers set up
+in a special way; EDX is expected to contain a function pointer.
+As SYSEXIT helpfully clobbers that one we loose. The solution is
+simply not to call exec with SYSENTER (an alternative could be to
+change execve() to always use the IRET return path, similarly to
+the way vm86() does.)
+INTERRUPT FLAG
+SYSENTER always turns off interrupts, and gives us no way to 
+determine the original value of this flag. So we have no choice
+but to always return with irqs on. I guess not a big problem,
+although it is noticable when benchmarking syscalls. :)
+5+ ARG SYSCALLS
+Not yet supported. I had a plan for a relatively cheap way to
+support five args, but with Linus' recent addition of a six arg
+variant it would no longer completely solve the problem. Note these
+often are complex (read: slow) syscalls, so that in many cases
+wouldn't be a big problem. Still, I'd like to play with select() etc.
+This could be solved by a (or more) wrappers that fetch the extra
+args. But all of this might change if the global pseudostubs become
+reality (in general a good idea, but for the sysenter case could
+mean added complexity. The benefits of having the same code handle
+intel/amd/transmeta/whatever cpus may or may not outweight this.)
+KERNEL STACK
+A SYSENTER intructions takes the stack pointer from an MSR register.
+As we need a per thread kernel stack the obvious solution is to
+update that MSR while swithing to a new thread. Well, there are two
+reasons why i'm not thrilled with that:
+(1) it means a SEP capable cpu needs a different switch_to from one
+w/o sysenter. I'd like to have sysenter not dependendent on any
+compilation flags and this means extra if()s to check for SE
+support. (while fixups tricks may work on older cpus i wouldn't
+trust clones) If support for other methods emerge it could make
+things even more complex.
+(2) an MSR write takes at least 80 cycles.
+So how could this be avoided? Well, sysenter masks off interrupts,
+right? So we can store a pointer to a per-cpu area in the MSR _once_
+while initializing, make switch_to store the new threads kernel stack
+address in the that area (a simple smp_processor_id indexed store),
+and start the system call with fetching the real stack pointer,
+followed by turning interrupts back on. Total cost for the syscall?
+Two cycles. That's ~1.33%. In return we save the 80 cycles while
+switching threads, and, perchaps more importantly, no cpu capability
+checks are necessary anywhere once we've initialized the cpus - zero
+CONFIG_ dependecies.
+[though vm86 handling could change this, see below]
+Note that the intel didn't go all the way, and we still can could a
+NMI before the first instruction (which corrects the stack). Making
+sure that that per-cpu area has enough room to be used as a
+temporary stack would be enough to solve the problem, unfortunately
+the linux NMI code assumes stacks are switched atomically and always
+valid. Changing these assumptions may be possible, but it's probably
+easier to just add a check for this special case to the NMI entry
+point and make it switch to the correct stack before continuing.
+This is not going to happen that often anyway.
+[note: the attached patch contains just a quick hack that was used
+ to evaluate this scheme -- this one does not handle NMIs and is
+ #if0-ed out]
+VM86 MODE
+Unfortunately the more i try to come up with a clever way to avoid
+the MSR manipulation in switch_to(), the more i'm convinced it is
+necessary. [doing this conditionally could mean three new checks
+(SEP support and VM mode of prev/next thread)]
+There must be a better way...
+getpid() using SYSENTER is now 150 cycles (including a small stub).
+A few simple stub examples that can be used to run simple tests by
+LD_PRELOADing a library is attached too. Don't expect wonders though -
+the errno handling is far from perfect. But it is enough to be able to
+compare lmbench numbers.
+Comments, bugreports and ideas how to handle the remaining issues are
+more than welcome.
+artur
+diff -urNp linux-2.3.31/arch/i386/kernel/entry.S linux-2.3.31as/arch/i386/kernel/entry.S
+--- linux-2.3.31/arch/i386/kernel/entry.S	Thu Dec  9 12:38:19 1999
++++ linux-2.3.31as/arch/i386/kernel/entry.S	Thu Dec  9 12:56:55 1999
+@@ -81,7 +81,6 @@ ENOSYS = 38
+ 
+ 
+ #define SAVE_ALL \
+-	cld; \
+ 	pushl %es; \
+ 	pushl %ds; \
+ 	pushl %eax; \
+@@ -133,6 +132,7 @@ ENOSYS = 38
+ ENTRY(lcall7)
+ 	pushfl			# We get a different stack layout with call gates,
+ 	pushl %eax		# which has to be cleaned up later..
++	cld
+ 	SAVE_ALL
+ 	movl EIP(%esp),%eax	# due to call gates, this is eflags, not eip..
+ 	movl CS(%esp),%edx	# this is eip..
+@@ -154,6 +154,7 @@ ENTRY(lcall7)
+ ENTRY(lcall27)
+ 	pushfl			# We get a different stack layout with call gates,
+ 	pushl %eax		# which has to be cleaned up later..
++	cld
+ 	SAVE_ALL
+ 	movl EIP(%esp),%eax	# due to call gates, this is eflags, not eip..
+ 	movl CS(%esp),%edx	# this is eip..
+@@ -191,11 +192,12 @@ ret_from_fork:
+ 
+ ENTRY(system_call)
+ 	pushl %eax			# save orig_eax
++	cld
+ 	SAVE_ALL
+ 	GET_CURRENT(%ebx)
+ 	cmpl $(NR_syscalls),%eax
+ 	jae badsys
+-	testb $0x20,flags(%ebx)		# PF_TRACESYS
++	testb $0x28,flags(%ebx)		# PF_TRACESYS|PF_IDLE
+ 	jne tracesys
+ 	call *SYMBOL_NAME(sys_call_table)(,%eax,4)
+ 	movl %eax,EAX(%esp)		# save the return value
+@@ -272,6 +274,137 @@ reschedule:
+ 	call SYMBOL_NAME(schedule)    # test
+ 	jmp ret_from_sys_call
+ 
++/*
++ * Intel Pentium II SYSENTER entry
++ *
++ * This is faster, but has some limitations. TANSTAAFL.
++ * The int80 interface uses EAX to pass the syscall number and
++ * EBX, ECX, EDX, ESI, EDI as arguments.
++ * The SYSENTER instruction clobbers the (user) EIP (with this
++ * routines address, stored in MSR(0x176)) and (user) ESP (with the
++ * current tasks kernel stack pointer, from MSR(0x175)). As if that
++ * were not enough it also masks off interrupts and VM86 mode.
++ * The SYSEXIT intruction in turn effectively clobbers EDX and ECX
++ * (by requiring that the target (user) EIP and ESP be placed there).
++ * Both manipulate the CS and SS registers too (using values derived
++ * from MSR(0x174)).
++ *
++ * This interface uses the same conventions as int80 except:
++ * (1) on entry it needs the return address in EDI and user
++ *     user stack pointer in EBP
++ * (2) EDX and ECX are modified after a syscall
++ *
++ * Yes, this means syscalls with five or more arguments (or otherwise
++ * using all five registers as inputs) can not directly take advantage
++ * of this. Tough. Shouldn't be a problem as these can use the int80
++ * entry. And if you need that many args, the syscall overhead
++ * shouldn't be critical.
++ * [note this can be solved, eg by defining new entry points for the
++ *  offending syscalls (in the normal table) and using wrappers to
++ *  fetch the extra data]
++ * 
++ * Currently execve() is not available via this entry point too.
++ * ([1] ABI requires EDX to contain DT_FINI function on exit, and 
++ *  [2] sys_execve clears all registers + sets ESP and EIP)
++ *
++ * NOTES:
++ * o FIXME - SYSENTER from vm86 mode is not handled yet.
++ * o what if TF is set on entry?
++ * o after entering with SYSENTER we always return with interrupts on.
++ */
++ENTRY(system_call_se)
++#if 0
++	movl (%esp),%esp		# 2 cycles, saves ~80 cycles in switch_to()...
++#endif
++	sti
++	
++	# Fake an int80. Ugh. But we might need this later on.
++	# (AOT ptrace and signal handling require this)
++	pushl $__USER_DS		# oldss
++	pushl %ebp			# oldesp
++	pushfl				# eflags (well, actually "(EFLAGS&~VM)|IF")
++	pushl $__USER_CS		# cs
++	cld
++	pushl %edi			# eip
++	# end of stack emulation code
++	
++	pushl %eax			# orig_eax
++	SAVE_ALL
++	GET_CURRENT(%ebx)
++	cmpl $(NR_syscalls),%eax
++	jae SEbadsys
++	testb $0x28,flags(%ebx)		# PF_TRACESYS|PF_IDLE
++	jne SEtracesys
++	call *SYMBOL_NAME(sys_call_table)(,%eax,4)
++	movl %eax,EAX(%esp)		# save the return value
++SEret_from_sys_call:
++	movl SYMBOL_NAME(bh_mask),%eax
++	andl SYMBOL_NAME(bh_active),%eax
++	jne SEhandle_bottom_half
++SEret_with_reschedule:
++	cmpl $0,need_resched(%ebx)
++	jne SEreschedule
++	cmpl $0,sigpending(%ebx)
++	jne SEsignal_return
++	
++	# Restore registers, while simultaneusly preparing for
++	# SYSEXIT by moving EDI -> EDX (EIP) and EBP -> ECX (ESP).
++	popl %ebx;
++	popl %ecx;
++	popl %edx;
++	popl %esi;
++	popl %edx;
++	popl %ecx;
++	popl %eax;
++1:	popl %ds;
++2:	popl %es;
++.section .fixup,"ax";	
++3:	movl $0,(%esp);	
++	jmp 1b;		
++4:	movl $0,(%esp);	
++	jmp 2b;		
++.previous;		
++.section __ex_table,"a";
++	.align 4;	
++	.long 1b,3b;	
++	.long 2b,4b;	
++.previous
++
++	# Now pick up some values from the int80-emulation stack.
++	# The only reason we have to this is EFLAGS - we need to
++	# restore them. Why? Because we may have lost the cpu
++	# (eg returning with a different IOPL is not really a
++	# great idea...). Yep, this means syscalls that modify
++	# EFLAGS (eg iopl) can use use this path too.
++	addl $12,%esp	      	 # skip ORIGEAX, EIP, and CS (always __USER_CS)
++	popfl        	      	 # restore EFLAGS
++	sysexit
++        
++SEsignal_return:
++	xorl %edx,%edx
++	movl %esp,%eax
++	call SYMBOL_NAME(do_signal)
++	# we fallback to the IRET version cause do_signal() might do
++	# weird stuff like modifying the registers saved on the stack
++	# and attempting to restart this syscall by decrementing EIP.
++	# (which can not work with SYSEXIT as it does not preserve
++	# the necessary register contents)
++	jmp restore_all
++SEhandle_bottom_half:
++	call SYMBOL_NAME(do_bottom_half)
++	jmp SEret_with_reschedule
++SEreschedule:
++	call SYMBOL_NAME(schedule)
++	jmp SEret_from_sys_call
++SEbadsys:
++	movl $-ENOSYS,EAX(%esp)
++	jmp SEret_from_sys_call
++
++SEtracesys:
++	# continue as if int80 was used (and return with IRET).
++	# this way ptrace continues to work exactly the same.
++	jmp tracesys
++
+ ENTRY(divide_error)
+ 	pushl $0		# no error code
+ 	pushl $ SYMBOL_NAME(do_divide_error)
+@@ -309,6 +442,7 @@ ENTRY(coprocessor_error)
+ 
+ ENTRY(device_not_available)
+ 	pushl $-1		# mark this as an int
++	cld
+ 	SAVE_ALL
+ 	GET_CURRENT(%ebx)
+ 	pushl $ret_from_exception
+@@ -327,6 +461,7 @@ ENTRY(debug)
+ 
+ ENTRY(nmi)
+ 	pushl %eax
++	cld
+ 	SAVE_ALL
+ 	movl %esp,%edx
+ 	pushl $0
+diff -urNp linux-2.3.31/arch/i386/kernel/process.c linux-2.3.31as/arch/i386/kernel/process.c
+--- linux-2.3.31/arch/i386/kernel/process.c	Tue Dec  7 20:35:24 1999
++++ linux-2.3.31as/arch/i386/kernel/process.c	Thu Dec  9 12:56:55 1999
+@@ -584,6 +584,12 @@ void __switch_to(struct task_struct *pre
+ 	 */
+ 	tss->esp0 = next->esp0;
+ 
++#if 1
++	/*
++	 * Update kernel ESP (used when entering SYSENTRY syscall)
++	 */
++	wrmsr(0x175, next->esp0, 0 );
++#endif
+ 	/*
+ 	 * Save away %fs and %gs. No need to save %es and %ds, as
+ 	 * those are always kernel segments while inside the kernel.
+diff -urNp linux-2.3.31/arch/i386/kernel/setup.c linux-2.3.31as/arch/i386/kernel/setup.c
+--- linux-2.3.31/arch/i386/kernel/setup.c	Thu Dec  9 12:38:19 1999
++++ linux-2.3.31as/arch/i386/kernel/setup.c	Thu Dec  9 12:56:55 1999
+@@ -1521,6 +1521,24 @@ void cpu_init (void)
+ 	gdt_table[__TSS(nr)].b &= 0xfffffdff;
+ 	load_TR(nr);
+ 	load_LDT(&init_mm);
++
++	if (boot_cpu_data.x86_vendor == X86_VENDOR_INTEL &&
++	    boot_cpu_data.x86 >= 6 &&
++	    boot_cpu_data.x86_model >= 3 &&
++	    boot_cpu_data.x86_capability & X86_FEATURE_SEP )
++	{
++		/* If boot CPU has SYSENTER we assume all CPUs have it */
++		asmlinkage int system_call_se(void);     /* in entry.S */
++		
++		printk(KERN_INFO "Enabling Pentium-II SYSENTER system call on CPU#%d\n", nr);
++		wrmsr(0x174, __KERNEL_CS, 0 );	      	    /* CS */
++#if 1
++		wrmsr(0x175, 0, 0 ); 	 /* ESP */
++#else
++		wrmsr(0x175, (unsigned)&t->esp0, 0 ); 	 /* ESP */
++#endif
++		wrmsr(0x176, (unsigned)system_call_se, 0 ); /* EIP */
++	}
+ 
+ 	/*
+ 	 * Clear all 6 debug registers:#!/bin/bash
+#if executed
+gcc -nostdlib -shared ldprel.S -o ldprel
+gcc -nostdlib -shared -DINT ldprel.S -o ldpreli
+#//LD_PRELOAD=./ldprel /usr/local/bin/whatever
+#//LD_PRELOAD=./ldpreli /usr/local/bin/whatever
+exit
+#endif
+#ifdef INT
+#define ENTRY int $0x80
+#else
+#define ENTRY sysenter
+#endif
+   
+#define STUB0(name,num) \
+.align 4 ;\
+.global name ;\
+name:;\
+   pushl %ebp;\
+   pushl %edi;\
+   movl  %esp,%ebp;\
+   movl  $1f,%edi;\
+   movl  $num,%eax;\
+   ENTRY;\
+1:;\
+   cmp   $0xfffff001,%eax;\
+   jae   2f;\
+   popl  %edi;\
+   popl  %ebp;\
+   ret;\
+2:;\
+   negl  %eax;\
+   movl  %eax,errno;\
+   movl  $-1,%eax;\
+   popl  %edi;\
+   popl  %ebp;\
+   ret
+   
+#define STUB1(name,num) \
+.align 4 ;\
+.global name ;\
+name:;\
+   pushl %ebp;\
+   pushl %edi;\
+   pushl %ebx;\
+   movl  %esp,%ebp;\
+   movl  16(%esp), %ebx;\
+   movl  $1f,%edi;\
+   movl  $num,%eax;\
+   ENTRY;\
+1:;\
+   cmp   $0xfffff001,%eax;\
+   jae   2f;\
+   popl  %ebx;\
+   popl  %edi;\
+   popl  %ebp;\
+   ret;\
+2:;\
+   negl  %eax;\
+   movl  %eax,errno;\
+   movl  $-1,%eax;\
+   popl  %ebx;\
+   popl  %edi;\
+   popl  %ebp;\
+   ret
+   
+#define STUB2(name,num) \
+.align 4 ;\
+.global name ;\
+name:;\
+   pushl %ebp;\
+   pushl %edi;\
+   pushl %ebx;\
+   movl  %esp,%ebp;\
+   movl  16(%esp), %ebx;\
+   movl  20(%esp), %ecx;\
+   movl  $1f,%edi;\
+   movl  $num,%eax;\
+   ENTRY;\
+1:;\
+   cmp   $0xfffff001,%eax;\
+   jae   2f;\
+   popl  %ebx;\
+   popl  %edi;\
+   popl  %ebp;\
+   ret;\
+2:;\
+   negl  %eax;\
+   movl  %eax,errno;\
+   movl  $-1,%eax;\
+   popl  %ebx;\
+   popl  %edi;\
+   popl  %ebp;\
+   ret
+   
+#define STUB3(name,num) \
+.align 4 ;\
+.global name ;\
+name:;\
+   pushl %ebp;\
+   pushl %edi;\
+   pushl %ebx;\
+   movl  %esp,%ebp;\
+   movl  16(%esp), %ebx;\
+   movl  20(%esp), %ecx;\
+   movl  24(%esp), %edx;\
+   movl  $1f,%edi;\
+   movl  $num,%eax;\
+   ENTRY;\
+1:;\
+   cmp   $0xfffff001,%eax;\
+   jae   2f;\
+   popl  %ebx;\
+   popl  %edi;\
+   popl  %ebp;\
+   ret;\
+2:;\
+   negl  %eax;\
+   movl  %eax,errno;\
+   movl  $-1,%eax;\
+   popl  %ebx;\
+   popl  %edi;\
+   popl  %ebp;\
+   ret
+#define STUB4(name,num) \
+.align 4 ;\
+.global name ;\
+name:;\
+   pushl %ebp;\
+   pushl %edi;\
+   pushl %esi;\
+   pushl %ebx;\
+   movl  %esp,%ebp;\
+   movl  20(%esp), %ebx;\
+   movl  24(%esp), %ecx;\
+   movl  28(%esp), %edx;\
+   movl  32(%esp), %esi;\
+   movl  $1f,%edi;\
+   movl  $num,%eax;\
+   ENTRY;\
+1:;\
+   cmp   $0xfffff001,%eax;\
+   jae   2f;\
+   popl  %ebx;\
+   popl  %esi;\
+   popl  %edi;\
+   popl  %ebp;\
+   ret;\
+2:;\
+   negl  %eax;\
+   movl  %eax,errno;\
+   movl  $-1,%eax;\
+   popl  %ebx;\
+   popl  %esi;\
+   popl  %edi;\
+   popl  %ebp;\
+   ret
+STUB0(fork,2)
+STUB0(getpid,20)
+STUB0(getppid,64)
+STUB0(getuid,24)
+STUB0(geteuid,49)
+STUB1(_exit,1)
+STUB1(close,6)
+STUB1(brk,45)
+STUB2(gettimeofday,78)
+STUB2(stat,106)
+STUB2(getrusage,77)
+STUB2(getrlimit,76)
+STUB2(pipe,42)
+STUB2(nanosleep,162)
+STUB2(kill,37)
+STUB3(read,3)
+STUB3(write,4)
+STUB3(readv,145)
+STUB3(writev,146)
+STUB3(getdents,141)
+//NOT! STUB3(execve,11)
+//NOT! STUB4(ptrace,26)
+STUB4(wait4,114)
+STUB4(rt_sigaction,174)
+.data
+.global errno
+errno:
+.long 0
+.text
+.global __errno_location
+__errno_location:
+   movl $errno,%eax
+   ret

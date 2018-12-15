@@ -1,0 +1,246 @@
+Date: Fri, 24 Mar 2006 11:24:03 -0500
+From: Brian Weaver <>
+Subject: [PATCH]: Add support for rx packet consumption by a network tap
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2006/3/24/193
+
+This is my first attempt doing any serious modifications to the Linux
+kernel. Feedback is welcome.
+I work for a company that does a lot of packet captures using Linux on a
+device with multiple ethernet interfaces. The normal configuration has
+one device that is configured with an actual IP address, the remaining
+interfaces are setup in promiscious mode without any IP bindings.
+In order to minimize the amount of time the kernel spends processing
+packets on the "listening" interfaces I've written a patch that allows a
+userspace program to direct the kernel to prevent the protocol handlers
+from seeing packets that a network tap has "consumed."
+The attached patch is against the 2.6.16 series, and I have one for the
+2.4 series if anyone would like a copy.
+-Brian
+----
+    [PATCH]: Add support for rx packet consumption by a network tap
+    
+        Many systems are configured with multiple network interfaces, however
+        there are times when one or more adapter is designated solely for
+        capturing packets. This is often the case with Intrusion Detection
+        System (IDS) and other network security applications.
+    
+        These systems need to capture packets as quickly as possible and
+        minimize the time the kernel spends processing the packets in the
+        protocol modules like IP, IPX, etc.
+    
+        This patch provides a way for a network tap (e.g. packet socket) to
+        notify the kernel that the packet was "consumed" and shouldn't be
+        passed to the specific network protocol handlers.
+diff --git a/include/linux/if_packet.h b/include/linux/if_packet.h
+index b925585..59e8b13 100644
+--- a/include/linux/if_packet.h
++++ b/include/linux/if_packet.h
+@@ -39,6 +39,7 @@ struct sockaddr_ll
+ #define PACKET_RX_RING			5
+ #define PACKET_STATISTICS		6
+ #define PACKET_COPY_THRESH		7
++#define PACKET_RX_CONSUME		8
+ 
+ struct tpacket_stats
+ {
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+index 7fda03d..44eb88d 100644
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -60,12 +60,13 @@ struct netpoll_info;
+ 					   returns this as NET_XMIT_SUCCESS) */
+ 
+ /* Backlog congestion levels */
+-#define NET_RX_SUCCESS		0   /* keep 'em coming, baby */
++#define NET_RX_SUCCESS		0  /* keep 'em coming, baby */
+ #define NET_RX_DROP		1  /* packet dropped */
+-#define NET_RX_CN_LOW		2   /* storm alert, just in case */
+-#define NET_RX_CN_MOD		3   /* Storm on its way! */
+-#define NET_RX_CN_HIGH		4   /* The storm is here */
++#define NET_RX_CN_LOW		2  /* storm alert, just in case */
++#define NET_RX_CN_MOD		3  /* Storm on its way! */
++#define NET_RX_CN_HIGH		4  /* The storm is here */
+ #define NET_RX_BAD		5  /* packet dropped due to kernel error */
++#define NET_RX_CONSUMED        16  /* packet consumed by network tap */
+ 
+ #define net_xmit_errno(e)	((e) != NET_XMIT_CN ? -ENOBUFS : 0)
+ 
+diff --git a/net/core/dev.c b/net/core/dev.c
+index 2afb0de..c1b59bb 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -305,6 +305,7 @@ void __dev_remove_pack(struct packet_typ
+ out:
+ 	spin_unlock_bh(&ptype_lock);
+ }
++
+ /**
+  *	dev_remove_pack	 - remove packet handler
+  *	@pt: packet type declaration
+@@ -1525,11 +1526,6 @@ static __inline__ int handle_bridge(stru
+ 	    (port = rcu_dereference((*pskb)->dev->br_port)) == NULL)
+ 		return 0;
+ 
+-	if (*pt_prev) {
+-		*ret = deliver_skb(*pskb, *pt_prev, orig_dev);
+-		*pt_prev = NULL;
+-	} 
+-	
+ 	return br_handle_frame_hook(port, pskb);
+ }
+ #else
+@@ -1580,6 +1576,7 @@ int netif_receive_skb(struct sk_buff *sk
+ 	struct net_device *orig_dev;
+ 	int ret = NET_RX_DROP;
+ 	unsigned short type;
++	int consumed = NET_RX_SUCCESS; 	/* consumed by network tap? NET_RX_SUCCESS = 0 */
+ 
+ 	/* if we've gotten here through NAPI, check netpoll */
+ 	if (skb->dev->poll && netpoll_rx(skb))
+@@ -1611,16 +1608,16 @@ int netif_receive_skb(struct sk_buff *sk
+ 
+ 	list_for_each_entry_rcu(ptype, &ptype_all, list) {
+ 		if (!ptype->dev || ptype->dev == skb->dev) {
+-			if (pt_prev) 
+-				ret = deliver_skb(skb, pt_prev, orig_dev);
++			if (pt_prev)
++				consumed |= (ret = deliver_skb(skb, pt_prev, orig_dev));
+ 			pt_prev = ptype;
+ 		}
+ 	}
+ 
+ #ifdef CONFIG_NET_CLS_ACT
+ 	if (pt_prev) {
+-		ret = deliver_skb(skb, pt_prev, orig_dev);
+-		pt_prev = NULL; /* noone else should process this after*/
++		consumed |= (ret = deliver_skb(skb, pt_prev, orig_dev));
++		pt_prev = NULL; /* no one else should process this after*/
+ 	} else {
+ 		skb->tc_verd = SET_TC_OK2MUNGE(skb->tc_verd);
+ 	}
+@@ -1634,6 +1631,11 @@ int netif_receive_skb(struct sk_buff *sk
+ 
+ 	skb->tc_verd = 0;
+ ncls:
++#else
++	if(pt_prev) {
++		consumed |= (ret = deliver_skb(skb, pt_prev, orig_dev));
++		pt_prev = NULL; /* prevent double processing after checking for consumption */
++	}
+ #endif
+ 
+ 	handle_diverter(skb);
+@@ -1641,13 +1643,15 @@ ncls:
+ 	if (handle_bridge(&skb, &pt_prev, &ret, orig_dev))
+ 		goto out;
+ 
+-	type = skb->protocol;
+-	list_for_each_entry_rcu(ptype, &ptype_base[ntohs(type)&15], list) {
+-		if (ptype->type == type &&
+-		    (!ptype->dev || ptype->dev == skb->dev)) {
+-			if (pt_prev) 
+-				ret = deliver_skb(skb, pt_prev, orig_dev);
+-			pt_prev = ptype;
++	if(likely(!(consumed & NET_RX_CONSUMED))) {
++		type = skb->protocol;
++		list_for_each_entry_rcu(ptype, &ptype_base[ntohs(type)&15], list) {
++			if (ptype->type == type &&
++			    (!ptype->dev || ptype->dev == skb->dev)) {
++				if (pt_prev) 
++					ret = deliver_skb(skb, pt_prev, orig_dev);
++				pt_prev = ptype;
++			}
+ 		}
+ 	}
+ 
+diff --git a/net/packet/af_packet.c b/net/packet/af_packet.c
+index 9db7dbd..918137f 100644
+--- a/net/packet/af_packet.c
++++ b/net/packet/af_packet.c
+@@ -212,6 +212,7 @@ struct packet_sock {
+ 	unsigned int		pg_vec_pages;
+ 	unsigned int		pg_vec_len;
+ #endif
++	int			consume;	/* consume RX packets */
+ };
+ 
+ #ifdef CONFIG_PACKET_MMAP
+@@ -544,7 +545,7 @@ static int packet_rcv(struct sk_buff *sk
+ 	__skb_queue_tail(&sk->sk_receive_queue, skb);
+ 	spin_unlock(&sk->sk_receive_queue.lock);
+ 	sk->sk_data_ready(sk, skb->len);
+-	return 0;
++	return (po->consume ? NET_RX_CONSUMED : 0);
+ 
+ drop_n_acct:
+ 	spin_lock(&sk->sk_receive_queue.lock);
+@@ -574,6 +575,7 @@ static int tpacket_rcv(struct sk_buff *s
+ 	unsigned long status = TP_STATUS_LOSING|TP_STATUS_USER;
+ 	unsigned short macoff, netoff;
+ 	struct sk_buff *copy_skb = NULL;
++	int eatskb = 0;
+ 
+ 	if (skb->pkt_type == PACKET_LOOPBACK)
+ 		goto drop;
+@@ -684,6 +686,7 @@ static int tpacket_rcv(struct sk_buff *s
+ 	}
+ 
+ 	sk->sk_data_ready(sk, 0);
++	eatskb = (po->consume ? NET_RX_CONSUMED : 0);
+ 
+ drop_n_restore:
+ 	if (skb_head != skb->data && skb_shared(skb)) {
+@@ -692,7 +695,7 @@ drop_n_restore:
+ 	}
+ drop:
+         kfree_skb(skb);
+-	return 0;
++	return eatskb;
+ 
+ ring_is_full:
+ 	po->stats.tp_drops++;
+@@ -1377,6 +1380,18 @@ packet_setsockopt(struct socket *sock, i
+ 		return 0;
+ 	}
+ #endif
++	case PACKET_RX_CONSUME:
++	{
++		int val;
++
++		if(optlen != sizeof(val))
++			return -EINVAL;
++		if(copy_from_user(&val, optval, sizeof(val)))
++			return -EFAULT;
++
++		pkt_sk(sk)->consume = val;
++		return 0;
++	}
+ 	default:
+ 		return -ENOPROTOOPT;
+ 	}
+@@ -1415,6 +1430,19 @@ static int packet_getsockopt(struct sock
+ 			return -EFAULT;
+ 		break;
+ 	}
++	case PACKET_RX_CONSUME:
++	{
++		int val;
++		int __user *dst = (int __user *)optval;
++
++		if(len < sizeof(val))
++			return -EINVAL;
++		if(put_user(po->consume,dst))
++			return -EFAULT;
++
++		len = sizeof(val);
++		break;
++	}
+ 	default:
+ 		return -ENOPROTOOPT;
+ 	}
+-- 
+/* insert witty signature here */[unhandled content-type:application/pgp-signature]

@@ -1,0 +1,168 @@
+Date: Tue, 5 Jun 2001 11:09:00 +0200 (CEST)
+From: Ingo Molnar <>
+Subject: [patch] softirq-2.4.6-B2
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2001/6/5/27
+
+the attached softirq-2.4.6-B2 patch against 2.4.6-pre1 includes additional
+softirq fixes and cleanups:
+ - David S. Miller noticed that 64-bit architectures are broken due to
+   set_bit() on an int. Moved __cpu_raise_softirq into asm/softirq.h,
+   every architecture can now define its fastest way of flipping a bit.
+ - fixes module exports
+ - got rid of softirq_mask, because it's completely unused currently, and
+   just causes inlined overhead. There is a clear update path for other
+   architectures: __softirq_mask, __softirq_active is replaced by a single
+   __softirq_pending field. This change also simplified the do_softirq()
+   code.
+ - a small enable_local_bh() optimization
+the patch compiles, boots & works just fine when applied to vanilla
+2.4.6-pre1.
+	Ingo
+--- linux/kernel/ksyms.c.orig	Tue Jun  5 09:59:44 2001
++++ linux/kernel/ksyms.c	Tue Jun  5 10:00:18 2001
+@@ -535,6 +535,9 @@
+ EXPORT_SYMBOL(tasklet_init);
+ EXPORT_SYMBOL(tasklet_kill);
+ EXPORT_SYMBOL(__run_task_queue);
++EXPORT_SYMBOL(do_softirq);
++EXPORT_SYMBOL(tasklet_schedule);
++EXPORT_SYMBOL(tasklet_hi_schedule);
+ 
+ /* init task, for moving kthread roots - ought to export a function ?? */
+ 
+--- linux/kernel/softirq.c.orig	Tue Jun  5 10:09:02 2001
++++ linux/kernel/softirq.c	Tue Jun  5 10:31:59 2001
+@@ -50,7 +50,7 @@
+ asmlinkage void do_softirq()
+ {
+ 	int cpu = smp_processor_id();
+-	__u32 active, mask;
++	__u32 pending;
+ 
+ 	local_irq_disable();
+ 	if (in_interrupt())
+@@ -58,31 +58,30 @@
+ 
+ 	local_bh_disable();
+ 
+-	mask = softirq_mask(cpu);
+-	active = softirq_active(cpu) & mask;
++	pending = softirq_pending(cpu);
+ 
+-	if (active) {
++	if (pending) {
+ 		struct softirq_action *h;
+ 
+ restart:
+-		/* Reset active bitmask before enabling irqs */
+-		softirq_active(cpu) &= ~active;
++		/* Reset the pending bitmask before enabling irqs */
++		softirq_pending(cpu) = 0;
+ 
+ 		local_irq_enable();
+ 
+ 		h = softirq_vec;
+ 
+ 		do {
+-			if (active & 1)
++			if (pending & 1)
+ 				h->action(h);
+ 			h++;
+-			active >>= 1;
+-		} while (active);
++			pending >>= 1;
++		} while (pending);
+ 
+ 		local_irq_disable();
+ 
+-		active = softirq_active(cpu) & mask;
+-		if (active)
++		pending = softirq_pending(cpu);
++		if (pending)
+ 			goto retry;
+ 	}
+ 
+@@ -100,20 +99,10 @@
+ }
+ 
+ 
+-static spinlock_t softirq_mask_lock = SPIN_LOCK_UNLOCKED;
+-
+ void open_softirq(int nr, void (*action)(struct softirq_action*), void *data)
+ {
+-	unsigned long flags;
+-	int i;
+-
+-	spin_lock_irqsave(&softirq_mask_lock, flags);
+ 	softirq_vec[nr].data = data;
+ 	softirq_vec[nr].action = action;
+-
+-	for (i=0; i<NR_CPUS; i++)
+-		softirq_mask(i) |= (1<<nr);
+-	spin_unlock_irqrestore(&softirq_mask_lock, flags);
+ }
+ 
+ 
+--- linux/include/linux/irq_cpustat.h.orig	Tue Jun  5 10:09:31 2001
++++ linux/include/linux/irq_cpustat.h	Tue Jun  5 10:21:16 2001
+@@ -26,15 +26,11 @@
+ #endif	
+ 
+   /* arch independent irq_stat fields */
+-#define softirq_active(cpu)	__IRQ_STAT((cpu), __softirq_active)
+-#define softirq_mask(cpu)	__IRQ_STAT((cpu), __softirq_mask)
++#define softirq_pending(cpu)	__IRQ_STAT((cpu), __softirq_pending)
+ #define local_irq_count(cpu)	__IRQ_STAT((cpu), __local_irq_count)
+ #define local_bh_count(cpu)	__IRQ_STAT((cpu), __local_bh_count)
+ #define syscall_count(cpu)	__IRQ_STAT((cpu), __syscall_count)
+   /* arch dependent irq_stat fields */
+ #define nmi_count(cpu)		__IRQ_STAT((cpu), __nmi_count)		/* i386, ia64 */
+-
+-#define softirq_pending(cpu) \
+-	((softirq_active(cpu) & softirq_mask(cpu)))
+ 
+ #endif	/* __irq_cpustat_h */
+--- linux/include/linux/interrupt.h.orig	Tue Jun  5 10:11:02 2001
++++ linux/include/linux/interrupt.h	Tue Jun  5 10:33:16 2001
+@@ -74,12 +74,6 @@
+ asmlinkage void do_softirq(void);
+ extern void open_softirq(int nr, void (*action)(struct softirq_action*), void *data);
+ 
+-/* Locally cached atomic variables are cheaper than cli/sti */
+-static inline void __cpu_raise_softirq(int cpu, int nr)
+-{
+-	set_bit(nr, &softirq_active(cpu));
+-}
+-
+ static inline void raise_softirq(int nr)
+ {
+ 	__cpu_raise_softirq(smp_processor_id(), nr);
+--- linux/include/asm-i386/hardirq.h.orig	Tue Jun  5 10:10:35 2001
++++ linux/include/asm-i386/hardirq.h	Tue Jun  5 10:21:17 2001
+@@ -7,8 +7,7 @@
+ 
+ /* entry.S is sensitive to the offsets of these fields */
+ typedef struct {
+-	unsigned int __softirq_active;
+-	unsigned int __softirq_mask;
++	unsigned int __softirq_pending;
+ 	unsigned int __local_irq_count;
+ 	unsigned int __local_bh_count;
+ 	unsigned int __syscall_count;
+--- linux/include/asm-i386/softirq.h.orig	Tue Jun  5 10:16:53 2001
++++ linux/include/asm-i386/softirq.h	Tue Jun  5 10:33:19 2001
+@@ -11,8 +11,8 @@
+ 
+ #define local_bh_disable()	cpu_bh_disable(smp_processor_id())
+ #define __local_bh_enable()	__cpu_bh_enable(smp_processor_id())
+-#define local_bh_enable()	do { if (!--local_bh_count(smp_processor_id()) && softirq_pending(smp_processor_id())) { do_softirq(); __sti(); } } while (0)
+-
++#define local_bh_enable()	do { int __cpu = smp_processor_id(); if (!--local_bh_count(__cpu) && softirq_pending(__cpu)) { do_softirq(); __sti(); } } while (0)
++#define __cpu_raise_softirq(cpu,nr) set_bit((nr), &softirq_pending(cpu));
+ #define in_softirq() (local_bh_count(smp_processor_id()) != 0)
+ 
+ #endif	/* __ASM_SOFTIRQ_H */

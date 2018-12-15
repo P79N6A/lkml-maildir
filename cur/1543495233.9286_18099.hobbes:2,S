@@ -1,0 +1,196 @@
+Date: Mon, 10 May 1999 13:32:40 +0200
+From: Jan Kara <>
+Subject: Re: HELP> VFS: dqput: trying to free free dquot
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/5/10/34
+
+  Hello.
+> I can't use 2.2.x kernels because then I should update hole system and
+> that is not good idea when running very busy server :)
+> 
+> But if you can remake the changes for 2.0.x kernels, please do it and send
+> me the patch, I appreciate that very much :-)
+  So I managed to fix the major problems with quotas. The problem is that in
+2.0 the quotas have unlucky design and so to fix them completly would mean
+to rewrite them as was done in 2.1... Here I'm sending you a patch (it was
+done against 2.0.35 but I hope there were no changes in quotas to current 2.0
+kernel). The patch works for me but I didn't try it really hard so you had better
+being careful... Mail me if you see any problems.
+							Honza.
+PS: The patch is also at 
+ftp://atrey.karlin.mff.cuni.cz/pub/local/jack/quota-fix-2.0.35-1.diff.gz
+--- linux/fs/dquot.c	Wed Nov 25 22:11:34 1998
++++ linux/fs/dquot.c	Sun May  9 12:52:22 1999
+@@ -143,14 +143,17 @@
+ 		return;
+ 	dqstats.pages_allocated++;
+ 	cnt = PAGE_SIZE / sizeof(struct dquot);
++	memset(dquot, 0, PAGE_SIZE);
+ 	nr_dquots += cnt;
+ 	nr_free_dquots += cnt;
+ 	if (!first_dquot) {
+ 		dquot->dq_next = dquot->dq_prev = first_dquot = dquot++;
+ 		cnt--;
+ 	}
+-	for (; cnt; cnt--)
++	for (; cnt; cnt--) {
++		init_waitqueue(&dquot->dq_wait);
+ 		insert_dquot_free(dquot++);
++	}
+ }
+ 
+ /*
+@@ -219,11 +222,18 @@
+ 	short type = dquot->dq_type;
+ 	struct file *filp = dquot->dq_mnt->mnt_quotas[type];
+ 	unsigned short fs;
++	struct dqblk wrt_dquot;
+ 
+ 	if (!(dquot->dq_flags & DQ_MOD) || (filp == (struct file *)NULL))
+ 		return;
+ 	lock_dquot(dquot);
++	if (!dquot->dq_mnt) {	/* Invalidated dquot? */
++		unlock_dquot(dquot);
++		return;
++	}
+ 	down(&dquot->dq_mnt->mnt_sem);
++	dquot->dq_flags &= ~DQ_MOD;	/* Clear the flag unconditionally - we don't want to loop on error */
++	memcpy(&wrt_dquot, &dquot->dq_dqb, sizeof(struct dqblk));	/* Copy structure so we can unlock it */
+ 	if (filp->f_op->lseek) {
+ 		if (filp->f_op->lseek(filp->f_inode, filp,
+ 		    dqoff(dquot->dq_id), 0) != dqoff(dquot->dq_id)) {
+@@ -238,14 +248,13 @@
+ 		if(p>=0)
+ 			filp->f_pos = p;
+ 	}
++	unlock_dquot(dquot);	/* We have to unlock structure as write might need to update it */
+ 	fs = get_fs();
+ 	set_fs(KERNEL_DS);
+-	if (filp->f_op->write(filp->f_inode, filp,
+-	   (char *)&dquot->dq_dqb, sizeof(struct dqblk)) == sizeof(struct dqblk))
+-		dquot->dq_flags &= ~DQ_MOD;
++	if (filp->f_op->write(filp->f_inode, filp, (char *)&wrt_dquot, sizeof(struct dqblk)) != sizeof(struct dqblk))
++		printk(KERN_ERR "VFS: write_dquot() failed.\n");
+ 	up(&dquot->dq_mnt->mnt_sem);
+ 	set_fs(fs);
+-	unlock_dquot(dquot);
+ 	dqstats.writes++;
+ }
+ 
+@@ -286,14 +295,18 @@
+ 	int i;
+ 
+ 	dqstats.syncs++;
++restart:
+ 	for (i = 0; i < nr_dquots * 2; i++, dquot = dquot->dq_next) {
+ 		if (dev == NODEV || dquot->dq_count == 0 || dquot->dq_dev != dev)
+ 			continue;
+ 		if (type != -1 && dquot->dq_type != type)
+ 			continue;
++		if (!(dquot->dq_flags & DQ_MOD))	/* It might get modified I know but to restart after each locked dquot... */
++			continue;
+ 		wait_on_dquot(dquot);
+ 		if (dquot->dq_flags & DQ_MOD)
+ 			write_dquot(dquot);
++		goto restart;
+ 	}
+ 	return(0);
+ }
+@@ -306,6 +319,7 @@
+ 	struct dquot *dquot, *next;
+ 	int cnt;
+ 
++restart:
+ 	next = first_dquot;
+ 	for (cnt = nr_dquots ; cnt > 0 ; cnt--) {
+ 		dquot = next;
+@@ -316,10 +330,14 @@
+ 			printk("VFS: dquot busy on removed device %s\n", kdevname(dev));
+ 			continue;
+ 		}
+-		if (dquot->dq_flags & DQ_MOD)
++		if (dquot->dq_flags & DQ_MOD) {
+ 			write_dquot(dquot);
++			dqstats.drops++;
++			clear_dquot(dquot);
++			goto restart;	/* As we might block inside of write or clear_dquot */
++		}
+ 		dqstats.drops++;
+-		clear_dquot(dquot);
++		clear_dquot(dquot);	/* Here we can't block - DQ_LOCKED was tested before */
+ 	}
+ }
+ 
+@@ -463,30 +481,34 @@
+ 	 * checking and doesn't need to be written. It just an empty
+ 	 * dquot that is put back into the freelist.
+ 	 */
+-	if (dquot->dq_mnt != (struct vfsmount *)NULL) {
+-		dqstats.drops++;
+-		wait_on_dquot(dquot);
++repeat:
++	if (dquot->dq_mnt) {	/* We can block inside of wait and so we have to check again */
++		if (dquot->dq_flags & DQ_LOCKED) {
++			__wait_on_dquot(dquot);
++			goto repeat;
++		}
++			
+ 		if (!dquot->dq_count) {
+ 			printk("VFS: dqput: trying to free free dquot\n");
+ 			printk("VFS: device %s, dquot of %s %d\n", kdevname(dquot->dq_dev),
+ 			       quotatypes[dquot->dq_type], dquot->dq_id);
+ 			return;
+ 		}
+-repeat:
+ 		if (dquot->dq_count > 1) {
+ 			dquot->dq_count--;
+ 			return;
+ 		}
+-		wake_up(&dquot_wait);
+ 		if (dquot->dq_flags & DQ_MOD) {
+ 			write_dquot(dquot);	/* we can sleep - so do again */
+ 			wait_on_dquot(dquot);
+ 			goto repeat;
+ 		}
++		dqstats.drops++;
+ 	}
+ 	if (dquot->dq_count) {
+ 		dquot->dq_count--;
+ 		nr_free_dquots++;
++		wake_up(&dquot_wait);	/* Here the dquot is really free */
+ 	}
+ 	return;
+ }
+@@ -583,6 +605,14 @@
+ 	put_last_free(dquot);
+ 	insert_dquot_hash(dquot);
+ 	read_dquot(dquot);
++	if (!dquot->dq_mnt) {	/* Invalidated in the mean time? */
++	/*
++	 * As quota was turned off we can just return NODQUOT. I know it's
++	 * not perfect as somebody might turn quota on again but...
++	 */
++		dqput(dquot);
++		return NODQUOT;
++	}
+ 	return(dquot);
+ }
+ 
+@@ -956,12 +986,14 @@
+ 		if ((vfsmnt = lookup_vfsmnt(dev)) == (struct vfsmount *)NULL ||
+ 	     	     vfsmnt->mnt_quotas[cnt] == (struct file *)NULL)
+ 			continue;
++		down(&vfsmnt->mnt_sem);	/* Wait for any pending IO - dquot is not locked on write so we can easily go here during write */
+ 		vfsmnt->mnt_sb->dq_op = (struct dquot_operations *)NULL;
+ 		reset_dquot_ptrs(dev, cnt);
+ 		invalidate_dquots(dev, cnt);
+ 		close_fp(vfsmnt->mnt_quotas[cnt]);
+ 		vfsmnt->mnt_quotas[cnt] = (struct file *)NULL;
+ 		vfsmnt->mnt_iexp[cnt] = vfsmnt->mnt_bexp[cnt] = (time_t)NULL;
++		up(&vfsmnt->mnt_sem);
+ 	}
+ 	return(0);
+ }

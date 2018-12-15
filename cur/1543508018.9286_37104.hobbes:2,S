@@ -1,0 +1,974 @@
+Date: Thu, 02 Sep 1999 23:04:00 +0100
+From: David Woodhouse <>
+Subject: WIP Patch: Cleanup of knfsd export handling.
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/9/2/175
+
+The current export handling by rpc.kmountd and friends is complex, and relies 
+on various state files (/var/lib/{e,x,rm}tab) which tend to get out of sync 
+with the real world, causing clients which ought to be authenticated to 
+complain of stale file handles.
+The fundamental reason for this is because the kernel can only handle FQDN 
+export entries; not network or group entries. So mountd has to add and remove 
+individual host entries when the client in question makes a mount/unmount 
+request respectively.
+The problem comes when the server is restarted (or crashes). If the server's 
+list of active clients is incorrect, for whatever reason, then some clients 
+won't have their entry put back in the kernel's table, and they'll get -ESTALE.
+This is because the host is only considered for addition to the kernel's list 
+of authenticated hosts when it makes a mount request. What we _ought_ to do is 
+make that decision whenever we receive _any_ request that would otherwise be 
+unauthenticated.
+So I've added a callback from the kernel to mountd for any request which would 
+otherwise be refused. I've also added a new export flag NFSEXP_NEGATIVE so 
+that mountd can let the kernel know about hosts/requests which actually should 
+result in a return code of ESTALE.
+With these patches, knfsd no longer requires xtab or rmtab to maintain state 
+across shutdown/startup - it will automatically add client entries to the 
+kernel's table when they actually start to make NFS requests.
+I have yet to fix up exportfs, and to implement expiry of the negative entries
+(and of positive ones for that matter), but I've got it to the state where it
+no longer requires xtab or rmtab to work reliably, and it'll automatically 
+reregister clients which ought to be authenticated, but aren't in the kernel's 
+client list. 
+This is work in progress, but I'm posting it for comments before I go and round
+up the loose ends. The patches are against knfsd-1.4.7, and 2.2.12 with the
+relevant patches included.
+Note the patch to net/sunrpc/svc.c, which allows RPC in from any host - I'd 
+like a better way of doing that, if possible, without adding a separate 
+netlink callback in the RPC layer. Is there a way that the nfsd service can 
+register itself as being promiscuous?
+diff -uNr knfsd-1.4.7/Makefile knfsd-1.4.7+autoauth/Makefile
+--- knfsd-1.4.7/Makefile	Wed Jul 14 22:40:41 1999
++++ knfsd-1.4.7+autoauth/Makefile	Thu Sep  2 19:16:52 1999
+@@ -17,6 +17,6 @@
+ 
+ install:: installman
+ 	if [ ! -d $(STATEDIR) ]; then mkdir -p $(STATEDIR); fi
+-	touch $(STATEDIR)/xtab; chmod 644 $(STATEDIR)/xtab
++#	touch $(STATEDIR)/xtab; chmod 644 $(STATEDIR)/xtab
+ 	touch $(STATEDIR)/etab; chmod 644 $(STATEDIR)/etab
+-	touch $(STATEDIR)/rmtab; chmod 644 $(STATEDIR)/rmtab
++#	touch $(STATEDIR)/rmtab; chmod 644 $(STATEDIR)/rmtab
+diff -uNr knfsd-1.4.7/support/export/xtab.c knfsd-1.4.7+autoauth/support/export/xtab.c
+--- knfsd-1.4.7/support/export/xtab.c	Wed Jul 14 22:40:45 1999
++++ knfsd-1.4.7+autoauth/support/export/xtab.c	Thu Sep  2 19:37:22 1999
+@@ -32,7 +32,10 @@
+ 			continue;
+ 		}
+ 		exp->m_xtabent = 1;
+-		exp->m_mayexport = 1;
++		if (xp->e_flags & NFSEXP_NEGATIVE)
++		  exp->m_mayexport = 0;
++		else
++		  exp->m_mayexport = 1;
+ 	}
+ 	endexportent();
+ 	xfunlock(lockid);
+diff -uNr knfsd-1.4.7/support/include/nfs/export.h knfsd-1.4.7+autoauth/support/include/nfs/export.h
+--- knfsd-1.4.7/support/include/nfs/export.h	Mon Sep  7 18:37:23 1998
++++ knfsd-1.4.7+autoauth/support/include/nfs/export.h	Wed Sep  1 02:54:15 1999
+@@ -21,6 +21,7 @@
+ #define NFSEXP_KERBEROS		0x0080		/* not available */
+ #define NFSEXP_SUNSECURE	0x0100
+ #define NFSEXP_CROSSMNT		0x0200		/* not available */
+-#define NFSEXP_ALLFLAGS		0x03FF
++#define NFSEXP_NEGATIVE		0x0400
++#define NFSEXP_ALLFLAGS		0x07FF
+ 
+ #endif /* _NSF_EXPORT_H */
+diff -uNr knfsd-1.4.7/support/include/nfslib.h knfsd-1.4.7+autoauth/support/include/nfslib.h
+--- knfsd-1.4.7/support/include/nfslib.h	Wed Jul 14 22:40:46 1999
++++ knfsd-1.4.7+autoauth/support/include/nfslib.h	Thu Sep  2 19:15:28 1999
+@@ -24,7 +24,7 @@
+ #define _PATH_EXPORTS		"/etc/exports"
+ #endif
+ #ifndef _PATH_XTAB
+-#define _PATH_XTAB		NFS_STATEDIR "/xtab"
++#define _PATH_XTAB		"/proc/fs/nfs/exports"
+ #endif
+ #ifndef _PATH_XTABTMP
+ #define _PATH_XTABTMP		NFS_STATEDIR "/xtab.tmp"
+diff -uNr knfsd-1.4.7/support/nfs/exports.c knfsd-1.4.7+autoauth/support/nfs/exports.c
+--- knfsd-1.4.7/support/nfs/exports.c	Fri Jun 11 22:44:36 1999
++++ knfsd-1.4.7+autoauth/support/nfs/exports.c	Wed Sep  1 02:56:15 1999
+@@ -147,6 +147,8 @@
+ 				"" : "no_");
+ 	fprintf(fp, "%sall_squash,", (ep->e_flags & NFSEXP_ALLSQUASH)?
+ 				"" : "no_");
++	if (ep->e_flags & NFSEXP_NEGATIVE)
++		fprintf(fp, "negative,");
+ 
+ 	fprintf(fp, "mapping=");
+ 	switch (ep->e_maptype) {
+@@ -293,6 +295,8 @@
+ 			ep->e_flags |= NFSEXP_ALLSQUASH;
+ 		else if (strcmp(opt, "no_all_squash") == 0)
+ 			ep->e_flags &= ~NFSEXP_ALLSQUASH;
++		else if (strcmp(opt, "negative") == 0)
++			ep->e_flags |= NFSEXP_NEGATIVE;
+ 		else if (strncmp(opt, "mapping=", 8) == 0)
+ 			ep->e_maptype = parsemaptype(opt+8);
+ 		else if (strcmp(opt, "map_identity") == 0)	/* old style */
+diff -uNr knfsd-1.4.7/utils/exportfs/exportfs.c knfsd-1.4.7+autoauth/utils/exportfs/exportfs.c
+--- knfsd-1.4.7/utils/exportfs/exportfs.c	Tue Jul 13 22:01:03 1999
++++ knfsd-1.4.7+autoauth/utils/exportfs/exportfs.c	Thu Sep  2 19:18:43 1999
+@@ -73,7 +73,6 @@
+ 	if (!f_ignore) {
+ 		export_read(_PATH_EXPORTS);
+ 		if (f_reexport) {
+-			rmtab_read();
+ 			unexportall(f_verbose);
+ 		}
+ 		else
+@@ -305,6 +304,8 @@
+ 				c = dumpopt(c, "no_root_squash");
+ 			if (ep->e_flags & NFSEXP_ALLSQUASH)
+ 				c = dumpopt(c, "all_squash");
++			if (ep->e_flags & NFSEXP_NEGATIVE)
++				c = dumpopt(c, "negative");
+ 			if (ep->e_maptype == CLE_MAP_UGIDD)
+ 				c = dumpopt(c, "mapping=ugidd");
+ 			else if (ep->e_maptype == CLE_MAP_FILE)
+@@ -313,7 +314,7 @@
+ 				c = dumpopt(c, "anonuid=%d", ep->e_anonuid);
+ 			if (ep->e_anongid != -2)
+ 				c = dumpopt(c, "anongid=%d", ep->e_anongid);
+-
++			
+ 			printf("%c\n", (c != '(')? ')' : ' ');
+ 		}
+ 	}
+diff -uNr knfsd-1.4.7/utils/mountd/Makefile knfsd-1.4.7+autoauth/utils/mountd/Makefile
+--- knfsd-1.4.7/utils/mountd/Makefile	Fri Jun 11 22:18:48 1999
++++ knfsd-1.4.7+autoauth/utils/mountd/Makefile	Thu Sep  2 18:38:17 1999
+@@ -4,7 +4,7 @@
+ 
+ PROGRAM	= mountd
+ PREFIX	= rpc.
+-OBJS	= mountd.o mount_dispatch.o auth.o rmtab.o
++OBJS	= mountd.o mount_dispatch.o auth.o svc_run.o rmtab.o
+ LIBDEPS	= $(TOP)support/lib/libexport.a $(TOP)/support/lib/libnfs.a
+ LIBS	= -lexport -lnfs
+ MAN8	= mountd
+diff -uNr knfsd-1.4.7/utils/mountd/auth.c knfsd-1.4.7+autoauth/utils/mountd/auth.c
+--- knfsd-1.4.7/utils/mountd/auth.c	Wed Jul 14 22:40:47 1999
++++ knfsd-1.4.7+autoauth/utils/mountd/auth.c	Thu Sep  2 22:22:05 1999
+@@ -31,17 +31,7 @@
+ static nfs_export*	auth_authenticate_internal
+   (char *what, struct sockaddr_in *caller, char *path,
+    struct hostent **hpp, enum auth_error *error);
+-static char	*export_file = NULL;
+ 
+-void
+-auth_init(char *exports)
+-{
+-	struct stat		stb;
+-
+-	export_file = exports;
+-	auth_reload();
+-	xtab_mount_write();
+-}
+ 
+ int
+ auth_reload()
+@@ -56,7 +46,7 @@
+ 	last_modified = stb.st_mtime;
+ 
+ 	export_freeall();
+-	// export_read(export_file);
++
+ 	xtab_export_read();
+ 
+ 	return 1;
+@@ -86,7 +76,7 @@
+ 		*error = no_entry;
+ 		return NULL;
+ 	}
+-	if (!exp->m_mayexport) {
++	if (!exp->m_mayexport || exp->m_export.e_flags & NFSEXP_NEGATIVE) {
+ 		*error = not_exported;
+ 		return NULL;
+ 	}
+diff -uNr knfsd-1.4.7/utils/mountd/mountd.c knfsd-1.4.7+autoauth/utils/mountd/mountd.c
+--- knfsd-1.4.7/utils/mountd/mountd.c	Tue Jul 13 22:01:06 1999
++++ knfsd-1.4.7+autoauth/utils/mountd/mountd.c	Thu Sep  2 22:30:41 1999
+@@ -23,9 +23,96 @@
+ #include "rpcmisc.h"
+ #include "version.h"
+ 
++static struct knfs_fh *	get_rootfh(struct sockaddr_in *, dirpath *, int *, char *);
++void my_svc_run(int fd, void (*handler)());
++
++struct nfsd_netlink_callback {
++	int vers;
++	struct sockaddr_in s;
++	int devlen;
++	char path[NFS_MAXPATHLEN+1];
++};
++
++void nlfd_handler(int fd)
++{
++	struct nfsd_netlink_callback buf;
++	nfs_export *exp;
++	struct nfsctl_client *nclp;
++	struct nfsctl_export *nexp;
++	struct hostent *hp;
++	struct stat stb;
++	int err;
++	char *p = buf.path;
++
++	xlog(L_NOTICE, "NFS request from unknown host\n");
++
++	if (read(fd, &buf, sizeof(buf)) != sizeof(buf)) {
++		xlog(L_ERROR, "read from nfsd netlink of wrong size\n");
++		return;
++	}
++
++	if (get_rootfh(&buf.s, &p, &err, 
++		       "punted nfsd"))
++		return;
++	
++	/* OK. So they weren't allowed. Make up a fake export entry for
++	   it, with a NFSEXP_NEGATIVE flag. */
++
++	/* Yes, we have enough information here to fake a complete entry.
++	   If there wasn't enough information, the kernel wouldn't have 
++	   punted it to us in the first place - it would have just refused
++	   the request */
++	xlog(L_NOTICE, "Adding negative export entry for %s", buf.path);
++
++	hp = gethostbyaddr(&buf.s.sin_addr, sizeof(buf.s.sin_addr), AF_INET);
++
++	/* Put in a negative export for the whole device */
++	buf.path[buf.devlen] = 0;
++	
++	if (stat(buf.path, &stb) < 0) {
++		xlog(L_ERROR, "Cannot stat %s for making negative exportent.",
++		     buf.path);
++		return;
++	}
++		
++	nclp = xmalloc(sizeof(*nclp));
++
++	memset(nclp, 0, sizeof(*nclp));
++	strncpy(nclp->cl_ident, hp->h_name, NFSCLNT_IDMAX);
++	nclp->cl_naddr = 1;
++	nclp->cl_addrlist[0] = buf.s.sin_addr;
++	
++	if (nfsaddclient(nclp)) {
++	  xlog(L_ERROR, "addclient for refused host %s failed: %s",
++	       inet_ntoa(buf.s.sin_addr), sys_errlist[errno]);
++	}	 
++
++	xfree(nclp);
++
++	nexp = xmalloc(sizeof(*nexp));
++	strncpy(nexp->ex_client, hp->h_name, NFSCLNT_IDMAX);
++	strncpy(nexp->ex_path, buf.path, NFS_MAXPATHLEN);
++	nexp->ex_dev = stb.st_dev;
++	nexp->ex_ino = stb.st_ino;
++	nexp->ex_flags = NFSEXP_NEGATIVE;
++
++	
++	if (nfsexport(nexp)) {
++		buf.path[buf.devlen] = '/';
++		xlog(L_ERROR, "addexport for refused %s:%s failed: %s",
++		     hp->h_name, buf.path);
++		return;
++	}
++	xlog(L_NOTICE, "Add negative export for %s:%s succeeded",
++	     hp->h_name, buf.path);
++	     
++	
++}
++		
++
++
+ static void		usage(const char *, int exitcode);
+ static exports		get_exportlist(void);
+-static struct knfs_fh *	get_rootfh(struct svc_req *, dirpath *, int *);
+ 
+ static struct option longopts[] =
+ {
+@@ -41,6 +128,7 @@
+ };
+ 
+ static int nfs_version = -1;
++extern int auth_need_reload;
+ 
+ /*
+  * Signal handler.
+@@ -48,6 +136,11 @@
+ static void 
+ killer (int sig)
+ {
++  if (sig == SIGHUP) {
++    xlog(L_NOTICE, "Received SIGHUP, reloading export table.");
++    auth_need_reload = 1;
++    return;
++  }
+   if (nfs_version & 0x1)
+     pmap_unset (MOUNTPROG, MOUNTVERS);
+   if (nfs_version & (0x1 << 1))
+@@ -57,6 +150,7 @@
+   xlog (L_FATAL, "Caught signal %d, un-registering and exiting.", sig);
+ }
+ 
++
+ bool_t
+ mount_null_1_svc(struct svc_req *rqstp, void *argp, void *resp)
+ {
+@@ -69,7 +163,8 @@
+ 	struct knfs_fh	*fh;
+ 
+ 	xlog(D_CALL, "MNT1(%s) called", *path);
+-	if ((fh = get_rootfh(rqstp, path, &res->fhs_status)) != NULL)
++	if ((fh = get_rootfh(svc_getcaller(rqstp->rq_xprt), path, 
++			     &res->fhs_status, "mountv1")) != NULL)
+ 		memcpy(&res->fhstatus_u.fhs_fhandle, fh, 32);
+ 	return 1;
+ }
+@@ -103,7 +198,6 @@
+ 	if (!(exp = auth_authenticate("unmount", sin, p))) {
+ 		return 1;
+ 	}
+-	mountlist_del(exp, p);
+ 	export_reset (exp);
+ 	return 1;
+ }
+@@ -114,7 +208,6 @@
+ 	/* Reload /etc/xtab if necessary */
+ 	auth_reload();
+ 
+-	mountlist_del_all(svc_getcaller(rqstp->rq_xprt));
+ 	return 1;
+ }
+ 
+@@ -207,7 +300,8 @@
+ 	struct knfs_fh	*fh;
+ 
+ 	xlog(D_CALL, "MNT3(%s) called", *path);
+-	if ((fh = get_rootfh(rqstp, path, (int *) &res->fhs_status)) != NULL) {
++	if ((fh = get_rootfh(svc_getcaller(rqstp->rq_xprt), path, 
++			     (int *) &res->fhs_status, "mountv3")) != NULL) {
+ 		struct mountres3_ok	*ok = &res->mountres3_u.mountinfo;
+ 
+ 		ok->fhandle.fhandle3_len = 32;
+@@ -219,9 +313,8 @@
+ }
+ 
+ static struct knfs_fh *
+-get_rootfh(struct svc_req *rqstp, dirpath *path, int *error)
++get_rootfh(struct sockaddr_in *sin, dirpath *path, int *error, char *what)
+ {
+-	struct sockaddr_in *sin = svc_getcaller(rqstp->rq_xprt);
+ 	struct stat	stb;
+ 	nfs_export	*exp;
+ 	char		rpath[MAXPATHLEN+1];
+@@ -240,7 +333,7 @@
+ 	}
+ 
+ 	/* Now authenticate the intruder... */
+-	if (!(exp = auth_authenticate("mount", sin, p))) {
++	if (!(exp = auth_authenticate(what, sin, p))) {
+ 		*error = NFSERR_ACCES;
+ 	} else if (stat(p, &stb) < 0) {
+ 		xlog(L_WARNING, "can't stat exported dir %s: %s",
+@@ -257,8 +350,6 @@
+ 
+ 		if (!exp->m_exported)
+ 			export_export(exp);
+-		if (!exp->m_xtabent)
+-			xtab_append(exp);
+ 
+ 		/* We first try the new nfs syscall. */
+ 		fh = getfh ((struct sockaddr *) sin, p);
+@@ -267,7 +358,6 @@
+ 			fh = getfh_old ((struct sockaddr *) sin,
+ 				    stb.st_dev, stb.st_ino);
+ 		if (fh != NULL) {
+-			mountlist_add(exp, p);
+ 			*error = NFS_OK;
+ 			export_reset (exp);
+ 			return fh;
+@@ -393,15 +483,14 @@
+ int
+ main(int argc, char **argv)
+ {
+-	char	*export_file = _PATH_EXPORTS;
+ 	int	foreground = 0;
+ 	int	port = 0;
+-	int	c;
++	int	c, nlfd;
+ 	struct sigaction sa;
+ 
+ 	/* Parse the command line options and arguments. */
+ 	opterr = 0;
+-	while ((c = getopt_long(argc, argv, "Fd:f:p:P:hN:V:v", longopts, NULL)) != EOF)
++	while ((c = getopt_long(argc, argv, "Fd:p:P:hN:V:v", longopts, NULL)) != EOF)
+ 		switch (c) {
+ 		case 'F':
+ 			foreground = 1;
+@@ -409,9 +498,6 @@
+ 		case 'd':
+ 			xlog_sconfig(optarg, 1);
+ 			break;
+-		case 'f':
+-			export_file = optarg;
+-			break;
+ 		case 'h':
+ 			usage(argv [0], 0);
+ 			break;
+@@ -469,7 +555,7 @@
+ 	sigaction(SIGINT, &sa, NULL);
+ 	sigaction(SIGTERM, &sa, NULL);
+ 
+-	auth_init(export_file);
++	auth_reload();
+ 
+ 	if (!foreground) {
+ 		/* We first fork off a child. */
+@@ -492,7 +578,9 @@
+ 		xlog_background();
+ 	}
+ 
+-	svc_run();
++	nlfd = open("/dev/nfsd_netlink", O_RDONLY | O_NONBLOCK);
++
++	my_svc_run(nlfd, nlfd_handler);
+ 
+ 	xlog(L_ERROR, "Ack! Gack! svc_run returned!\n");
+ 	exit(1);
+diff -uNr knfsd-1.4.7/utils/mountd/rmtab.c knfsd-1.4.7+autoauth/utils/mountd/rmtab.c
+--- knfsd-1.4.7/utils/mountd/rmtab.c	Tue Jul 13 22:01:07 1999
++++ knfsd-1.4.7+autoauth/utils/mountd/rmtab.c	Thu Sep  2 22:32:37 1999
+@@ -18,119 +18,7 @@
+ #include "xio.h"
+ #include "mountd.h"
+ 
+-void
+-mountlist_add(nfs_export *exp, const char *path)
+-{
+-	struct rmtabent	xe;
+-	struct rmtabent	*rep;
+-	int		lockid;
+-
+-	if ((lockid = xflock(_PATH_RMTAB, "a")) < 0)
+-		return;
+-	setrmtabent("r");
+-	while ((rep = getrmtabent(1)) != NULL) {
+-		if (strcmp (rep->r_client,
+-			    exp->m_client->m_hostname) == 0
+-		    && strcmp(rep->r_path, path) == 0) {
+-			endrmtabent();
+-			xfunlock(lockid);
+-			return;
+-		}
+-	}
+-	endrmtabent();
+-	strncpy(xe.r_client, exp->m_client->m_hostname,
+-		sizeof (xe.r_client) - 1);
+-	xe.r_client [sizeof (xe.r_client) - 1] = '\0';
+-	strncpy(xe.r_path, path, sizeof (xe.r_path) - 1);
+-	xe.r_path [sizeof (xe.r_path) - 1] = '\0';
+-	if (setrmtabent("a")) {
+-		putrmtabent(&xe);
+-		endrmtabent();
+-	}
+-	xfunlock(lockid);
+-}
+-
+-void
+-mountlist_del(nfs_export *exp, const char *path)
+-{
+-	struct rmtabent	*rep;
+-	FILE		*fp;
+-	char		*hname = exp->m_client->m_hostname;
+-	int		lockid;
+-
+-	if ((lockid = xflock(_PATH_RMTAB, "w")) < 0)
+-		return;
+-	if (!setrmtabent("r")) {
+-		xfunlock(lockid);
+-		return;
+-	}
+-	if (!(fp = fsetrmtabent(_PATH_RMTABTMP, "w"))) {
+-		endrmtabent();
+-		xfunlock(lockid);
+-		return;
+-	}
+-	while ((rep = getrmtabent(1)) != NULL) {
+-		if (strcmp (rep->r_client, hname)
+-		    || strcmp(rep->r_path, path))
+-			fputrmtabent(fp, rep);
+-	}
+-	if (rename(_PATH_RMTABTMP, _PATH_RMTAB) < 0) {
+-		xlog(L_ERROR, "couldn't rename %s to %s",
+-				_PATH_RMTABTMP, _PATH_RMTAB);
+-	}
+-	endrmtabent();	/* close & unlink */
+-	fendrmtabent(fp);
+-	xfunlock(lockid);
+-}
+-
+-void
+-mountlist_del_all(struct sockaddr_in *sin)
+-{
+-	struct in_addr	addr = sin->sin_addr;
+-	struct hostent	*hp;
+-	struct rmtabent	*rep;
+-	nfs_export	*exp;
+-	FILE		*fp;
+-	int		lockid;
+-
+-	if ((lockid = xflock(_PATH_RMTAB, "w")) < 0)
+-		return;
+-	if (!(hp = gethostbyaddr((char *)&addr, sizeof(addr), AF_INET))) {
+-		xlog(L_ERROR, "can't get hostname of %s", inet_ntoa(addr));
+-		xfunlock(lockid);
+-		return;
+-	}
+-	else
+-		hp = hostent_dup (hp);
+-
+-	if (!setrmtabent("r")) {
+-		xfunlock(lockid);
+-		free (hp);
+-		return;
+-	}
+-	if (!(fp = fsetrmtabent(_PATH_RMTABTMP, "w"))) {
+-		endrmtabent();
+-		xfunlock(lockid);
+-		free (hp);
+-		return;
+-	}
+-	while ((rep = getrmtabent(1)) != NULL) {
+-		if (strcmp(rep->r_client, hp->h_name) == 0 &&
+-		    (exp = auth_authenticate("umountall", sin, rep->r_path))) {
+-			export_reset(exp);
+-			continue;
+-		}
+-		fputrmtabent(fp, rep);
+-	}
+-	if (rename(_PATH_RMTABTMP, _PATH_RMTAB) < 0) {
+-		xlog(L_ERROR, "couldn't rename %s to %s",
+-				_PATH_RMTABTMP, _PATH_RMTAB);
+-	}
+-	endrmtabent();	/* close & unlink */
+-	fendrmtabent(fp);
+-	xfunlock(lockid);
+-	free (hp);
+-}
++#define _PATH_EXPORTS "/proc/fs/nfs/exports"
+ 
+ mountlist
+ mountlist_list(void)
+@@ -142,7 +30,7 @@
+ 	struct stat		stb;
+ 	int			lockid;
+ 
+-	if ((lockid = xflock(_PATH_RMTAB, "r")) < 0)
++	if ((lockid = xflock(_PATH_EXPORTS, "r")) < 0)
+ 		return NULL;
+ 	if (stat(_PATH_RMTAB, &stb) < 0) {
+ 		xlog(L_ERROR, "can't stat %s", _PATH_RMTAB);
+diff -uNr knfsd-1.4.7/utils/mountd/svc_run.c knfsd-1.4.7+autoauth/utils/mountd/svc_run.c
+--- knfsd-1.4.7/utils/mountd/svc_run.c	Thu Jan  1 01:00:00 1970
++++ knfsd-1.4.7+autoauth/utils/mountd/svc_run.c	Thu Sep  2 20:17:15 1999
+@@ -0,0 +1,91 @@
++/* @(#)svc_run.c	2.1 88/07/29 4.0 RPCSRC */
++
++/*
++ * Sun RPC is a product of Sun Microsystems, Inc. and is provided for
++ * unrestricted use provided that this legend is included on all tape
++ * media and as a part of the software program in whole or part.  Users
++ * may copy or modify Sun RPC without charge, but are not authorized
++ * to license or distribute it to anyone else except as part of a product or
++ * program developed by the user.
++ *
++ * SUN RPC IS PROVIDED AS IS WITH NO WARRANTIES OF ANY KIND INCLUDING THE
++ * WARRANTIES OF DESIGN, MERCHANTIBILITY AND FITNESS FOR A PARTICULAR
++ * PURPOSE, OR ARISING FROM A COURSE OF DEALING, USAGE OR TRADE PRACTICE.
++ *
++ * Sun RPC is provided with no support and without any obligation on the
++ * part of Sun Microsystems, Inc. to assist in its use, correction,
++ * modification or enhancement.
++ *
++ * SUN MICROSYSTEMS, INC. SHALL HAVE NO LIABILITY WITH RESPECT TO THE
++ * INFRINGEMENT OF COPYRIGHTS, TRADE SECRETS OR ANY PATENTS BY SUN RPC
++ * OR ANY PART THEREOF.
++ *
++ * In no event will Sun Microsystems, Inc. be liable for any lost revenue
++ * or profits or other special, indirect and consequential damages, even if
++ * Sun has been advised of the possibility of such damages.
++ *
++ * Sun Microsystems, Inc.
++ * 2550 Garcia Avenue
++ * Mountain View, California  94043
++ */
++
++/*
++ * This is the rpc server side idle loop
++ * Wait for input, call server program.
++ */
++#include <errno.h>
++#include <rpc/rpc.h>
++
++static int svc_stop = 0;
++
++/* This function can be used as a signal handler to terminate the
++   server loop.  */
++void
++my_svc_exit (void)
++{
++  svc_stop = 1;
++}
++int auth_need_reload = 0;
++
++void
++my_svc_run (int xfd, void (*handler)(int))
++{
++  fd_set readfds;
++
++  svc_stop = 0;
++
++  for (;;)
++    {
++      if (svc_stop)
++	return;
++
++      if (auth_need_reload) {
++	auth_need_reload = 0;
++	auth_reload();
++      }
++
++      readfds = svc_fdset;
++      
++      if (xfd != -1 && handler != NULL)
++	FD_SET(xfd, &readfds);
++      
++      switch (select (FD_SETSIZE, &readfds, (fd_set *)NULL,
++			(fd_set *)NULL, (struct timeval *) 0))
++	{
++	case -1:
++	  if (errno == EINTR)
++	    {
++	      continue;
++	    }
++	  perror ("svc_run: - select failed");
++	  return;
++	case 0:
++	  continue;
++	default:
++	  if (FD_ISSET(xfd, &readfds)) {
++	    (*handler)(xfd);
++	  }
++	  svc_getreqset (&readfds);
++	}
++    }
++}--- ./fs/nfsd/export.c.autoauth	Wed Sep  1 02:04:25 1999
++++ ./fs/nfsd/export.c	Wed Sep  1 02:06:05 1999
+@@ -629,6 +629,7 @@
+ 	{ NFSEXP_KERBEROS, { "kerberos", ""}},
+ 	{ NFSEXP_SUNSECURE, { "sunsecure", ""}},
+ 	{ NFSEXP_CROSSMNT, {"crossmnt", ""}},
++	{ NFSEXP_NEGATIVE, {"negative", ""}},
+ 	{ 0, {"", ""}}
+ };
+ 
+--- ./fs/nfsd/nfssvc.c.autoauth	Wed Sep  1 02:06:27 1999
++++ ./fs/nfsd/nfssvc.c	Wed Sep  1 14:35:56 1999
+@@ -238,6 +238,14 @@
+ 
+ 	/* Now call the procedure handler, and encode NFS status. */
+ 	nfserr = proc->pc_func(rqstp, rqstp->rq_argp, rqstp->rq_resp);
++	if (nfserr == NFSERR__DROPIT) {
++		/* We know nothing about this client. Just drop
++		 * the request and it'll be requeued when we've
++		 * decided whether we should honour it or not.
++		 */
++		printk("Dropping request for NFSERR__DROPIT\n");
++		return 0;
++	}
+ 	if (rqstp->rq_proc != 0)
+ 		svc_putlong(&rqstp->rq_resbuf, nfserr);
+ 
+--- ./fs/nfsd/nfsfh.c.autoauth	Wed Sep  1 02:29:12 1999
++++ ./fs/nfsd/nfsfh.c	Wed Sep  1 17:20:09 1999
+@@ -18,6 +18,7 @@
+ 
+ #include <linux/sunrpc/svc.h>
+ #include <linux/nfsd/nfsd.h>
++#include <linux/nfsd/cache.h>
+ 
+ #define NFSDDBG_FACILITY		NFSDDBG_FH
+ #define NFSD_PARANOIA 1
+@@ -946,7 +947,7 @@
+  * Note: steps (4) and (5) above are probably unnecessary now that (3)
+  * is working. Remove the code once this is verified ...
+  */
+-static struct dentry *
++struct dentry *
+ find_fh_dentry(struct knfs_fh *fh)
+ {
+ 	struct super_block *sb;
+@@ -1120,11 +1121,41 @@
+ 			u32_to_kdev_t(fh->fh_xdev),
+ 			u32_to_ino_t(fh->fh_xino));
+ 	if (!exp) {
+-		/* export entry revoked */
++		/* Nothing known about this client. 
++		 * We need to notify mountd about it.
++		 */
++		printk("Unknown client/export pair. Callback to mountd\n");
++		error = nfsd_netlink_notify(rqstp, fhp);
++
++		/* Don't cache this as RC_DROPIT or it'll never
++		 * get answered. 
++		 */
++		if (error == NFSERR__DROPIT)
++		  nfsd_cache_update(rqstp, RC_NOCACHE, NULL);
++
++		/* 
++		 * Ideally, we now stick the request on a separate
++		 * queue, and deal with it when we receive the answer 
++		 * from mountd. For now, we just drop it, though.
++		 *
++		 * Perhaps we should just pass the whole thing up to
++		 * mountd - it holds all the information that it needs
++		 * to decide whether to authenticate it. We just let it
++		 * stick it back in our request queue somehow if the
++		 * answer is 'yes'. 
++		 */
++		goto out;
++	}
++	if (exp->ex_flags & NFSEXP_NEGATIVE) {
++		/* This is a negative export entry - put there
++		 * to inform us that this client isn't authenticated.
++		 * Respond accordingly. 
++		 */
++		printk("Responding to negative client entry for %s:%s\n", 
++		       exp->ex_client->cl_ident, exp->ex_path);
+ 		nfsdstats.fh_stale++;
+ 		goto out;
+ 	}
+-
+ 	/* Check if the request originated from a secure port. */
+ 	error = nfserr_perm;
+ 	if (!rqstp->rq_secure && EX_SECURE(exp)) {
+--- ./fs/nfsd/netlink.c.autoauth	Wed Sep  1 13:41:36 1999
++++ ./fs/nfsd/netlink.c	Thu Sep  2 21:56:15 1999
+@@ -0,0 +1,103 @@
++#include <linux/config.h>
++#include <linux/kernel.h>
++
++#include <linux/malloc.h>
++#include <linux/fs.h>
++#include <linux/unistd.h>
++#include <net/sock.h>
++#include <linux/socket.h>
++#include <linux/skbuff.h>
++#include <linux/mount.h>
++
++#include <linux/sunrpc/types.h>
++#include <linux/sunrpc/stats.h>
++#include <linux/sunrpc/svc.h>
++#include <linux/sunrpc/svcsock.h>
++#include <linux/nfsd/nfsd.h>
++#include <linux/nfsd/stats.h>
++#include <linux/nfsd/cache.h>
++#include <linux/nfsd/xdr.h>
++#include <linux/lockd/bind.h>
++
++#include <linux/netlink.h>
++
++static struct sock *nfsdnlsk = NULL;
++
++	
++struct nfsd_netlink_callback {
++	int vers;
++	struct sockaddr s;
++	int devlen;
++	char path[NFS_MAXPATHLEN+1];
++};
++
++void nfsd_netlink_init()
++{
++	nfsdnlsk = netlink_kernel_create(NETLINK_NFSD, NULL);
++
++	if (nfsdnlsk == NULL)
++		printk("nfsd_netlink_init: cannot initialise netlink\n");
++}
++
++void nfsd_netlink_shutdown()
++{
++	if (nfsdnlsk) {
++		sock_release(nfsdnlsk->socket);
++		nfsdnlsk = NULL;
++	}
++
++}
++
++
++int nfsd_netlink_notify(struct svc_rqst *rqstp, struct svc_fh *fhp)
++{
++	struct knfs_fh *fh = &fhp->fh_handle;
++	struct dentry *d;
++	struct sk_buff *outskb;
++	struct nfsd_netlink_callback *cbk;
++	struct vfsmount *vfsm;
++
++	if (nfsdnlsk == NULL)
++		return nfserr_stale;
++
++	vfsm = lookup_vfsmnt(u32_to_kdev_t(fh->fh_base.fb_dev));
++
++	if (!vfsm)
++		return nfserr_stale;
++
++	d = find_fh_dentry(fh);
++	
++	if (!d)
++		return nfserr_stale;
++	if (IS_ERR(d))
++		return nfserrno(-PTR_ERR(d));
++
++	outskb = alloc_skb(sizeof(*cbk), GFP_KERNEL);
++
++	if (!outskb) {
++		if (net_ratelimit())
++			printk(KERN_WARNING "nfsd_netlink: packet drop due to"
++			       "netlink failure\n");
++		return nfserr_stale;
++	}
++
++	skb_put(outskb, sizeof(*cbk));
++
++	cbk = (struct nfsd_netlink_callback *)outskb->data;
++
++	cbk->vers = 1;
++	memcpy(&cbk->s, &rqstp->rq_addr, sizeof(struct sockaddr));
++
++	strncpy(cbk->path, vfsm->mnt_dirname, NFS_MAXPATHLEN);
++	cbk->devlen = strlen(vfsm->mnt_dirname);
++
++	d_path(d, &cbk->path[cbk->devlen+1], NFS_MAXPATHLEN - cbk->devlen);
++
++	netlink_broadcast(nfsdnlsk, outskb, 0, ~0, GFP_KERNEL);
++
++	/* Tell the handler to just drop the request. It'll be
++	 * resubmitted later, hopefully, and we'll have decided
++	 * whether to authenticate it by then.
++	 */
++	return NFSERR__DROPIT;
++}
+--- ./fs/nfsd/Makefile.autoauth	Wed Sep  1 13:42:57 1999
++++ ./fs/nfsd/Makefile	Wed Sep  1 13:43:05 1999
+@@ -10,7 +10,7 @@
+ O_TARGET := nfsd.o
+ O_OBJS   := nfssvc.o nfsctl.o nfsproc.o nfsfh.o vfs.o \
+ 	    export.o auth.o lockd.o nfscache.o nfsxdr.o \
+-	    stats.o
++	    stats.o netlink.o
+ 
+ M_OBJS   := $(O_TARGET)
+ 
+--- ./fs/Config.in.autoauth	Wed Sep  1 14:46:21 1999
++++ ./fs/Config.in	Wed Sep  1 14:46:43 1999
+@@ -73,7 +73,7 @@
+     bool '   Root file system on NFS' CONFIG_ROOT_NFS
+   fi
+   if [ "$CONFIG_EXPERIMENTAL" = "y" ]; then
+-    tristate 'NFS server support' CONFIG_NFSD
++    dep_tristate 'NFS server support' CONFIG_NFSD $CONFIG_NETLINK
+   fi
+   if [ "$CONFIG_EXPERIMENTAL" = "y" -a "$CONFIG_NFSD" != "n" ]; then
+     bool '   Emulate SUN NFS server' CONFIG_NFSD_SUN
+--- ./include/linux/nfsd/export.h.autoauth	Wed Sep  1 02:02:46 1999
++++ ./include/linux/nfsd/export.h	Wed Sep  1 02:03:19 1999
+@@ -35,7 +35,8 @@
+ #define NFSEXP_KERBEROS		0x0080		/* not available */
+ #define NFSEXP_SUNSECURE	0x0100
+ #define NFSEXP_CROSSMNT		0x0200		/* not available */
+-#define NFSEXP_ALLFLAGS		0x03FF
++#define NFSEXP_NEGATIVE		0x0400
++#define NFSEXP_ALLFLAGS		0x07FF
+ 
+ 
+ #ifdef __KERNEL__
+--- ./include/linux/nfsd/const.h.autoauth	Wed Sep  1 13:14:02 1999
++++ ./include/linux/nfsd/const.h	Wed Sep  1 13:16:50 1999
+@@ -81,6 +81,12 @@
+ #define NFSERR_BADTYPE		10007		/*    v3 */
+ #define NFSERR_JUKEBOX		10008		/*    v3 */
+ 
++	/* We mustn't ever actually return this. It's 
++	 * a placeholder to instruct the dispatch 
++	 * routine to drop the request.
++	 */
++#define NFSERR__DROPIT		99999		/*       */
++
+ #endif /* __KERNEL__ */
+ 
+ #endif /* __NFSCONST_H__ */
+--- ./include/linux/nfsd/nfsd.h.autoauth	Wed Sep  1 14:42:01 1999
++++ ./include/linux/nfsd/nfsd.h	Wed Sep  1 17:05:58 1999
+@@ -113,6 +113,14 @@
+ /* nfsd/nfsctl.c */
+ void		nfsd_modcount(struct inode *, int);
+ 
++/* nfsd/netlink.c */
++void		nfsd_netlink_init(void);
++void		nfsd_netlink_shutdown(void);
++int		nfsd_netlink_notify(struct svc_rqst *rqstp, struct svc_fh *fhp);
++
++/* nfsd/nfsfh.c */
++struct dentry *	find_fh_dentry(struct knfs_fh *fh);
++
+ /*
+  * lockd binding
+  */
+--- ./include/linux/netlink.h.autoauth	Wed Sep  1 13:43:17 1999
++++ ./include/linux/netlink.h	Wed Sep  1 13:45:12 1999
+@@ -5,6 +5,7 @@
+ #define NETLINK_SKIP		1	/* Reserved for ENskip  			*/
+ #define NETLINK_USERSOCK	2	/* Reserved for user mode socket protocols 	*/
+ #define NETLINK_FIREWALL	3	/* Firewalling hook				*/
++#define NETLINK_NFSD		4	/* knfsd callback for authentication */
+ #define NETLINK_ARPD		8
+ #define NETLINK_ROUTE6		11	/* af_inet6 route comm channel */
+ #define NETLINK_IP6_FW		13
+--- ./kernel/ksyms.c.autoauth	Thu Sep  2 17:47:33 1999
++++ ./kernel/ksyms.c	Thu Sep  2 17:47:50 1999
+@@ -190,6 +190,7 @@
+ EXPORT_SYMBOL(vfs_rmdir);
+ EXPORT_SYMBOL(vfs_unlink);
+ EXPORT_SYMBOL(vfs_rename);
++EXPORT_SYMBOL(lookup_vfsmnt);
+ EXPORT_SYMBOL(__pollwait);
+ EXPORT_SYMBOL(ROOT_DEV);
+ 
+--- ./net/sunrpc/svc.c.autoauth	Thu Sep  2 23:00:19 1999
++++ ./net/sunrpc/svc.c	Thu Sep  2 11:44:23 1999
+@@ -245,11 +245,12 @@
+ 	argp->len -= 5;
+ 
+ 	/* Used by nfsd to only allow the NULL procedure for amd. */
++#if 0
+ 	if (rqstp->rq_auth && !rqstp->rq_client && proc) {
+ 		auth_stat = rpc_autherr_badcred;
+ 		goto err_bad_auth;
+ 	}
+-
++#endif
+ 	/*
+ 	 * Decode auth data, and add verifier to reply buffer.
+ 	 * We do this before anything else in order to get a decent----                                 ----                                 ----
+David Woodhouse        David.Woodhouse@mvhi.com       Office: (+44) 1223 810302
+ Project Leader,     Process Information Systems      Mobile: (+44) 976 658355
+    Axiom (Cambridge) Ltd., Swaffham Bulbeck, Cambridge, CB5 0NA, UK.
+             finger dwmw2@ferret.lmh.ox.ac.uk for PGP key.

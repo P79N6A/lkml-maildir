@@ -1,0 +1,142 @@
+Date: Wed, 18 Oct 2000 22:30:45 -0400
+From: Jeff Garzik <>
+Subject: Re: mapping user space buffer to kernel address space
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/10/18/118
+
+Linus Torvalds wrote:
+> Anyway, I didn't realize you were talking about the sound drivers use of
+> remap_page_range(). That's not the original reason for remap_page_range()
+> at all, and in fact it's the _ugly_ way to do things. It's simple and it
+> works, but it's not pretty.
+> 
+> Quite frankly, the way I'd conceptually prefer people do these kinds of
+> DMA buffers etc is to just have a "nopage()" function, and let that
+> nopage() function just fill in the page from the DMA buffer directly. This
+> would work fine, and would get rid of all the playing with PG_reserved
+> etc.
+Well coolio.  Would somebody be up for sanity checking my audio mmap
+code (attached)?  It doesn't look too hard at all to get the audio
+drivers doing the correct thing.
+Converting to this was easy...  my driver hardcodes the buffer size at
+PAGE_SIZE.  Since Via audio uses scatter-gather DMA, all I need to do in
+'nopage' is get the virtual page number for the vma, and use that as a
+direct index into the scatter-gather array.
+Since this code works in my local tests, my two concerns at this point
+are correct vma->vm_pgoff treatment, and correct vm_flags/vm_file usage.
+	Jeff
+-- 
+Jeff Garzik                    | The difference between laziness and
+Building 1024                  | prioritization is the end result.
+MandrakeSoft                   |
+#ifdef VIA_SUPPORT_MMAP
+static struct page * via_mm_nopage (struct vm_area_struct * vma,
+				    unsigned long address, int write_access)
+{
+	struct via_info *card = vma->vm_private_data;
+	struct via_channel *chan = &card->ch_out;
+	unsigned long pgoff;
+	int rd, wr;
+	DPRINTK ("ENTER, start %lXh, ofs %lXh, pgoff %ld, addr %lXh, wr %d\n",
+		 vma->vm_start,
+		 address - vma->vm_start,
+		 (address - vma->vm_start) >> PAGE_SHIFT,
+		 address,
+		 write_access);
+	assert (VIA_DMA_BUF_SIZE == PAGE_SIZE);
+	
+        if (address > vma->vm_end) {
+		DPRINTK ("EXIT, returning NOPAGE_SIGBUS\n");
+		return NOPAGE_SIGBUS; /* Disallow mremap */
+	}
+        if (!card) {
+		DPRINTK ("EXIT, returning NOPAGE_OOM\n");
+		return NOPAGE_OOM;	/* Nothing allocated */
+	}
+	/* XXX what about vma->vm_pgoff? */
+	pgoff = (address - vma->vm_start) >> PAGE_SHIFT;
+	rd = card->ch_in.is_mapped;
+	wr = card->ch_out.is_mapped;
+#ifndef VIA_NDEBUG
+	{
+	unsigned long max_bufs = VIA_DMA_BUFFERS;
+	if (rd && wr) max_bufs *= 2;
+	/* via_dsp_mmap() should ensure this */
+	assert (pgoff < max_bufs);
+	}
+#endif
+	/* if full-duplex (read+write) and we have two sets of bufs,
+	 * then the playback buffers come first, sez soundcard.c */
+	if (pgoff >= VIA_DMA_BUFFERS) {
+		pgoff -= VIA_DMA_BUFFERS;
+		chan = &card->ch_in;
+	} else if (!wr)
+		chan = &card->ch_in;
+	assert ((((unsigned long)chan->sgbuf[pgoff].cpuaddr) % PAGE_SIZE) == 0);
+	DPRINTK ("EXIT, returning page %p for cpuaddr %lXh\n",
+		 virt_to_page (chan->sgbuf[pgoff].cpuaddr),
+		 (unsigned long) chan->sgbuf[pgoff].cpuaddr);
+	return virt_to_page (chan->sgbuf[pgoff].cpuaddr);
+}
+static int via_mm_swapout (struct page *page, struct file *filp)
+{
+	return 0;
+}
+struct vm_operations_struct via_mm_ops = {
+	nopage:		via_mm_nopage,
+	swapout:	via_mm_swapout,
+};
+static int via_dsp_mmap(struct file *file, struct vm_area_struct *vma)
+{
+	struct via_info *card;
+	int nonblock = (file->f_flags & O_NONBLOCK);
+	int rc = -EINVAL, rd=0, wr=0;
+	unsigned long max_size, size, start, offset;
+	assert (file != NULL);
+	assert (vma != NULL);
+	card = file->private_data;
+	assert (card != NULL);
+	
+	DPRINTK ("ENTER, start %lXh, size %ld, pgoff %ld\n",
+		 vma->vm_start,
+		 vma->vm_end - vma->vm_start,
+		 vma->vm_pgoff);
+	assert (VIA_DMA_BUF_SIZE == PAGE_SIZE);
+	
+	max_size = 0;
+	if (file->f_mode & FMODE_READ) {
+		rd = 1;
+		max_size += (VIA_DMA_BUFFERS * VIA_DMA_BUF_SIZE);
+	}
+	if (file->f_mode & FMODE_WRITE) {
+		wr = 1;
+		max_size += (VIA_DMA_BUFFERS * VIA_DMA_BUF_SIZE);
+	}
+	start = vma->vm_start;
+	offset = (vma->vm_pgoff << PAGE_SHIFT);
+	size = vma->vm_end - vma->vm_start;
+	if (size > max_size)
+		goto out;
+	if ((offset >= max_size) || (offset >= size))
+		goto out;
+	rc = via_syscall_down (card, nonblock);
+	if (rc) goto out;
+	
+	vma->vm_ops = &via_mm_ops;
+	vma->vm_private_data = card;
+	vma->vm_flags |= VM_LOCKED | VM_SHM; /* Don't swap */
+	vma->vm_file = file;
+	if (rd)
+		card->ch_in.is_mapped = 1;
+	if (wr)
+		card->ch_out.is_mapped = 1;
+	up (&card->syscall_sem);
+	rc = 0;
+out:
+	DPRINTK("EXIT, returning %d\n", rc);
+	return rc;
+}
+#endif /* VIA_SUPPORT_MMAP */

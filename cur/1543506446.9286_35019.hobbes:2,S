@@ -1,0 +1,188 @@
+Date: Fri, 20 Aug 1999 17:21:21 +0200 (CEST)
+From: Andrea Arcangeli <>
+Subject: [patch] ramdisk blocksize
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/8/20/77
+
+This patch fixes the ramdisk wrt blocksize different than 512byte.
+Currently (in 2.2.x and 2.3.x) it seems possible to change the ramdisk
+blocksize changin the #define RDBLK_SIZE_BITS, but there is some small bug
+(the sectors and current_nr_sectors are multiple of 512 and not of the
+hardblocksize) that cause the ramdisk driver to crash using higher
+blocksizes.
+People who wants to use extensively ramdisks should use a blocksize of
+PAGE_SIZE to avoid the fragmentation of not-freeable memory. NOTE: you
+can't generate a 4k filesystem using a blocksize of 1k simply because the
+buffer-size used from mke2fs must be the same used by the filesystem code
+otherwise you won't read on the memory you written before (on a ramdisk
+you can't emulate larger softblocksize). So to use a blocksize of 4k you
+must:
+	insmod rd rd_blocksize=4096
+	mke2fs -b 4096 /dev/ramdisk
+	mount /dev/ramdisk /mnt
+then you'll avoid the fragmentation of protected buffers (really I don't
+ever know if the ramdisk driver will work correctly on 2.3.14-pre2 but
+that's a different issue and it has only to deal with the VM not with the
+ramdisk internals that have only to set the protected bit upon lowlevel
+writes).
+Insmodding rd without parameters you'll use a hardblocksize of 1k and
+everything will work as usual. btw currently rd.c works as usual even with
+512 byte of hardblocksize because both the blockdevice layer, and ext2fs
+prefer to start reading/writeing with a softblocksize of 1k (and mke2fs
+generate filesystem with 1k blocksize as default). With the fixes now the
+hardblocksize and the softblocksize will be both set to 1k and this looks
+cleaner to me.
+The last issue is with the ramdisk images: the helper function
+(identify_ramdisk_image) that reads the superblock only check how many
+blocks it contains but it doesn't check the blocksize of the filesystem.
+So basically you must use a blocksize of 1k if you want rd_load_image to
+work properly. At least now it's a know feature and the check at the end
+of the patch will be done right.
+Patch against 2.3.14-2:
+diff -urN 2.3.14-pre2/drivers/block/rd.c 2.3.14-pre2-1/drivers/block/rd.c
+--- 2.3.14-pre2/drivers/block/rd.c	Thu Aug 12 02:53:19 1999
++++ 2.3.14-pre2-1/drivers/block/rd.c	Fri Aug 20 16:52:56 1999
+@@ -74,15 +74,6 @@
+ #include <linux/blk.h>
+ #include <linux/blkpg.h>
+ 
+-/*
+- * We use a block size of 512 bytes in comparision to BLOCK_SIZE
+- * defined in include/linux/blk.h. This because of the finer
+- * granularity for filling up a RAM disk.
+- */
+-#define RDBLK_SIZE_BITS		9
+-#define RDBLK_SIZE		(1<<RDBLK_SIZE_BITS)
+-
+-
+ /* The RAM disk size is now a parameter */
+ #define NUM_RAMDISKS 16		/* This cannot be overridden (yet) */ 
+ 
+@@ -114,6 +105,18 @@
+  * information). 
+  */
+ int rd_size = 4096;		/* Size of the RAM disks */
++/*
++ * It would be very desiderable to have a soft-blocksize (that in the case
++ * of the ramdisk driver is also the hardblocksize ;) of PAGE_SIZE because
++ * doing that we'll achieve a far better MM footprint. Using a rd_blocksize of
++ * BLOCK_SIZE in the worst case we'll make PAGE_SIZE/BLOCK_SIZE buffer-pages
++ * unfreeable. With a rd_blocksize of PAGE_SIZE instead we are sure that only
++ * 1 page will be protected. Depending on the size of the ramdisk you
++ * may want to change the ramdisk blocksize to achieve a better or worse MM
++ * behaviour. The default is still BLOCK_SIZE (needed by rd_load_image that
++ * supposes the filesystem in the image uses a BLOCK_SIZE blocksize).
++ */
++int rd_blocksize = BLOCK_SIZE;	/* Size of the RAM disks */
+ 
+ #ifndef MODULE
+ 
+@@ -184,9 +187,6 @@
+ 	unsigned long offset, len;
+ 
+ repeat:
+-	if (!CURRENT)
+-		return;
+-
+ 	INIT_REQUEST;
+ 	
+ 	minor = MINOR(CURRENT->rq_dev);
+@@ -196,8 +196,8 @@
+ 		goto repeat;
+ 	}
+ 	
+-	offset = CURRENT->sector << RDBLK_SIZE_BITS;
+-	len = CURRENT->current_nr_sectors << RDBLK_SIZE_BITS;
++	offset = CURRENT->sector << 9;
++	len = CURRENT->current_nr_sectors << 9;
+ 
+ 	if ((offset + len) > rd_length[minor]) {
+ 		end_request(0);
+@@ -243,7 +243,7 @@
+ 
+          	case BLKGETSIZE:   /* Return device size */
+ 			if (!arg)  return -EINVAL;
+-			return put_user(rd_length[minor] >> RDBLK_SIZE_BITS, (long *) arg);
++			return put_user(rd_kbsize[minor] << 1, (long *) arg);
+ 
+ 		case BLKROSET:
+ 		case BLKROGET:
+@@ -347,6 +347,14 @@
+ {
+ 	int		i;
+ 
++	if (rd_blocksize > PAGE_SIZE || rd_blocksize < 512 ||
++	    (rd_blocksize & (rd_blocksize-1)))
++	{
++		printk("RAMDISK: wrong blocksize %d, reverting to defaults\n",
++		       rd_blocksize);
++		rd_blocksize = BLOCK_SIZE;
++	}
++
+ 	if (register_blkdev(MAJOR_NR, "ramdisk", &fd_fops)) {
+ 		printk("RAMDISK: Could not get major %d", MAJOR_NR);
+ 		return -EIO;
+@@ -356,18 +364,19 @@
+ 
+ 	for (i = 0; i < NUM_RAMDISKS; i++) {
+ 		/* rd_size is given in kB */
+-		rd_length[i] = (rd_size << BLOCK_SIZE_BITS);
+-		rd_hardsec[i] = RDBLK_SIZE;
+-		rd_blocksizes[i] = BLOCK_SIZE;
+-		rd_kbsize[i] = (rd_length[i] >> BLOCK_SIZE_BITS);
++		rd_length[i] = rd_size << 10;
++		rd_hardsec[i] = rd_blocksize;
++		rd_blocksizes[i] = rd_blocksize;
++		rd_kbsize[i] = rd_size;
+ 	}
+ 
+ 	hardsect_size[MAJOR_NR] = rd_hardsec;		/* Size of the RAM disk blocks */
+ 	blksize_size[MAJOR_NR] = rd_blocksizes;		/* Avoid set_blocksize() check */
+ 	blk_size[MAJOR_NR] = rd_kbsize;			/* Size of the RAM disk in kB  */
+ 
+-	printk("RAM disk driver initialized:  %d RAM disks of %dK size\n",
+-							NUM_RAMDISKS, rd_size);
++	printk("RAMDISK driver initialized: "
++	       "%d RAM disks of %dK size %d blocksize\n",
++	       NUM_RAMDISKS, rd_size, rd_blocksize);
+ 
+ 	return 0;
+ }
+@@ -377,7 +386,9 @@
+ #ifdef MODULE
+ 
+ MODULE_PARM     (rd_size, "1i");
+-MODULE_PARM_DESC(rd_size, "Size of each RAM disk.");
++MODULE_PARM_DESC(rd_size, "Size of each RAM disk in kbytes.");
++MODULE_PARM     (rd_blocksize, "i");
++MODULE_PARM_DESC(rd_blocksize, "Blocksize of each RAM disk in bytes.");
+ 
+ int init_module(void)
+ {
+@@ -564,9 +575,15 @@
+ 		goto done;
+ 	}
+ 
+-	if (nblocks > (rd_length[unit] >> RDBLK_SIZE_BITS)) {
++	/*
++	 * NOTE NOTE: nblocks suppose that the blocksize is BLOCK_SIZE, so
++	 * rd_load_image will work only with filesystem BLOCK_SIZE wide!
++	 * So make sure to use 1k blocksize while generating ext2fs
++	 * ramdisk-images.
++	 */
++	if (nblocks > (rd_length[unit] >> BLOCK_SIZE_BITS)) {
+ 		printk("RAMDISK: image too big! (%d/%ld blocks)\n",
+-		       nblocks, rd_length[unit] >> RDBLK_SIZE_BITS);
++		       nblocks, rd_length[unit] >> BLOCK_SIZE_BITS);
+ 		goto done;
+ 	}
+ 		
+Andrea
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

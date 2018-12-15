@@ -1,0 +1,147 @@
+Date: Sat, 17 Apr 1999 14:38:36 +0200 (CEST)
+From: Trond Myklebust <>
+Subject: Re: Problems with NFS write of setuid executeables
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/4/17/27
+
+>>>>> " " == Dick Streefland <dick_streefland@tasking.com> writes:
+     > On Friday 1999-04-16 18:23, Trond Myklebust wrote: | | If it
+     > doesn't work with the 0.7.2 patch, do you think you could |
+     > provide me with a tcpdump of the NFS traffic between the client
+     > and | server? I think the problems of flushing of write
+     > requests is fixed | now.
+     > I'm not sure if this is the same problem, but permission
+     > checking also fails in the following cases (note that mount is
+     > setuid):
+     >   $ mount > x ; ls -l x; sleep 10; ls -l x -rw-r--r-- 1 dicks
+     >   sec 3344 Apr 16 20:19 x -rw-r--r-- 1 dicks sec 0 Apr 16 20:19
+     >   x $ mount > x ; ls -l x; wc x; ls -l x -rw-r--r-- 1 dicks sec
+     >   3344 Apr 16 20:19 x wc: x: Input/output error
+     >         0 0 0 x
+     >   -rw-r--r-- 1 dicks sec 0 Apr 16 20:19 x
+     > This is with kernel 2.2.5 + nfsv3-0.7.3 patch, but older 2.1
+     > kernels have similar behavior. The NFS server is an Alpha
+     > running Digital UNIX. The same example works in the 2.0.36
+     > kernel:
+<snip>
+     > I think the problem is that the permissions are checked on
+     > every file operation, although it is sufficient to have
+     > appropriate permissions when the file is opened by the shell.
+Your diagnosis is entirely correct. The answer, I think, is to reset
+the fsuid/fsgid to that recorded in the file structure, since that is
+set to the value of the fsuid/fsgid that was used when the file was
+opened.
+The appended patch (based on what I'm now using in the NFSv3 patches) 
+should be correct for linux-2.2.5. It's untested but (in the words of
+Linus) 'obviously correct'...
+Cheers,
+  Trond
+diff -u --recursive --new-file linux-2.2.5/fs/nfs/read.c linux-2.2.5-patched/fs/nfs/read.c
+--- linux-2.2.5/fs/nfs/read.c	Tue Dec 22 18:37:43 1998
++++ linux-2.2.5-patched/fs/nfs/read.c	Sat Apr 17 14:23:53 1999
+@@ -226,11 +226,13 @@
+ 	struct dentry *dentry = file->f_dentry;
+ 	struct inode *inode = dentry->d_inode;
+ 	int		error;
++	NFS_PERM_VARDEF;
+ 
+ 	dprintk("NFS: nfs_readpage (%p %ld@%ld)\n",
+ 		page, PAGE_SIZE, page->offset);
+ 	atomic_inc(&page->count);
+ 	set_bit(PG_locked, &page->flags);
++	NFS_SET_PERM(file);
+ 
+ 	/*
+ 	 * Try to flush any pending writes to the file..
+@@ -260,5 +262,6 @@
+ out_free:
+ 	free_page(page_address(page));
+ out:
++	NFS_CLEAR_PERM;
+ 	return error;
+ }
+diff -u --recursive --new-file linux-2.2.5/fs/nfs/write.c linux-2.2.5-patched/fs/nfs/write.c
+--- linux-2.2.5/fs/nfs/write.c	Wed Mar  3 20:17:02 1999
++++ linux-2.2.5-patched/fs/nfs/write.c	Sat Apr 17 14:32:55 1999
+@@ -414,11 +414,13 @@
+ 	struct nfs_wreq	*req;
+ 	int		synchronous = sync;
+ 	int		retval;
++	NFS_PERM_VARDEF;
+ 
+ 	dprintk("NFS:      nfs_updatepage(%s/%s %d@%ld, sync=%d)\n",
+ 		dentry->d_parent->d_name.name, dentry->d_name.name,
+ 		count, page->offset+offset, sync);
+ 
++	NFS_SET_PERM(file);
+ 	/*
+ 	 * Try to find a corresponding request on the writeback queue.
+ 	 * If there is one, we can be sure that this request is not
+@@ -437,13 +439,18 @@
+ 	 * If wsize is smaller than page size, update and write
+ 	 * page synchronously.
+ 	 */
+-	if (NFS_SERVER(inode)->wsize < PAGE_SIZE)
+-		return nfs_writepage_sync(dentry, inode, page, offset, count);
++	if (NFS_SERVER(inode)->wsize < PAGE_SIZE) {
++		status = nfs_writepage_sync(dentry, inode, page, offset, count);
++		NFS_CLEAR_PERM;
++		return status;
++	}
+ 
+ 	/* Create the write request. */
+ 	req = create_write_request(file, page, offset, count);
+-	if (!req)
++	if (!req) {
++		NFS_CLEAR_PERM;
+ 		return -ENOBUFS;
++	}
+ 
+ 	/*
+ 	 * Ok, there's another user of this page with the new request..
+@@ -476,6 +483,7 @@
+ 	}
+ 
+ 	free_write_request(req);
++	NFS_CLEAR_PERM;
+ 	return retval;
+ }
+ 
+diff -u --recursive --new-file linux-2.2.5/include/linux/nfs_fs.h linux-2.2.5-patched/include/linux/nfs_fs.h
+--- linux-2.2.5/include/linux/nfs_fs.h	Sun Mar 28 20:03:31 1999
++++ linux-2.2.5-patched/include/linux/nfs_fs.h	Sat Apr 17 14:34:41 1999
+@@ -80,6 +80,26 @@
+ #define NFS_REVALIDATING(inode)		(NFS_FLAGS(inode) & NFS_INO_REVALIDATE)
+ #define NFS_WRITEBACK(inode)		((inode)->u.nfs_i.writeback)
+ 
++#define NFS_PERM_VARDEF \
++	int old_fsuid, old_fsgid; \
++	kernel_cap_t old_cap;
++
++#define NFS_SET_PERM(file) \
++	old_fsuid = current->fsuid; \
++	old_fsgid = current->fsgid; \
++	old_cap = current->cap_effective; \
++	current->fsuid = (file)->f_uid; \
++	current->fsgid = (file)->f_gid; \
++	if (current->uid) \
++		cap_clear(current->cap_effective); \
++	else \
++		current->cap_effective = current->cap_permitted;
++
++#define NFS_CLEAR_PERM \
++	current->fsuid = old_fsuid; \
++	current->fsgid = old_fsgid; \
++	current->cap_effective = old_cap;
++
+ /*
+  * These are the default flags for swap requests
+  */
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

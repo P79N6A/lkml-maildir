@@ -1,0 +1,133 @@
+Date: Tue, 14 Mar 2000 02:59:15 +0100 (CET)
+From: Ingo Molnar <>
+Subject: [patch] preemptive kernel, preemptive-2.3.52-A7
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/3/14/68
+
+On Mon, 13 Mar 2000, Linus Torvalds wrote:
+> We want to avoid having long latencies, and we can easily get that by
+> just allowing timer interrupts to schedule which we're in a big
+> "memcpy_to_user()" and we don't hold any kernel lock etc. No need to
+> try to be clever at lock release time - if we get a pending
+> reschedule, we might as well leave it pending, it's going to be
+> serviced soon enough anyway.
+i've just implemented this (free preemption of pre-specified kernel areas)
+and it's really simple, and appears to work nicely both in the UP and SMP
+case.
+There is a single current->may_preempt counter which is typically zero. If
+the counter is non-zero, then the IRQ return path may preempt the process.
+The counter is recursive (unused feature currently but same cost), and is
+used in uaccess.h when the memcpy is non-constant (probably big enough.
+It's cheaper to unconditionally do the incl+decl than checking for memcpy
+size). Note that 'current' is already cached in 99% of these cases because
+we already did an access_ok() check for the user-space copy, which
+accessed current->addr_limit. The counter is persistent and present even
+if the process is non-running - the 'may preempt' property of the task
+does not depend on wether it's running. (This method differs from Andrea's
+similar 'all-inclusive' method by having a clean per-process counter.)
+i've also introduced a new light-weight 'IRQ-atomic' increment and
+decrement method in atomic.h, because ->may_preempt has to be
+local-IRQ-safe.
+the IRQ return path in entry.S now checks wether:
+	1) ->need_resched or ->pending is set
+    and 2) wether we return to non-IRQ context
+    and 3) ->allow_preempt is set.
+the entry.S IRQ return path got one more conditional instruction, which
+checks for need_resched and moves into the 'we might preempt even
+kernel-space' path. This branch comes _after_ checking all the common
+cases: return-to-userspace and no-event-pending. I believe this is pretty
+much the cheapest way we can get away with this. (The patch does not allow
+processing signal handlers though, only reschedules - that would be a
+security hole in certain cases, correct?)
+the uaccess.h changes are safe because we can reschedule even with the
+kernel lock held, but it's illegal to call any of the user-copy routines
+with spinlocks held. (There are some other places that we want to make
+preemptible as well, but i first wanted to have this simple prototype.)
+the patch gets some non-obvious cases right as well: if a cross-IPI marks
+the process need_resched==1 then we might reschedule immediately if it
+hits a big memcpy.
+i've tested the patch (against pre-2.3.52-1) and it compiles both UP and
+SMP, and i've tested it under load on SMP - appears to be stable. Have i
+missed anything, and is this what we want?
+> If you really want hard realtime, go to work with Victor and RTLinux..
+(yep.)
+	Ingo
+--- linux/include/linux/sched.h.orig	Mon Mar 13 16:49:12 2000
++++ linux/include/linux/sched.h	Mon Mar 13 16:49:12 2000
+@@ -268,6 +268,7 @@
+ 					 */
+ 	struct exec_domain *exec_domain;
+ 	volatile long need_resched;
++	int allow_preempt;
+ 
+ 	cycles_t avg_slice;
+ 	int lock_depth;		/* Lock depth. We can context switch in and out of holding a syscall kernel lock... */	
+--- linux/include/asm-i386/uaccess.h.orig	Mon Mar 13 16:49:12 2000
++++ linux/include/asm-i386/uaccess.h	Mon Mar 13 16:54:48 2000
+@@ -253,6 +253,7 @@
+ #define __copy_user(to,from,size)					\
+ do {									\
+ 	int __d0, __d1;							\
++	current->allow_preempt++;					\
+ 	__asm__ __volatile__(						\
+ 		"0:	rep; movsl\n"					\
+ 		"	movl %3,%0\n"					\
+@@ -270,11 +271,13 @@
+ 		: "=&c"(size), "=&D" (__d0), "=&S" (__d1)		\
+ 		: "r"(size & 3), "0"(size / 4), "1"(to), "2"(from)	\
+ 		: "memory");						\
++	current->allow_preempt--;					\
+ } while (0)
+ 
+ #define __copy_user_zeroing(to,from,size)				\
+ do {									\
+ 	int __d0, __d1;							\
++	current->allow_preempt++;					\
+ 	__asm__ __volatile__(						\
+ 		"0:	rep; movsl\n"					\
+ 		"	movl %3,%0\n"					\
+@@ -298,6 +301,7 @@
+ 		: "=&c"(size), "=&D" (__d0), "=&S" (__d1)		\
+ 		: "r"(size & 3), "0"(size / 4), "1"(to), "2"(from)	\
+ 		: "memory");						\
++	current->allow_preempt--;					\
+ } while (0)
+ 
+ /* We let the __ versions of copy_from/to_user inline, because they're often
+--- linux/arch/i386/kernel/entry.S.orig	Mon Mar 13 16:49:12 2000
++++ linux/arch/i386/kernel/entry.S	Mon Mar 13 16:51:00 2000
+@@ -76,7 +76,8 @@
+ addr_limit	= 12
+ exec_domain	= 16
+ need_resched	= 20
+-processor	= 56
++allow_preempt	= 24
++processor	= 60
+ 
+ ENOSYS = 38
+ 
+@@ -276,9 +277,21 @@
+ 	ALIGN
+ ret_from_intr:
+ 	GET_CURRENT(%ebx)
++	/*
++	 * both ->need_resched and ->sigpending are relatively
++	 * rare cases:
++	 */
++	cmpl $0,need_resched(%ebx)
++	jne maybe_slow_return
++	cmpl $0,sigpending(%ebx)
++	jne maybe_slow_return
++	jmp restore_all
++maybe_slow_return:
+ 	movl EFLAGS(%esp),%eax		# mix EFLAGS and CS
+ 	movb CS(%esp),%al
+ 	testl $(VM_MASK | 3),%eax	# return to VM86 mode or non-supervisor?
++	jne ret_with_reschedule
++	cmpl $0, allow_preempt(%ebx)
+ 	jne ret_with_reschedule
+ 	jmp restore_all
+ 

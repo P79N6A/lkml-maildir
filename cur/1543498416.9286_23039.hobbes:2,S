@@ -1,0 +1,131 @@
+Date: Wed, 9 Jun 1999 09:53:29 -0700 (PDT)
+From: (H.J. Lu)
+Subject: Re: An SMP patch for NFS
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/6/9/111
+
+> 
+> > It is svc_exit_thread () called from nfsd. I am not sure if it
+> > takes the kernel lock.
+> 
+> nfsd takes the lock at startup. See nfsd(). The first stuff it does is to
+> do a MOD_INC_USE_COUNT, lock_kernel();
+> 
+> handle_sys_nfsservctl also holds the lock.
+> 
+> So its safe as is. Thats not saying the change might not be a good thing
+> anyway for when we loosen the locking
+> 
+> 
+I kept getting:
+Jun  8 10:33:05 nfs kernel: svc: server socket destroy delayed 
+Jun  8 12:33:08 nfs kernel: svc: server socket destroy delayed 
+Jun  8 15:55:01 nfs kernel: svc: server socket destroy delayed 
+Jun  9 07:14:43 nfs kernel: svc: server socket destroy delayed 
+on my SMP NFS server. I modified the kernel to print the sk_inuse
+field. I got
+Jun  9 08:03:35 nfs kernel: svc: server socket destroy delayed (sk_inuse: 255) 
+sk_inuse was unsigned char. 255 indicates something is wrong. I changed
+sk_inuse to atomic_t. It seems to work so far.
+-- 
+H.J. Lu (hjl@gnu.org)
+----
+Index: ./include/linux/sunrpc/svcsock.h
+===================================================================
+RCS file: /work/cvs/linux/linux/include/linux/sunrpc/svcsock.h,v
+retrieving revision 1.1.1.4
+diff -u -p -r1.1.1.4 svcsock.h
+--- ./include/linux/sunrpc/svcsock.h	1999/03/23 22:57:03	1.1.1.4
++++ ./include/linux/sunrpc/svcsock.h	1999/06/09 15:11:20
+@@ -10,6 +10,7 @@
+ #define SUNRPC_SVCSOCK_H
+ 
+ #include <linux/sunrpc/svc.h>
++#include <asm/atomic.h>
+ 
+ /*
+  * RPC server socket.
+@@ -23,7 +24,7 @@ struct svc_sock {
+ 	struct sock *		sk_sk;		/* INET layer */
+ 
+ 	struct svc_serv *	sk_server;	/* service for this socket */
+-	unsigned char		sk_inuse;	/* use count */
++	atomic_t		sk_inuse;	/* use count */
+ 	unsigned char		sk_busy;	/* enqueued/receiving */
+ 	unsigned char		sk_conn;	/* conn pending */
+ 	unsigned char		sk_close;	/* dead or dying */
+Index: ./net/sunrpc/svcsock.c
+===================================================================
+RCS file: /work/cvs/linux/linux/net/sunrpc/svcsock.c,v
+retrieving revision 1.1.1.16
+diff -u -p -r1.1.1.16 svcsock.c
+--- ./net/sunrpc/svcsock.c	1999/05/12 00:49:47	1.1.1.16
++++ ./net/sunrpc/svcsock.c	1999/06/09 15:22:08
+@@ -124,7 +124,7 @@ svc_sock_enqueue(struct svc_sock *svsk)
+ 				"svc_sock_enqueue: server %p, rq_sock=%p!\n",
+ 				rqstp, rqstp->rq_sock);
+ 		rqstp->rq_sock = svsk;
+-		svsk->sk_inuse++;
++		atomic_inc(&svsk->sk_inuse);
+ 		wake_up(&rqstp->rq_wait);
+ 	} else {
+ 		dprintk("svc: socket %p put into queue\n", svsk->sk_sk);
+@@ -148,7 +148,7 @@ svc_sock_dequeue(struct svc_serv *serv)
+ 
+ 	if (svsk) {
+ 		dprintk("svc: socket %p dequeued, inuse=%d\n",
+-			svsk->sk_sk, svsk->sk_inuse);
++			svsk->sk_sk, atomic_read(&svsk->sk_inuse));
+ 		svsk->sk_qued = 0;
+ 	}
+ 
+@@ -206,7 +206,7 @@ svc_sock_release(struct svc_rqst *rqstp)
+ 		return;
+ 	svc_release_skb(rqstp);
+ 	rqstp->rq_sock = NULL;
+-	if (!--(svsk->sk_inuse) && svsk->sk_dead) {
++	if (atomic_dec_and_test(&svsk->sk_inuse) && svsk->sk_dead) {
+ 		dprintk("svc: releasing dead socket\n");
+ 		sock_release(svsk->sk_sock);
+ 		kfree(svsk);
+@@ -763,7 +763,7 @@ again:
+ 	start_bh_atomic();
+ 	if ((svsk = svc_sock_dequeue(serv)) != NULL) {
+ 		rqstp->rq_sock = svsk;
+-		svsk->sk_inuse++;
++		atomic_inc(&svsk->sk_inuse);
+ 	} else {
+ 		/* No data pending. Go to sleep */
+ 		svc_serv_enqueue(serv, rqstp);
+@@ -790,7 +790,7 @@ again:
+ 	end_bh_atomic();
+ 
+ 	dprintk("svc: server %p, socket %p, inuse=%d\n",
+-		 rqstp, svsk, svsk->sk_inuse);
++		 rqstp, svsk, atomic_read(&svsk->sk_inuse));
+ 	len = svsk->sk_recvfrom(rqstp);
+ 	dprintk("svc: got len=%d\n", len);
+ 
+@@ -985,11 +985,12 @@ svc_delete_socket(struct svc_sock *svsk)
+ 		rpc_remove_list(&serv->sv_sockets, svsk);
+ 	svsk->sk_dead = 1;
+ 
+-	if (!svsk->sk_inuse) {
++	if (!atomic_read(&svsk->sk_inuse)) {
+ 		sock_release(svsk->sk_sock);
+ 		kfree(svsk);
+ 	} else {
+-		printk(KERN_NOTICE "svc: server socket destroy delayed\n");
++		printk(KERN_NOTICE "svc: server socket destroy delayed (sk_inuse: %d)\n",
++		       atomic_read(&svsk->sk_inuse));
+ 		/* svsk->sk_server = NULL; */
+ 	}
+ }
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

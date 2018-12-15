@@ -1,0 +1,172 @@
+Date: Tue, 28 Aug 2007 22:08:51 +0200
+From: Arnd Bergmann <>
+Subject: Re: [kvm-devel] [RFC] 9p: add KVM/QEMU pci transport
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2007/8/28/302
+
+On Tuesday 28 August 2007, Eric Van Hensbergen wrote:
+> This adds a shared memory transport for a synthetic 9p device for
+> paravirtualized file system support under KVM/QEMU.
+Nice driver. I'm hoping we can do a virtio driver using a similar
+concept.
+> +#define PCI_VENDOR_ID_9P	0x5002
+> +#define PCI_DEVICE_ID_9P	0x000D
+Where do these numbers come from? Can we be sure they don't conflict with
+actual hardware?
+> +struct p9pci_trans {
+> +	struct pci_dev		*pdev;
+> +	void __iomem		*ioaddr;
+> +	void __iomem		*tx;
+> +	void __iomem		*rx;
+> +	int			irq;
+> +	int			pos;
+> +	int			len;
+> +	wait_queue_head_t	wait;
+> +};
+I would expect the data structure to contain an embedded struct p9_trans,
+which is how most drivers work nowadays.
+> +static struct p9pci_trans *p9pci_trans; /* single channel for now */
+As a result, it should be easier to get rid of this global. My feeling is
+that it really should not be here.
+> +static irqreturn_t p9pci_interrupt(int irq, void *dev)
+> +{
+> +	p9pci_trans = dev;
+This can simply use a local variable.
+> +	p9pci_trans->len = le32_to_cpu(readl(p9pci_trans->rx));
+readl implies le32_to_cpu. Doing it twice on a PCI device is broken
+on big-endian hardware.
+> +	P9_DPRINTK(P9_DEBUG_TRANS, "%p len %d\n", p9pci_trans->pdev,
+> +							p9pci_trans->len);
+> +	iowrite32(0, p9pci_trans->ioaddr + 4);
+Also, you should not mix iowriteXX/ioreadXX and writeX/readX calls in one
+driver. Since you use pci_iomap, iowriteXX/ioreadXX are the correct functions.
+> +	wake_up_interruptible(&p9pci_trans->wait);
+> +	return IRQ_HANDLED;
+> +}
+> +
+> +static int p9pci_read(struct p9_trans *trans, void *v, int len)
+> +{
+> +	struct p9pci_trans *ts;
+> +
+> +	if (!trans || trans->status == Disconnected || !trans->priv)
+> +		return -EREMOTEIO;
+> +
+> +	ts = trans->priv;
+> +
+> +	P9_DPRINTK(P9_DEBUG_TRANS, "trans %p rx %p tx %p buf %p len %d\n",
+> +						trans, ts->rx, ts->tx, v, len);
+> +	if (len > ts->len)
+> +		len = ts->len;
+> +
+> +	if (len) {
+> +		memcpy_fromio(v, ts->rx, len);
+> +		ts->len = 0;
+> +		/* let the host knows the message is consumed */
+> +		writel(0, ts->rx);
+> +		iowrite32(0, p9pci_trans->ioaddr + 4);
+> +		P9_DPRINTK(P9_DEBUG_TRANS, "zero rxlen %d txlen %d\n",
+> +						readl(ts->rx), readl(ts->tx));
+> +	}
+> +
+> +	return len;
+> +}
+I would expect memcpy_fromio and memcpy_toio to be relatively inefficient
+compared to virtual DMA, depending on the hypervisor. Do you have plans
+to change that, or did you have specific reasons to do the memcpy here?
+> +	P9_DPRINTK(P9_DEBUG_TRANS, "trans %p rx %p tx %p buf %p len %d\n",
+> +						trans, ts->rx, ts->tx, v, len);
+> +	P9_DPRINTK(P9_DEBUG_TRANS, "rxlen %d\n", readl(ts->rx));
+> +	if (readb(ts->tx) != 0)
+> +		return 0;
+> +
+> +	P9_DPRINTK(P9_DEBUG_TRANS, "tx addr %p io addr %p\n", ts->tx,
+> +								ts->ioaddr);
+All these P9_DPRINTK statements somewhat limit readability. I would suggest
+you kill them as soon as the driver is considered stable.
+> +static int __devinit p9pci_probe(struct pci_dev *pdev,
+> +		const struct pci_device_id *ent)
+> +{
+> +	int err;
+> +	u8 pci_rev;
+> +
+> +	if (p9pci_trans)
+> +		return -1;
+probe should return -EBUSY or similar, not -1.
+> +	pci_read_config_byte(pdev, PCI_REVISION_ID, &pci_rev);
+> +
+> +	if (pdev->vendor == PCI_VENDOR_ID_9P &&
+> +	    pdev->device == PCI_DEVICE_ID_9P)
+> +		printk(KERN_INFO "pci dev %s (id %04x:%04x rev %02x) is a 9P\n",
+> +		       pci_name(pdev), pdev->vendor, pdev->device, pci_rev);
+You wouldn't be here for a different vendor/device code, so the check is
+bogus.
+> +	P9_DPRINTK(P9_DEBUG_TRANS, "%p\n", pdev);
+> +	p9pci_trans = kzalloc(sizeof(*p9pci_trans), GFP_KERNEL);
+> +	p9pci_trans->irq = -1;
+Use NO_IRQ to signify an invalid irq.
+> +	init_waitqueue_head(&p9pci_trans->wait);
+> +	err = pci_enable_device(pdev);
+> +	if (err)
+> +		goto error;
+> +
+> +	p9pci_trans->pdev = pdev;
+> +	err = pci_request_regions(pdev, "9p");
+> +	if (err)
+> +		goto error;
+> +
+> +	p9pci_trans->ioaddr = pci_iomap(pdev, 0, 8);
+> +	if (!p9pci_trans->ioaddr) {
+> +		P9_DPRINTK(P9_DEBUG_ERROR, "Cannot remap MMIO, aborting\n");
+> +		err = -EIO;
+> +		goto error;
+> +	}
+> +
+> +	p9pci_trans->tx = pci_iomap(pdev, 1, 0x20000);
+> +	p9pci_trans->rx = pci_iomap(pdev, 2, 0x20000);
+New code should use pcim_iomap, you don't need the unmapping code
+any more then.
+> +	pci_set_drvdata(pdev, p9pci_trans);
+> +	err = request_irq(pdev->irq, &p9pci_interrupt, 0, "p9pci", p9pci_trans);
+> +	if (err)
+> +		goto error;
+> +
+> +	p9pci_trans->irq = pdev->irq;
+> +	return 0;
+> +
+> +error:
+> +	P9_DPRINTK(P9_DEBUG_ERROR, "error %d\n", err);
+> +	if (p9pci_trans->irq >= 0) {
+> +		synchronize_irq(p9pci_trans->irq);
+> +		free_irq(p9pci_trans->irq, p9pci_trans);
+> +	}
+> +
+> +	if (p9pci_trans->pdev) {
+> +		pci_release_regions(pdev);
+> +		pci_iounmap(pdev, p9pci_trans->ioaddr);
+> +		pci_set_drvdata(pdev, NULL);
+> +		pci_disable_device(pdev);
+> +	}
+> +
+> +	kfree(p9pci_trans);
+> +	return -1;
+> +}
+return err;
+> +static void __exit p9pci_cleanup_module(void)
+> +{
+> +	pci_unregister_driver(&p9pci_driver);
+> +	printk(KERN_ERR "Removal of 9p transports not implemented\n");
+> +	BUG();
+> +}
+Not having a cleanup function at all is a much better way of preventing module
+unload.
+	Arnd <><
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+More majordomo info at  
+http://vger.kernel.org/majordomo-info.html
+Please read the FAQ at  
+http://www.tux.org/lkml/

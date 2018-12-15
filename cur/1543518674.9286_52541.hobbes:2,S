@@ -1,0 +1,667 @@
+Date: Fri, 10 Dec 1999 12:09:11 +0100 (CET)
+From: Ingo Molnar <>
+Subject: [patch] fastcall-2.3.32-B6, SYSENTER/SYSEXIT support
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/12/10/25
+
+hi Artur,
+On Fri, 10 Dec 1999, Artur Skawina wrote:
+> [Ingo, i believe most of the issues mentioned below aren't handled by
+>  your patch, hence the cc.]
+(those issues were mentioned in the discussion and i've fixed them
+already. Nevertheless it's worthwile listing all the stumbling blocks in
+one place)
+the attached patch (and test-utility) also does the following things
+additional things:
+- handles 5 and 6 argument system calls too. (see how sys_mmap is
+  handled)
+- is conditional on CPU capabilities, checks the CPU for fast syscall
+  capabilities correctly.
+- does not generate code bloat if the kernel is compiled for a CPU that
+  cannot have a fast system call
+- is 8 cycles faster :-) can certainly still be improved, working on it.
+> RESTORING EFLAGS
+yep, fixed. We definitely want X to use fast system calls.
+> SIGNAL HANDLING
+> SYSCALL RESTARTING
+works just fine here without going into the slow iret path, this was just
+a matter of generating a stack layout where pregs->eip and pregs->esp is
+popped into %ecx and %edx by sysexit. signal handlers do not need fancy
+register state, they need a good %esp and %eip, plus they need their
+stackframe.
+signals generated after interrupts _need_ to restore all registers
+exactly, but after interrupts we are not in the fastcall path anyway, so
+iret is used.
+> EXEC
+yep, exec is such a heavy function that it can be called int $80 just
+fine.
+> INTERRUPT FLAG
+simply turned back on. Yep, Intel (or rather those guys up far north)
+clearly messed up, and this stupidity costs 7 cycles latency for no good.
+I cannot believe it, is Windows really disabling interrupts on system
+entry or what?
+> 5+ ARG SYSCALLS
+see my suggestion in the first mail: we can create _two_ syscall tables.
+I've done this in the attached patch and it works just fine.
+Under Linux we have 6 system calls that have 5 or 6 parameters:
+	init_module     EXTRA   init_module     5
+	mmap            -       mmap            6
+	mount           EXTRA   mount           5
+	prctl           EXTRA   prctl           5
+	query_module    EXTRA   query_module    5
+	select          -       _newselect      5
+fortunately most of these are rarely used system calls. The ones we worry
+about are mmap() and select(). Fortunately mmap() already has a trampoline
+in the x86 architecture, thus parameter preparation can be done cheaply
+(see sys_mmap2_4arg()). The other system-calls have to be trampolined
+similarly.
+this method enables us to support these few system calls without slowing
+down the fast-path!
+> KERNEL STACK
+> (1) it means a SEP capable cpu needs a different switch_to from one
+> w/o sysenter. I'd like to have sysenter not dependendent on any
+> compilation flags and this means extra if()s to check for SE
+> support. (while fixups tricks may work on older cpus i wouldn't
+> trust clones) If support for other methods emerge it could make
+> things even more complex.
+> (2) an MSR write takes at least 80 cycles.
+not a problem i believe. fast system calls are an optimization, just like
+eg. the 'Good APIC' flag is an optimization, the 'INVLPG' instruction is a
+compilation-time flag as well - it's perfectly fine to have fast-syscall
+support as a compilation flag i believe. Since it's not a mandatory
+interface, no need to slow down the context-switch path for CPUs which
+have no support for this.
+> VM86 MODE
+vm86() mode is clearly hard to handle, i believe it's acceptable to link
+dosemu against the int $80 library of glibc. It's simply not possible to
+return to a 16-bit CS with sysexit. The VM flag itself can be set though.
+> getpid() using SYSENTER is now 150 cycles (including a small stub).
+with my attached patch and testcode it's 142 cycles :-) [and yours is 150
+cycles with my testcode as well.]
+	moon:~/fastcall> ./fastcall
+	(INT $0x80 based getpid(), got pid 322) latency:285 cycles
+	(SYSENTER  based getpid(), got pid 322) latency:142 cycles
+comments, reports, suggestions, flames^H^H^H^H^H^H welcome.
+-- mingo
+--- linux/include/asm-i386/processor.h.orig	Thu Dec  9 05:22:21 1999
++++ linux/include/asm-i386/processor.h	Thu Dec  9 07:19:47 1999
+@@ -114,7 +114,9 @@
+ #define cpu_has_pae \
+ 		(boot_cpu_data.x86_capability & X86_FEATURE_PAE)
+ #define cpu_has_tsc \
+-		(cpu_data[smp_processor_id()].x86_capability & X86_FEATURE_TSC)
++		(boot_cpu_data.x86_capability & X86_FEATURE_TSC)
++#define cpu_has_fastcall \
++		(boot_cpu_data.x86_capability & X86_FEATURE_SEP)
+ 
+ extern char ignore_irq13;
+ 
+--- linux/include/asm-i386/bugs.h.orig	Thu Dec  9 05:22:15 1999
++++ linux/include/asm-i386/bugs.h	Thu Dec  9 07:19:47 1999
+@@ -398,10 +398,18 @@
+  * If we configured ourselves for a TSC, we'd better have one!
+  */
+ #ifdef CONFIG_X86_TSC
+-	if (!(boot_cpu_data.x86_capability & X86_FEATURE_TSC))
++	if (!cpu_has_tsc)
+ 		panic("Kernel compiled for Pentium+, requires TSC");
+ #endif
+ 
++/*
++ * If we configured ourselves for a 686 CPU, we'd better have
++ * SYSENTER/SYSEXIT!
++ */
++#ifdef CONFIG_X86_FASTCALL
++	if (!cpu_has_fastcall)
++		panic("Kernel compiled for Pentium+, requires fastcall");
++#endif
+ /*
+  * If we were told we had a good APIC for SMP, we'd better be a PPro
+  */
+--- linux/arch/i386/kernel/process.c.orig	Thu Dec  9 05:22:24 1999
++++ linux/arch/i386/kernel/process.c	Thu Dec  9 08:15:25 1999
+@@ -547,6 +547,15 @@
+ 			: /* no output */ \
+ 			:"r" (thread->debugreg[register]))
+ 
++#if CONFIG_X86_FASTCALL
++#define LOAD_FASTSYS(p) \
++		__asm__ __volatile__("wrmsr" : : \
++			"c" (0x175), "a" ((int)(p) + 2*PAGE_SIZE), "d" (0))
++#else
++#define LOAD_FASTSYS(p) \
++		do { } while (0)
++#endif
++
+ /*
+  *	switch_to(x,yn) should switch tasks from x to y.
+  *
+@@ -579,6 +588,7 @@
+ 
+ 	unlazy_fpu(prev_p);
+ 
++	LOAD_FASTSYS(next_p);
+ 	/*
+ 	 * Reload esp0, LDT and the page table pointer:
+ 	 */
+--- linux/arch/i386/kernel/entry.S.orig	Thu Dec  9 05:22:24 1999
++++ linux/arch/i386/kernel/entry.S	Thu Dec  9 08:53:38 1999
+@@ -2,6 +2,8 @@
+  *  linux/arch/i386/entry.S
+  *
+  *  Copyright (C) 1991, 1992  Linus Torvalds
++ *
++ *  implemented fast system call support, Ingo Molnar <mingo@redhat.com>
+  */
+ 
+ /*
+@@ -45,6 +47,7 @@
+ #include <asm/segment.h>
+ #define ASSEMBLY
+ #include <asm/smp.h>
++#include <asm/page.h>
+ 
+ EBX		= 0x00
+ ECX		= 0x04
+@@ -95,7 +98,7 @@
+ 	movl %dx,%ds; \
+ 	movl %dx,%es;
+ 
+-#define RESTORE_ALL	\
++#define RESTORE_ALL_REGS\
+ 	popl %ebx;	\
+ 	popl %ecx;	\
+ 	popl %edx;	\
+@@ -106,12 +109,22 @@
+ 1:	popl %ds;	\
+ 2:	popl %es;	\
+ 	addl $4,%esp;	\
+-3:	iret;		\
+ .section .fixup,"ax";	\
+ 4:	movl $0,(%esp);	\
+ 	jmp 1b;		\
+ 5:	movl $0,(%esp);	\
+ 	jmp 2b;		\
++.previous;		\
++.section __ex_table,"a";\
++	.align 4;	\
++	.long 1b,4b;	\
++	.long 2b,5b;	\
++.previous;
++
++#define RESTORE_ALL \
++	RESTORE_ALL_REGS \
++3:	iret;		\
++.section .fixup,"ax";	\
+ 6:	pushl %ss;	\
+ 	popl %ds;	\
+ 	pushl %ss;	\
+@@ -121,15 +134,134 @@
+ .previous;		\
+ .section __ex_table,"a";\
+ 	.align 4;	\
+-	.long 1b,4b;	\
+-	.long 2b,5b;	\
+ 	.long 3b,6b;	\
+ .previous
+ 
++#define SAVE_ALL_FASTSYS \
++	cld; \
++	pushl %ebp; \
++	subl $8, %esp; \
++	pushl %edi; \
++	subl $8, %esp; \
++	pushl %eax; \
++	pushl %ebp; \
++	pushl %edi; \
++	pushl %esi; \
++	pushl %edx; \
++	pushl %ecx; \
++	pushl %ebx; \
++	movl $(__KERNEL_DS),%edx; \
++	movl %dx,%ds; \
++	movl %dx,%es;
++
++#define RESTORE_ALL_REGS_FASTSYS\
++	movl $(__USER_DS),%eax; \
++	movl 0x28(%esp), %edx; \
++	movl 0x38(%esp), %ecx; \
++	movl %ax,%ds;	\
++	movl %ax,%es;	\
++	popl %ebx;	\
++	addl $8,%esp;	\
++	popl %esi;	\
++	addl $8,%esp;	\
++	popl %eax;
++
++#define RESTORE_ALL_FASTSYS \
++	RESTORE_ALL_REGS_FASTSYS \
++3:	sysexit; \
++.section .fixup,"ax";	\
++6:	pushl %ss;	\
++	popl %ds;	\
++	pushl %ss;	\
++	popl %es;	\
++	pushl $11;	\
++	call do_exit;	\
++.previous;		\
++.section __ex_table,"a";\
++	.align 4;	\
++	.long 3b,6b;	\
++.previous
++
++
+ #define GET_CURRENT(reg) \
+ 	movl %esp, reg; \
+ 	andl $-8192, reg;
+ 
++#ifdef CONFIG_X86_FASTCALL
++
++ENTRY(fast_system_call)
++
++/*
++ * %ebp has the caller's stack, first entry on the stack is the
++ * return eip ... a bit ugly but we have to do it this way due
++ * to the (only?) 5 parameter system call select().
++ *
++ * alternatively, if we could restrict all x86 system calls to be
++ * 4-parameter only, and send 5-6 parameter system calls through
++ * special stubs which fetch additional parameters from the stack,
++ * then we could further speed up the common path.
++ */
++
++	pushl %eax			# save orig_eax
++	sti				# ugh! SYSENTER disables IRQs
++	SAVE_ALL_FASTSYS
++
++	GET_CURRENT(%ebx)
++	cmpl  $(NR_syscalls),%eax
++	jae   badfastsys
++	testl $0x20,flags(%ebx)		# PF_TRACESYS
++	jne tracefastsys
++	call *SYMBOL_NAME(fastsys_call_table)(,%eax,4)
++	movl %eax,EAX(%esp)		# save the return value
++	.globl ret_from_fastsys_call
++ret_from_fastsys_call:
++	movl SYMBOL_NAME(bh_mask),%eax
++	andl SYMBOL_NAME(bh_active),%eax
++	jne handle_bottom_half_fastsys
++ret_with_reschedule_fastsys:
++	cmpl $0,need_resched(%ebx)
++	jne reschedule_fastsys
++	cmpl $0,sigpending(%ebx)
++	jne signal_return_fastsys
++restore_all_fastsys:
++	RESTORE_ALL_FASTSYS
++
++	ALIGN
++handle_bottom_half_fastsys:
++	call SYMBOL_NAME(do_bottom_half)
++	jmp ret_with_reschedule_fastsys;
++
++	ALIGN
++reschedule_fastsys:
++	call SYMBOL_NAME(schedule)
++	jmp ret_with_reschedule_fastsys;
++
++signal_return_fastsys:
++	sti				# we can get here from an interrupt handler
++	movl %esp,%eax
++	xorl %edx,%edx
++	call SYMBOL_NAME(do_signal)
++	jmp restore_all_fastsys
++
++tracefastsys:
++	movl $-ENOSYS,EAX(%esp)
++	call SYMBOL_NAME(syscall_trace)
++	movl ORIG_EAX(%esp),%eax
++	cmpl $(NR_syscalls),%eax
++	jae tracefastsys_exit
++	call *SYMBOL_NAME(fastsys_call_table)(,%eax,4)
++	movl %eax,EAX(%esp)		# save the return value
++tracefastsys_exit:
++	call SYMBOL_NAME(syscall_trace)
++	jmp ret_from_fastsys_call
++badfastsys:
++	movl $-ENOSYS,EAX(%esp)
++	jmp ret_from_fastsys_call
++
++	ALIGN
++
++#endif /* CONFIG_X86_FASTCALL */
++
+ ENTRY(lcall7)
+ 	pushfl			# We get a different stack layout with call gates,
+ 	pushl %eax		# which has to be cleaned up later..
+@@ -173,15 +305,14 @@
+ 	jmp ret_from_sys_call
+ 
+ 
+-	ALIGN
+-	.globl	ret_from_fork
+-ret_from_fork:
++ENTRY(ret_from_fork)
+ 	pushl %ebx
+ 	call SYMBOL_NAME(schedule_tail)
+ 	addl $4, %esp
+ 	GET_CURRENT(%ebx)
+ 	jmp	ret_from_sys_call
+ 
++
+ /*
+  * Return to user mode is not as complex as all this looks,
+  * but we want the default path for a system call return to
+@@ -269,7 +400,7 @@
+ 
+ 	ALIGN
+ reschedule:
+-	call SYMBOL_NAME(schedule)    # test
++	call SYMBOL_NAME(schedule)
+ 	jmp ret_from_sys_call
+ 
+ ENTRY(divide_error)
+@@ -399,6 +530,215 @@
+ 	jmp error_code
+ 
+ .data
++#ifdef CONFIG_X86_FASTCALL
++ENTRY(fastsys_call_table)
++	.long SYMBOL_NAME(sys_ni_syscall)	/* 0  -  old "setup()" system call*/
++	.long SYMBOL_NAME(sys_exit)
++	.long SYMBOL_NAME(sys_fork)
++	.long SYMBOL_NAME(sys_read)
++	.long SYMBOL_NAME(sys_write)
++	.long SYMBOL_NAME(sys_open)		/* 5 */
++	.long SYMBOL_NAME(sys_close)
++	.long SYMBOL_NAME(sys_waitpid)
++	.long SYMBOL_NAME(sys_creat)
++	.long SYMBOL_NAME(sys_link)
++	.long SYMBOL_NAME(sys_unlink)		/* 10 */
++	.long SYMBOL_NAME(sys_execve)
++	.long SYMBOL_NAME(sys_chdir)
++	.long SYMBOL_NAME(sys_time)
++	.long SYMBOL_NAME(sys_mknod)
++	.long SYMBOL_NAME(sys_chmod)		/* 15 */
++	.long SYMBOL_NAME(sys_lchown)
++	.long SYMBOL_NAME(sys_ni_syscall)				/* old break syscall holder */
++	.long SYMBOL_NAME(sys_stat)
++	.long SYMBOL_NAME(sys_lseek)
++	.long SYMBOL_NAME(sys_getpid)		/* 20 */
++	.long SYMBOL_NAME(sys_mount)
++	.long SYMBOL_NAME(sys_oldumount)
++	.long SYMBOL_NAME(sys_setuid)
++	.long SYMBOL_NAME(sys_getuid)
++	.long SYMBOL_NAME(sys_stime)		/* 25 */
++	.long SYMBOL_NAME(sys_ptrace)
++	.long SYMBOL_NAME(sys_alarm)
++	.long SYMBOL_NAME(sys_fstat)
++	.long SYMBOL_NAME(sys_pause)
++	.long SYMBOL_NAME(sys_utime)		/* 30 */
++	.long SYMBOL_NAME(sys_ni_syscall)				/* old stty syscall holder */
++	.long SYMBOL_NAME(sys_ni_syscall)				/* old gtty syscall holder */
++	.long SYMBOL_NAME(sys_access)
++	.long SYMBOL_NAME(sys_nice)
++	.long SYMBOL_NAME(sys_ni_syscall)	/* 35 */		/* old ftime syscall holder */
++	.long SYMBOL_NAME(sys_sync)
++	.long SYMBOL_NAME(sys_kill)
++	.long SYMBOL_NAME(sys_rename)
++	.long SYMBOL_NAME(sys_mkdir)
++	.long SYMBOL_NAME(sys_rmdir)		/* 40 */
++	.long SYMBOL_NAME(sys_dup)
++	.long SYMBOL_NAME(sys_pipe)
++	.long SYMBOL_NAME(sys_times)
++	.long SYMBOL_NAME(sys_ni_syscall)				/* old prof syscall holder */
++	.long SYMBOL_NAME(sys_brk)		/* 45 */
++	.long SYMBOL_NAME(sys_setgid)
++	.long SYMBOL_NAME(sys_getgid)
++	.long SYMBOL_NAME(sys_signal)
++	.long SYMBOL_NAME(sys_geteuid)
++	.long SYMBOL_NAME(sys_getegid)		/* 50 */
++	.long SYMBOL_NAME(sys_acct)
++	.long SYMBOL_NAME(sys_umount)					/* recycled never used phys() */
++	.long SYMBOL_NAME(sys_ni_syscall)				/* old lock syscall holder */
++	.long SYMBOL_NAME(sys_ioctl)
++	.long SYMBOL_NAME(sys_fcntl)		/* 55 */
++	.long SYMBOL_NAME(sys_ni_syscall)				/* old mpx syscall holder */
++	.long SYMBOL_NAME(sys_setpgid)
++	.long SYMBOL_NAME(sys_ni_syscall)				/* old ulimit syscall holder */
++	.long SYMBOL_NAME(sys_olduname)
++	.long SYMBOL_NAME(sys_umask)		/* 60 */
++	.long SYMBOL_NAME(sys_chroot)
++	.long SYMBOL_NAME(sys_ustat)
++	.long SYMBOL_NAME(sys_dup2)
++	.long SYMBOL_NAME(sys_getppid)
++	.long SYMBOL_NAME(sys_getpgrp)		/* 65 */
++	.long SYMBOL_NAME(sys_setsid)
++	.long SYMBOL_NAME(sys_sigaction)
++	.long SYMBOL_NAME(sys_sgetmask)
++	.long SYMBOL_NAME(sys_ssetmask)
++	.long SYMBOL_NAME(sys_setreuid)		/* 70 */
++	.long SYMBOL_NAME(sys_setregid)
++	.long SYMBOL_NAME(sys_sigsuspend)
++	.long SYMBOL_NAME(sys_sigpending)
++	.long SYMBOL_NAME(sys_sethostname)
++	.long SYMBOL_NAME(sys_setrlimit)	/* 75 */
++	.long SYMBOL_NAME(sys_old_getrlimit)
++	.long SYMBOL_NAME(sys_getrusage)
++	.long SYMBOL_NAME(sys_gettimeofday)
++	.long SYMBOL_NAME(sys_settimeofday)
++	.long SYMBOL_NAME(sys_getgroups)	/* 80 */
++	.long SYMBOL_NAME(sys_setgroups)
++	.long SYMBOL_NAME(old_select)
++	.long SYMBOL_NAME(sys_symlink)
++	.long SYMBOL_NAME(sys_lstat)
++	.long SYMBOL_NAME(sys_readlink)		/* 85 */
++	.long SYMBOL_NAME(sys_uselib)
++	.long SYMBOL_NAME(sys_swapon)
++	.long SYMBOL_NAME(sys_reboot)
++	.long SYMBOL_NAME(old_readdir)
++	.long SYMBOL_NAME(old_mmap)		/* 90 */
++	.long SYMBOL_NAME(sys_munmap)
++	.long SYMBOL_NAME(sys_truncate)
++	.long SYMBOL_NAME(sys_ftruncate)
++	.long SYMBOL_NAME(sys_fchmod)
++	.long SYMBOL_NAME(sys_fchown)		/* 95 */
++	.long SYMBOL_NAME(sys_getpriority)
++	.long SYMBOL_NAME(sys_setpriority)
++	.long SYMBOL_NAME(sys_ni_syscall)				/* old profil syscall holder */
++	.long SYMBOL_NAME(sys_statfs)
++	.long SYMBOL_NAME(sys_fstatfs)		/* 100 */
++	.long SYMBOL_NAME(sys_ioperm)
++	.long SYMBOL_NAME(sys_socketcall)
++	.long SYMBOL_NAME(sys_syslog)
++	.long SYMBOL_NAME(sys_setitimer)
++	.long SYMBOL_NAME(sys_getitimer)	/* 105 */
++	.long SYMBOL_NAME(sys_newstat)
++	.long SYMBOL_NAME(sys_newlstat)
++	.long SYMBOL_NAME(sys_newfstat)
++	.long SYMBOL_NAME(sys_uname)
++	.long SYMBOL_NAME(sys_iopl)		/* 110 */
++	.long SYMBOL_NAME(sys_vhangup)
++	.long SYMBOL_NAME(sys_ni_syscall)	/* old "idle" system call */
++	.long SYMBOL_NAME(sys_vm86old)
++	.long SYMBOL_NAME(sys_wait4)
++	.long SYMBOL_NAME(sys_swapoff)		/* 115 */
++	.long SYMBOL_NAME(sys_sysinfo)
++	.long SYMBOL_NAME(sys_ipc)
++	.long SYMBOL_NAME(sys_fsync)
++	.long SYMBOL_NAME(sys_sigreturn)
++	.long SYMBOL_NAME(sys_clone)		/* 120 */
++	.long SYMBOL_NAME(sys_setdomainname)
++	.long SYMBOL_NAME(sys_newuname)
++	.long SYMBOL_NAME(sys_modify_ldt)
++	.long SYMBOL_NAME(sys_adjtimex)
++	.long SYMBOL_NAME(sys_mprotect)		/* 125 */
++	.long SYMBOL_NAME(sys_sigprocmask)
++	.long SYMBOL_NAME(sys_create_module)
++	.long SYMBOL_NAME(sys_init_module)
++	.long SYMBOL_NAME(sys_delete_module)
++	.long SYMBOL_NAME(sys_get_kernel_syms)	/* 130 */
++	.long SYMBOL_NAME(sys_quotactl)
++	.long SYMBOL_NAME(sys_getpgid)
++	.long SYMBOL_NAME(sys_fchdir)
++	.long SYMBOL_NAME(sys_bdflush)
++	.long SYMBOL_NAME(sys_sysfs)		/* 135 */
++	.long SYMBOL_NAME(sys_personality)
++	.long SYMBOL_NAME(sys_ni_syscall)	/* for afs_syscall */
++	.long SYMBOL_NAME(sys_setfsuid)
++	.long SYMBOL_NAME(sys_setfsgid)
++	.long SYMBOL_NAME(sys_llseek)		/* 140 */
++	.long SYMBOL_NAME(sys_getdents)
++	.long SYMBOL_NAME(sys_select)
++	.long SYMBOL_NAME(sys_flock)
++	.long SYMBOL_NAME(sys_msync)
++	.long SYMBOL_NAME(sys_readv)		/* 145 */
++	.long SYMBOL_NAME(sys_writev)
++	.long SYMBOL_NAME(sys_getsid)
++	.long SYMBOL_NAME(sys_fdatasync)
++	.long SYMBOL_NAME(sys_sysctl)
++	.long SYMBOL_NAME(sys_mlock)		/* 150 */
++	.long SYMBOL_NAME(sys_munlock)
++	.long SYMBOL_NAME(sys_mlockall)
++	.long SYMBOL_NAME(sys_munlockall)
++	.long SYMBOL_NAME(sys_sched_setparam)
++	.long SYMBOL_NAME(sys_sched_getparam)   /* 155 */
++	.long SYMBOL_NAME(sys_sched_setscheduler)
++	.long SYMBOL_NAME(sys_sched_getscheduler)
++	.long SYMBOL_NAME(sys_sched_yield)
++	.long SYMBOL_NAME(sys_sched_get_priority_max)
++	.long SYMBOL_NAME(sys_sched_get_priority_min)  /* 160 */
++	.long SYMBOL_NAME(sys_sched_rr_get_interval)
++	.long SYMBOL_NAME(sys_nanosleep)
++	.long SYMBOL_NAME(sys_mremap)
++	.long SYMBOL_NAME(sys_setresuid)
++	.long SYMBOL_NAME(sys_getresuid)	/* 165 */
++	.long SYMBOL_NAME(sys_vm86)
++	.long SYMBOL_NAME(sys_query_module)
++	.long SYMBOL_NAME(sys_poll)
++	.long SYMBOL_NAME(sys_nfsservctl)
++	.long SYMBOL_NAME(sys_setresgid)	/* 170 */
++	.long SYMBOL_NAME(sys_getresgid)
++	.long SYMBOL_NAME(sys_prctl)
++	.long SYMBOL_NAME(sys_rt_sigreturn)
++	.long SYMBOL_NAME(sys_rt_sigaction)
++	.long SYMBOL_NAME(sys_rt_sigprocmask)	/* 175 */
++	.long SYMBOL_NAME(sys_rt_sigpending)
++	.long SYMBOL_NAME(sys_rt_sigtimedwait)
++	.long SYMBOL_NAME(sys_rt_sigqueueinfo)
++	.long SYMBOL_NAME(sys_rt_sigsuspend)
++	.long SYMBOL_NAME(sys_pread)		/* 180 */
++	.long SYMBOL_NAME(sys_pwrite)
++	.long SYMBOL_NAME(sys_chown)
++	.long SYMBOL_NAME(sys_getcwd)
++	.long SYMBOL_NAME(sys_capget)
++	.long SYMBOL_NAME(sys_capset)           /* 185 */
++	.long SYMBOL_NAME(sys_sigaltstack)
++	.long SYMBOL_NAME(sys_sendfile)
++	.long SYMBOL_NAME(sys_ni_syscall)		/* streams1 */
++	.long SYMBOL_NAME(sys_ni_syscall)		/* streams2 */
++	.long SYMBOL_NAME(sys_vfork)            /* 190 */
++	.long SYMBOL_NAME(sys_getrlimit)
++	.long SYMBOL_NAME(sys_mmap2_4arg)
++	.long SYMBOL_NAME(sys_truncate64)
++	.long SYMBOL_NAME(sys_ftruncate64)
++	/* 195 */
++
++	/*
++	 * NOTE!! This doesn't have to be exact - we just have
++	 * to make sure we have _enough_ of the "sys_ni_syscall"
++	 * entries. Don't panic if you notice that this hasn't
++	 * been shrunk every time we add a new system call.
++	 */
++	.rept NR_syscalls-194
++		.long SYMBOL_NAME(sys_ni_syscall)
++	.endr
++#endif /* CONFIG_X86_FASTCALL */
+ ENTRY(sys_call_table)
+ 	.long SYMBOL_NAME(sys_ni_syscall)	/* 0  -  old "setup()" system call*/
+ 	.long SYMBOL_NAME(sys_exit)
+--- linux/arch/i386/kernel/setup.c.orig	Thu Dec  9 05:22:24 1999
++++ linux/arch/i386/kernel/setup.c	Thu Dec  9 05:22:47 1999
+@@ -1479,6 +1479,26 @@
+ 	return p - buffer;
+ }
+ 
++#ifdef CONFIG_X86_FASTCALL
++/*
++ * SYSENTER/SYSEXIT fast system call support on PPro+ CPUs.
++ * K6+ CPUs have this too - only the MSRs differ.
++ *
++ * This functions sets up the MSRs which show the kernel entrypoint
++ * for fast syscalls. See entry.S's fast_system_call for more.
++ */
++static inline void fastsys_init (void)
++{
++	extern char fast_system_call;
++
++	printk("fastsys init on CPU#%d.\n", smp_processor_id());
++
++	wrmsr(0x174, 0x10, 0);
++	wrmsr(0x175, 0, 0);
++	wrmsr(0x176, &fast_system_call, 0);
++}
++#endif
++
+ int cpus_initialized = 0;
+ unsigned long cpu_initialized = 0;
+ 
+@@ -1488,7 +1508,7 @@
+  * and IDT. We reload them nevertheless, this function acts as a
+  * 'CPU state barrier', nothing should get across.
+  */
+-void cpu_init (void)
++void __init cpu_init (void)
+ {
+ 	int nr = smp_processor_id();
+ 	struct tss_struct * t = &init_tss[nr];
+@@ -1538,4 +1558,8 @@
+ 	current->flags &= ~PF_USEDFPU;
+ 	current->used_math = 0;
+ 	stts();
++
++#ifdef CONFIG_X86_FASTCALL
++	fastsys_init();
++#endif
+ }
+--- linux/arch/i386/kernel/sys_i386.c.orig	Thu Dec  9 07:12:18 1999
++++ linux/arch/i386/kernel/sys_i386.c	Thu Dec  9 07:16:27 1999
+@@ -78,6 +78,26 @@
+ 	return do_mmap2(addr, len, prot, flags, fd, pgoff);
+ }
+ 
++asmlinkage long sys_mmap2_4arg(unsigned long addr, unsigned long len,
++	unsigned long prot, unsigned long * userstack)
++{
++	int err;
++	unsigned long flags;
++	unsigned long fd;
++	unsigned long pgoff;
++
++	if (verify_area(VERIFY_READ, userstack, 3*sizeof(long)))
++		return -EFAULT;
++
++	err = 0;
++	err |= __get_user(flags, userstack++);
++	err |= __get_user(fd, userstack++);
++	err |= __get_user(pgoff, userstack);
++	if (err)
++		return -EFAULT;
++	
++	return do_mmap2(addr, len, prot, flags, fd, pgoff);
++}
+ /*
+  * Perform the select(nd, in, out, ex, tv) and mmap() system
+  * calls. Linux/i386 didn't use to be able to handle more than
+--- linux/arch/i386/config.in.orig	Thu Dec  9 05:22:24 1999
++++ linux/arch/i386/config.in	Thu Dec  9 05:22:47 1999
+@@ -35,6 +35,7 @@
+ fi
+ if [ "$CONFIG_M686" = "y" ]; then
+    define_bool CONFIG_X86_GOOD_APIC y
++   define_bool CONFIG_X86_FASTCALL y
+ fi
+ if [ "$CONFIG_MK7" = "y" ]; then
+    define_bool CONFIG_X86_TSC y[unhandled content-type:application/octet-stream]

@@ -1,0 +1,178 @@
+Date: Fri, 17 Aug 2007 13:49:34 +0200
+From: Bernd Schmidt <>
+Subject: Re: [PATCH] NOMMU: Separate out VMAs
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2007/8/17/107
+
+David Howells wrote:
+> David Howells <dhowells@redhat.com> wrote:
+> 
+>> Yes.  I found the major leak this morning.  There may be a minor leak, but I'm
+>> not convinced it's in the mmap stuff.  See revised patch.
+> 
+> Oops.  That was the old patch.  Try this one instead.
+> 
+Here are some changes to make it more stable on my system.  In 
+do_mmap_private, I've commented out the logic to free excess pages, as 
+it fragments terribly and causes a simple
+  while true; do cat /proc/buddyinfo; done
+loop to go oom.  Also, I think you're freeing high-order pages unaligned 
+to their order?
+In shrink_vma, we must save the mm across calls to remove_vma_from_mm 
+(oops when telnetting into the box).
+In do_munmap, we can deal with freeing more than one vma.  I've not 
+touched the rb-tree logic in the shared file case, as I have no idea 
+what it's trying to do given that only exact matches are allowed.
+It still does not survive my mmap stress-tester, so I'll keep looking.
+Why do we need vm_regions for anonymous memory?  Wouldn't it be enough 
+to just have a VMA?
+Bernd
+-- 
+This footer brought to you by insane German lawmakers.
+Analog Devices GmbH      Wilhelm-Wagenfeld-Str. 6      80807 Muenchen
+Sitz der Gesellschaft Muenchen, Registergericht Muenchen HRB 40368
+Geschaeftsfuehrer Thomas Wessel, William A. Martin, Margaret Seif
+diff --width=180 -x '*~' -x '.*' -x 'Sys*' -dru linux-2.6.x-daves-baseline/mm/nommu.c linux-2.6.x/mm/nommu.c
+--- linux-2.6.x-daves-baseline/mm/nommu.c	2007-08-14 21:20:43.000000000 +0200
++++ linux-2.6.x/mm/nommu.c	2007-08-16 19:11:29.000000000 +0200
+@@ -922,19 +931,23 @@
+ 	total = 1 << order;
+ 	atomic_add(total, &mmap_pages_allocated);
+ 
+-	point = len >> PAGE_SHIFT;
+-	while (point < total) {
+-		order = ilog2(total - point);
+-		_debug("shave %u/%lu", 1 << order, total - point);
+-		atomic_sub(1 << order, &mmap_pages_allocated);
+-		__free_pages(pages + point, order);
+-		point += 1 << order;
++	len = PAGE_SIZE << order;
++#if 0
++	while (total > (len >> PAGE_SHIFT)) {
++		unsigned long to_free;
++		order = ilog2(total - (len >> PAGE_SHIFT));
++		to_free = 1 << order;
++		_debug("shave %u/%lu", to_free, total - (len >> PAGE_SHIFT));
++		atomic_sub(to_free, &mmap_pages_allocated);
++		__free_pages(pages + total - to_free, order);
++		total -= to_free;
+ 	}
+ 
+ 	total = len >> PAGE_SHIFT;
+ 	for (point = 1; point < total; point++)
+ 		set_page_refcounted(&pages[point]);
+-
++#endif
++	split_page(pages, order);
+ 	base = page_address(pages);
+ 	region->vm_start = vma->vm_start = (unsigned long) base;
+ 	region->vm_end   = vma->vm_end   = vma->vm_start + len;
+@@ -1294,6 +1307,7 @@
+ 		      unsigned long from, unsigned long to)
+ {
+ 	struct vm_region *region;
++	struct mm_struct *mm = vma->vm_mm;
+ 
+ 	_enter("");
+ 
+@@ -1304,7 +1318,7 @@
+ 		vma->vm_end = from;
+ 	else
+ 		vma->vm_start = to;
+-	add_vma_to_mm(vma->vm_mm, vma);
++	add_vma_to_mm(mm, vma);
+ 
+ 	/* cut the region down to size */
+ 	region = vma->vm_region;
+@@ -1337,44 +1351,59 @@
+ 
+ 	_enter(",%lx,%zx", start, len);
+ 
+-	/* find the first potentially overlapping VMA */
+-	vma = find_vma(mm, start);
+-	if (!vma) {
+-		_leave(" = -EINVAL [no]");
+-		return -EINVAL;
+-	}
+-
+-	/* we're allowed to split an anonymous VMA but not a file-backed one */
+-	if (vma->vm_file) {
+-		do {
+-			if (start > vma->vm_start) {
+-				_leave(" = -EINVAL [miss]");
+-				return -EINVAL;
+-			}
+-			if (end == vma->vm_end)
+-				goto erase_whole_vma;
+-			rb = rb_next(&vma->vm_rb);
+-			vma = rb_entry(rb, struct vm_area_struct, vm_rb);
+-		} while (rb);
+-		_leave(" = -EINVAL [split file]");
+-		return -EINVAL;
+-	} else {
+-		/* the region must be a subset of the VMA found */
+-		if (start == vma->vm_start && end == vma->vm_end)
+-			goto erase_whole_vma;
+-		if (start < vma->vm_start || end > vma->vm_end) {
++	while (start < end) {
++		unsigned long this_end;
++		/* find the first potentially overlapping VMA */
++		vma = find_vma(mm, start);
++		if (!vma) {
++			_leave(" = -EINVAL [no]");
++			return -EINVAL;
++		}
++		if (start < vma->vm_start) {
+ 			_leave(" = -EINVAL [superset]");
+ 			return -EINVAL;
+ 		}
+-		if (start != vma->vm_start && end != vma->vm_end) {
++
++		this_end = vma->vm_end;
++
++		/* See if we can delete the entire VMA.  */
++		if (start == vma->vm_start && end >= this_end) {
++			delete_vma_from_mm(vma);
++			put_vma(vma);
++			start = this_end;
++			continue;
++		}
++
++		/* we're allowed to split an anonymous VMA but not a file-backed one */
++		if (vma->vm_file) {
++			do {
++				if (start > vma->vm_start) {
++					_leave(" = -EINVAL [miss]");
++					return -EINVAL;
++				}
++				if (end == vma->vm_end)
++					goto erase_whole_vma;
++				rb = rb_next(&vma->vm_rb);
++				vma = rb_entry(rb, struct vm_area_struct, vm_rb);
++			} while (rb);
++			_leave(" = -EINVAL [split file]");
++			return -EINVAL;
++		} else {
++			if (start > vma->vm_start && end >= this_end) {
++				shrink_vma(vma, start, this_end);
++				start = this_end;
++			} else if (start == vma->vm_start && end < this_end) {
++				shrink_vma(vma, start, end);
++				break;
++			}
+ 			ret = split_vma(mm, vma, start, 1);
+ 			if (ret < 0) {
+ 				_leave(" = %d [split]", ret);
+ 				return ret;
+-			}
++			}
+ 		}
+-		return shrink_vma(vma, start, end);
+ 	}
++	return 0;
+ 
+ erase_whole_vma:
+ 	delete_vma_from_mm(vma);

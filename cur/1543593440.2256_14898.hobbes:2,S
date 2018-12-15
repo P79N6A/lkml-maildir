@@ -1,0 +1,202 @@
+Date: Wed, 6 Jun 2001 10:22:54 +0200 (CEST)
+From: Ingo Molnar <>
+Subject: [patch] softirq-2.4.6-C3
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2001/6/6/29
+
+a number of softirq.c updates (the patch is still relative to -B4 and
+includes all -C2 changes as well):
+- do_softirq() does not have to keep irqs disabled when returning.
+- in do_softirq(), disable_local_bh() can be done after checking for
+  pending softirqs.
+- the goto retry thing has no effect on gcc's code, so it's an unnecessery
+  complication of the code.
+- ditto the in_interrupt() check, no point in doing a goto, gcc optimizes
+  this already.
+do_softirq() is now a very compact and straightforward function.
+	Ingo
+--- linux/kernel/softirq.c.orig	Wed Jun  6 09:00:13 2001
++++ linux/kernel/softirq.c	Wed Jun  6 09:56:06 2001
+@@ -52,17 +52,17 @@
+ 	int cpu = smp_processor_id();
+ 	__u32 pending;
+ 
+-	local_irq_disable();
+ 	if (in_interrupt())
+-		goto out;
++		return;
+ 
+-	local_bh_disable();
++	local_irq_disable();
+ 
+ 	pending = softirq_pending(cpu);
+ 
+ 	if (pending) {
+ 		struct softirq_action *h;
+ 
++		local_bh_disable();
+ restart:
+ 		/* Reset the pending bitmask before enabling irqs */
+ 		softirq_pending(cpu) = 0;
+@@ -82,20 +82,11 @@
+ 
+ 		pending = softirq_pending(cpu);
+ 		if (pending)
+-			goto retry;
++			goto restart;
++		__local_bh_enable();
+ 	}
+ 
+-	__local_bh_enable();
+-out:
+-
+-	/* Leave with locally disabled hard irqs. It is critical to close
+-	 * window for infinite recursion, while we help local bh count,
+-	 * it protected us. Now we are defenceless.
+-	 */
+-	return;
+-
+-retry:
+-	goto restart;
++	local_irq_enable();
+ }
+ 
+ 
+--- linux/include/asm-i386/softirq.h.orig	Wed Jun  6 08:51:54 2001
++++ linux/include/asm-i386/softirq.h	Wed Jun  6 09:48:22 2001
+@@ -11,10 +11,39 @@
+ 
+ #define local_bh_disable()	cpu_bh_disable(smp_processor_id())
+ #define __local_bh_enable()	__cpu_bh_enable(smp_processor_id())
+-#define local_bh_enable()	do { int __cpu = smp_processor_id(); if (!--local_bh_count(__cpu) && softirq_pending(__cpu)) { do_softirq(); __sti(); } } while (0)
+ #define __cpu_raise_softirq(cpu,nr) set_bit((nr), &softirq_pending(cpu));
+ #define raise_softirq(nr) __cpu_raise_softirq(smp_processor_id(), (nr))
+ 
+ #define in_softirq() (local_bh_count(smp_processor_id()) != 0)
++
++/*
++ * NOTE: this assembly code assumes:
++ *
++ *    (char *)&local_bh_count - 8 == (char *)&softirq_pending
++ *
++ * If you change the offsets in irq_stat then you have to
++ * update this code as well.
++ */
++#define local_bh_enable()						\
++do {									\
++	unsigned int *ptr = &local_bh_count(smp_processor_id());	\
++									\
++	if (!--*ptr)							\
++		__asm__ __volatile__ (					\
++			"cmpl $0, -8(%0);"				\
++			"jnz 2f;"					\
++			"1:;"						\
++									\
++			".section .text.lock,\"ax\";"			\
++			"2: pushl %%eax; pushl %%ecx; pushl %%edx;"	\
++			"call do_softirq;"				\
++			"popl %%edx; popl %%ecx; popl %%eax;"		\
++			"jmp 1b;"					\
++			".previous;"					\
++									\
++		: /* no output */					\
++		: "r" (ptr)						\
++		/* no registers clobbered */ );				\
++} while (0)
+ 
+ #endif	/* __ASM_SOFTIRQ_H */
+--- linux/include/asm-i386/hardirq.h.orig	Wed Jun  6 09:04:59 2001
++++ linux/include/asm-i386/hardirq.h	Wed Jun  6 09:16:26 2001
+@@ -5,7 +5,7 @@
+ #include <linux/threads.h>
+ #include <linux/irq.h>
+ 
+-/* entry.S is sensitive to the offsets of these fields */
++/* assembly code in softirq.h is sensitive to the offsets of these fields */
+ typedef struct {
+ 	unsigned int __softirq_pending;
+ 	unsigned int __local_irq_count;
+--- linux/arch/i386/kernel/entry.S.orig	Wed Jun  6 08:48:09 2001
++++ linux/arch/i386/kernel/entry.S	Wed Jun  6 08:51:39 2001
+@@ -133,18 +133,6 @@
+ 	movl $-8192, reg; \
+ 	andl %esp, reg
+ 
+-#ifdef CONFIG_SMP
+-#define CHECK_SOFTIRQ \
+-	movl processor(%ebx),%eax; \
+-	shll $CONFIG_X86_L1_CACHE_SHIFT,%eax; \
+-	xorl %ecx,%ecx; \
+-	testl SYMBOL_NAME(irq_stat)+4(,%eax),%ecx
+-#else
+-#define CHECK_SOFTIRQ \
+-	xorl %ecx,%ecx; \
+-	testl SYMBOL_NAME(irq_stat)+4,%ecx
+-#endif
+-
+ ENTRY(lcall7)
+ 	pushfl			# We get a different stack layout with call gates,
+ 	pushl %eax		# which has to be cleaned up later..
+@@ -215,9 +203,7 @@
+ 	call *SYMBOL_NAME(sys_call_table)(,%eax,4)
+ 	movl %eax,EAX(%esp)		# save the return value
+ ENTRY(ret_from_sys_call)
+-	cli
+-	CHECK_SOFTIRQ
+-	jne handle_softirq
++	cli				# need_resched and signals atomic test
+ 	cmpl $0,need_resched(%ebx)
+ 	jne reschedule
+ 	cmpl $0,sigpending(%ebx)
+@@ -233,13 +219,6 @@
+ 	jne v86_signal_return
+ 	xorl %edx,%edx
+ 	call SYMBOL_NAME(do_signal)
+-#ifdef CONFIG_SMP
+-	GET_CURRENT(%ebx)
+-#endif
+-	cli
+-	CHECK_SOFTIRQ
+-	je restore_all
+-	call SYMBOL_NAME(do_softirq)
+ 	jmp restore_all
+ 
+ 	ALIGN
+@@ -248,13 +227,6 @@
+ 	movl %eax,%esp
+ 	xorl %edx,%edx
+ 	call SYMBOL_NAME(do_signal)
+-#ifdef CONFIG_SMP
+-	GET_CURRENT(%ebx)
+-#endif
+-	cli
+-	CHECK_SOFTIRQ
+-	je restore_all
+-	call SYMBOL_NAME(do_softirq)
+ 	jmp restore_all
+ 
+ 	ALIGN
+@@ -276,8 +248,6 @@
+ 	ALIGN
+ ret_from_exception:
+ 	cli
+-	CHECK_SOFTIRQ
+-	jne handle_softirq
+ 	cmpl $0,need_resched(%ebx)
+ 	jne reschedule
+ 	cmpl $0,sigpending(%ebx)
+@@ -292,11 +262,6 @@
+ 	jne ret_from_sys_call
+ 	jmp restore_all
+ 
+-	ALIGN
+-handle_softirq:
+-	call SYMBOL_NAME(do_softirq)
+-	jmp ret_from_intr
+-	
+ 	ALIGN
+ reschedule:
+ 	call SYMBOL_NAME(schedule)    # test

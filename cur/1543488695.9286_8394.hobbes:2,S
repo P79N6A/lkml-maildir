@@ -1,0 +1,216 @@
+Date: Fri, 5 Mar 1999 22:25:36 +0100 (CET)
+From: Andrea Arcangeli <>
+Subject: Re: select()/socket has problems under 2.2.x.
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/3/5/117
+
+On 5 Mar 1999, Andi Kleen wrote:
+>andrea@e-mind.com (Andrea Arcangeli) writes:
+>>  			}
+>>  		} else if (TCP_SKB_CB(skb)->ack_seq == tp->snd_una &&
+>> -			   atomic_read(&sk->rmem_alloc) <= sk->rcvbuf) {
+>> +			   (sock_rspace(sk) ||
+>> +			    (!skb_queue_len(&sk->receive_queue) &&
+>> +			     !skb_queue_len(&tp->out_of_order_queue)))) {
+>>  			/* Bulk data transfer: receiver */
+>>  			__skb_pull(skb,th->doff*4);
+>
+>The out_of_order_queue check is bogus because the fast path should be never
+>entered when there are ooo packets. Also you just introduced a costly
+Woops agreed, thanks.
+Here an incremental patch (I did also some performance optimization):
+Index: tcp_input.c
+===================================================================
+RCS file: /var/cvs/linux/net/ipv4/tcp_input.c,v
+retrieving revision 1.1.2.19
+diff -u -r1.1.2.19 tcp_input.c
+--- tcp_input.c	1999/03/05 19:47:01	1.1.2.19
++++ tcp_input.c	1999/03/05 21:15:58
+@@ -1421,7 +1421,7 @@
+ 	SOCK_DEBUG(sk, "out of order segment: rcv_next %X seq %X - %X\n",
+ 		   tp->rcv_nxt, TCP_SKB_CB(skb)->seq, TCP_SKB_CB(skb)->end_seq);
+ 
+-	if (skb_peek(&tp->out_of_order_queue) == NULL) {
++	if (!skb_queue_len(&tp->out_of_order_queue)) {
+ 		/* Initial out of order segment, build 1 SACK. */
+ 		if(tp->sack_ok) {
+ 			tp->num_sacks = 1;
+@@ -1587,7 +1587,7 @@
+ 	    /* We entered "quick ACK" mode or... */
+ 	    tcp_in_quickack_mode(tp) ||
+ 	    /* We have out of order data */
+-	    (skb_peek(&tp->out_of_order_queue) != NULL) ||
++	    skb_queue_len(&tp->out_of_order_queue) ||
+ 	    /* TCP_NODELAY is set */
+ 	    sk->nonagle == 1) {
+ 		/* Then ack it now */
+@@ -1831,8 +1831,7 @@
+ 			}
+ 		} else if (TCP_SKB_CB(skb)->ack_seq == tp->snd_una &&
+ 			   (sock_rspace(sk) ||
+-			    (!skb_queue_len(&sk->receive_queue) &&
+-			     !skb_queue_len(&tp->out_of_order_queue)))) {
++			    !skb_queue_len(&sk->receive_queue))) {
+ 			/* Bulk data transfer: receiver */
+ 			__skb_pull(skb,th->doff*4);
+ 
+And here a new whole patch against 2.2.2:
+Index: tcp_input.c
+===================================================================
+RCS file: /var/cvs/linux/net/ipv4/tcp_input.c,v
+retrieving revision 1.1.1.6
+diff -u -r1.1.1.6 tcp_input.c
+--- tcp_input.c	1999/02/23 16:48:26	1.1.1.6
++++ linux/net/ipv4/tcp_input.c	1999/03/05 21:15:58
+@@ -55,6 +55,13 @@
+  *					work without delayed acks. 
+  *		Andi Kleen:		Process packets with PSH set in the
+  *					fast path.
++ *		Andrea Arcangeli:	TCP_NODELAY disable delacks.
++ *		Andrea Arcangeli:	Delay also the first ack to be able to
++ *					join the ack in the first data packet.
++ *		Andrea Arcangeli:	Always queue a packet from the other
++ *					end if all receive queues are empty,
++ *					this avoid the receiver to deadlock
++ *					if rcvbuf < packet truesize.
+  */
+ 
+ #include <linux/config.h>
+@@ -99,12 +106,11 @@
+ 	if(tp->ato == 0) {
+ 		tp->lrcvtime = jiffies;
+ 
+-		/* Help sender leave slow start quickly,
+-		 * and also makes sure we do not take this
+-		 * branch ever again for this connection.
++		/*
++		 * Don't enter quickack mode to be able to join the first
++		 * ack with a data packet. -arca
+ 		 */
+-		tp->ato = 1;
+-		tcp_enter_quickack_mode(tp);
++		tp->ato = (HZ+49)/50;
+ 	} else {
+ 		int m = jiffies - tp->lrcvtime;
+ 
+@@ -135,9 +141,9 @@
+ 	 */
+ 	if(th->psh && (skb->len < (tp->mss_cache >> 1))) {
+ 		/* Preserve the quickack state. */
+-		if((tp->ato & 0x7fffffff) > HZ/50)
++		if((tp->ato & 0x7fffffff) > (HZ+49)/50)
+ 			tp->ato = ((tp->ato & 0x80000000) |
+-				   (HZ/50));
++				   ((HZ+49)/50));
+ 	}
+ } 
+ 
+@@ -241,7 +247,7 @@
+ extern __inline__ int tcp_paws_discard(struct tcp_opt *tp, struct tcphdr *th, unsigned len)
+ {
+ 	/* ts_recent must be younger than 24 days */
+-	return (((jiffies - tp->ts_recent_stamp) >= PAWS_24DAYS) ||
++	return (((s32)(jiffies - tp->ts_recent_stamp) >= PAWS_24DAYS) ||
+ 		(((s32)(tp->rcv_tsval-tp->ts_recent) < 0) &&
+ 		 /* Sorry, PAWS as specified is broken wrt. pure-ACKs -DaveM */
+ 		 (len != (th->doff * 4))));
+@@ -1415,7 +1421,7 @@
+ 	SOCK_DEBUG(sk, "out of order segment: rcv_next %X seq %X - %X\n",
+ 		   tp->rcv_nxt, TCP_SKB_CB(skb)->seq, TCP_SKB_CB(skb)->end_seq);
+ 
+-	if (skb_peek(&tp->out_of_order_queue) == NULL) {
++	if (!skb_queue_len(&tp->out_of_order_queue)) {
+ 		/* Initial out of order segment, build 1 SACK. */
+ 		if(tp->sack_ok) {
+ 			tp->num_sacks = 1;
+@@ -1484,7 +1490,8 @@
+ 	 *	Make sure to do this before moving snd_nxt, otherwise
+ 	 *	data might be acked for that we don't have enough room.
+ 	 */
+-	if (atomic_read(&sk->rmem_alloc) > sk->rcvbuf) { 
++	if (!sock_rspace(sk) && (skb_queue_len(&sk->receive_queue) ||
++				 skb_queue_len(&tp->out_of_order_queue))) { 
+ 		if (prune_queue(sk) < 0) { 
+ 			/* Still not enough room. That can happen when
+ 			 * skb->true_size differs significantly from skb->len.
+@@ -1580,7 +1587,9 @@
+ 	    /* We entered "quick ACK" mode or... */
+ 	    tcp_in_quickack_mode(tp) ||
+ 	    /* We have out of order data */
+-	    (skb_peek(&tp->out_of_order_queue) != NULL)) {
++	    skb_queue_len(&tp->out_of_order_queue) ||
++	    /* TCP_NODELAY is set */
++	    sk->nonagle == 1) {
+ 		/* Then ack it now */
+ 		tcp_send_ack(sk);
+ 	} else {
+@@ -1821,7 +1830,8 @@
+ 				goto discard;
+ 			}
+ 		} else if (TCP_SKB_CB(skb)->ack_seq == tp->snd_una &&
+-			   atomic_read(&sk->rmem_alloc) <= sk->rcvbuf) {
++			   (sock_rspace(sk) ||
++			    !skb_queue_len(&sk->receive_queue))) {
+ 			/* Bulk data transfer: receiver */
+ 			__skb_pull(skb,th->doff*4);
+ 
+Index: tcp_output.c
+===================================================================
+RCS file: /var/cvs/linux/net/ipv4/tcp_output.c,v
+retrieving revision 1.1.1.5
+diff -u -r1.1.1.5 tcp_output.c
+--- tcp_output.c	1999/02/23 16:48:26	1.1.1.5
++++ linux/net/ipv4/tcp_output.c	1999/03/02 16:53:50
+@@ -580,6 +580,19 @@
+ 	if(tp->af_specific->rebuild_header(sk))
+ 		return 1; /* Routing failure or similar. */
+ 
++	/* Solaris sucks. */
++	if(skb->len > 0 &&
++	   (TCP_SKB_CB(skb)->flags & TCPCB_FLAG_FIN) &&
++	   tp->snd_una == (TCP_SKB_CB(skb)->end_seq - 1)) {
++#if 1
++		printk("TCP: Doing Solaris hack for [%p:%08x:%04x:%08x]\n",
++		       skb, sk->daddr, sk->dport, tp->snd_una);
++#endif
++		TCP_SKB_CB(skb)->seq = TCP_SKB_CB(skb)->end_seq - 1;
++		skb_trim(skb, 0);
++		skb->csum = 0;
++	}
++
+ 	/* Ok, we're gonna send it out, update state. */
+ 	TCP_SKB_CB(skb)->sacked |= TCPCB_SACKED_RETRANS;
+ 	tp->retrans_out++;
+@@ -973,6 +986,8 @@
+ 	timeout = tp->ato;
+ 	if (timeout > max_timeout)
+ 		timeout = max_timeout;
++	if (timeout < (HZ+49)/50)
++		timeout = (HZ+49)/50;
+ 	timeout += jiffies;
+ 
+ 	/* Use new timeout only if there wasn't a older one earlier. */
+@@ -980,7 +995,7 @@
+ 		tp->delack_timer.expires = timeout;
+ 		add_timer(&tp->delack_timer);
+         } else {
+-		if (timeout < tp->delack_timer.expires)
++		if (time_before(timeout, tp->delack_timer.expires))
+ 			mod_timer(&tp->delack_timer, timeout);
+ 	}
+ }
+>I also don't see what you're trying to archieve with this change.
+If rcvbuf < skb->truesize you won't have way to receive something without
+my patch. My changes allow always a packet to be queued in the receiver
+and so it avoids deadlocking in the receiver.
+Andrea Arcangeli
+PS. The testing can be done also with the previous patch, the difference
+between the previous and this one are only performances.
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

@@ -1,0 +1,346 @@
+Date: Mon, 1 Feb 1999 15:00:12 +0100 (CET)
+From: MOLNAR Ingo <>
+Subject: [patch] SMP fixes 2.2.1
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/2/1/54
+
+this SMP patchset fixes 3 problems, they affect only a small percentage of
+SMP boards, but for them these are real showstoppers:
+ - boot panics with 'IO-APIC + timer doesn't work!' (thanks to Brian
+   Perkins for finding and fixing this one, and i now finally understand
+   why it can happen) This bug was introduced in 2.1.105.
+ - 'spurious APIC interrupt, ayiee, should never happen.' seen on some
+   boards showed another (real) bug (thanks to Alex Buell for testing this
+   one out) [this sw bug is not to be confused with the P6 'spurious IRQ
+   16' hw bug] this bug was introduced with my 2.2.0 SMP changes and
+   is harmless mostly because APICs retry messages.
+ - cycle counter isnt sync between CPUs (this fixes Mark-Andre Hopf's
+   problematic board which gave time warps otherwise). Problem first
+   proved/detected by Colin Plumb.
+   This is the most intrusive fix of all, thus it has been tested on 4
+   different SMP boards (P5, PPro and Xeon boards) and UP configurations
+   as well. this one was there forever, and since the MP spec doesnt
+   explicitly say that cycle counters have to be sync, i think this should
+   be considered a Linux bug. This is what gets printed on a 'buggy'
+   board: 
+  checking TSC synchronization across CPUs: 
+  BIOS BUG: CPU#0 improperly initialized, has -25 usecs TSC skew! FIXED. 
+  BIOS BUG: CPU#1 improperly initialized, has 25 usecs TSC skew! FIXED. 
+   and a 'good' board prints: 
+  checking TSC synchronization across CPUs: passed. 
+let me know if there are still unfixed problems out there ... 
+-- mingo
+--- linux/arch/i386/kernel/smp.c.orig	Tue Jan 26 10:47:16 1999
++++ linux/arch/i386/kernel/smp.c	Mon Feb  1 12:10:05 1999
+@@ -147,6 +147,17 @@
+ #define APIC_DEFAULT_PHYS_BASE 0xfee00000
+ 
+ /*
++ * Reads and clears the Pentium Timestamp-Counter
++ */
++#define READ_TSC(x)	__asm__ __volatile__ (  "rdtsc" \
++				:"=a" (((unsigned long*)&(x))[0]),  \
++				 "=d" (((unsigned long*)&(x))[1]))
++
++#define CLEAR_TSC \
++	__asm__ __volatile__ ("\t.byte 0x0f, 0x30;\n"::\
++		"a"(0x00001000), "d"(0x00001000), "c"(0x10):"memory")
++
++/*
+  *	Setup routine for controlling SMP activation
+  *
+  *	Command-line option of "nosmp" or "maxcpus=0" will disable SMP
+@@ -710,24 +721,19 @@
+ 	value |= 0xff;			/* Set spurious IRQ vector to 0xff */
+  	apic_write(APIC_SPIV,value);
+ 
+- 	value = apic_read(APIC_TASKPRI);
+- 	value &= ~APIC_TPRI_MASK;	/* Set Task Priority to 'accept all' */
+- 	apic_write(APIC_TASKPRI,value);
+-
+ 	/*
+-	 * Set arbitrarion priority to 0
++	 * Set Task Priority to 'accept all'
+ 	 */
+- 	value = apic_read(APIC_ARBPRI);
+- 	value &= ~APIC_ARBPRI_MASK;
+- 	apic_write(APIC_ARBPRI, value);
++ 	value = apic_read(APIC_TASKPRI);
++ 	value &= ~APIC_TPRI_MASK;
++ 	apic_write(APIC_TASKPRI,value);
+ 
+ 	/*
+-	 * Set the logical destination ID to 'all', just to be safe.
++	 * Clear the logical destination ID, just to be safe.
+ 	 * also, put the APIC into flat delivery mode.
+ 	 */
+  	value = apic_read(APIC_LDR);
+ 	value &= ~APIC_LDR_MASK;
+-	value |= SET_APIC_LOGICAL_ID(0xff);
+  	apic_write(APIC_LDR,value);
+ 
+  	value = apic_read(APIC_DFR);
+@@ -735,8 +741,6 @@
+  	apic_write(APIC_DFR, value);
+ 
+ 	udelay(100);			/* B safe */
+-	ack_APIC_irq();
+-	udelay(100);
+ }
+ 
+ unsigned long __init init_smp_mappings(unsigned long memory_start)
+@@ -780,6 +784,160 @@
+ 	return memory_start;
+ }
+ 
++#ifdef CONFIG_X86_TSC
++/*
++ * TSC synchronization.
++ *
++ * We first check wether all CPUs have their TSC's synchronized,
++ * then we print a warning if not, and always resync.
++ */
++
++static atomic_t tsc_start_flag = ATOMIC_INIT(0);
++static atomic_t tsc_count = ATOMIC_INIT(0);
++static unsigned long long tsc_values[NR_CPUS] = { 0, };
++
++#define NR_LOOPS 5
++
++extern unsigned long fast_gettimeoffset_quotient;
++
++/*
++ * accurate 64-bit division, expanded to 32-bit divisions. Not terribly
++ * optimized but we need it at boot time only anyway.
++ *
++ * result == a / b
++ *        == (a1 + a2*(2^32)) / b
++ *        == a1/b + a2*(2^32/b)
++ *        == a1/b + a2*((2^32-1)/b) + a2/b + (a2*((2^32-1) % b))/b
++ *                    ^---- (this multiplication can overflow)
++ */
++
++unsigned long long div64 (unsigned long long a, unsigned long long b)
++{
++	unsigned int a1, a2, b0;
++	unsigned long long res;
++
++	if (b > 0x00000000ffffffffULL)
++		return 0;
++	if (!b)
++		panic("huh?\n");
++
++	b0 = (unsigned int) b;
++	a1 = ((unsigned int*)&a)[0];
++	a2 = ((unsigned int*)&a)[1];
++
++	res = a1/b0 +
++		(unsigned long long)a2 * (unsigned long long)(0xffffffff/b0) +
++		a2 / b0 +
++		(a2 * (0xffffffff % b0)) / b0;
++
++        return res;
++}
++
++
++static void __init synchronize_tsc_bp (void)
++{
++	int i;
++	unsigned long long t0;
++	unsigned long long sum, avg;
++	long long delta;
++	unsigned long one_usec;
++	int buggy = 0;
++
++	printk("checking TSC synchronization across CPUs: ");
++
++	one_usec = ((1<<30)/fast_gettimeoffset_quotient)*(1<<2);
++	
++	atomic_inc(&tsc_count);
++	while (atomic_read(&tsc_count) != smp_num_cpus) mb();
++
++	/*
++	 * We loop a few times to get a primed instruction cache,
++	 * then the last pass is more or less synchronized and
++	 * the BP and APs set their cycle counters to zero all at
++	 * once. This reduces the chance of having random offsets
++	 * between the processors, and guarantees that the maximum
++	 * delay between the cycle counters is never bigger than
++	 * the latency of information-passing (cachelines) between
++	 * two CPUs.
++	 */
++	for (i = 0; i < NR_LOOPS; i++) {
++		atomic_set(&tsc_count, 0);
++		wmb();
++		atomic_set(&tsc_start_flag, 1);
++
++		READ_TSC(tsc_values[smp_processor_id()]);
++
++		atomic_inc(&tsc_count);
++		atomic_set(&tsc_start_flag, 0);
++		wmb();
++		while (atomic_read(&tsc_count) != smp_num_cpus) mb();
++
++		if (i == NR_LOOPS-1)
++			CLEAR_TSC;
++	}
++
++	sum = 0;
++	for (i = 0; i < NR_CPUS; i++) {
++		if (!(cpu_online_map & (1 << i)))
++			continue;
++
++		t0 = tsc_values[i];
++		sum += t0;
++	}
++	avg = div64(sum, smp_num_cpus);
++
++	sum = 0;
++	for (i = 0; i < NR_CPUS; i++) {
++		if (!(cpu_online_map & (1 << i)))
++			continue;
++
++		delta = tsc_values[i] - avg;
++		if (delta < 0)
++			delta = -delta;
++		/*
++		 * We report bigger than 2 microseconds clock differences.
++		 */
++		if (delta > 2*one_usec) {
++			long realdelta;
++			if (!buggy) {
++				buggy = 1;
++				printk("\n");
++			}
++			realdelta = div64(delta, one_usec);
++			if (tsc_values[i] < avg)
++				realdelta = -realdelta;
++		
++			printk("BIOS BUG: CPU#%d improperly initialized, has %ld usecs TSC skew! FIXED.\n",
++				i, realdelta);
++		}
++				
++		sum += delta;
++	}
++	if (!buggy)
++		printk("passed.\n");
++}
++
++static void __init synchronize_tsc_ap (void)
++{
++	int i;
++
++	atomic_inc(&tsc_count);
++	while (atomic_read(&tsc_count) != smp_num_cpus) mb();
++
++	for (i = 0; i < NR_LOOPS; i++) {
++		while (!atomic_read(&tsc_start_flag)) mb();
++
++		READ_TSC(tsc_values[smp_processor_id()]);
++		atomic_inc(&tsc_count);
++		while (atomic_read(&tsc_count) != smp_num_cpus) mb();
++		if (i == NR_LOOPS-1)
++			CLEAR_TSC;
++	}
++}
++#undef NR_LOOPS
++
++#endif
++
+ extern void calibrate_delay(void);
+ 
+ void __init smp_callin(void)
+@@ -857,6 +1015,13 @@
+ 	 *	Allow the master to continue.
+ 	 */
+ 	set_bit(cpuid, (unsigned long *)&cpu_callin_map[0]);
++
++#ifdef CONFIG_X86_TSC
++	/*
++	 *	Synchronize the TSC with the BP
++	 */
++ 	synchronize_tsc_ap ();
++#endif
+ }
+ 
+ int cpucount = 0;
+@@ -1445,6 +1610,14 @@
+ #else
+ 	return cached_APIC_ICR;
+ #endif
++#ifdef CONFIG_X86_TSC
++	/*
++	 * Synchronize the TSC with the AP
++	 */
++	if (cpucount)
++	 	synchronize_tsc_bp();
++#endif
++
+ }
+ 
+ static inline unsigned int __get_ICR2 (void)
+@@ -1815,10 +1988,6 @@
+  * closely follows bus clocks.
+  */
+ 
+-#define RDTSC(x)	__asm__ __volatile__ (  "rdtsc" \
+-				:"=a" (((unsigned long*)&x)[0]),  \
+-				 "=d" (((unsigned long*)&x)[1]))
+-
+ /*
+  * The timer chip is already set up at HZ interrupts per second here,
+  * but we do not accept timer interrupts yet. We only allow the BP
+@@ -1937,7 +2106,7 @@
+ 	/*
+ 	 * We wrapped around just now. Let's start:
+ 	 */
+-	RDTSC(t1);
++	READ_TSC(t1);
+ 	tt1=apic_read(APIC_TMCCT);
+ 
+ #define LOOPS (HZ/10)
+@@ -1948,7 +2117,7 @@
+ 		wait_8254_wraparound ();
+ 
+ 	tt2=apic_read(APIC_TMCCT);
+-	RDTSC(t2);
++	READ_TSC(t2);
+ 
+ 	/*
+ 	 * The APIC bus clock counter is 32 bits only, it
+--- linux/arch/i386/kernel/time.c.orig	Tue Jan 26 10:47:12 1999
++++ linux/arch/i386/kernel/time.c	Mon Feb  1 12:09:37 1999
+@@ -86,7 +86,7 @@
+  * Equal to 2^32 * (1 / (clocks per usec) ).
+  * Initialized in time_init.
+  */
+-static unsigned long fast_gettimeoffset_quotient=0;
++unsigned long fast_gettimeoffset_quotient=0;
+ 
+ extern rwlock_t xtime_lock;
+ 
+--- linux/arch/i386/kernel/io_apic.c.orig	Tue Dec 29 16:37:07 1998
++++ linux/arch/i386/kernel/io_apic.c	Mon Feb  1 12:10:05 1999
+@@ -637,7 +637,13 @@
+ 	entry.delivery_mode = dest_ExtINT;
+ 	entry.dest_mode = 1;				/* logical delivery */
+ 	entry.mask = 0;					/* unmask IRQ now */
+-	entry.dest.logical.logical_dest = 0x01;		/* logical CPU #0 */
++	/*
++	 * Careful with this one. We do not use 'true' logical
++	 * delivery, as we set local APICs to LDR == 0. But
++	 * 0xff logical destination is special (broadcast).
++	 * Any other combination will cause problems.
++	 */
++	entry.dest.logical.logical_dest = 0xff;
+ 
+ 	entry.vector = 0;				/* it's ignored */
+ 
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

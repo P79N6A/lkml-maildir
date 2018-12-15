@@ -1,0 +1,218 @@
+Date: Sat, 2 Sep 2000 13:36:04 -0400 (EDT)
+From: Alexander Viro <>
+Subject: Re: hfs support for blocksize != 512
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/9/2/66
+
+On Sat, 2 Sep 2000, Roman Zippel wrote:
+> Hi,
+> 
+> On Thu, 31 Aug 2000, Alexander Viro wrote:
+> 
+> > Go ahead, write it. IMNSHO it's going to be much more complicated and
+> > race-prone, but code talks. If you will manage to write it in clear and
+> > race-free way - fine. Frankly, I don't believe that it's doable.
+> 
+> It will be insofar more complicated, as I want to use a more complex state
+> machine than "locked <-> unlocked", on the other hand I can avoid such
+> funny constructions as triple_down() and obscure locking order rules.
+Obscure? Look: all locking order rules in two lines -
+	All ->i_sem ones go before all ->i_zombie ones.
+	Within the same group order is just by memory address.
+You claim that you have something easier to understand? triple_down() is a
+_sort_ on 3 elements, for fsck sake. Conceptually very simple.
+> At any time the object will be either locked or in a well defined state,
+> where at any time only a single object is locked by a thread. (I hope some
+I don't believe that you can achieve that. Reason: rmdir()/rename() races.
+> pseudo code does for the beginning, too?) Most namespace operation work
+> simply like a semaphore:
+> 
+> restart:
+> 	lock(dentry);
+> 	if (dentry is busy) {
+> 		unlock(dentry);
+> 		sleep();
+> 		goto restart;
+> 	}
+> 	dentry->state = busy;
+> 	unlock(dentry);
+Look, could you call it d_set_state(dentry, busy) or something? It would
+really help reading the thing.
+> If the operation is finished, the state is reset and everyone sleeping is
+> woken up. Ok, let's come to the most interesting operation - rename():
+Show me your rmdir() and lookup(), will you?
+> restart:
+> 	lock(olddentry);
+> 	if (olddentry is busy) {
+> 		unlock(olddentry);
+> 		sleep();
+> 		goto restart;
+> 	}
+> 	olddentry->state = moving;
+> 	unlock(olddentry);
+Are 'moving' dentries busy? From the code below it seems that they are
+not, so you are wide-open to e.g. file creation in the target (originally
+- empty directory).
+> restart2:
+> 	lock(newdentry);
+> 	if (newdentry->state == moving) {
+> 		lock(renamelock);
+> 		if (olddentry->state == deleted) {
+> 			unlock(renamelock);
+> 			unlock(newdentry);
+> 			sleep();
+> 			goto restart;
+> 		}
+> 		newdentry->state = deleted;
+> 		unlock(renamelock);
+> 	} else if (newdentry is busy) {
+> 		unlock(newdentry);
+> 		sleep();
+> 		goto restart2;
+> 	} else
+> 		newdentry->state = deleted;
+> 	unlock(newdentry);
+Huh? See - here's a problem with your approach: can you tell in one
+sentence what the piece above does? It's _not_ a nitpick. Debugging such
+stuff really requires the ability to say concisely WTF it is supposed to
+achieve.
+> 	if (!rename_valid(olddentry, newdentry)) {
+Which is...?
+> 		lock(newdentry);
+> 		newdentry->state = idle;
+> 		unlock(renamelock);
+> 		lock(olddentry);
+> 		olddentry->state = idle;
+> 		unlock(olddentry);
+> 		wakeup_sleepers();
+> 		return;
+> 	}
+> 	if (newdentry exists)
+> 		unlink(newdentry);
+> 	do_rename(olddentry, newdentry);
+Broken. rename() must be atomic.
+> 	lock(newdentry);
+> 	newdentry->state = idle;
+> 	unlock(renamelock);
+> 	lock(olddentry);
+> 	olddentry->state = deleted;
+> 	unlock(olddentry);
+> 	wakeup_sleepers();
+> 	return;
+> 
+> Note that I don't touch any inode here, everything happens in the dcache.
+> That means I move the complete inode locking into the fs, all I do here is
+> to make sure, that while operation("foo") is busy, no other operation will
+> use "foo".
+> IMO this should work, I tried it with a rename("foo", "bar") and 
+> rename("bar", "foo"):
+> case 1: one rename gets both dentries busy, the other rename will wait
+> till it's finished.
+> case 2: both mark the old dentry as moving and find the new dentry also
+> moving. To make the rename atomic the global rename lock is needed, one
+> rename will find the old dentry isn't moving anymore and has to restart
+> and wait, the other rename will complete.
+OK, just for starters, what happens if two rename() are trying to move the
+thing into different places? Both succeeding? What happens if the target
+(originally empty) gets a new child? Prevent that in fs? Fine, but then
+you've just moved locking of inode pairs (if not triples) into _every_ fs
+out there.
+> Other operations will keep only one dentry busy, so that I don't a see
+> problem here. If you don't find any major problem here, I'm going to try
+rmdir() and lookup(), please.
+> this. Since if this works, it will have some other advantages:
+> - a user space fs will become possible, that can't even deadlock the
+> system. The first restart loop can be easily made interruptable, so it can
+> be safely killed. (I don't really want to know how a 
+Erm... Filesystem that requires killing is about as good as deadlocking.
+Besides, I'm yet to see a deadlock scenario with userland filesystem that
+would go anywhere near the directory operations. So I'm not sure what you
+are trying to fix here.
+> triple_down_interruptable() looks, not to mention the other three locks
+> (+ BKL) taken during a rename.)
+> - I can imagine better support for hfs. It can access the other fork
+> without excessive locking (I think currently it doesn't even tries to).
+> The order in which the forks can be created can change then too.
+> 
+> > BTW, I really wonder what kind of locks are you going to have on _blocks_
+> > (you've mentioned that, unless I've misparsed what you've said). IMO that
+> > way lies the horror, but hey, code talks.
+> 
+> I thought about catching a bread, but while thinking about it, there
+> should also be other ways. But that's fs specific, let's concentrate on
+> the generic part first.
+Sorry. I think that you are missing a detail: your variant will need a
+_lot_ of cruft in every fs. And I think that asking to show a proof-of-concept
+_full_ thing for some filesystems is not unreasonable. Just to estimate
+the amounts of the cruft.
+> > You claim that it's doable. I seriously doubt it. Nobody knows your ideas
+> > better than you do, so... come on, demonstrate the patch.
+> 
+> I think the above example should do basically the same as some nothing
+> doing patch within affs.
+Not. You've suddenly got a need to deal with a lot of _new_ locking in
+filesystems. All of them. Please, show the AFFS patch, just to demonstrate 
+how to deal with them. "Let fs maintainers deal with it" is _not_ a valid
+answer. At least describe what is needed and show how to fix the in-tree
+instances. You'll have to fix them if that proposal will get to something
+workable. I'm not asking for complete patch right now, but IMO at least
+one fs must be done _and_ tested. Just to let everyone estimate the
+results.
+> I hope that example shows two important ideas (no idea if they will save
+> the world, but I'm willing to learn):
+> - I use the dcache instead of the inode to synchronize namespace
+> operation, what IMO makes quite a lot of sense, since it represents our
+> (cached) representation of the fs.
+>
+> - Using states instead of a semaphore, makes it easily possible to detect
+> e.g. a rename loop.
+Where? You've skipped the most interesting part: check for rename()
+validity. And yes, it will take some locking in your variant.
+Look: more states for dentry are needed. No arguments here. I could
+probably even save you some time just digging out the proposal and
+pre-patches around the same idea. However:
+	* your "ordering" snippet in rename() (if I've parsed you right
+and that's what you are trying to do there) is _way_ more complex than
+double_down() and even triple_down(). Why? Because there you can trace all
+possible paths of execution - there's finite amount. All you need is to
+show that sorting is right. I claim that your retry scheme is inherently
+harder to proof. And unlike the situation in ext2_get_block() (that made
+you retch, IIRC) there's no obvious invariants.
+	* you've completely missed all fun problems with creation of
+children in the object we are renaming over. It will come back to haunt
+you in every local fs that has ->rename().
+	* fs locking becomes much more of a burden. I don't see how it's a
+good thing. Right now one can write a filesystem and ignore the directory
+races completely, unless he is has operations with side effects on other
+directories. With your own proposal for extent flipping (horrible, IMO) it
+would become a non-issue even on AFFS and I'm yet to see any other
+example. And yes, AFFS can be done simpler than your variant. Complex
+issues didn't become simpler. Simple ones became complex. VFS also grew
+and became more complex. That might be justified if it bought us
+simplification in filesystems, but it didn't. Notice that you can (right
+now) drop and reacquire the locks if you want to be smart, so it didn't
+buy you even better threading.
+	I don't understand your reaction to ordering, BTW - if you have a
+class of locks used only in one place it's not a problem. Overdoing the
+amount of locks is seriously bad idea, but you didn't decrease it.
+_Sharing_ locking mechanisms between different subsystems is very bad, but
+having a semaphore in private part of struct inode? Makes sense to me.
+Look: our inodes are strange beasts and there really should be no union
+(inode->u). There is VFS inode (called vnode in SunOS-derived designs) and
+there is an fs inode. The latter happens to be kept together with vnode
+for several filesystems. Hystorical reasons... It doesn't change the
+nature of the beast - you want fs-private, you look into fs-private part.
+There are 3 objects, not 2 - dentry->vnode->inode. The latter is optional
+_and_ fs-only.
+	BTW, your design doesn't exclude deadlocks, even if you manage to
+lock (as in "down()/up()") only one dentry at time. You can deadlock on
+the dentry state, busy looping. And the fact that you've got more states
+just makes analysis harder...
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+Please read the FAQ at 
+http://www.tux.org/lkml/

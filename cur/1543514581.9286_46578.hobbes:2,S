@@ -1,0 +1,132 @@
+Date: Sat, 30 Oct 1999 11:35:12 +0200
+From: Arnd Bergmann <>
+Subject: scsi cdrom panic in 2.3.13+(?) with isa dma [patch]
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/10/30/6
+
+Hi!
+I always get a 'Kernel panic: Buffer at physical address > 16Mb 
+used for aha1542' when accessing my cd-writer as a cd rom drive
+in the latest 2.3 kernels.
+Roel Teuwen (Roel.Teuwen@advalvas.be) has reporeted the same 
+problem some weeks ago.
+The problem is that the current sr driver uses transfer buffers 
+on the stack instead of scsi_malloc()'ed ones like the 2.2.x 
+driver. This will not work with ISA scsi adaptors using DMA.
+I wrote a small patch that implements extra buffering in the 
+same way the sd drivers uses them, which works perfectly for me.
+The patch is attached to this mail and I put it up on
+http://www.et.fh-osnabrueck.de/~std7652/scsi-dmabuf.patch
+ as 
+well.
+I'm not sure whether I got the spin locks right so this should 
+be checked before it get included in a main kernel.
+Arnd <><--- linux-2.3.24/drivers/scsi/sr.c.bak	Fri Oct 29 14:12:39 1999
++++ linux-2.3.24/drivers/scsi/sr.c	Sat Oct 30 00:13:07 1999
+@@ -1031,12 +1031,27 @@
+ 	Scsi_Cmnd *SCpnt;
+ 	Scsi_Device *device = scsi_CDs[MINOR(cdi->dev)].device;
+ 	int stat;
++	unsigned long flags;
++	unsigned char *buffer = cgc->buffer;
++	int buflen;
+ 
+ 	/* get the device */
+ 	SCpnt = scsi_allocate_device(NULL, device, 1);
+ 	if (SCpnt == NULL)
+ 		return -ENODEV;	/* this just doesn't seem right /axboe */
+ 
++	/* use buffer for ISA DMA */
++	buflen=(cgc->buflen + 511) & ~511;
++	if (cgc->buffer && SCpnt->host->unchecked_isa_dma &&
++			(virt_to_phys(cgc->buffer) + cgc->buflen - 1 > ISA_DMA_THRESHOLD)) {
++		spin_lock_irqsave(&io_request_lock, flags);
++		buffer=scsi_malloc(buflen);
++		if (!buffer)
++			panic("SCSI DMA pool exhausted.");
++		memcpy(buffer,cgc->buffer,cgc->buflen);
++		spin_unlock_irqrestore(&io_request_lock, flags);
++	}
++
+ 	/* set the LUN */
+ 	cgc->cmd[1] |= device->lun << 5;
+ 
+@@ -1044,8 +1059,8 @@
+ 	SCpnt->request.rq_dev = cdi->dev;
+ 	/* scsi_do_cmd sets the command length */
+ 	SCpnt->cmd_len = 0;
+-	
+-	scsi_wait_cmd (SCpnt, (void *)cgc->cmd, (void *)cgc->buffer, cgc->buflen,
++
++	scsi_wait_cmd (SCpnt, (void *)cgc->cmd, (void *)buffer, cgc->buflen,
+ 		sr_init_done, SR_TIMEOUT, MAX_RETRIES);
+ 
+ 	stat = SCpnt->result;
+@@ -1054,6 +1069,14 @@
+ 	SCpnt->request.rq_dev = MKDEV(0, 0);
+ 	scsi_release_command(SCpnt);
+ 	SCpnt = NULL;
++
++	/* write DMA buffer back if used */
++	if (buffer && buffer != cgc->buffer){
++		spin_lock_irqsave(&io_request_lock, flags);
++		memcpy(cgc->buffer,buffer,cgc->buflen);
++		scsi_free(buffer,buflen);
++		spin_unlock_irqrestore(&io_request_lock, flags);
++	}
+ 
+ 	return stat;
+ }
+--- linux-2.3.24/drivers/scsi/sr_ioctl.c.bak	Wed Oct 27 22:42:08 1999
++++ linux-2.3.24/drivers/scsi/sr_ioctl.c	Fri Oct 29 23:50:37 1999
+@@ -33,9 +33,18 @@
+ static void sr_ioctl_done(Scsi_Cmnd * SCpnt)
+ {
+     struct request * req;
++    unsigned long flags;
+     
+     req = &SCpnt->request;
+     req->rq_status = RQ_SCSI_DONE; /* Busy, but indicate request done */
++
++    if (SCpnt->buffer && req->buffer && SCpnt->buffer != req->buffer) {
++	spin_lock_irqsave(&io_request_lock, flags);
++	memcpy(req->buffer,SCpnt->buffer,SCpnt->bufflen);
++	scsi_free(SCpnt->buffer, (SCpnt->bufflen + 511) & ~511);
++	spin_unlock_irqrestore(&io_request_lock, flags);
++	SCpnt->buffer=req->buffer;
++    } 
+     
+     if (req->sem != NULL) {
+ 	up(req->sem);
+@@ -52,6 +61,7 @@
+     Scsi_Device * SDev;
+     int result, err = 0, retries = 0;
+     unsigned long flags;
++    char * bounce_buffer;
+ 
+     spin_lock_irqsave(&io_request_lock, flags);
+     SDev  = scsi_CDs[target].device;
+@@ -64,6 +74,20 @@
+     {
+ 	DECLARE_MUTEX_LOCKED(sem);
+ 	SCpnt->request.sem = &sem;
++	
++	/* use ISA DMA buffer if necessary */
++	SCpnt->request.buffer=buffer;
++	if (buffer && SCpnt->host->unchecked_isa_dma
++	      && (virt_to_phys(buffer) + buflength - 1 > ISA_DMA_THRESHOLD)) {
++	    spin_lock_irqsave(&io_request_lock, flags);
++	    bounce_buffer=(char *)(scsi_malloc((buflength + 511) & ~511));
++	    if (!bounce_buffer)
++		panic("SCSI DMA pool exhausted.");
++	    memcpy(bounce_buffer,(char *)buffer,buflength);
++	    spin_unlock_irqrestore(&io_request_lock, flags);
++	    buffer=bounce_buffer;
++	}
++
+ 	spin_lock_irqsave(&io_request_lock, flags);
+ 	scsi_do_cmd(SCpnt,
+ 		    (void *) sr_cmd, buffer, buflength, sr_ioctl_done, 

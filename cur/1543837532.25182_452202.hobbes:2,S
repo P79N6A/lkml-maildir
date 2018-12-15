@@ -1,0 +1,191 @@
+Date: Thu, 10 Aug 2006 12:48:42 +0300
+From: Shem Multinymous <>
+Subject: [PATCH 04/12] hdaps: Correct readout and remove nonsensical attributes
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2006/8/10/101
+
+The current hdaps driver got some details wrong about the result of
+hardware queries. 
+First, it fails to check a couple of status values.
+Second, it turns out that the hardware will return up to two readouts:
+the latest one and also the previous one if it was missed (host didn't
+poll fast enough). The current driver wrongly interprets the latter as
+a "variance". We have no use for that previous readout, so it should 
+be ignored. The corresponding sysfs attributes, "temp2" and "variance"
+are bogus and thus removed.
+This patch adds proper status checking, and removes the "variance" and
+"temp2" sysfs attributes which refer to the old readout.
+Signed-off-by: Shem Multinymous <multinymous@gmail.com>
+Signed-off-by: Pavel Machek <pavel@suse.cz>
+---
+ drivers/hwmon/hdaps.c |   75 +++++++++++++++++++++++---------------------------
+ 1 file changed, 35 insertions(+), 40 deletions(-)
+--- a/drivers/hwmon/hdaps.c
++++ b/drivers/hwmon/hdaps.c
+@@ -49,12 +49,16 @@ static const struct thinkpad_ec_row ec_a
+ #define EC_ACCEL_IDX_TEMP2	0xb	/*   device temperature in Celsius */
+ #define EC_ACCEL_IDX_QUEUED	0xc	/* Number of queued readouts left */
+ #define EC_ACCEL_IDX_KMACT	0xd	/* keyboard or mouse activity */
++#define EC_ACCEL_IDX_RETVAL	0xf	/* command return value, good=0x00 */
+ 
+ #define KEYBD_MASK		0x20	/* set if keyboard activity */
+ #define MOUSE_MASK		0x40	/* set if mouse activity */
+ #define KEYBD_ISSET(n)		(!! (n & KEYBD_MASK))	/* keyboard used? */
+ #define MOUSE_ISSET(n)		(!! (n & MOUSE_MASK))	/* mouse used? */
+ 
++#define READ_TIMEOUT_MSECS	100	/* wait this long for device read */
++#define RETRY_MSECS		3	/* retry delay */
++
+ #define HDAPS_POLL_PERIOD	(HZ/20)	/* poll for input every 1/20s */
+ #define HDAPS_INPUT_FUZZ	4	/* input event threshold */
+ #define HDAPS_INPUT_FLAT	4
+@@ -66,8 +70,7 @@ static unsigned int hdaps_invert;
+ 
+ /* Latest state readout */
+ static int pos_x, pos_y;   /* position */
+-static int var_x, var_y;   /* variance (what is this?) */
+-static u8 temp1, temp2;    /* temperatures */
++static int temperature;    /* temperature */
+ static u8 km_activity;
+ static int rest_x, rest_y; /* calibrated rest position */
+ 
+@@ -93,10 +96,9 @@ static int __hdaps_update(int fast)
+ 	struct thinkpad_ec_row data;
+ 	int ret;
+ 
+-	data.mask = (1 << EC_ACCEL_IDX_KMACT)    |
++	data.mask = (1 << EC_ACCEL_IDX_READOUTS) | (1 << EC_ACCEL_IDX_KMACT) |
+ 	            (3 << EC_ACCEL_IDX_YPOS1)    | (3 << EC_ACCEL_IDX_XPOS1) |
+-	            (3 << EC_ACCEL_IDX_YPOS2)    | (3 << EC_ACCEL_IDX_XPOS2) |
+-	            (1 << EC_ACCEL_IDX_TEMP1)    | (1 << EC_ACCEL_IDX_TEMP2);
++	            (1 << EC_ACCEL_IDX_TEMP1)    | (1 << EC_ACCEL_IDX_RETVAL);
+ 	if (fast)
+ 		ret = thinkpad_ec_try_read_row(&ec_accel_args, &data);
+ 	else
+@@ -105,20 +107,24 @@ static int __hdaps_update(int fast)
+ 	if (ret)
+ 		return ret;
+ 
++	/* Check status: */
++	if (data.val[EC_ACCEL_IDX_RETVAL] != 0x00) {
++		printk(KERN_WARNING "hdaps: read RETVAL=0x%02x\n",
++		       data.val[EC_ACCEL_IDX_RETVAL]);
++		return -EIO;
++	}
++
++	if (data.val[EC_ACCEL_IDX_READOUTS] < 1)
++		return -EBUSY; /* no pending readout, try again later */
++
+ 	/* Parse position data: */
+ 	pos_x = *(s16*)(data.val+EC_ACCEL_IDX_XPOS1);
+ 	pos_y = *(s16*)(data.val+EC_ACCEL_IDX_YPOS1);
+ 	transform_axes(&pos_x, &pos_y);
+ 
+-	/* Parse so-called "variance" data: */
+-	var_x = *(s16*)(data.val+EC_ACCEL_IDX_XPOS2);
+-	var_y = *(s16*)(data.val+EC_ACCEL_IDX_YPOS2);
+-	transform_axes(&var_x, &var_y);
+-
+ 	km_activity = data.val[EC_ACCEL_IDX_KMACT];
+ 
+-	temp1 = data.val[EC_ACCEL_IDX_TEMP1];
+-	temp2 = data.val[EC_ACCEL_IDX_TEMP2];
++	temperature = data.val[EC_ACCEL_IDX_TEMP1];
+ 
+ 	return 0;
+ }
+@@ -128,15 +134,25 @@ static int __hdaps_update(int fast)
+  *
+  * Query current accelerometer state and update global state variables.
+  * Also prefetches the next query.
++ * Retries until timeout if the accelerometer is not in ready status (common).
+  * Does its own locking.
+  */
+ static int hdaps_update(void)
+ {
+-	int ret = thinkpad_ec_lock();
+-	if (ret)
+-		return ret;
+-	ret = __hdaps_update(0);
+-	thinkpad_ec_unlock();
++	int total, ret;
++	for (total=0; total<READ_TIMEOUT_MSECS; total+=RETRY_MSECS) {
++		ret = thinkpad_ec_lock();
++		if (ret)
++			return ret;
++		ret = __hdaps_update(0);
++		thinkpad_ec_unlock();
++
++		if (!ret)
++			return 0;
++		if (ret != -EBUSY)
++			break;
++		msleep(RETRY_MSECS);
++	}
+ 	return ret;
+ }
+ 
+@@ -303,31 +319,13 @@ static ssize_t hdaps_position_show(struc
+ 	return sprintf(buf, "(%d,%d)\n", pos_x, pos_y);
+ }
+ 
+-static ssize_t hdaps_variance_show(struct device *dev,
+-				   struct device_attribute *attr, char *buf)
+-{
+-	int ret = hdaps_update();
+-	if (ret)
+-		return ret;
+-	return sprintf(buf, "(%d,%d)\n", var_x, var_y);
+-}
+-
+ static ssize_t hdaps_temp1_show(struct device *dev,
+ 				struct device_attribute *attr, char *buf)
+ {
+ 	int ret = hdaps_update();
+ 	if (ret)
+ 		return ret;
+-	return sprintf(buf, "%u\n", temp1);
+-}
+-
+-static ssize_t hdaps_temp2_show(struct device *dev,
+-				struct device_attribute *attr, char *buf)
+-{
+-	int ret = hdaps_update();
+-	if (ret)
+-		return ret;
+-	return sprintf(buf, "%u\n", temp2);
++	return sprintf(buf, "%d\n", temperature);
+ }
+ 
+ static ssize_t hdaps_keyboard_activity_show(struct device *dev,
+@@ -380,9 +378,8 @@ static ssize_t hdaps_invert_store(struct
+ }
+ 
+ static DEVICE_ATTR(position, 0444, hdaps_position_show, NULL);
+-static DEVICE_ATTR(variance, 0444, hdaps_variance_show, NULL);
+ static DEVICE_ATTR(temp1, 0444, hdaps_temp1_show, NULL);
+-static DEVICE_ATTR(temp2, 0444, hdaps_temp2_show, NULL);
++  /* "temp1" instead of "temperature" is hwmon convention */
+ static DEVICE_ATTR(keyboard_activity, 0444, hdaps_keyboard_activity_show, NULL);
+ static DEVICE_ATTR(mouse_activity, 0444, hdaps_mouse_activity_show, NULL);
+ static DEVICE_ATTR(calibrate, 0644, hdaps_calibrate_show,hdaps_calibrate_store);
+@@ -390,9 +387,7 @@ static DEVICE_ATTR(invert, 0644, hdaps_i
+ 
+ static struct attribute *hdaps_attributes[] = {
+ 	&dev_attr_position.attr,
+-	&dev_attr_variance.attr,
+ 	&dev_attr_temp1.attr,
+-	&dev_attr_temp2.attr,
+ 	&dev_attr_keyboard_activity.attr,
+ 	&dev_attr_mouse_activity.attr,
+ 	&dev_attr_calibrate.attr,
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+More majordomo info at  
+http://vger.kernel.org/majordomo-info.html
+Please read the FAQ at  
+http://www.tux.org/lkml/

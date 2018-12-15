@@ -1,0 +1,210 @@
+Date: Fri, 5 Mar 1999 20:46:51 +0100 (CET)
+From: Andrea Arcangeli <>
+Subject: Re: select()/socket has problems under 2.2.x.
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/3/5/103
+
+On Fri, 5 Mar 1999, Frederick (Rick) A Niles wrote:
+>Andrea's patch only seemed to make the problem twice as bad. :)
+I know it was bogus and was only a late-night (to tired to really
+think at what was doing ;) guess.
+Please apply this patch and you'll get the thing fixed. The thing was
+completly select unrelated. It was the receiver that wasn't able to queue
+incoming data. It wasn't able to read packets from the network due a
+rcvbuf < of the truesize of the skbuff.
+Here a snapshot of my fix (the diff is against 2.2.2_arca8.gz) just to
+show to DaveM the interesting changes I did to fix the bug (but it will
+not apply cleanly to 2.2.2 so apply the second down instead):
+Index: tcp_input.c
+===================================================================
+RCS file: /var/cvs/linux/net/ipv4/tcp_input.c,v
+retrieving revision 1.1.2.18
+diff -u -r1.1.2.18 tcp_input.c
+--- tcp_input.c	1999/03/05 18:07:03	1.1.2.18
++++ tcp_input.c	1999/03/05 19:44:30
+@@ -56,8 +56,12 @@
+  *		Andi Kleen:		Process packets with PSH set in the
+  *					fast path.
+  *		Andrea Arcangeli:	TCP_NODELAY disable delacks.
+- *		Andrea Arcangeli:	Delay also the first ack to be able
+- *					to join the ack in the first data packet.
++ *		Andrea Arcangeli:	Delay also the first ack to be able to
++ *					join the ack in the first data packet.
++ *		Andrea Arcangeli:	Always queue a packet from the other
++ *					end if all receive queues are empty,
++ *					this avoid the receiver to deadlock
++ *					if rcvbuf < packet truesize.
+  */
+ 
+ #include <linux/config.h>
+@@ -1486,7 +1490,8 @@
+ 	 *	Make sure to do this before moving snd_nxt, otherwise
+ 	 *	data might be acked for that we don't have enough room.
+ 	 */
+-	if (atomic_read(&sk->rmem_alloc) > sk->rcvbuf) { 
++	if (!sock_rspace(sk) && (skb_queue_len(&sk->receive_queue) ||
++				 skb_queue_len(&tp->out_of_order_queue))) { 
+ 		if (prune_queue(sk) < 0) { 
+ 			/* Still not enough room. That can happen when
+ 			 * skb->true_size differs significantly from skb->len.
+@@ -1825,7 +1830,9 @@
+ 				goto discard;
+ 			}
+ 		} else if (TCP_SKB_CB(skb)->ack_seq == tp->snd_una &&
+-			   atomic_read(&sk->rmem_alloc) <= sk->rcvbuf) {
++			   (sock_rspace(sk) ||
++			    (!skb_queue_len(&sk->receive_queue) &&
++			     !skb_queue_len(&tp->out_of_order_queue)))) {
+ 			/* Bulk data transfer: receiver */
+ 			__skb_pull(skb,th->doff*4);
+ 
+And here down the patch I ask you to try out and confirm that fix
+everything for you. This second my patch is against clean 2.2.2 and it's
+the diff between my current tree and 2.2.2. It includes also DaveM
+Solaris-workaround:
+Index: tcp_input.c
+===================================================================
+RCS file: /var/cvs/linux/net/ipv4/tcp_input.c,v
+retrieving revision 1.1.1.6
+diff -u -r1.1.1.6 tcp_input.c
+--- tcp_input.c	1999/02/23 16:48:26	1.1.1.6
++++ linux/net/ipv4/tcp_input.c	1999/03/05 19:44:30
+@@ -55,6 +55,13 @@
+  *					work without delayed acks. 
+  *		Andi Kleen:		Process packets with PSH set in the
+  *					fast path.
++ *		Andrea Arcangeli:	TCP_NODELAY disable delacks.
++ *		Andrea Arcangeli:	Delay also the first ack to be able to
++ *					join the ack in the first data packet.
++ *		Andrea Arcangeli:	Always queue a packet from the other
++ *					end if all receive queues are empty,
++ *					this avoid the receiver to deadlock
++ *					if rcvbuf < packet truesize.
+  */
+ 
+ #include <linux/config.h>
+@@ -99,12 +106,11 @@
+ 	if(tp->ato == 0) {
+ 		tp->lrcvtime = jiffies;
+ 
+-		/* Help sender leave slow start quickly,
+-		 * and also makes sure we do not take this
+-		 * branch ever again for this connection.
++		/*
++		 * Don't enter quickack mode to be able to join the first
++		 * ack with a data packet. -arca
+ 		 */
+-		tp->ato = 1;
+-		tcp_enter_quickack_mode(tp);
++		tp->ato = (HZ+49)/50;
+ 	} else {
+ 		int m = jiffies - tp->lrcvtime;
+ 
+@@ -135,9 +141,9 @@
+ 	 */
+ 	if(th->psh && (skb->len < (tp->mss_cache >> 1))) {
+ 		/* Preserve the quickack state. */
+-		if((tp->ato & 0x7fffffff) > HZ/50)
++		if((tp->ato & 0x7fffffff) > (HZ+49)/50)
+ 			tp->ato = ((tp->ato & 0x80000000) |
+-				   (HZ/50));
++				   ((HZ+49)/50));
+ 	}
+ } 
+ 
+@@ -241,7 +247,7 @@
+ extern __inline__ int tcp_paws_discard(struct tcp_opt *tp, struct tcphdr *th, unsigned len)
+ {
+ 	/* ts_recent must be younger than 24 days */
+-	return (((jiffies - tp->ts_recent_stamp) >= PAWS_24DAYS) ||
++	return (((s32)(jiffies - tp->ts_recent_stamp) >= PAWS_24DAYS) ||
+ 		(((s32)(tp->rcv_tsval-tp->ts_recent) < 0) &&
+ 		 /* Sorry, PAWS as specified is broken wrt. pure-ACKs -DaveM */
+ 		 (len != (th->doff * 4))));
+@@ -1484,7 +1490,8 @@
+ 	 *	Make sure to do this before moving snd_nxt, otherwise
+ 	 *	data might be acked for that we don't have enough room.
+ 	 */
+-	if (atomic_read(&sk->rmem_alloc) > sk->rcvbuf) { 
++	if (!sock_rspace(sk) && (skb_queue_len(&sk->receive_queue) ||
++				 skb_queue_len(&tp->out_of_order_queue))) { 
+ 		if (prune_queue(sk) < 0) { 
+ 			/* Still not enough room. That can happen when
+ 			 * skb->true_size differs significantly from skb->len.
+@@ -1580,7 +1587,9 @@
+ 	    /* We entered "quick ACK" mode or... */
+ 	    tcp_in_quickack_mode(tp) ||
+ 	    /* We have out of order data */
+-	    (skb_peek(&tp->out_of_order_queue) != NULL)) {
++	    (skb_peek(&tp->out_of_order_queue) != NULL) ||
++	    /* TCP_NODELAY is set */
++	    sk->nonagle == 1) {
+ 		/* Then ack it now */
+ 		tcp_send_ack(sk);
+ 	} else {
+@@ -1821,7 +1830,9 @@
+ 				goto discard;
+ 			}
+ 		} else if (TCP_SKB_CB(skb)->ack_seq == tp->snd_una &&
+-			   atomic_read(&sk->rmem_alloc) <= sk->rcvbuf) {
++			   (sock_rspace(sk) ||
++			    (!skb_queue_len(&sk->receive_queue) &&
++			     !skb_queue_len(&tp->out_of_order_queue)))) {
+ 			/* Bulk data transfer: receiver */
+ 			__skb_pull(skb,th->doff*4);
+ 
+Index: tcp_output.c
+===================================================================
+RCS file: /var/cvs/linux/net/ipv4/tcp_output.c,v
+retrieving revision 1.1.1.5
+diff -u -r1.1.1.5 tcp_output.c
+--- tcp_output.c	1999/02/23 16:48:26	1.1.1.5
++++ linux/net/ipv4/tcp_output.c	1999/03/02 16:53:50
+@@ -580,6 +580,19 @@
+ 	if(tp->af_specific->rebuild_header(sk))
+ 		return 1; /* Routing failure or similar. */
+ 
++	/* Solaris sucks. */
++	if(skb->len > 0 &&
++	   (TCP_SKB_CB(skb)->flags & TCPCB_FLAG_FIN) &&
++	   tp->snd_una == (TCP_SKB_CB(skb)->end_seq - 1)) {
++#if 1
++		printk("TCP: Doing Solaris hack for [%p:%08x:%04x:%08x]\n",
++		       skb, sk->daddr, sk->dport, tp->snd_una);
++#endif
++		TCP_SKB_CB(skb)->seq = TCP_SKB_CB(skb)->end_seq - 1;
++		skb_trim(skb, 0);
++		skb->csum = 0;
++	}
++
+ 	/* Ok, we're gonna send it out, update state. */
+ 	TCP_SKB_CB(skb)->sacked |= TCPCB_SACKED_RETRANS;
+ 	tp->retrans_out++;
+@@ -973,6 +986,8 @@
+ 	timeout = tp->ato;
+ 	if (timeout > max_timeout)
+ 		timeout = max_timeout;
++	if (timeout < (HZ+49)/50)
++		timeout = (HZ+49)/50;
+ 	timeout += jiffies;
+ 
+ 	/* Use new timeout only if there wasn't a older one earlier. */
+@@ -980,7 +995,7 @@
+ 		tp->delack_timer.expires = timeout;
+ 		add_timer(&tp->delack_timer);
+         } else {
+-		if (timeout < tp->delack_timer.expires)
++		if (time_before(timeout, tp->delack_timer.expires))
+ 			mod_timer(&tp->delack_timer, timeout);
+ 	}
+ }
+Comments?
+Andrea Arcangeli
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

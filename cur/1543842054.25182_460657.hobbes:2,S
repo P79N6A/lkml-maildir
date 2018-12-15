@@ -1,0 +1,1186 @@
+Date: Tue, 5 Sep 2006 14:38:39 -0400
+From: "Kimball Murray" <>
+Subject: Re: [Feature] x86_64 page tracking for Stratus servers
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2006/9/5/194
+
+Hi Arjan,
+Unfortunately, our situation has not changed much, so I feel this may
+be a replay of the last time you asked.  One of our modules is GPL,
+and that is the one that implements the page tracking.  It's fairly
+large because it also provides PCI hotplug functionality and other
+things for our platform.
+As before, Stratus would not object to providing all kernel modules as
+GPL, but still our problem is that there is some code that reflects
+some of our chipset vendor's proprietary information, so they won't
+allow us to release it under GPL.  So the best we can do under those
+circumstances is to mimic something like the NVIDIA driver model to
+satisfy our chipset vendors.
+The file that implements the page tracking is called harvest.c, and is
+part of the GPL module.  I have attached the code, in its
+developmental form (so please pardon the #Ifdef's).  The entry point
+for the page tracking is the routine fosil_synchronize_memory.
+At 1400 lines, I should probably find a server to make this available.
+ But not having one at the moment, please forgive the attachment.
+-kimball
+On 9/5/06, Arjan van de Ven <arjan@infradead.org> wrote:
+> On Tue, 2006-09-05 at 13:34 -0400, Kimball Murray wrote:
+> > Attached is a git patch that implements a feature that is used by Stratus
+> > fault-tolerant servers running on Intel x86_64 platforms.  It provides the
+> > kernel mechanism that allows a loadable module to be able to keep track of
+> > recently dirtied pages for the purpose of copying live, currently active
+> > memory, to a spare memory module.
+>
+>
+> last time this came up, your module wasn't open source.... has that
+> changed since?
+> Maybe you should just post it...
+>
+>
+>
+>
+/*
+ * Low-level routines for memory mirroring.  Tracks dirty pages and
+ * utilizes provided copy routine to transfer pages which have changed
+ * between harvest passes.
+ *
+ * Copyright (C) 2006 Stratus Technologies Bermuda Ltd.
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+ */
+#include "fosil.h"
+#include "syncd.h"
+#include "harvest.h"
+#include "smallpmd.h"
+/*
+ * The following ifdef allows harvest to be built against a kernel
+ * which does not implement memory tracking.
+ */
+#ifdef CONFIG_TRACK_DIRTY_PAGES
+#include <linux/interrupt.h>
+#include <linux/mm.h>
+#include <linux/vmalloc.h>
+#include <linux/highmem.h>
+#include <asm/io.h>
+#include <asm/atomic.h>
+#include <asm/tlb.h>
+#include <asm/uaccess.h>
+#define HARVEST_BY_TABLE 1
+#define SMP_HARVEST 1
+//#define USE_SMALL_PMD	1
+#define USE_TASK_HARVEST	1
+#define MAX_COPYRANGE	100	/* this is actually defined in cc/host.h */
+#define MB (1024*1024)
+#define NEARBY		6
+#ifdef CONFIG_X86_PAE
+typedef unsigned long long paddr_t;	/* physical address type */
+#define PADDR_FMT "%09lx"		/* printf format for paddr_t */
+#else
+typedef unsigned long paddr_t;		/* physical address type */
+#define PADDR_FMT "%08lx"		/* printf format for paddr_t */
+#endif
+enum {
+	DBGLVL_NONE     = 0x00,
+	DBGLVL_HARVEST  = 0x01,
+	DBGLVL_BROWNOUT = 0x02,
+	DBGLVL_TIMER    = 0x04,
+};
+static int dbgmask = DBGLVL_NONE;
+#define DBGPRNT(lvl, args...)			\
+({						\
+	if (lvl & dbgmask)			\
+		printk(args);			\
+})
+enum {
+	IN_BROWNOUT = 0,
+	IN_BLACKOUT = 1,
+};
+struct timer_set {
+	unsigned long long before;
+	unsigned long long after;
+};
+struct syncd_data {
+	unsigned long flags[NR_CPUS];
+	copy_proc copy;
+	sync_proc sync;
+	void * context;
+	is_pfn_valid_proc is_pfn_valid;
+	is_pfnrange_valid_proc is_pfnrange_valid;
+	int status;		// return status from command inside blackout
+	int max_range;		// # of valid ranges in following CopyRange
+	fosil_page_range_t CopyRange[MAX_COPYRANGE];
+	unsigned long nearby;	// insert merge tunable
+	unsigned int  duration_in_ms;	// blackout during
+	unsigned long bitcnt;	// number of bits find in last harvest
+	int blackout;		// 1 == blackout, 0 == brownout
+	int pass;		// # of times through harvest/process cycle
+	int done;		// 1 == done - time to leave
+	unsigned int threshold;	// number of dirty pages before sync
+	atomic_t r;
+};
+#ifdef HARVEST_BY_TABLE
+void harvest_table(pgd_t * pgd_base, unsigned long start, unsigned long end)
+{
+	unsigned long i, j, k, l;
+	pgd_t *pgd;
+	unsigned long pgd_start, pgd_end;
+	unsigned long pud_start, pud_end;
+	unsigned long pmd_start, pmd_end;
+	unsigned long pte_start, pte_end;
+	unsigned long pud_last;
+	unsigned long pmd_last;
+	unsigned long pte_last;
+	/*
+	 * end marks the first byte after the upper limit of the address
+	 * range
+	 */
+	end--;
+	if (!pgd_base) {
+		printk("%s: null pgd?\n", __func__);
+		return;
+	}
+	pgd_start = pgd_index(start);
+	pgd_end = pgd_index(end);
+	pud_start = pud_index(start);
+	pud_end = pud_index(end);
+	pmd_start = pmd_index(start);
+	pmd_end = pmd_index(end);
+	pte_start = pte_index(start);
+	pte_end = pte_index(end);
+	pgd = pgd_base + pgd_start;
+	for (i = pgd_start; i <= pgd_end; i++, pgd++) {
+		pud_t *pud;
+		if (pgd_none(*pgd) || !pgd_present(*pgd))
+			continue;
+		if (i == pgd_start)
+			j = pud_start;
+		else
+			j = 0;
+		pud = pud_offset(pgd, 0) + j;
+		if (i == pgd_end)
+			pud_last = pud_end;
+		else
+			pud_last = PTRS_PER_PUD - 1;
+		for (; j <= pud_last; j++, pud++) {
+			pmd_t *pmd;
+			unsigned long addr;
+			pud_t tmp_pud = *pud;
+			addr = i << PGDIR_SHIFT;
+			addr += j << PUD_SHIFT;
+			if (pud_none(tmp_pud) || !pud_present(tmp_pud))
+				continue;
+			if ((i == pgd_start) && (j == pud_start))
+				k = pmd_start;
+			else
+				k = 0;
+			pmd = pmd_offset(pud, 0) + k;
+			if ((i == pgd_end) && (j == pud_end))
+				pmd_last = pmd_end;
+			else
+				pmd_last = PTRS_PER_PMD - 1;
+			for (; k <= pmd_last; k++, pmd++) {
+				pte_t *pte;
+				pmd_t tmp_pmd = *pmd;
+				addr += k << PMD_SHIFT;
+				if (pmd_none(tmp_pmd) || !pmd_present(tmp_pmd))
+					continue;
+				
+				if (pmd_large(tmp_pmd)) {
+					if (pmd_val(tmp_pmd) & _PAGE_DIRTY) {
+						pmd_val(tmp_pmd) &= ~_PAGE_DIRTY;
+						pmd_val(tmp_pmd) |= _PAGE_SOFTDIRTY;
+						mm_track_pmd(pmd);
+					}
+				}
+				if (pmd_val(tmp_pmd) != pmd_val(*pmd)) {
+					*pmd = tmp_pmd;
+					if (pmd_val(tmp_pmd) & _PAGE_GLOBAL)
+						__flush_tlb_global();
+					else
+						__flush_tlb_one(addr);
+					mm_track_phys((void*)virt_to_phys(pmd));
+				}
+				if (pmd_large(tmp_pmd))
+					continue;
+				if ((i == pgd_start) && (j == pud_start) && (k == pmd_start))
+					l = pte_start;
+				else
+					l = 0;
+				pte = pte_offset_kernel(pmd, 0) + l;
+				if ((i == pgd_end) && (j == pud_end) && (k == pmd_end))
+					pte_last = pte_end;
+				else
+					pte_last = PTRS_PER_PTE - 1;
+				for (; l <= pte_last; l++, pte++) {
+					unsigned long addr_pte = addr + (k << PAGE_SHIFT);
+					pte_t tmp_pte = *pte;
+					if (pte_val(tmp_pte) & _PAGE_DIRTY) {
+						pte_val(tmp_pte) &= ~_PAGE_DIRTY;
+						pte_val(tmp_pte) |= _PAGE_SOFTDIRTY;
+						mm_track_pte(pte);
+					}
+					if (pte_val(tmp_pte) != pte_val(*pte)) {
+						*pte = tmp_pte;
+						if (pte_val(tmp_pte) & _PAGE_GLOBAL)
+							__flush_tlb_global();
+						else
+							__flush_tlb_one(addr_pte);
+						mm_track_phys((void*)virt_to_phys(pte));
+					}
+				}
+			}
+		}
+	}
+}
+#else
+static void harvest_page(pgd_t * pgd_base, unsigned long addr)
+{
+	// for all pages in this vm_area_struct
+	pgd_t *pgd;
+	pmd_t *pmd;
+	pte_t *pte;
+	DBGPRNT(DBGLVL_HARVEST, "pgd_base %p + offset %ld\n",
+		pgd_base, pgd_index(addr));
+	DBGPRNT(DBGLVL_HARVEST, "    pgd[0] %09lx\n", pgd_val(pgd_base[0]));
+	DBGPRNT(DBGLVL_HARVEST, "    pgd[1] %09lx\n", pgd_val(pgd_base[1]));
+	DBGPRNT(DBGLVL_HARVEST, "    pgd[2] %09lx\n", pgd_val(pgd_base[2]));
+	DBGPRNT(DBGLVL_HARVEST, "    pgd[3] %09lx\n", pgd_val(pgd_base[3]));
+	pgd = pgd_base + pgd_index(addr);
+	if (pgd_none(*pgd))
+		return;
+	if (!pgd_present(*pgd))
+		return;
+	pmd = pmd_offset(pgd, addr);
+	DBGPRNT(DBGLVL_HARVEST, "        pmd[%ld] %p is %lx\n",
+		pmd_index(addr), pmd, pmd_val(*pmd));
+	if (pmd_none(*pmd))
+		return;
+	if (!pmd_present(*pmd))
+		return;
+	// large pages
+	if (pmd_large(*pmd)) {
+		if ((pmd_val(*pmd) & _PAGE_DIRTY) == 0)
+			return;
+		mm_track_pmd(pmd);
+		pmd_val(*pmd) &= ~_PAGE_DIRTY;
+		pmd_val(*pmd) |= _PAGE_SOFTDIRTY;
+		return;
+	}
+	if (addr < PAGE_OFFSET)
+		pte = pte_offset_map(pmd, addr);
+	else
+		pte = pte_offset_kernel(pmd, addr);
+	DBGPRNT(DBGLVL_HARVEST, "            page table %lx\n",
+		pmd_val(*pmd) & PAGE_MASK);
+	DBGPRNT(DBGLVL_HARVEST, "            pte[%ld] %p is %lx\n",
+		pte_index(addr), pte, pte_val(*pte));
+	if (pte_none(*pte) || !pte_present(*pte))
+		goto out_unmap_pte;
+	if (!(pte_val(*pte) & _PAGE_DIRTY))
+		goto out_unmap_pte;
+	mm_track_pte(pte);
+	pte_val(*pte) &= ~_PAGE_DIRTY;
+	pte_val(*pte) |= _PAGE_SOFTDIRTY;
+	DBGPRNT(DBGLVL_HARVEST, "a           pte[%ld] %p is %lx\n",
+		pte_index(addr), pte, pte_val(*pte));
+out_unmap_pte:
+	if (addr < PAGE_OFFSET)
+		pte_unmap(pte);
+	return;
+}
+#endif
+static pgd_t *get_pgd(unsigned long address) {
+#if 0
+        pgd_t *pgd;
+        asm volatile("movq %%cr3,%0" : "=r" (pgd));
+        pgd = __va((unsigned long)pgd & PHYSICAL_PAGE_MASK);
+        pgd += pgd_index(address);
+        if (!pgd_present(*pgd)) {
+		printk("%s-KAM: pgd not present (%p)\n", __func__,
+			(void*)(pgd_val(*pgd)));
+		return NULL;
+	}
+	if (pgd != init_level4_pgt)
+		printk("%s: got %p, but init_level4_pgt is %p\n", __func__,
+			pgd, init_level4_pgt);
+	return pgd;
+#else
+	return init_level4_pgt;
+#endif
+}
+/*
+ * Traverse the kernel page tables, but don't use the
+ * loop-over-all-kernel-address technique, as that
+ * takes one fourth of forever on a 64-bit machine.
+ * Instead, iterate over the page tables themselves,
+ * starting with the pgd table.  This will be a quadruple-
+ * nested loop,  relying on p[ml4/gd/md/te]_none checks
+ * for early-outs in the loops.
+ * Be nice to find a useful way to SMP-ify this traversal,
+ * but so far haven't found a way.
+ */
+static void harvest_kernel(void)
+{
+	unsigned long n, i, j, k;
+	pgd_t *pgd_0 = get_pgd(0);
+	pgd_t *pgd = get_pgd(PAGE_OFFSET);
+	if (!pgd_0) {
+		printk("%s: null pgd_0\n", __func__);
+		return;
+	}
+	if (!pgd) {
+		printk("%s: null pgd\n", __func__);
+		return;
+	}
+	// Skip addrs < PAGE_OFFSET
+	for (n = pgd - pgd_0; n < PTRS_PER_PGD; n++, pgd++) {
+		pud_t *pud;
+		if (pgd_none(*pgd) || !pgd_present(*pgd))
+			continue;
+		pud = pud_offset(pgd, 0);
+		if (!pud) {
+			printk("%s: null pud?\n", __func__);
+			return;
+		}
+		mm_track_phys((void*)virt_to_phys(pud));
+		
+		for (i = 0; i < PTRS_PER_PUD; i++, pud++) {
+			pmd_t *pmd;
+			if (pud_none(*pud) || !pud_present(*pud))
+				continue;
+			pmd = pmd_offset(pud, 0);
+			for (j = 0; j < PTRS_PER_PMD; j++, pmd++) {
+				pte_t *pte;
+				pmd_t tmp_pmd = *pmd;
+				unsigned long addr;
+				addr = n << PGDIR_SHIFT;
+				addr += i << PUD_SHIFT;
+				addr += j << PMD_SHIFT;
+				if (pmd_none(tmp_pmd) || !pmd_present(tmp_pmd))
+					continue;
+				if (pmd_large(tmp_pmd)) {
+					if (pmd_val(tmp_pmd) & _PAGE_DIRTY) {
+						pmd_val(tmp_pmd) &= ~_PAGE_DIRTY;
+						pmd_val(tmp_pmd) |= _PAGE_SOFTDIRTY;
+						mm_track_pmd(pmd);
+					}
+				}
+				if (pmd_val(tmp_pmd) != pmd_val(*pmd)) {
+					*pmd = tmp_pmd;
+					if (pmd_val(tmp_pmd) & _PAGE_GLOBAL)
+						__flush_tlb_global();
+					else
+						__flush_tlb_one(addr);
+					mm_track_phys((void*)virt_to_phys(pmd));
+				}
+				if (pmd_large(tmp_pmd))
+					continue;
+				pte = pte_offset_kernel(pmd, 0);
+				for (k = 0; k < PTRS_PER_PTE; k++, pte++) {
+					unsigned long addr_pte = addr + (k << PAGE_SHIFT);
+					pte_t tmp_pte = *pte;
+					if (pte_none(tmp_pte) || !pte_present(tmp_pte))
+						continue;
+					if (pte_val(tmp_pte) & _PAGE_DIRTY) {
+						pte_val(tmp_pte) &= ~_PAGE_DIRTY;
+						pte_val(tmp_pte) |= _PAGE_SOFTDIRTY;
+						mm_track_pte(pte);
+					}
+					if (pte_val(tmp_pte) != pte_val(*pte)) {
+						*pte = tmp_pte;
+						if (pte_val(tmp_pte) & _PAGE_GLOBAL)
+							__flush_tlb_global();
+						else
+							__flush_tlb_one(addr_pte);
+						mm_track_phys((void*)virt_to_phys(pte));
+					}
+				}
+			}
+		}
+	}
+}
+static unsigned long map_kernel_small_pmd(void * __attribute__ ((unused)) unused_arg)
+{
+#ifdef USE_SMALL_PMD
+	small_pmd_enter();
+#endif
+	return 0;
+}
+static unsigned long map_kernel_orig_pmd(void * __attribute__ ((unused)) unused_arg)
+{
+#ifdef USE_SMALL_PMD
+	small_pmd_leave();
+#endif
+	return 0;
+}
+#ifdef USE_TASK_HARVEST
+static void harvest_mm(struct mm_struct *mm) {
+	struct vm_area_struct * mmap, * vma;
+	vma = mmap = mm->mmap;
+	if (!mmap)
+		return;
+	do {
+		unsigned long start, end;
+		if (!vma)
+			break;
+		start = vma->vm_start;
+		end   = vma->vm_end;
+#ifdef HARVEST_BY_TABLE
+		harvest_table(mm->pgd, start, end);
+#else
+		for (addr = start; addr <= end; addr += PAGE_SIZE)
+			harvest_page(mm->pgd, addr);
+#endif
+	} while ((vma = vma->vm_next) != mmap);
+}
+static void harvest_user(void)
+{
+	struct task_struct *p;
+	int task_count = 0;
+	int this_cpu = smp_processor_id();
+	int num_cpus = num_online_cpus();
+	for_each_process(p) {
+		struct mm_struct *mm = p->mm;
+#ifdef SMP_HARVEST
+		if (this_cpu != (task_count++ % num_cpus))
+			continue;
+#endif
+		if (!mm)
+			continue;
+		harvest_mm(mm);
+	}
+}
+#else
+static void harvest_user(void)
+{
+	struct list_head * m = NULL;
+	struct mm_struct * mmentry;
+	struct vm_area_struct * mmap, * vma;
+#ifndef HARVEST_BY_TABLE
+	unsigned long addr;
+#endif
+	int num_cpus = num_online_cpus();
+	int this_cpu = smp_processor_id();
+	int pgd_count = 0;
+	m = &init_mm.mmlist;
+	do {
+		mmentry = list_entry(m, struct mm_struct, mmlist);
+		m = m->next;
+		vma = mmap = mmentry->mmap;
+		if (!mmap)
+			continue;
+#ifdef SMP_HARVEST
+		if (this_cpu != (pgd_count++ % num_cpus))
+			continue;
+#endif
+		do {
+			unsigned long start, end;
+			if (!vma)
+				break;
+			start = vma->vm_start;
+			end   = vma->vm_end;
+#ifdef HARVEST_BY_TABLE
+			harvest_table(mmentry->pgd, start, end);
+#else
+			for (addr = start; addr <= end; addr += PAGE_SIZE)
+				harvest_page(mmentry->pgd, addr);
+#endif
+		} while ((vma = vma->vm_next) != mmap);
+	} while (m != &init_mm.mmlist);
+}
+#endif
+#define VIRT_TO_PFN(pfn) (virt_to_phys(pfn) >> PAGE_SHIFT)
+#define TEST_BIT(x, pfn, vector)				\
+({								\
+	int retval;						\
+								\
+	if (x->blackout)					\
+		retval = test_bit(pfn, vector);			\
+	else							\
+		retval = test_and_clear_bit(pfn, vector);	\
+								\
+	retval;							\
+})
+static void process_vector(void * arg)
+{
+	struct syncd_data * x = (struct syncd_data *) arg;
+	unsigned long pfn;
+	unsigned long start_pfn, runlength;
+	// traverse the the bitmap looking for dirty pages
+	runlength = 0;
+	start_pfn = 0;
+	for (pfn = 0; pfn < mm_tracking_struct.bitcnt; pfn++) {
+		if (TEST_BIT(x, pfn, mm_tracking_struct.vector)) {
+			if (!(x->blackout))
+				atomic_dec(&mm_tracking_struct.count);
+		    	if (x->is_pfn_valid(pfn)) {
+				if (runlength == 0) {
+					start_pfn = pfn;
+				}
+				runlength++;
+			} else {
+				if (runlength) {
+					x->status = x->copy(start_pfn, runlength,
+							    x->blackout, x->context);
+					if (x->status != FOSIL_ERR_OK) {
+						printk("%s: %d error (%d), start_pfn %lx, runlength %lx\n",
+							__FUNCTION__, __LINE__,
+							x->status,
+							start_pfn,
+							runlength);
+						return;
+					}
+				}
+				start_pfn = runlength = 0;
+			}
+		} else if (runlength) {
+			x->status = x->copy(start_pfn, runlength,
+					    x->blackout, x->context);
+			if (x->status != FOSIL_ERR_OK) {
+				printk("%s: %d error (%d), start_pfn %lx, runlength %lx\n",
+					__FUNCTION__, __LINE__,
+					x->status,
+					start_pfn,
+					runlength);
+				return;
+			}
+			start_pfn = runlength = 0;
+		}
+	}
+	// Catch the last ones.
+	if (runlength) {
+		x->status = x->copy(start_pfn, runlength,
+				    x->blackout, x->context);
+		if (x->status != FOSIL_ERR_OK) {
+			printk("%s: %d\n", __FUNCTION__, __LINE__);
+			return;
+		}
+	}
+}
+static void enable_tracking(void)
+{
+	// initialize tracking structure
+	atomic_set(&mm_tracking_struct.count, 0);
+	memset(mm_tracking_struct.vector, 0, mm_tracking_struct.bitcnt/8);
+        // turn on tracking
+        mm_tracking_struct.active = 1;
+}
+static void disable_tracking(void)
+{
+	// turn off tracking
+	mm_tracking_struct.active = 0;
+}
+/*
+ * Difference or zero
+ *
+ *  d <- (x - y), x >= y
+ *	    0	, x < y
+ */
+unsigned long
+doz(unsigned long x, unsigned long y)
+{
+	if (x < y)
+		return 0;
+	return x - y;
+}
+/*
+ * Merge closest two regions to free up one slot in table.
+ */
+int
+merge(struct syncd_data * x)
+{
+	int i, ii;
+	unsigned long delta, ndelta;
+	unsigned long end;
+	fosil_page_range_t * cr = x->CopyRange;
+	i = 0;
+	ii = ~0;
+	delta = ~0UL;
+	do {
+		end = cr[i].start + cr[i].num - 1;
+		ndelta = cr[i+1].start - end;
+		if (!x->is_pfnrange_valid(end, cr[i+1].start))
+			continue;
+		if (ndelta <= delta) {
+			delta = ndelta;
+			ii = i;
+		}
+	} while (i++ < (x->max_range - 1));
+	if (ii == ~0)
+		return 1;
+	cr[ii].num = (cr[ii+1].start + cr[ii+1].num) - cr[ii].start;
+	// shift everyone down
+	x->max_range--;
+	for (i = ii + 1; i < x->max_range; i++) {
+		cr[i].start = cr[i+1].start;
+		cr[i].num   = cr[i+1].num;
+	}
+	return 0;
+}
+int
+insert_pfn(struct syncd_data * x, unsigned long pfn)
+{
+	int i;
+	int ii;
+	fosil_page_range_t * cr = x->CopyRange;
+	int nearby = x->nearby;
+	if (!x->is_pfn_valid(pfn))
+		return 0;
+ restart:
+	for (i = 0; i < x->max_range; i++) {
+		unsigned long start = cr[i].start;
+		unsigned long len   = cr[i].num;
+		unsigned long end   = start + len - 1;
+		// inside current region	start <= pfn <= end
+		if ((pfn - start) <= (len - 1))
+			return 0;
+		// adjacent to start		start-nearby <= pfn <= start
+		if ((pfn - doz(start, nearby)) <= start - doz(start, nearby)) {
+			cr[i].num  += (cr[i].start - pfn);
+			cr[i].start = pfn;
+			return 0;
+		}
+		// adjacent to end		end <= pfn <= end+nearby
+		if ((pfn - end) <= nearby) {
+			cr[i].num += pfn - end;
+			end += pfn - end;
+ again:
+			if (i+1 == x->max_range)
+				return 0;
+			// this range may overlap or abut next range
+			// after insert		(next.start - nearby) <= end
+			if (doz(cr[i+1].start, nearby) <= end) {
+				cr[i].num = (cr[i+1].start + cr[i+1].num)
+					- cr[i].start;
+				end = cr[i].start + cr[i].num - 1;
+				// shift everyone down
+				x->max_range--;
+				for (ii = i + 1; ii < x->max_range; ii++) {
+					cr[ii].start = cr[ii+1].start;
+					cr[ii].num   = cr[ii+1].num;
+				}
+				goto again;
+			}
+			return 0;
+		}
+		// before region	pfn < start-nearby	- OR -
+		//			!at end of array	- AND -
+		// between regions	end+nearby < pfn < next.start-nearby
+		if ((pfn < doz(start, nearby)) ||
+			((i+1 == x->max_range) &&
+			((end+nearby < pfn) &&
+			 (pfn < doz(cr[i+1].start, nearby))))) {
+			if (x->max_range == MAX_COPYRANGE) {
+				if (merge(x))
+					return 1;
+				goto restart;
+			}
+			// shift everyone up to make room
+			for (ii = x->max_range; ii > i; ii--) {
+				cr[ii].start = cr[ii-1].start;
+				cr[ii].num   = cr[ii-1].num;
+			}
+			if (pfn < doz(start, nearby))
+				ii = i;		// before region
+			else
+				ii = i + 1;	// between regions
+			cr[ii].start = pfn;
+			cr[ii].num = 1;
+			x->max_range++;
+			return 0;
+		}
+	}
+	if (x->max_range == MAX_COPYRANGE)
+		if (merge(x))
+			return 1;
+	// append to array
+	cr[x->max_range].start = pfn;
+	cr[x->max_range].num = 1;
+	x->max_range++;
+	return 0;
+}
+/*
+ * x86_64 stacks are different from i386 in that you don't get
+ * there by adding 2 pages to "current".  Instead, we'll put
+ * a dummy variable on the stack and look at its address.
+ */
+static int add_stack_pages(struct syncd_data * x) {
+	unsigned long dummy;
+	unsigned long *stack = &dummy;
+	unsigned long pfn, num_pfns;
+	int rc = 0;
+	unsigned long i;
+	pfn = (unsigned long)(virt_to_phys(stack) & ~(THREAD_SIZE - 1));
+	pfn >>= PAGE_SHIFT;
+	num_pfns = (THREAD_SIZE + (PAGE_SIZE - 1)) >> PAGE_SHIFT;
+	for (i = 0; i < num_pfns; i++, pfn++) {
+		rc = insert_pfn(x, pfn);
+		if (rc)
+			return rc;
+	}
+	return 0;
+}
+static unsigned long virt_to_pfn(void *addr) {
+	unsigned long phys = virt_to_phys(addr);
+	return phys >> PAGE_SHIFT;
+}
+/*
+ * ftmod dirties a page for OS_DEBUG prints (ringbuffer).
+ * Provide that page here, so we can track it, as it will be
+ * dirtied on the way to the sync point.
+ */
+void *fosil_scratch_page;
+EXPORT_SYMBOL_GPL(fosil_scratch_page);
+static spinlock_t *fosil_scratch_lock;
+EXPORT_SYMBOL_GPL(fosil_scratch_lock);
+/*
+ * With a fundamental knowledge of what absolutely MUST be copied
+ * by the HOST during blackout, add pfn's to the copy range list.
+ *
+ * All page tables are added to avoid having to deal with optimizing
+ * which ptes might be set dirty or accessed by the last few operations
+ * before blackout.
+ *
+ * After page tables, the remainder of the pages are our known "working
+ * set".  This includes the stack frames for this task and processor and
+ * the syncd structure (which we are making dirty by compiling this list).
+ *
+ * Finally, all pages marked as dirty in their pte's are added to the
+ * list.  These are pages which escaped the harvest/process cycles and
+ * were presumably dirtied between harvest and here.
+ */
+static int setup_blackout_copylist(struct syncd_data * x)
+{
+	pgd_t *pgd;
+	int i, j, k;
+	int n;
+	x->max_range = 0;
+	pgd = get_pgd(0);
+	if (!pgd) {
+		printk("%s: no pgd?\n", __func__);
+		return FOSIL_ERR_MERGE_FAIL;
+	}
+	if (insert_pfn(x, virt_to_pfn(pgd)))
+		return FOSIL_ERR_MERGE_FAIL;
+	for (n = 0; n < PTRS_PER_PGD; n++, pgd++) {
+		pud_t *pud;
+		if (pgd_none(*pgd) || !pgd_present(*pgd))
+			continue;
+		pud = pud_offset(pgd, 0);
+		if (insert_pfn(x, virt_to_pfn(pud)))
+			return FOSIL_ERR_MERGE_FAIL;
+		for (i = 0; i < PTRS_PER_PUD; i++, pud++) {
+			pmd_t *pmd;
+			if (pud_none(*pud) || !pud_present(*pud))
+				continue;
+			pmd = pmd_offset(pud, 0);
+			if (insert_pfn(x, virt_to_pfn(pmd)))
+				return FOSIL_ERR_MERGE_FAIL;
+			for (j = 0; j < PTRS_PER_PMD; j++, pmd++) {
+				pte_t *pte;
+				if (pmd_none(*pmd) || !pmd_present(*pmd))
+					continue;
+				if (pmd_large(*pmd)) {
+					/* Skip it if it covers an invalid area */
+					if (!x->is_pfn_valid(pmd_pfn(*pmd)))
+						continue;
+					if ((pmd_val(*pmd) & _PAGE_DIRTY)) {
+						unsigned long p, pfn = pmd_pfn(*pmd);
+						for (p = 0; p < 0x200; p++) {
+							if (insert_pfn(x, pfn + p))
+								return FOSIL_ERR_MERGE_FAIL;
+						}	
+					}
+					continue;
+				}
+				pte = pte_offset_kernel(pmd, 0);
+				if (insert_pfn(x, virt_to_pfn(pte)))
+					return FOSIL_ERR_MERGE_FAIL;
+				for (k = 0; k < PTRS_PER_PTE; k++, pte++) {
+					if (pte_none(*pte) || !pte_present(*pte))
+						continue;
+					/* Skip it if it covers an invalid area */
+					if (!x->is_pfn_valid(pte_pfn(*pte)))
+						continue;
+					if (pte_val(*pte) & _PAGE_DIRTY) {
+						if (insert_pfn(x, pte_pfn(*pte)))
+							return FOSIL_ERR_MERGE_FAIL;
+					}
+				}
+			}
+		}
+	}
+	// copy the stack we are working from 
+	if (add_stack_pages(x))
+		return FOSIL_ERR_MERGE_FAIL;
+	// add syncd structure
+	if (insert_pfn(x, virt_to_pfn(x)))
+		return FOSIL_ERR_MERGE_FAIL;
+	// add mm_tracking_struct (disable_tracking() dirtied it).
+	if (insert_pfn(x, virt_to_pfn(&mm_tracking_struct)))
+		return FOSIL_ERR_MERGE_FAIL;
+	// add the scratch page, in case ftmod wants to dirty it on the way to sync.
+	if (insert_pfn(x, virt_to_pfn(fosil_scratch_page)))
+		return FOSIL_ERR_MERGE_FAIL;
+	if (insert_pfn(x, virt_to_pfn(fosil_scratch_lock)))
+		return FOSIL_ERR_MERGE_FAIL;
+	return FOSIL_ERR_OK;
+}
+static void __attribute__ ((__unused__)) do_blackout(void * arg)
+{
+	struct syncd_data * x = (struct syncd_data *) arg;
+	fosil_page_range_t ranges[1] = {{0, ~0}};
+	x->status = x->sync(1, ranges, &x->duration_in_ms, x->context);
+}
+static unsigned long harvest(void * arg)
+{
+#ifdef SMP_HARVEST
+	struct syncd_data * x = (struct syncd_data *) arg;
+#else
+	if (smp_processor_id() != 0)
+		return 0;
+#endif
+	harvest_user();
+#ifdef SMP_HARVEST
+	rendezvous(&x->r);
+	if (smp_processor_id() == 0)
+		harvest_kernel();
+#else
+	harvest_kernel();
+#endif
+	return 0;
+}
+/*
+ * This is where all processors are sent for blackout processing.  
+ * The driving processor is diverted to work on harvest and if necessary
+ * entry to Common Code for synchronization.  All other processors are
+ * spinning in a rendezvous at the bottom of this routine waiting for
+ * the driving processor to finish.
+ */
+static unsigned long brownout_cycle(void * arg)
+{
+	struct syncd_data * x = (struct syncd_data *) arg;
+	unsigned long long before, after;
+	unsigned long delta;
+#ifndef SMP_HARVEST
+	if (smp_processor_id() != 0)
+		return 0;
+#endif
+	rdtscll(before);
+	harvest_user();
+#ifdef SMP_HARVEST
+	rendezvous(&x->r);
+	if (smp_processor_id() != 0)
+		return 0;
+#endif
+	harvest_kernel();
+	x->bitcnt = atomic_read(&mm_tracking_struct.count);
+	if ((x->bitcnt < x->threshold) || (x->pass == 0)) {
+		x->blackout = IN_BLACKOUT;
+		disable_tracking();
+		x->status = setup_blackout_copylist(x);
+		if (x->status)
+			return 0;
+		process_vector(x);
+		if (x->status)
+			return FOSIL_ERR_COPY_FAIL;
+		rdtscll(after);
+		x->status = x->sync(x->max_range,
+				    x->CopyRange,
+				    &x->duration_in_ms, x->context);
+		x->done = 1;
+		if (x->status) {
+			printk("%s: %d (%s)\n", __FUNCTION__, __LINE__,
+			       FOSIL_ERR_STRING(x->status));
+		}
+		delta = after - before;
+		return x->duration_in_ms + (delta / cpu_khz);
+	}
+	return 0;
+}
+static void roll_time_forward(unsigned long adjust_in_ms)
+{
+#if 0	// FIXME
+	struct timeval tv;
+	struct timespec ts;
+	do_gettimeofday(&tv);
+	ts.tv_sec = tv.tv_sec;
+	ts.tv_nsec = tv.tv_usec + adjust_in_ms * USEC_PER_SEC;
+	while(unlikely(ts.tv_nsec >= NSEC_PER_SEC)) {
+		ts.tv_nsec -= NSEC_PER_SEC;
+		++ts.tv_sec;
+	}
+	do_settimeofday(&ts);
+#endif
+}
+struct blackout_data {
+	atomic_t r[5];
+	unsigned int oncpu;
+	unsigned long (*func)(void *);
+	void * arg;
+};
+static void fosil_blackout(void * arg)
+{
+	struct blackout_data * x = (struct blackout_data *) arg;
+	unsigned long flags;
+	unsigned long long before, after;
+	unsigned long delta, adjust;
+	int this_cpu = smp_processor_id();
+	rendezvous(&x->r[0]);
+	local_bh_disable();
+	rendezvous(&x->r[1]);
+	local_irq_save(flags);
+	rendezvous(&x->r[2]);
+	rdtscll(before);
+	adjust = x->func(x->arg);
+	rdtscll(after);
+	if (adjust) {
+		delta = adjust;
+	} else {
+		delta = after - before;
+		delta /= cpu_khz;
+	}
+	rendezvous(&x->r[3]);
+	if (this_cpu == x->oncpu)
+		roll_time_forward(delta);
+	rendezvous(&x->r[4]);
+	local_irq_restore(flags);
+	local_bh_enable();
+}
+/*
+ * Call the specified function with the provide argument in
+ * during a blackout.
+ */
+void fosil_exec_onall(unsigned long (*func)(void *), void * arg)
+{
+	struct blackout_data x;
+	init_rendezvous(&x.r[0]);
+	init_rendezvous(&x.r[1]);
+	init_rendezvous(&x.r[2]);
+	init_rendezvous(&x.r[3]);
+	init_rendezvous(&x.r[4]);
+	x.oncpu = smp_processor_id();
+	x.func  = func;
+	x.arg   = arg;
+	fosil_syncd_start(SYNCD_ON_ALL_PROCESSORS, fosil_blackout, &x, 0);
+	fosil_syncd_finish();
+}
+/*
+ * This routine is responsible for driving all of the memory
+ * synchronization processing.  When complete the sync function should
+ * be called to enter blackout and finalize synchronization.
+ */
+int fosil_synchronize_memory(copy_proc copy,
+			     sync_proc sync,
+			     is_pfn_valid_proc is_pfn_valid,
+			     is_pfnrange_valid_proc is_pfnrange_valid,
+			     unsigned int threshold,
+			     unsigned int passes,
+			     void * context)
+{
+	int status;
+	struct syncd_data * x;
+	x = kmalloc(sizeof(struct syncd_data), GFP_KERNEL);
+	if (x == NULL) {
+		printk("unable to allocate syncd control structure\n");
+		return 1;
+	}
+	memset(x, 0, sizeof(struct syncd_data));
+	x->copy = copy;
+	x->sync = sync;
+	x->is_pfn_valid = is_pfn_valid;
+	x->is_pfnrange_valid = is_pfnrange_valid;
+	x->bitcnt = 0;
+	x->blackout = IN_BROWNOUT;
+	x->done = 0;
+	x->threshold = threshold;
+	x->context = context;
+	x->nearby = NEARBY;
+	fosil_exec_onall(map_kernel_small_pmd, NULL);
+	// clean up hardware dirty bits
+	init_rendezvous(&x->r);
+	fosil_exec_onall(harvest, x);
+	enable_tracking();
+	/*
+	 * Copy all memory.  After this we only copy modified
+	 * pages, so we need to make sure the unchanged parts
+	 * get copied at least once.
+	 */
+	status = x->copy(0, ~0, 0, x->context);
+	if (status != FOSIL_ERR_OK) {
+		printk("%s: %d\n", __FUNCTION__, __LINE__);
+		goto fosil_sync_out;
+	}
+	for (x->pass = passes; (x->pass >= 0); x->pass--) {
+		DBGPRNT(DBGLVL_BROWNOUT,
+			"brownout pass %d - %ld pages found (%d)\n",
+			x->pass, x->bitcnt,
+			atomic_read(&mm_tracking_struct.count));
+		init_rendezvous(&x->r);
+		fosil_exec_onall(brownout_cycle, x);
+		if (x->status) {
+			printk("%s(%d): brownout_cycle failed \n",
+			       __FUNCTION__, __LINE__);
+			// flush any incomplete transactions
+			x->copy(~0, ~0, 0, x->context);
+			break;
+		}
+		if (x->done)
+			break;
+		/* Give back some time to everybody else */
+		schedule();
+		process_vector(x);
+		if (x->status) {
+			printk("%s(%d): process_vector failed \n",
+			       __FUNCTION__, __LINE__);
+			// flush any incomplete transactions
+			x->copy(~0, ~0, 0, x->context);
+			break;
+		}
+	}
+	disable_tracking();
+#if 0
+	{
+		int i;
+		int total = 0;
+		for (i = 0; i < x->max_range; i++) {
+			printk("start %08lx num %lx(%ld) gap [%ld]\n",
+				x->CopyRange[i].start,
+				x->CopyRange[i].num,
+				x->CopyRange[i].num,
+				(i==0)?0:(x->CopyRange[i].start -
+					  (x->CopyRange[i-1].start +
+					   x->CopyRange[i-1].num)));
+			total += x->CopyRange[i].num;
+		}
+		printk("max range %d total pages %d\n",
+			x->max_range, total);
+	}
+#endif
+	DBGPRNT(DBGLVL_BROWNOUT, "last pass found %ld pages\n", x->bitcnt);
+	DBGPRNT(DBGLVL_BROWNOUT, "copy range max %d\n", x->max_range);
+	status = x->status;
+fosil_sync_out:
+	kfree(x);
+	fosil_exec_onall(map_kernel_orig_pmd, NULL);
+	return status;
+}
+EXPORT_SYMBOL(fosil_synchronize_memory);
+#ifdef REPLACE_KERN_FUNCS
+static void (*orig_track_pmd)(void *);
+static int check_old_ptes(pmd_t *pmd, int *u_count, int *k_count) {
+	int i, lost_pte = 0;
+	unsigned long pfn;
+	pte_t *pte = pte_offset_kernel(pmd, 0);
+	for (i = 0; i < PTRS_PER_PTE; i++, pte++) {
+		if (pte_none(*pte) || !pte_present(*pte))
+			continue;
+		pfn = pte_pfn(*pte);
+		
+		if (pfn >= mm_tracking_struct.bitcnt)
+			continue;
+		if (!test_and_set_bit(pfn, mm_tracking_struct.vector)) {
+			if (pte_val(*pte) & _PAGE_USER)
+				(*u_count)++;
+			else
+				(*k_count)++;
+			atomic_inc(&mm_tracking_struct.count);
+			lost_pte++;
+		}
+	}
+	return lost_pte;
+}
+static void fosil_track_pmd(void * val) {
+	pmd_t *pmd = (pmd_t*)val;
+	int u_count = 0, k_count = 0;
+	if (pmd_large(*pmd)) {
+		orig_track_pmd(val);
+		return;
+	}
+	check_old_ptes(pmd, &u_count, &k_count);
+	orig_track_pmd(val);
+}
+#endif
+int __init fosil_harvest_init(void)
+{
+	extern unsigned long num_physpages;
+#ifdef USE_SMALL_PMD
+	if (small_pmd_init())
+		goto out_small_pmd;
+#endif
+#ifdef REPLACE_KERN_FUNCS
+	orig_track_pmd = do_mm_track_pmd;
+	do_mm_track_pmd = fosil_track_pmd;
+#endif
+	mm_tracking_struct.vector = vmalloc(num_physpages/8);
+	mm_tracking_struct.bitcnt = num_physpages;
+	if (mm_tracking_struct.vector == NULL) {
+		printk("%s: unable to allocate memory tracking bitmap\n",
+		       __FUNCTION__);
+		goto out_no_mm_track;
+	}
+	fosil_scratch_page = (void*)__get_free_pages(GFP_KERNEL, 0);
+	if (!fosil_scratch_page)
+		goto out_no_fsp;
+	fosil_scratch_lock = (spinlock_t*)kmalloc(sizeof(spinlock_t), GFP_KERNEL);
+	if (!fosil_scratch_lock)
+		goto out_no_fsl;
+	spin_lock_init(fosil_scratch_lock);
+	return 0;
+out_no_fsl:
+	free_pages((unsigned long)fosil_scratch_page, 0);
+out_no_fsp:
+	vfree(mm_tracking_struct.vector);
+out_no_mm_track:
+#ifdef USE_SMALL_PMD
+	small_pmd_exit();
+out_small_pmd:
+#endif
+	return -ENOMEM;
+}
+void __exit fosil_harvest_cleanup(void)
+{
+#ifdef USE_SMALL_PMD
+	small_pmd_exit();
+#endif
+#ifdef REPLACE_KERN_FUNCS
+	do_mm_track_pmd = orig_track_pmd;
+#endif
+	// make sure tracking is definitely turned off
+	disable_tracking();
+	// wake me after everyone is sure to be done with mm_track()
+	synchronize_sched();
+	if (mm_tracking_struct.vector)
+		vfree(mm_tracking_struct.vector);
+	if (fosil_scratch_page)
+		free_pages((unsigned long)fosil_scratch_page, 0);
+	if (fosil_scratch_lock)
+		kfree(fosil_scratch_lock);
+	mm_tracking_struct.bitcnt = 0;
+	return;
+}
+#else /* CONFIG_TRACK_DIRTY_PAGES */
+int __init fosil_harvest_init(void)
+{
+	return 0;
+}
+void __exit fosil_harvest_cleanup(void)
+{
+	return;
+}
+#endif /* CONFIG_TRACK_DIRTY_PAGES */

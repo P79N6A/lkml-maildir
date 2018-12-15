@@ -1,0 +1,123 @@
+Date: Tue, 14 Nov 2006 19:00:36 -0800 (PST)
+From: David Miller <>
+Subject: Re: [PATCH] ALSA: hda-intel - Disable MSI support by default
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2006/11/14/347
+
+From: Linus Torvalds <torvalds@osdl.org>
+Date: Tue, 14 Nov 2006 18:49:43 -0800 (PST)
+> In the meantime, I'm really tired of continually hearing about MSI 
+> problems, when there really aren't that many advantages.
+> 
+> > It's nice not to have to deal with shared interrupts.
+> 
+> I don't think "nice" is enough of an advantage to overcome "doesn't work 
+> on God knows how many systems".
+From what I see, that's not the advantage of MSI.  The following
+doesn't apply so well to sound, but it does apply significantly
+to the networking.
+The big advantage is that it eliminates the ordering issue in
+interrupt handlers that use a DMA'd status block.  Look at the Tigon3
+driver for one good example.
+If you take an INTX interrupt, it's over a pin on the motherboard and
+thus can arrive before the DMA makes it to main memory, so you have to
+have all of this fixup logic to handle that case and you don't even
+know the interrupt is really for you so you have to actually check
+the status block.
+static irqreturn_t tg3_interrupt(int irq, void *dev_id)
+{
+	struct net_device *dev = dev_id;
+	struct tg3 *tp = netdev_priv(dev);
+	struct tg3_hw_status *sblk = tp->hw_status;
+	unsigned int handled = 1;
+	/* In INTx mode, it is possible for the interrupt to arrive at
+	 * the CPU before the status block posted prior to the interrupt.
+	 * Reading the PCI State register will confirm whether the
+	 * interrupt is ours and will flush the status block.
+	 */
+	if ((sblk->status & SD_STATUS_UPDATED) ||
+	    !(tr32(TG3PCI_PCISTATE) & PCISTATE_INT_NOT_ACTIVE)) {
+		/*
+		 * Writing any value to intr-mbox-0 clears PCI INTA# and
+		 * chip-internal interrupt pending events.
+		 * Writing non-zero to intr-mbox-0 additional tells the
+		 * NIC to stop sending us irqs, engaging "in-intr-handler"
+		 * event coalescing.
+		 */
+		tw32_mailbox(MAILBOX_INTERRUPT_0 + TG3_64BIT_REG_LOW,
+			     0x00000001);
+		if (tg3_irq_sync(tp))
+			goto out;
+		sblk->status &= ~SD_STATUS_UPDATED;
+		if (likely(tg3_has_work(tp))) {
+			prefetch(&tp->rx_rcb[tp->rx_rcb_ptr]);
+			netif_rx_schedule(dev);		/* schedule NAPI poll */
+		} else {
+			/* No work, shared interrupt perhaps?  re-enable
+			 * interrupts, and flush that PCI write
+			 */
+			tw32_mailbox_f(MAILBOX_INTERRUPT_0 + TG3_64BIT_REG_LOW,
+			     	0x00000000);
+		}
+	} else {	/* shared interrupt */
+		handled = 0;
+	}
+out:
+	return IRQ_RETVAL(handled);
+}
+This whole initial if statement goes away with MSI, you don't even
+need to check the status block, you know the interrupt is for you and
+the device did generate it and has work pending.
+/* MSI ISR - No need to check for interrupt sharing and no need to
+ * flush status block and interrupt mailbox. PCI ordering rules
+ * guarantee that MSI will arrive after the status block.
+ */
+static irqreturn_t tg3_msi(int irq, void *dev_id)
+{
+	struct net_device *dev = dev_id;
+	struct tg3 *tp = netdev_priv(dev);
+	prefetch(tp->hw_status);
+	prefetch(&tp->rx_rcb[tp->rx_rcb_ptr]);
+	/*
+	 * Writing any value to intr-mbox-0 clears PCI INTA# and
+	 * chip-internal interrupt pending events.
+	 * Writing non-zero to intr-mbox-0 additional tells the
+	 * NIC to stop sending us irqs, engaging "in-intr-handler"
+	 * event coalescing.
+	 */
+	tw32_mailbox(MAILBOX_INTERRUPT_0 + TG3_64BIT_REG_LOW, 0x00000001);
+	if (likely(!tg3_irq_sync(tp)))
+		netif_rx_schedule(dev);		/* schedule NAPI poll */
+	return IRQ_RETVAL(1);
+}
+Taken to the next level MSI can be implemented in a "one-shot"
+manner such that once the MSI is generated the chip shuts off
+all further interrupts automatically.
+This is perfect for networking devices since that is the first
+thing we need to do in the interrupt handler for NAPI, and Tigon3
+actually implements this.
+/* One-shot MSI handler - Chip automatically disables interrupt
+ * after sending MSI so driver doesn't have to do it.
+ */
+static irqreturn_t tg3_msi_1shot(int irq, void *dev_id)
+{
+	struct net_device *dev = dev_id;
+	struct tg3 *tp = netdev_priv(dev);
+	prefetch(tp->hw_status);
+	prefetch(&tp->rx_rcb[tp->rx_rcb_ptr]);
+	if (likely(!tg3_irq_sync(tp)))
+		netif_rx_schedule(dev);		/* schedule NAPI poll */
+	return IRQ_HANDLED;
+}
+It saves an MMIO write in the interrupt handler and makes a huge
+different in performance.
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+More majordomo info at  
+http://vger.kernel.org/majordomo-info.html
+Please read the FAQ at  
+http://www.tux.org/lkml/

@@ -1,0 +1,323 @@
+Date: Wed, 15 Aug 2007 17:57:11 -0300
+From: "Glauber de Oliveira Costa" <>
+Subject: Re: [PATCH 3/25][V3] irq_flags / halt routines
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2007/8/15/334
+
+On 8/15/07, Chris Wright <chrisw@sous-sol.org> wrote:
+> * Glauber de Oliveira Costa (gcosta@redhat.com) wrote:
+> > Only caveat, is that it has to be done before smp gets in the game, and
+> > with interrupts disabled. (which makes the function in vsmp.c not eligible).
+> >
+> > My current option is to force VSMP to use PARAVIRT, as said before, and
+> > then fill paravirt_arch_setup, which is currently unused, with code to
+> > replace the needed paravirt_ops.fn.
+> >
+> > I don't know if there is any method to dynamically determine (at this
+> > point) that we are in a vsmp arch, and if there are not, it will have to
+> > get ifdefs anyway. But at least, they are far more local.
+>
+> between __cacheline_aligned_in_smp and other compile time bits based on
+> VSMP specific INTERNODE_CACHE, etc. I think compile time the way to go.
+>
+> > I am okay with both, but after all the explanation, I don't think that
+> > adding a new pvops is a bad idea. It would make things less cumbersome
+> > in this case. Also, hacks like this save_fl may require changes to the
+> > hypervisor, right? I don't even know where such hypervisor is, and how
+> > easy it is to replace it (it may be deeply hidden in firmware)
+>
+> No hypervisor change needed.  Just the pv backend needs to return 0 or
+> X86_EFLAGS_IF for save_flags (and similar translation on restore_flags).
+> Xen uses a simple shared memory flag and does something which you could
+> roughly translate into this:
+>
+>         xen_save_flags()
+>         if (xen_vcpu_interrupts_enabled)
+>                 return X86_EFLAGS_IF;
+>         else
+>                 return 0;
+>
+> This doesn't require any hypervisor changes.  Similarly, VSMP could do
+> something along the lines of:
+>
+>         vsmp_save_flags()
+>         flags = native_save_flags();
+>         if (flags & X86_EFLAGS_IF) || (flags & X86_EFLAGS_AC)
+>                 return X86_EFLAGS_IF;
+>         else
+>                 return 0;
+>
+I'm attaching to this message my idea on how would it work.
+This is just for comments/considerations. If you all ack this, I'll
+spread the changes over the patch series as needed, and then resend
+the patches.
+-- 
+Glauber de Oliveira Costa.
+"Free as in Freedom"
+http://glommer.net
+"The less confident you are, the more serious you have to act."
+diff --git a/arch/x86_64/Kconfig b/arch/x86_64/Kconfig
+index 00b2fc9..1204b08 100644
+--- a/arch/x86_64/Kconfig
++++ b/arch/x86_64/Kconfig
+@@ -150,6 +150,7 @@ config X86_PC
+ config X86_VSMP
+ 	bool "Support for ScaleMP vSMP"
+ 	depends on PCI
++	select PARAVIRT
+ 	 help
+ 	  Support for ScaleMP vSMP systems.  Say 'Y' here if this kernel is
+ 	  supposed to run on these EM64T-based machines.  Only choose this option
+diff --git a/arch/x86_64/kernel/paravirt.c b/arch/x86_64/kernel/paravirt.c
+index dcd9919..23a8786 100644
+--- a/arch/x86_64/kernel/paravirt.c
++++ b/arch/x86_64/kernel/paravirt.c
+@@ -22,6 +22,8 @@
+ #include <linux/efi.h>
+ #include <linux/bcd.h>
+ #include <linux/start_kernel.h>
++#include <linux/pci_regs.h>
++#include <linux/pci_ids.h>
+ 
+ #include <asm/bug.h>
+ #include <asm/paravirt.h>
+@@ -40,15 +42,30 @@
+ #include <asm/asm-offsets.h>
+ #include <asm/smp.h>
+ #include <asm/irqflags.h>
++#include <asm/pci-direct.h>
+ 
+ /* nop stub */
+ void _paravirt_nop(void)
+ {
+ }
+ 
++int arch_is_vsmp = 0;
++
+ /* natively, we do normal setup, but we still need to return something */
+ static int native_arch_setup(void)
+ {
++	if (!early_pci_allowed())
++		goto out;
++		
++	if ((read_pci_config_16(0, 0x1f, 0, PCI_VENDOR_ID) == PCI_VENDOR_ID_SCALEMP) &&
++            (read_pci_config_16(0, 0x1f, 0, PCI_DEVICE_ID) == PCI_DEVICE_ID_SCALEMP_VSMP_CTL)) {
++		paravirt_ops.irq_disable = vsmp_irq_disable;
++		paravirt_ops.irq_enable  = vsmp_irq_enable;
++		paravirt_ops.save_fl  = vsmp_save_flags;
++		arch_is_vsmp = 1;
++	}
++
++out:
+ 	return 0;
+ }
+ 
+@@ -103,8 +120,6 @@ static unsigned native_patch(u8 type, u16 clobbers, void *insns, unsigned len)
+ 
+ 	switch(type) {
+ #define SITE(x)	case PARAVIRT_PATCH(x):	start = start_##x; end = end_##x; goto patch_site
+-		SITE(irq_disable);
+-		SITE(irq_enable);
+ 		SITE(restore_fl);
+ 		SITE(save_fl);
+ 		SITE(iret);
+@@ -117,7 +132,23 @@ static unsigned native_patch(u8 type, u16 clobbers, void *insns, unsigned len)
+ 		SITE(flush_tlb_single);
+ 		SITE(wbinvd);
+ #undef SITE
+-
++	case PARAVIRT_PATCH(irq_disable): 
++	case PARAVIRT_PATCH(irq_enable): 
++		start = start_irq_disable;
++		end = end_irq_disable;
++
++		if (type == PARAVIRT_PATCH(irq_enable)) {
++			start = start_irq_enable;
++			end = end_irq_enable;
++		}
++
++		if (arch_is_vsmp) {
++			ret = paravirt_patch_default(type,
++						     clobbers,
++						     insns,
++						     len);
++			break;
++		}
+ 	patch_site:
+ 		ret = paravirt_patch_insns(insns, len, start, end);
+ 		break;
+@@ -214,30 +245,6 @@ void init_IRQ(void)
+ 	paravirt_ops.init_IRQ();
+ }
+ 
+-static unsigned long native_save_fl(void)
+-{
+-	unsigned long f;
+-	asm volatile("pushfq ; popq %0":"=g" (f): /* no input */);
+-	return f;
+-}
+-
+-static void native_restore_fl(unsigned long f)
+-{
+-	asm volatile("pushq %0 ; popfq": /* no output */
+-			     :"g" (f)
+-			     :"memory", "cc");
+-}
+-
+-static void native_irq_disable(void)
+-{
+-	asm volatile("cli": : :"memory");
+-}
+-
+-static void native_irq_enable(void)
+-{
+-	asm volatile("sti": : :"memory");
+-}
+-
+ static void native_io_delay(void)
+ {
+ 	asm volatile("outb %al,$0x80");
+@@ -328,8 +328,8 @@ struct paravirt_ops paravirt_ops = {
+ 	.write_cr3 = native_write_cr3,
+ 	.read_cr4 = native_read_cr4,
+ 	.write_cr4 = native_write_cr4,
+-	.save_fl = native_save_fl,
+-	.restore_fl = native_restore_fl,
++	.save_fl = native_save_flags,
++	.restore_fl = native_restore_flags,
+ 	.irq_disable = native_irq_disable,
+ 	.irq_enable = native_irq_enable,
+ 	.safe_halt = native_raw_safe_halt,
+diff --git a/arch/x86_64/kernel/vsmp.c b/arch/x86_64/kernel/vsmp.c
+index 414caf0..ddfb1b7 100644
+--- a/arch/x86_64/kernel/vsmp.c
++++ b/arch/x86_64/kernel/vsmp.c
+@@ -15,6 +15,7 @@
+ #include <linux/pci_regs.h>
+ #include <asm/pci-direct.h>
+ #include <asm/io.h>
++#include <asm/irqflags.h>
+ 
+ static int __init vsmp_init(void)
+ {
+diff --git a/include/asm-x86_64/irqflags.h b/include/asm-x86_64/irqflags.h
+index fe0d346..eb993f4 100644
+--- a/include/asm-x86_64/irqflags.h
++++ b/include/asm-x86_64/irqflags.h
+@@ -16,11 +16,7 @@
+  * Interrupt control:
+  */
+ 
+-#ifdef CONFIG_PARAVIRT
+-#include <asm/paravirt.h>
+-#else /* PARAVIRT */
+-
+-static inline unsigned long __raw_local_save_flags(void)
++static inline unsigned long native_save_flags(void)
+ {
+ 	unsigned long flags;
+ 
+@@ -35,7 +31,7 @@ static inline unsigned long __raw_local_save_flags(void)
+ 	return flags;
+ }
+ 
+-static inline void raw_local_irq_restore(unsigned long flags)
++static inline void native_restore_flags(unsigned long flags)
+ {
+ 	__asm__ __volatile__(
+ 		"pushq %0 ; popfq"
+@@ -45,57 +41,59 @@ static inline void raw_local_irq_restore(unsigned long flags)
+ 	);
+ }
+ 
+-#ifdef CONFIG_X86_VSMP
++static inline void native_irq_disable(void)
++{
++	__asm__ __volatile__("cli" : : : "memory");
++}
++
++static inline void native_irq_enable(void)
++{
++	__asm__ __volatile__("sti" : : : "memory");
++}
++
++static inline long raw_irqs_disabled_flags(unsigned long flags)
++{
++	return !(flags & X86_EFLAGS_IF);
++}
+ 
+ /*
+  * Interrupt control for the VSMP architecture:
+  */
+ 
+-static inline void raw_local_irq_disable(void)
++static inline unsigned long vsmp_save_flags(void)
+ {
+-	unsigned long flags = __raw_local_save_flags();
++	unsigned long flags = vsmp_save_flags();
+ 
+-	raw_local_irq_restore((flags & ~X86_EFLAGS_IF) | X86_EFLAGS_AC);
++	if ((flags & X86_EFLAGS_IF) || (flags & X86_EFLAGS_AC))
++		return X86_EFLAGS_IF;
++	return 0;
+ }
+ 
+-static inline void raw_local_irq_enable(void)
++static inline void vsmp_irq_disable(void)
+ {
+ 	unsigned long flags = __raw_local_save_flags();
+ 
+-	raw_local_irq_restore((flags | X86_EFLAGS_IF) & (~X86_EFLAGS_AC));
++	raw_local_irq_restore((flags & ~X86_EFLAGS_IF) | X86_EFLAGS_AC);
+ }
+ 
+-#else /* CONFIG_X86_VSMP */
+-
+-static inline void raw_local_irq_disable(void)
++static inline void vsmp_irq_enable(void)
+ {
+-	__asm__ __volatile__("cli" : : : "memory");
+-}
++	unsigned long flags = __raw_local_save_flags();
+ 
+-static inline void raw_local_irq_enable(void)
+-{
+-	__asm__ __volatile__("sti" : : : "memory");
++	raw_local_irq_restore((flags | X86_EFLAGS_IF) & (~X86_EFLAGS_AC));
+ }
+ 
+-#endif /* CONFIG_X86_VSMP */
+-#endif /* CONFIG_PARAVIRT */
++#ifdef CONFIG_PARAVIRT
++#include <asm/paravirt.h>
++#else /* PARAVIRT */
++#define __raw_local_save_flags()		native_save_flags()
++#define raw_local_irq_restore(x)		native_restore_flags(x)
++#define raw_local_irq_disable()			native_irq_disable()
++#define raw_local_irq_enable()			native_irq_enable()
++#endif
+ 
+ /* Those are not paravirt stubs, so they live out of the PARAVIRT ifdef */
+ 
+-#ifdef CONFIG_X86_VSMP
+-static inline int raw_irqs_disabled_flags(unsigned long flags)
+-{
+-	return !(flags & X86_EFLAGS_IF) || (flags & X86_EFLAGS_AC);
+-}
+-
+-#else
+-static inline int raw_irqs_disabled_flags(unsigned long flags)
+-{
+-	return !(flags & X86_EFLAGS_IF);
+-}
+-
+-#endif /* CONFIG_X86_VSMP */
+-
+ #define raw_local_save_flags(flags) \
+ 		do { (flags) = __raw_local_save_flags(); } while (0)
+ /*
+diff --git a/include/asm-x86_64/paravirt.h b/include/asm-x86_64/paravirt.h
+diff --git a/include/asm-x86_64/processor.h b/include/asm-x86_64/processor.h

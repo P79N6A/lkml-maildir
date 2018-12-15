@@ -1,0 +1,3052 @@
+Date: Wed, 26 May 1999 16:11:21 -0400
+From: Niels Provos <>
+Subject: [PATCH] hinting system for poll()/select()
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/5/28/181
+
+Hi,
+here are patches to enable hinting for select()/poll() in 2.2.9.  The
+first patch is the large fdset support taken from 2.2.7-ac4, and the
+second one is the hinting system itself.  You can find the patches
+also at 
+http://www.citi.umich.edu/u/provos/linux/.
+For my testing I used thttpd-2.04 and httperf-0.6. The hinting system
+significantly reduces the number of times the driver specific poll()
+needs to be called.  See my previous emails for stats.
+One drawback of poll() is that is has to scan all file descriptors
+when it is invoked.  Hinting tells do_poll() and do_select() which
+file descriptors have changed status and the specific poll() needs to
+be called for those only.
+Please test the patches, see if you like them and send feedback to me.  
+Greetings,
+ Niels.
+NB: the poll() prototype has changed and takes "struct poll_table_entry *"
+    instead of "poll_table *" as argument now.  I did not change all 
+    invocations of poll(), so you will get the occasional compiler warning.
+    You can either ignore or change them to match the right pointer type.
+--
+Niels Provos <provos@citi.umich.edu> finger provos@umich.edu for pgp info
+The Linux Scalability Project:
+	
+http://www.citi.umich.edu/projects/linux-scalability/
+Two patches follow, apply in order against 2.2.9:
+diff -u --new-file --recursive --exclude-from ../exclude linux.vanilla/Makefile linux.ac/Makefile
+--- linux.vanilla/Makefile	Wed Apr 28 19:14:23 1999
++++ linux.ac/Makefile	Sun May  9 23:37:08 1999
+@@ -1,7 +1,7 @@
+ VERSION = 2
+ PATCHLEVEL = 2
+ SUBLEVEL = 9
+-EXTRAVERSION =
++EXTRAVERSION = -np
+ 
+ ARCH := $(shell uname -m | sed -e s/i.86/i386/ -e s/sun4u/sparc64/ -e s/arm.*/arm/ -e s/sa110/arm/)
+ 
+diff -u --new-file --recursive --exclude-from ../exclude linux.vanilla/fs/Makefile linux.ac/fs/Makefile
+--- linux.vanilla/fs/Makefile	Sun Nov  8 15:06:31 1998
++++ linux.ac/fs/Makefile	Sun May  9 23:30:28 1999
+@@ -13,12 +13,12 @@
+ O_OBJS    = open.o read_write.o devices.o file_table.o buffer.o \
+ 		super.o  block_dev.o stat.o exec.o pipe.o namei.o fcntl.o \
+ 		ioctl.o readdir.o select.o fifo.o locks.o filesystems.o \
+-		dcache.o inode.o attr.o bad_inode.o $(BINFMTS) 
++		dcache.o inode.o attr.o bad_inode.o file.o $(BINFMTS) 
+ 
+ MOD_LIST_NAME := FS_MODULES
+ ALL_SUB_DIRS = coda minix ext2 fat msdos vfat proc isofs nfs umsdos ntfs \
+-		hpfs sysv smbfs ncpfs ufs affs romfs autofs hfs lockd nfsd \
+-		nls devpts adfs qnx4
++		hpfs sysv smbfs ncpfs ufs affs romfs autofs hfs lockd nfsd \
++		nls devpts adfs qnx4
+ 
+ ifeq ($(CONFIG_QUOTA),y)
+ O_OBJS += dquot.o
+diff -u --new-file --recursive --exclude-from ../exclude linux.vanilla/fs/exec.c linux.ac/fs/exec.c
+--- linux.vanilla/fs/exec.c	Tue Jan 19 02:57:34 1999
++++ linux.ac/fs/exec.c	Fri May  7 16:47:25 1999
+@@ -479,10 +478,10 @@
+ 		unsigned long set, i;
+ 
+ 		i = j * __NFDBITS;
+-		if (i >= files->max_fds)
++		if (i >= files->max_fds || i >= files->max_fdset)
+ 			break;
+-		set = files->close_on_exec.fds_bits[j];
+-		files->close_on_exec.fds_bits[j] = 0;
++		set = files->close_on_exec->fds_bits[j];
++		files->close_on_exec->fds_bits[j] = 0;
+ 		j++;
+ 		for ( ; set ; i++,set >>= 1) {
+ 			if (set & 1)
+diff -u --new-file --recursive --exclude-from ../exclude linux.vanilla/fs/fcntl.c linux.ac/fs/fcntl.c
+--- linux.vanilla/fs/fcntl.c	Thu Nov 19 18:38:46 1998
++++ linux.ac/fs/fcntl.c	Fri Dec  4 17:15:07 1998
+@@ -12,14 +12,15 @@
+ 
+ extern int sock_fcntl (struct file *, unsigned int cmd, unsigned long arg);
+ 
+-static inline int dupfd(unsigned int fd, unsigned int arg)
++static inline int dupfd(unsigned int fd, unsigned int start)
+ {
+ 	struct files_struct * files = current->files;
+ 	struct file * file;
++	unsigned int newfd;
+ 	int error;
+ 
+ 	error = -EINVAL;
+-	if (arg >= NR_OPEN)
++	if (start >= NR_OPEN)
+ 		goto out;
+ 
+ 	error = -EBADF;
+@@ -27,15 +28,39 @@
+ 	if (!file)
+ 		goto out;
+ 
++repeat:
+ 	error = -EMFILE;
+-	arg = find_next_zero_bit(&files->open_fds, NR_OPEN, arg);
+-	if (arg >= current->rlim[RLIMIT_NOFILE].rlim_cur)
++	if (start < files->next_fd)
++		start = files->next_fd;
++	/* At this point, start MUST be <= max_fdset */
++#if 1
++	if (start > files->max_fdset)
++		printk (KERN_ERR "dupfd: fd %d, max %d\n", 
++			start, files->max_fdset);
++#endif
++	newfd = find_next_zero_bit(files->open_fds->fds_bits, 
++				files->max_fdset,
++				start);
++	if (newfd >= current->rlim[RLIMIT_NOFILE].rlim_cur)
+ 		goto out_putf;
+-	FD_SET(arg, &files->open_fds);
+-	FD_CLR(arg, &files->close_on_exec);
+-	fd_install(arg, file);
+-	error = arg;
++
++	error = expand_files(files, newfd);
++	if (error < 0)
++		goto out_putf;
++	if (error) /* If we might have blocked, try again. */
++		goto repeat;
++
++	FD_SET(newfd, files->open_fds);
++	FD_CLR(newfd, files->close_on_exec);
++	if (start <= files->next_fd)
++		files->next_fd = newfd + 1;
++	fd_install(newfd, file);
++	error = newfd;
+ out:
++#ifdef FDSET_DEBUG	
++	if (error < 0)
++		printk (KERN_ERR __FUNCTION__ ": return %d\n", error);
++#endif
+ 	return error;
+ 
+ out_putf:
+@@ -48,18 +73,30 @@
+ 	int err = -EBADF;
+ 
+ 	lock_kernel();
++#ifdef FDSET_DEBUG	
++	printk (KERN_ERR __FUNCTION__ " 0: oldfd = %d, newfd = %d\n", 
++		oldfd, newfd);
++#endif
+ 	if (!fcheck(oldfd))
+ 		goto out;
++	if (newfd >= NR_OPEN)
++		goto out;	/* following POSIX.1 6.2.1 */
++
+ 	err = newfd;
+ 	if (newfd == oldfd)
+ 		goto out;
+-	err = -EBADF;
+-	if (newfd >= NR_OPEN)
+-		goto out;	/* following POSIX.1 6.2.1 */
+ 
++	/* We must be able to do the fd setting inside dupfd() without
++           blocking after the sys_close(). */
++	if ((err = expand_files(current->files, newfd)) < 0)
++		goto out;
++	
+ 	sys_close(newfd);
+ 	err = dupfd(oldfd, newfd);
+ out:
++#ifdef FDSET_DEBUG	
++	printk (KERN_ERR __FUNCTION__ ": return %d\n", err);
++#endif
+ 	unlock_kernel();
+ 	return err;
+ }
+@@ -71,6 +108,10 @@
+ 	lock_kernel();
+ 	ret = dupfd(fildes, 0);
+ 	unlock_kernel();
++#ifdef FDSET_DEBUG	
++	if (ret < 0)
++		printk (KERN_ERR __FUNCTION__ ": return %d\n", ret);
++#endif
+ 	return ret;
+ }
+ 
+@@ -111,19 +152,20 @@
+ 	filp = fget(fd);
+ 	if (!filp)
+ 		goto out;
++
+ 	err = 0;
+ 	switch (cmd) {
+ 		case F_DUPFD:
+ 			err = dupfd(fd, arg);
+ 			break;
+ 		case F_GETFD:
+-			err = FD_ISSET(fd, &current->files->close_on_exec);
++			err = FD_ISSET(fd, current->files->close_on_exec);
+ 			break;
+ 		case F_SETFD:
+ 			if (arg&1)
+-				FD_SET(fd, &current->files->close_on_exec);
++				FD_SET(fd, current->files->close_on_exec);
+ 			else
+-				FD_CLR(fd, &current->files->close_on_exec);
++				FD_CLR(fd, current->files->close_on_exec);
+ 			break;
+ 		case F_GETFL:
+ 			err = filp->f_flags;
+diff -u --new-file --recursive --exclude-from ../exclude linux.vanilla/fs/file.c linux.ac/fs/file.c
+--- linux.vanilla/fs/file.c	Thu Jan  1 01:00:00 1970
++++ linux.ac/fs/file.c	Fri Dec  4 17:15:07 1998
+@@ -0,0 +1,224 @@
++/*
++ *  linux/fs/open.c
++ *
++ *  Copyright (C) 1998, Stephen Tweedie and Bill Hawes
++ *
++ *  Manage the dynamic fd arrays in the process files_struct.
++ */
++
++#include <linux/fs.h>
++#include <linux/mm.h>
++#include <linux/sched.h>
++#include <linux/malloc.h>
++#include <linux/vmalloc.h>
++
++#include <asm/bitops.h>
++
++
++/*
++ * Allocate an fd array, using get_free_page() if possible.
++ * Note: the array isn't cleared at allocation time.
++ */
++struct file ** alloc_fd_array(int num)
++{
++	struct file **new_fds;
++	int size = num * sizeof(struct file *);
++
++	if (size < PAGE_SIZE)
++		new_fds = (struct file **) kmalloc(size, GFP_KERNEL);
++	else if (size == PAGE_SIZE)
++		new_fds = (struct file **) __get_free_page(GFP_KERNEL);
++	else
++		new_fds = (struct file **) vmalloc(size);
++	return new_fds;
++}
++
++void free_fd_array(struct file **array, int num)
++{
++	int size = num * sizeof(struct file *);
++
++	if (!array) {
++		printk (KERN_ERR __FUNCTION__ "array = 0 (num = %d)\n", num);
++		return;
++	}
++
++	if (num <= NR_OPEN_DEFAULT) /* Don't free the embedded fd array! */
++		return;
++	else if (size < PAGE_SIZE)
++		kfree(array);
++	else if (size == PAGE_SIZE)
++		free_page((unsigned long) array);
++	else
++		vfree(array);
++}
++
++/*
++ * Expand the fd array in the files_struct.
++ */
++
++int expand_fd_array(struct files_struct *files, int nr)
++{
++	struct file **new_fds;
++	int error, nfds;
++
++	
++	error = -EMFILE;
++	if (files->max_fds >= NR_OPEN || nr > NR_OPEN)
++		goto out;
++
++	nfds = files->max_fds;
++
++	/* 
++	 * Expand to the max in easy steps, and keep expanding it until
++	 * we have enough for the requested fd array size. 
++	 */
++
++	do {
++#if NR_OPEN_DEFAULT < 256
++		if (nfds < 256)
++			nfds = 256;
++		else 
++#endif
++		if (nfds < (PAGE_SIZE / sizeof(struct file *)))
++			nfds = PAGE_SIZE / sizeof(struct file *);
++		else {
++			nfds = nfds * 2;
++			if (nfds > NR_OPEN)
++				nfds = NR_OPEN;
++		}
++	} while (nfds < nr);
++
++	error = -ENOMEM;
++	new_fds = alloc_fd_array(nfds);
++	if (!new_fds)
++		goto out;
++
++	/* Copy the existing array and install the new pointer */
++
++	if (nfds > files->max_fds) {
++		struct file **old_fds;
++		int i = files->max_fds;
++		
++		old_fds = files->fd;
++		files->fd = new_fds;
++		files->max_fds = nfds;
++		/* Don't copy/clear the array if we are creating a new
++		   fd array for fork() */
++		if (i) {
++			memcpy(new_fds, old_fds, i * sizeof(struct file *));
++			/* clear the remainder of the array */
++			memset(&new_fds[i], 0,
++			       (nfds-i) * sizeof(struct file *)); 
++			free_fd_array(old_fds, i);
++		}
++	} else {
++		/* Somebody expanded the array while we slept ... */
++		free_fd_array(new_fds, nfds);
++	}
++	error = 0;
++out:
++	return error;
++}
++
++/*
++ * Allocate an fdset array, using get_free_page() if possible.
++ * Note: the array isn't cleared at allocation time.
++ */
++fd_set * alloc_fdset(int num)
++{
++	fd_set *new_fdset;
++	int size = num / 8;
++
++	if (size < PAGE_SIZE)
++		new_fdset = (fd_set *) kmalloc(size, GFP_KERNEL);
++	else if (size == PAGE_SIZE)
++		new_fdset = (fd_set *) __get_free_page(GFP_KERNEL);
++	else
++		new_fdset = (fd_set *) vmalloc(size);
++	return new_fdset;
++}
++
++void free_fdset(fd_set *array, int num)
++{
++	int size = num / 8;
++
++	if (!array) {
++		printk (KERN_ERR __FUNCTION__ "array = 0 (num = %d)\n", num);
++		return;
++	}
++	
++	if (num <= __FD_SETSIZE) /* Don't free an embedded fdset */
++		return;
++	else if (size < PAGE_SIZE)
++		kfree(array);
++	else if (size == PAGE_SIZE)
++		free_page((unsigned long) array);
++	else
++		vfree(array);
++}
++
++/*
++ * Expand the fdset in the files_struct.
++ */
++int expand_fdset(struct files_struct *files, int nr)
++{
++	fd_set *new_openset = 0, *new_execset = 0;
++	int error, nfds = 0;
++
++	error = -EMFILE;
++	if (files->max_fdset >= NR_OPEN || nr > NR_OPEN)
++		goto out;
++
++	nfds = files->max_fdset;
++	/* Expand to the max in easy steps */
++	do {
++		if (nfds < (PAGE_SIZE * 8))
++			nfds = PAGE_SIZE * 8;
++		else {
++			nfds = nfds * 2;
++			if (nfds > NR_OPEN)
++				nfds = NR_OPEN;
++		}
++	} while (nfds < nr);
++
++	error = -ENOMEM;
++	new_openset = alloc_fdset(nfds);
++	new_execset = alloc_fdset(nfds);
++	if (!new_openset || !new_execset)
++		goto out;
++
++	error = 0;
++	
++	/* Copy the existing tables and install the new pointers */
++	if (nfds > files->max_fdset) {
++		int i = files->max_fdset / (sizeof(unsigned long) * 8);
++		int count = (nfds - files->max_fdset) / 8;
++
++		/* 
++		 * Don't copy the entire array if the current fdset is
++		 * not yet initialised.  
++		 */
++		if (i) {
++			memcpy (new_openset, files->open_fds, files->max_fdset/8);
++			memcpy (new_execset, files->close_on_exec, files->max_fdset/8);
++			memset (&new_openset->fds_bits[i], 0, count);
++			memset (&new_execset->fds_bits[i], 0, count);
++		}
++
++		free_fdset (files->close_on_exec, files->max_fdset);
++		free_fdset (files->open_fds, files->max_fdset);
++		files->max_fdset = nfds;
++		files->open_fds = new_openset;
++		files->close_on_exec = new_execset;
++		return 0;
++	} 
++	/* Somebody expanded the array while we slept ... */
++
++out:
++	if (new_openset)
++		free_fdset(new_openset, nfds);
++	if (new_execset)
++		free_fdset(new_execset, nfds);
++	return error;
++}
++
+diff -u --new-file --recursive --exclude-from ../exclude linux.vanilla/fs/ioctl.c linux.ac/fs/ioctl.c
+--- linux.vanilla/fs/ioctl.c	Mon Mar 29 10:25:56 1999
++++ linux.ac/fs/ioctl.c	Fri Mar 26 21:13:41 1999
+@@ -52,11 +52,11 @@
+ 	error = 0;
+ 	switch (cmd) {
+ 		case FIOCLEX:
+-			FD_SET(fd, &current->files->close_on_exec);
++			FD_SET(fd, current->files->close_on_exec);
+ 			break;
+ 
+ 		case FIONCLEX:
+-			FD_CLR(fd, &current->files->close_on_exec);
++			FD_CLR(fd, current->files->close_on_exec);
+ 			break;
+ 
+ 		case FIONBIO:
+diff -u --new-file --recursive --exclude-from ../exclude linux.vanilla/fs/open.c linux.ac/fs/open.c
+--- linux.vanilla/fs/open.c	Fri Apr 16 22:10:59 1999
++++ linux.ac/fs/open.c	Fri Apr 16 22:26:27 1999
+@@ -691,9 +691,13 @@
+ {
+ 	struct files_struct * files = current->files;
+ 	int fd, error;
+-
++	
++repeat:
+ 	error = -EMFILE;
+-	fd = find_first_zero_bit(&files->open_fds, NR_OPEN);
++
++	fd = find_next_zero_bit(files->open_fds, 
++				current->files->max_fdset, 
++				files->next_fd);
+ 	/*
+ 	 * N.B. For clone tasks sharing a files structure, this test
+ 	 * will limit the total number of files that can be opened.
+@@ -701,10 +705,27 @@
+ 	if (fd >= current->rlim[RLIMIT_NOFILE].rlim_cur)
+ 		goto out;
+ 
+-	/* Check here for fd > files->max_fds to do dynamic expansion */
++	/* Do we need to expand the fdset array? */
++	if (fd >= current->files->max_fdset) {
++		error = expand_fdset(files, 0);
++		if (!error)
++			goto repeat;
++		goto out;
++	}
++	
++	/* 
++	 * Check whether we need to expand the fd array.
++	 */
++	if (fd >= files->max_fds) {
++		error = expand_fd_array(files, 0);
++		if (!error)
++			goto repeat;
++		goto out;
++	}
+ 
+-	FD_SET(fd, &files->open_fds);
+-	FD_CLR(fd, &files->close_on_exec);
++	FD_SET(fd, files->open_fds);
++	FD_CLR(fd, files->close_on_exec);
++	files->next_fd = fd + 1;
+ #if 1
+ 	/* Sanity check */
+ 	if (files->fd[fd] != NULL) {
+@@ -715,12 +736,18 @@
+ 	error = fd;
+ 
+ out:
++#ifdef FDSET_DEBUG	
++	if (error < 0)
++		printk (KERN_ERR __FUNCTION__ ": return %d\n", error);
++#endif
+ 	return error;
+ }
+ 
+ inline void put_unused_fd(unsigned int fd)
+ {
+-	FD_CLR(fd, &current->files->open_fds);
++	FD_CLR(fd, current->files->open_fds);
++	if (fd < current->files->next_fd)
++		current->files->next_fd = fd;
+ }
+ 
+ asmlinkage int sys_open(const char * filename, int flags, int mode)
+@@ -820,8 +847,8 @@
+ 		struct files_struct * files = current->files;
+ 		files->fd[fd] = NULL;
+ 		put_unused_fd(fd);
+-		FD_CLR(fd, &files->close_on_exec);
+-		error = filp_close(filp, files);
++		FD_CLR(fd, files->close_on_exec);
++ 		error = filp_close(filp, files);
+ 	}
+ 	unlock_kernel();
+ 	return error;
+diff -u --new-file --recursive --exclude-from ../exclude linux.vanilla/fs/select.c linux.ac/fs/select.c
+--- linux.vanilla/fs/select.c	Sun Jan 24 19:55:38 1999
++++ linux.ac/fs/select.c	Sun Jan 24 20:31:02 1999
+@@ -107,7 +107,7 @@
+ 	/* handle last in-complete long-word first */
+ 	set = ~(~0UL << (n & (__NFDBITS-1)));
+ 	n /= __NFDBITS;
+-	open_fds = current->files->open_fds.fds_bits+n;
++	open_fds = current->files->open_fds->fds_bits+n;
+ 	max = 0;
+ 	if (set) {
+ 		set &= BITS(fds, n);
+@@ -264,19 +264,31 @@
+ 		if ((unsigned long) sec < MAX_SELECT_SECONDS) {
+ 			timeout = ROUND_UP(usec, 1000000/HZ);
+ 			timeout += sec * (unsigned long) HZ;
++
++			if (timeout < 0) {
++				ret = -EINVAL;
++				goto out_nofds;
++			}
+ 		}
+ 	}
+ 
+ 	ret = -EINVAL;
+-	if (n < 0 || n > KFDS_NR)
++	
++	/*
++	 * We ought to optimise the n=0 case - it is used enough..
++	 */
++	 
++	if (n < 0 || n > current->files->max_fdset + 1)
+ 		goto out_nofds;
++		
+ 	/*
+ 	 * We need 6 bitmaps (in/out/ex for both incoming and outgoing),
+ 	 * since we used fdset we need to allocate memory in units of
+-	 * long-words. 
++	 * long-words.
+ 	 */
++
+ 	ret = -ENOMEM;
+-	size = FDS_BYTES(n);
++	size = (n + 8 * sizeof(long) - 1) / (8 * sizeof(long)) * sizeof(long);
+ 	bits = kmalloc(6 * size, GFP_KERNEL);
+ 	if (!bits)
+ 		goto out_nofds;
+@@ -379,13 +391,13 @@
+ 	lock_kernel();
+ 	/* Do a sanity check on nfds ... */
+ 	err = -EINVAL;
+-	if (nfds > NR_OPEN)
++	if (nfds > current->files->max_fds)
+ 		goto out;
+ 
+ 	if (timeout) {
+-		/* Carefula about overflow in the intermediate values */
++		/* Careful about overflow in the intermediate values */
+ 		if ((unsigned long) timeout < MAX_SCHEDULE_TIMEOUT / HZ)
+-			timeout = (unsigned long)(timeout*HZ+999)/1000+1;
++			timeout = (timeout*HZ+999)/1000+1;
+ 		else /* Negative or overflow */
+ 			timeout = MAX_SCHEDULE_TIMEOUT;
+ 	}
+diff -u --new-file --recursive --exclude-from ../exclude linux.vanilla/include/linux/fs.h linux.ac/include/linux/fs.h
+--- linux.vanilla/include/linux/fs.h	Wed Apr 28 19:14:34 1999
++++ linux.ac/include/linux/fs.h	Sun May  9 23:38:22 1999
+@@ -27,17 +27,19 @@
+ 
+ 
+ /*
+- * It's silly to have NR_OPEN bigger than NR_FILE, but I'll fix
+- * that later. Anyway, now the file code is no longer dependent
+- * on bitmaps in unsigned longs, but uses the new fd_set structure..
++ * It's silly to have NR_OPEN bigger than NR_FILE, but you can change
++ * the file limit at runtime and only root can increase the per-process
++ * nr_file rlimit, so it's safe to set up a ridiculously high absolute
++ * upper limit on files-per-process.
+  *
+  * Some programs (notably those using select()) may have to be 
+- * recompiled to take full advantage of the new limits..
++ * recompiled to take full advantage of the new limits..  
+  */
+ 
+ /* Fixed constants first: */
+ #undef NR_OPEN
+-#define NR_OPEN 1024
++#define NR_OPEN (1024*1024)	/* Absolute upper limit on fd num */
++#define INR_OPEN 1024		/* Initial setting for nfile rlimits */
+ 
+ #define BLOCK_SIZE_BITS 10
+ #define BLOCK_SIZE (1<<BLOCK_SIZE_BITS)
+diff -u --new-file --recursive --exclude-from ../exclude linux.vanilla/include/linux/poll.h linux.ac/include/linux/poll.h
+--- linux.vanilla/include/linux/poll.h	Sun Jan 24 19:55:40 1999
++++ linux.ac/include/linux/poll.h	Sun May  9 23:38:27 1999
+@@ -59,9 +59,6 @@
+ 	unsigned long *res_in, *res_out, *res_ex;
+ } fd_set_bits;
+ 
+-/*
+- * How many longwords for "nr" bits?
+- */
+ #define FDS_BITPERLONG	(8*sizeof(long))
+ #define FDS_LONGS(nr)	(((nr)+FDS_BITPERLONG-1)/FDS_BITPERLONG)
+ #define FDS_BYTES(nr)	(FDS_LONGS(nr)*sizeof(long))
+@@ -90,14 +87,17 @@
+ static inline
+ void set_fd_set(unsigned long nr, void *ufdset, unsigned long *fdset)
+ {
+-	if (ufdset)
+-		__copy_to_user(ufdset, fdset, FDS_BYTES(nr));
++	if (ufdset) {
++		nr = (nr + 8*sizeof(long) - 1) / (8*sizeof(long))*sizeof(long);
++		__copy_to_user(ufdset, fdset, nr);
++	}
+ }
+ 
+ static inline
+ void zero_fd_set(unsigned long nr, unsigned long *fdset)
+ {
+-	memset(fdset, 0, FDS_BYTES(nr));
++	nr = (nr + 8*sizeof(long) - 1) / (8*sizeof(long)) * sizeof(long);
++	memset(fdset, 0, nr);
+ }
+ 
+ extern int do_select(int n, fd_set_bits *fds, long *timeout);
+diff -u --new-file --recursive --exclude-from ../exclude linux.vanilla/include/linux/sched.h linux.ac/include/linux/sched.h
+--- linux.vanilla/include/linux/sched.h	Mon Mar 29 10:25:57 1999
++++ linux.ac/include/linux/sched.h	Sun May  9 23:38:22 1999
+@@ -124,22 +124,38 @@
+ asmlinkage void schedule(void);
+ 
+ /*
++ * The default fd array needs to be at least BITS_PER_LONG,
++ * as this is the granularity returned by copy_fdset().
++ */
++#define NR_OPEN_DEFAULT BITS_PER_LONG
++
++/*
+  * Open file table structure
+  */
+ struct files_struct {
+ 	atomic_t count;
+ 	int max_fds;
++	int max_fdset;
++	int next_fd;
+ 	struct file ** fd;	/* current fd array */
+-	fd_set close_on_exec;
+-	fd_set open_fds;
++	fd_set *close_on_exec;
++	fd_set *open_fds;
++	fd_set close_on_exec_init;
++	fd_set open_fds_init;
++	struct file * fd_array[NR_OPEN_DEFAULT];
+ };
+ 
+ #define INIT_FILES { \
+ 	ATOMIC_INIT(1), \
+-	NR_OPEN, \
+-	&init_fd_array[0], \
++	NR_OPEN_DEFAULT, \
++	__FD_SETSIZE, \
++	0, \
++	&init_files.fd_array[0], \
++	&init_files.close_on_exec_init, \
++	&init_files.open_fds_init, \
+ 	{ { 0, } }, \
+-	{ { 0, } } \
++	{ { 0, } }, \
++	{ NULL, } \
+ }
+ 
+ struct fs_struct {
+@@ -617,6 +633,45 @@
+ extern void mmput(struct mm_struct *);
+ /* Remove the current tasks stale references to the old mm_struct */
+ extern void mm_release(void);
++
++/*
++ * Routines for handling the fd arrays
++ */
++extern struct file ** alloc_fd_array(int);
++extern int expand_fd_array(struct files_struct *, int nr);
++extern void free_fd_array(struct file **, int);
++
++extern fd_set *alloc_fdset(int);
++extern int expand_fdset(struct files_struct *, int nr);
++extern void free_fdset(fd_set *, int);
++
++/* Expand files.  Return <0 on error; 0 nothing done; 1 files expanded,
++ * we may have blocked. */
++static inline int expand_files(struct files_struct *files, int nr)
++{
++	int err, expand = 0;
++#ifdef FDSET_DEBUG	
++	printk (KERN_ERR __FUNCTION__ " %d: nr = %d\n", current->pid, nr);
++#endif
++	
++	if (nr >= files->max_fdset) {
++		expand = 1;
++		if ((err = expand_fdset(files, nr)))
++			goto out;
++	}
++	if (nr >= files->max_fds) {
++		expand = 1;
++		if ((err = expand_fd_array(files, nr)))
++			goto out;
++	}
++	err = expand;
++ out:
++#ifdef FDSET_DEBUG	
++	if (err)
++		printk (KERN_ERR __FUNCTION__ " %d: return %d\n", current->pid, err);
++#endif
++	return err;
++}
+ 
+ extern int  copy_thread(int, unsigned long, unsigned long, struct task_struct *, struct pt_regs *);
+ extern void flush_thread(void);
+diff -u --new-file --recursive --exclude-from ../exclude linux.vanilla/kernel/exit.c linux.ac/kernel/exit.c
+--- linux.vanilla/kernel/exit.c	Wed Mar 24 10:55:28 1999
++++ linux.ac/kernel/exit.c	Fri May  7 16:50:05 1999
+@@ -9,6 +9,7 @@
+ #include <linux/interrupt.h>
+ #include <linux/smp_lock.h>
+ #include <linux/module.h>
++#include <linux/vmalloc.h>
+ #ifdef CONFIG_BSD_PROCESS_ACCT
+ #include <linux/acct.h>
+ #endif
+@@ -159,11 +160,11 @@
+ 
+ 	j = 0;
+ 	for (;;) {
+-		unsigned long set = files->open_fds.fds_bits[j];
++		unsigned long set;
+ 		i = j * __NFDBITS;
+-		j++;
+-		if (i >= files->max_fds)
++		if (i >= files->max_fdset || i >= files->max_fds)
+ 			break;
++		set = files->open_fds->fds_bits[j++];
+ 		while (set) {
+ 			if (set & 1) {
+ 				struct file * file = files->fd[i];
+@@ -189,12 +190,14 @@
+ 		if (atomic_dec_and_test(&files->count)) {
+ 			close_files(files);
+ 			/*
+-			 * Free the fd array as appropriate ...
++ 			 * Free the fd and fdset arrays if we expanded them.
+ 			 */
+-			if (NR_OPEN * sizeof(struct file *) == PAGE_SIZE)
+-				free_page((unsigned long) files->fd);
+-			else
+-				kfree(files->fd);
++ 			if (files->fd != &files->fd_array[0])
++ 				free_fd_array(files->fd, files->max_fds);
++ 			if (files->max_fdset > __FD_SETSIZE) {
++ 				free_fdset(files->open_fds, files->max_fdset);
++ 				free_fdset(files->close_on_exec, files->max_fdset);
++ 			}
+ 			kmem_cache_free(files_cachep, files);
+ 		}
+ 	}
+diff -u --new-file --recursive --exclude-from ../exclude linux.vanilla/kernel/fork.c linux.ac/kernel/fork.c
+--- linux.vanilla/kernel/fork.c	Fri Apr 16 22:11:00 1999
++++ linux.ac/kernel/fork.c	Fri Apr 16 22:33:54 1999
+@@ -362,6 +362,9 @@
+ 
+ 	if (clone_flags & CLONE_VM) {
+ 		mmget(current->mm);
++		tsk->min_flt = tsk->maj_flt = 0;
++		tsk->cmin_flt = tsk->cmaj_flt = 0;
++		tsk->nswap = tsk->cnswap = 0;
+ 		/*
+ 		 * Set up the LDT descriptor for the clone task.
+ 		 */
+@@ -414,32 +417,11 @@
+ 	return 0;
+ }
+ 
+-/*
+- * Copy a fd_set and compute the maximum fd it contains. 
+- */
+-static inline int __copy_fdset(unsigned long *d, unsigned long *src)
+-{
+-	int i; 
+-	unsigned long *p = src; 
+-	unsigned long *max = src; 
+-
+-	for (i = __FDSET_LONGS; i; --i) {
+-		if ((*d++ = *p++) != 0) 
+-			max = p; 
+-	}
+-	return (max - src)*sizeof(long)*8; 
+-}
+-
+-static inline int copy_fdset(fd_set *dst, fd_set *src)
+-{
+-	return __copy_fdset(dst->fds_bits, src->fds_bits);  
+-}
+-
+ static int copy_files(unsigned long clone_flags, struct task_struct * tsk)
+ {
+ 	struct files_struct *oldf, *newf;
+ 	struct file **old_fds, **new_fds;
+-	int size, i, error = 0;
++	int nfds, size, i, error = 0;
+ 
+ 	/*
+ 	 * A background process may not have any files ...
+@@ -459,25 +441,74 @@
+ 	if (!newf) 
+ 		goto out;
+ 
+-	/*
+-	 * Allocate the fd array, using get_free_page() if possible.
+-	 * Eventually we want to make the array size variable ...
+-	 */
+-	size = NR_OPEN * sizeof(struct file *);
+-	if (size == PAGE_SIZE)
+-		new_fds = (struct file **) __get_free_page(GFP_KERNEL);
+-	else
+-		new_fds = (struct file **) kmalloc(size, GFP_KERNEL);
+-	if (!new_fds)
+-		goto out_release;
++	size = oldf->max_fdset;
++	nfds = NR_OPEN_DEFAULT;
+ 
++#ifdef FDSET_DEBUG	
++	printk (KERN_ERR __FUNCTION__ " size = %d/%d\n",
++		oldf->max_fds, oldf->max_fdset);
++#endif
+ 	atomic_set(&newf->count, 1);
+-	newf->max_fds = NR_OPEN;
+-	newf->fd = new_fds;
+-	newf->close_on_exec = oldf->close_on_exec;
+-	i = copy_fdset(&newf->open_fds, &oldf->open_fds);
+ 
++	newf->next_fd	    = 0;
++	newf->max_fds	    = NR_OPEN_DEFAULT;
++	newf->max_fdset	    = __FD_SETSIZE;
++	newf->close_on_exec = &newf->close_on_exec_init;
++	newf->open_fds	    = &newf->open_fds_init;
++	newf->fd	    = &newf->fd_array[0];
++
++	/* Even if the old fdset gets grown here, we'll only copy "size" fds */
++	if (size > __FD_SETSIZE) {
++		newf->max_fdset = 0;
++		error = expand_fdset(newf, size);
++		if (error)
++			goto out_release;
++	}
++	memcpy(newf->open_fds->fds_bits, oldf->open_fds->fds_bits, size/8);
++	memcpy(newf->close_on_exec->fds_bits, oldf->close_on_exec->fds_bits, size/8);
++	if (newf->max_fdset > size) {
++		int left = (newf->max_fdset-size)/8;
++		int start = size / (8 * sizeof(unsigned long));
++		
++		memset(&newf->open_fds->fds_bits[start], 0, left);
++		memset(&newf->close_on_exec->fds_bits[start], 0, left);
++	}
++
++	/* Find the last open fd */
++	for (i = size/(8*sizeof(long)); i > 0; ) {
++		if (newf->open_fds->fds_bits[--i])
++			break;
++	}
++	i = (i+1) * 8 * sizeof(long);
++
++#ifdef FDSET_DEBUG	
++	printk (KERN_ERR __FUNCTION__ " first-free = %d/%d\n", i, size);
++#endif
++
++	/* Do a sanity check ... */
++	if (i > oldf->max_fds)
++		printk(KERN_ERR 
++		       "copy_files: pid %d, open files %d exceeds max %d!\n",
++		       current->pid, i, oldf->max_fds);
++
++	/*
++	 * Check whether we need to allocate a larger fd array.
++	 * Note: we're not a clone task, so the open count won't
++	 * change.
++	 */
++	if (i > NR_OPEN_DEFAULT) {
++		newf->max_fds = 0;
++		error = expand_fd_array(newf, i);
++		if (error)
++			goto out_release;
++		nfds = newf->max_fds;
++	}
++
++	/* compute the remainder to be cleared */
++	size = (nfds - i) * sizeof(struct file *);
+ 	old_fds = oldf->fd;
++	new_fds = newf->fd;
++
+ 	for (; i != 0; i--) {
+ 		struct file *f = *old_fds++;
+ 		*new_fds = f;
+@@ -486,14 +517,20 @@
+ 		new_fds++;
+ 	}
+ 	/* This is long word aligned thus could use a optimized version */ 
+-	memset(new_fds, 0, (char *)newf->fd + size - (char *)new_fds); 
++	memset(new_fds, 0, size); 
+       
+ 	tsk->files = newf;
+ 	error = 0;
+ out:
++#ifdef FDSET_DEBUG	
++	if (error)
++		printk (KERN_ERR "copy_files: return %d\n", error);
++#endif
+ 	return error;
+ 
+ out_release:
++	free_fdset (newf->close_on_exec, newf->max_fdset);
++	free_fdset (newf->open_fds, newf->max_fdset);
+ 	kmem_cache_free(files_cachep, newf);
+ 	goto out;
+ }
+@@ -632,7 +669,7 @@
+ 		goto bad_fork_cleanup_sighand;
+ 	retval = copy_thread(nr, clone_flags, usp, p, regs);
+ 	if (retval)
+-		goto bad_fork_cleanup_sighand;
++		goto bad_fork_cleanup_mm;
+ 	p->semundo = NULL;
+ 
+ 	/* ok, now we should be set up.. */
+@@ -679,6 +716,9 @@
+ 		down(&sem);
+ 	return retval;
+ 
++bad_fork_cleanup_mm:
++	mmput(p->mm);
++	p->mm = NULL;
+ bad_fork_cleanup_sighand:
+ 	exit_sighand(p);
+ bad_fork_cleanup_fs:
+diff -u --new-file --recursive --exclude-from ../exclude linux.vanilla/include/asm-alpha/resource.h linux.ac/include/asm-alpha/resource.h
+--- linux.vanilla/include/asm-alpha/resource.h	Sun Nov  8 15:06:56 1998
++++ linux.ac/include/asm-alpha/resource.h	Fri Dec  4 17:15:34 1998
+@@ -28,7 +28,7 @@
+     {_STK_LIM, _STK_LIM},			/* RLIMIT_STACK */	\
+     {       0, LONG_MAX},			/* RLIMIT_CORE */	\
+     {LONG_MAX, LONG_MAX},			/* RLIMIT_RSS */	\
+-    { NR_OPEN,  NR_OPEN},			/* RLIMIT_NOFILE */	\
++    {INR_OPEN, INR_OPEN},			/* RLIMIT_NOFILE */	\
+     {LONG_MAX, LONG_MAX},			/* RLIMIT_AS */		\
+     {MAX_TASKS_PER_USER, MAX_TASKS_PER_USER},	/* RLIMIT_NPROC */	\
+     {LONG_MAX, LONG_MAX},			/* RLIMIT_MEMLOCK */	\
+diff -u --new-file --recursive --exclude-from ../exclude linux.vanilla/include/asm-i386/resource.h linux.ac/include/asm-i386/resource.h
+--- linux.vanilla/include/asm-i386/resource.h	Thu Nov 19 18:38:47 1998
++++ linux.ac/include/asm-i386/resource.h	Fri Dec  4 17:15:34 1998
+@@ -29,7 +29,7 @@
+ 	{        0, LONG_MAX },				\
+ 	{ LONG_MAX, LONG_MAX },				\
+ 	{ MAX_TASKS_PER_USER, MAX_TASKS_PER_USER },	\
+-	{ NR_OPEN, NR_OPEN },				\
++	{ INR_OPEN, INR_OPEN },				\
+ 	{ LONG_MAX, LONG_MAX },				\
+ 	{ LONG_MAX, LONG_MAX },				\
+ }
+diff -u --new-file --recursive --exclude-from ../exclude linux.vanilla/include/asm-m68k/resource.h linux.ac/include/asm-m68k/resource.h
+--- linux.vanilla/include/asm-m68k/resource.h	Wed Jan  6 23:02:29 1999
++++ linux.ac/include/asm-m68k/resource.h	Wed Jan  6 23:16:34 1999
+@@ -29,7 +29,7 @@
+   {       0, LONG_MAX}, \
+   {LONG_MAX, LONG_MAX}, \
+   {MAX_TASKS_PER_USER, MAX_TASKS_PER_USER}, \
+-  {NR_OPEN, NR_OPEN},   \
++  {INR_OPEN, INR_OPEN}, \
+   {LONG_MAX, LONG_MAX}, \
+   {LONG_MAX, LONG_MAX}  \
+ }
+diff -u --new-file --recursive --exclude-from ../exclude linux.vanilla/include/asm-mips/resource.h linux.ac/include/asm-mips/resource.h
+--- linux.vanilla/include/asm-mips/resource.h	Sun Nov  8 15:06:55 1998
++++ linux.ac/include/asm-mips/resource.h	Fri Dec  4 17:15:34 1998
+@@ -35,7 +35,7 @@
+ 	{LONG_MAX, LONG_MAX},				\
+ 	{_STK_LIM, _STK_LIM},				\
+ 	{       0, LONG_MAX},				\
+-	{NR_OPEN, NR_OPEN},				\
++	{INR_OPEN, INR_OPEN},				\
+ 	{LONG_MAX, LONG_MAX},				\
+ 	{LONG_MAX, LONG_MAX},				\
+ 	{MAX_TASKS_PER_USER, MAX_TASKS_PER_USER},	\
+diff -u --new-file --recursive --exclude-from ../exclude linux.vanilla/include/asm-ppc/resource.h linux.ac/include/asm-ppc/resource.h
+--- linux.vanilla/include/asm-ppc/resource.h	Tue Dec 22 23:20:10 1998
++++ linux.ac/include/asm-ppc/resource.h	Wed Dec 23 00:20:27 1998
+@@ -25,7 +25,7 @@
+     {       0, LONG_MAX},			/* RLIMIT_CORE */	\
+     {LONG_MAX, LONG_MAX},			/* RLIMIT_RSS */	\
+     {MAX_TASKS_PER_USER, MAX_TASKS_PER_USER},	/* RLIMIT_NPROC */	\
+-    { NR_OPEN,  NR_OPEN},			/* RLIMIT_NOFILE */	\
++    {INR_OPEN, INR_OPEN},			/* RLIMIT_NOFILE */	\
+     {LONG_MAX, LONG_MAX},			/* RLIMIT_MEMLOCK */	\
+     {LONG_MAX, LONG_MAX},			/* RLIMIT_AS */		\
+ }
+diff -u --new-file --recursive --exclude-from ../exclude linux.vanilla/include/asm-sparc/resource.h linux.ac/include/asm-sparc/resource.h
+--- linux.vanilla/include/asm-sparc/resource.h	Wed Mar 24 10:55:27 1999
++++ linux.ac/include/asm-sparc/resource.h	Sat Mar 20 23:07:45 1999
+@@ -31,7 +31,7 @@
+     {LONG_MAX, LONG_MAX}, {LONG_MAX, LONG_MAX},				\
+     {LONG_MAX, LONG_MAX}, {_STK_LIM, LONG_MAX},				\
+     {       0, LONG_MAX}, {LONG_MAX, LONG_MAX},				\
+-    {NR_OPEN, NR_OPEN}, {MAX_TASKS_PER_USER, MAX_TASKS_PER_USER},	\
++    {INR_OPEN, INR_OPEN}, {MAX_TASKS_PER_USER, MAX_TASKS_PER_USER},	\
+     {LONG_MAX, LONG_MAX}, {LONG_MAX, LONG_MAX}                          \
+ }
+ 
+diff -u --new-file --recursive --exclude-from ../exclude linux.vanilla/include/asm-sparc64/resource.h linux.ac/include/asm-sparc64/resource.h
+--- linux.vanilla/include/asm-sparc64/resource.h	Wed Mar 24 10:55:27 1999
++++ linux.ac/include/asm-sparc64/resource.h	Sat Mar 20 23:08:38 1999
+@@ -30,7 +30,7 @@
+     {LONG_MAX, LONG_MAX}, {LONG_MAX, LONG_MAX},				\
+     {LONG_MAX, LONG_MAX}, {_STK_LIM, LONG_MAX},				\
+     {       0, LONG_MAX}, {LONG_MAX, LONG_MAX},				\
+-    {NR_OPEN, NR_OPEN}, {MAX_TASKS_PER_USER, MAX_TASKS_PER_USER},	\
++    {INR_OPEN, INR_OPEN}, {MAX_TASKS_PER_USER, MAX_TASKS_PER_USER},	\
+     {LONG_MAX, LONG_MAX}, {LONG_MAX, LONG_MAX}                          \
+ }
+ 
+diff -u --new-file --recursive --exclude-from ../exclude linux.vanilla/arch/alpha/kernel/process.c linux.ac/arch/alpha/kernel/process.c
+--- linux.vanilla/arch/alpha/kernel/process.c	Sun Jan 24 19:55:29 1999
++++ linux.ac/arch/alpha/kernel/process.c	Sun Jan 24 20:20:25 1999
+@@ -55,7 +55,6 @@
+ unsigned long init_user_stack[1024] = { STACK_MAGIC, };
+ static struct vm_area_struct init_mmap = INIT_MMAP;
+ static struct fs_struct init_fs = INIT_FS;
+-static struct file * init_fd_array[NR_OPEN] = { NULL, };
+ static struct files_struct init_files = INIT_FILES;
+ static struct signal_struct init_signals = INIT_SIGNALS;
+ struct mm_struct init_mm = INIT_MM;
+diff -u --new-file --recursive --exclude-from ../exclude linux.vanilla/arch/arm/kernel/init_task.c linux.ac/arch/arm/kernel/init_task.c
+--- linux.vanilla/arch/arm/kernel/init_task.c	Tue Dec 22 23:19:26 1998
++++ linux.ac/arch/arm/kernel/init_task.c	Mon Dec 28 10:05:48 1998
+@@ -6,6 +6,7 @@
+ 
+ static struct vm_area_struct init_mmap = INIT_MMAP;
+ static struct fs_struct init_fs = INIT_FS;
++static struct file * init_fd_array[NR_OPEN] = { NULL, };
+ static struct files_struct init_files = INIT_FILES;
+ static struct signal_struct init_signals = INIT_SIGNALS;
+ struct mm_struct init_mm = INIT_MM;
+diff -u --new-file --recursive --exclude-from ../exclude linux.vanilla/arch/i386/kernel/init_task.c linux.ac/arch/i386/kernel/init_task.c
+--- linux.vanilla/arch/i386/kernel/init_task.c	Sun Nov  8 15:08:22 1998
++++ linux.ac/arch/i386/kernel/init_task.c	Fri Dec  4 17:14:23 1998
+@@ -7,7 +7,6 @@
+ 
+ static struct vm_area_struct init_mmap = INIT_MMAP;
+ static struct fs_struct init_fs = INIT_FS;
+-static struct file * init_fd_array[NR_OPEN] = { NULL, };
+ static struct files_struct init_files = INIT_FILES;
+ static struct signal_struct init_signals = INIT_SIGNALS;
+ struct mm_struct init_mm = INIT_MM;
+diff -u --new-file --recursive --exclude-from ../exclude linux.vanilla/arch/m68k/kernel/process.c linux.ac/arch/m68k/kernel/process.c
+--- linux.vanilla/arch/m68k/kernel/process.c	Sun Jan 24 19:55:31 1999
++++ linux.ac/arch/m68k/kernel/process.c	Sun Jan 24 20:22:53 1999
+@@ -40,7 +40,6 @@
+  */
+ static struct vm_area_struct init_mmap = INIT_MMAP;
+ static struct fs_struct init_fs = INIT_FS;
+-static struct file * init_fd_array[NR_OPEN] = { NULL, };
+ static struct files_struct init_files = INIT_FILES;
+ static struct signal_struct init_signals = INIT_SIGNALS;
+ struct mm_struct init_mm = INIT_MM;
+diff -u --new-file --recursive --exclude-from ../exclude linux.vanilla/arch/mips/kernel/init_task.c linux.ac/arch/mips/kernel/init_task.c
+--- linux.vanilla/arch/mips/kernel/init_task.c	Sun Nov  8 15:08:29 1998
++++ linux.ac/arch/mips/kernel/init_task.c	Fri Dec  4 17:14:23 1998
+@@ -6,7 +6,6 @@
+ 
+ static struct vm_area_struct init_mmap = INIT_MMAP;
+ static struct fs_struct init_fs = INIT_FS;
+-static struct files * init_fd_array[NR_OPEN] = { NULL, };
+ static struct files_struct init_files = INIT_FILES;
+ static struct signal_struct init_signals = INIT_SIGNALS;
+ struct mm_struct init_mm = INIT_MM;
+diff -u --new-file --recursive --exclude-from ../exclude linux.vanilla/arch/sparc/kernel/init_task.c linux.ac/arch/sparc/kernel/init_task.c
+--- linux.vanilla/arch/sparc/kernel/init_task.c	Sun Nov  8 15:10:06 1998
++++ linux.ac/arch/sparc/kernel/init_task.c	Fri Dec  4 17:14:35 1998
+@@ -6,7 +6,6 @@
+ 
+ static struct vm_area_struct init_mmap = INIT_MMAP;
+ static struct fs_struct init_fs = INIT_FS;
+-static struct file * init_fd_array[NR_OPEN] = { NULL, };
+ static struct files_struct init_files = INIT_FILES;
+ static struct signal_struct init_signals = INIT_SIGNALS;
+ struct mm_struct init_mm = INIT_MM;
+diff -u --new-file --recursive --exclude-from ../exclude linux.vanilla/arch/sparc64/kernel/init_task.c linux.ac/arch/sparc64/kernel/init_task.c
+--- linux.vanilla/arch/sparc64/kernel/init_task.c	Sun Nov  8 15:08:40 1998
++++ linux.ac/arch/sparc64/kernel/init_task.c	Fri Dec  4 17:14:35 1998
+@@ -6,7 +6,6 @@
+ 
+ static struct vm_area_struct init_mmap = INIT_MMAP;
+ static struct fs_struct init_fs = INIT_FS;
+-static struct file * init_fd_array[NR_OPEN] = { NULL, };
+ static struct files_struct init_files = INIT_FILES;
+ static struct signal_struct init_signals = INIT_SIGNALS;
+ struct mm_struct init_mm = INIT_MM;
+------------------------- cut here -----------------------------
+diff -ur linux-2.2.9-np/Makefile linux/Makefile
+--- linux-2.2.9-np/Makefile	Sat May 22 14:28:59 1999
++++ linux/Makefile	Sat May 22 14:54:23 1999
+@@ -1,7 +1,7 @@
+ VERSION = 2
+ PATCHLEVEL = 2
+ SUBLEVEL = 9
+-EXTRAVERSION = -np
++EXTRAVERSION = -np-hint
+ 
+ ARCH := $(shell uname -m | sed -e s/i.86/i386/ -e s/sun4u/sparc64/ -e s/arm.*/arm/ -e s/sa110/arm/)
+ 
+diff -ur linux-2.2.9-np/arch/i386/kernel/apm.c linux/arch/i386/kernel/apm.c
+--- linux-2.2.9-np/arch/i386/kernel/apm.c	Fri Jan 15 01:57:25 1999
++++ linux/arch/i386/kernel/apm.c	Tue May 25 17:06:54 1999
+@@ -278,7 +278,7 @@
+ static int	do_open(struct inode *, struct file *);
+ static int	do_release(struct inode *, struct file *);
+ static ssize_t	do_read(struct file *, char *, size_t , loff_t *);
+-static unsigned int do_poll(struct file *, poll_table *);
++static unsigned int do_poll(struct file *, struct poll_table_entry *);
+ static int	do_ioctl(struct inode *, struct file *, u_int, u_long);
+ 
+ static int	apm_get_info(char *, char **, off_t, int, int);
+@@ -1062,7 +1062,7 @@
+ 	return 0;
+ }
+ 
+-static unsigned int do_poll(struct file *fp, poll_table * wait)
++static unsigned int do_poll(struct file *fp, struct poll_table_entry * wait)
+ {
+ 	struct apm_bios_struct * as;
+ 
+diff -ur linux-2.2.9-np/drivers/char/n_tty.c linux/drivers/char/n_tty.c
+--- linux-2.2.9-np/drivers/char/n_tty.c	Sat May 22 13:43:03 1999
++++ linux/drivers/char/n_tty.c	Tue May 25 16:52:07 1999
+@@ -1123,7 +1123,7 @@
+ 	return (b - buf) ? b - buf : retval;
+ }
+ 
+-static unsigned int normal_poll(struct tty_struct * tty, struct file * file, poll_table *wait)
++static unsigned int normal_poll(struct tty_struct * tty, struct file * file, struct poll_table_entry *wait)
+ {
+ 	unsigned int mask = 0;
+ 
+diff -ur linux-2.2.9-np/drivers/char/pc_keyb.c linux/drivers/char/pc_keyb.c
+--- linux-2.2.9-np/drivers/char/pc_keyb.c	Sat May 22 13:43:03 1999
++++ linux/drivers/char/pc_keyb.c	Tue May 25 16:52:45 1999
+@@ -925,7 +925,7 @@
+ 	return retval;
+ }
+ 
+-static unsigned int aux_poll(struct file *file, poll_table * wait)
++static unsigned int aux_poll(struct file *file, struct poll_table_entry * wait)
+ {
+ 	poll_wait(file, &queue->proc_list, wait);
+ 	if (!queue_empty())
+diff -ur linux-2.2.9-np/drivers/char/random.c linux/drivers/char/random.c
+--- linux-2.2.9-np/drivers/char/random.c	Thu Dec 31 15:03:49 1998
++++ linux/drivers/char/random.c	Tue May 25 16:52:23 1999
+@@ -431,7 +431,8 @@
+ 			   size_t nbytes, loff_t *ppos);
+ static ssize_t random_read_unlimited(struct file * file, char * buf,
+ 				     size_t nbytes, loff_t *ppos);
+-static unsigned int random_poll(struct file *file, poll_table * wait);
++static unsigned int random_poll(struct file *file,
++				struct poll_table_entry * wait);
+ static ssize_t random_write(struct file * file, const char * buffer,
+ 			    size_t count, loff_t *ppos);
+ static int random_ioctl(struct inode * inode, struct file * file,
+@@ -1360,7 +1361,7 @@
+ }
+ 
+ static unsigned int
+-random_poll(struct file *file, poll_table * wait)
++random_poll(struct file *file, struct poll_table_entry * wait)
+ {
+ 	unsigned int mask;
+ 
+diff -ur linux-2.2.9-np/drivers/char/rtc.c linux/drivers/char/rtc.c
+--- linux-2.2.9-np/drivers/char/rtc.c	Fri Jan 15 01:58:47 1999
++++ linux/drivers/char/rtc.c	Tue May 25 16:52:36 1999
+@@ -81,7 +81,7 @@
+ static int rtc_ioctl(struct inode *inode, struct file *file,
+ 		     unsigned int cmd, unsigned long arg);
+ 
+-static unsigned int rtc_poll(struct file *file, poll_table *wait);
++static unsigned int rtc_poll(struct file *file, struct poll_table_entry *wait);
+ 
+ void get_rtc_time (struct rtc_time *rtc_tm);
+ void get_rtc_alm_time (struct rtc_time *alm_tm);
+@@ -485,7 +485,7 @@
+ 	return 0;
+ }
+ 
+-static unsigned int rtc_poll(struct file *file, poll_table *wait)
++static unsigned int rtc_poll(struct file *file, struct poll_table_entry *wait)
+ {
+ 	poll_wait(file, &rtc_wait, wait);
+ 	if (rtc_irq_data != 0)
+diff -ur linux-2.2.9-np/drivers/char/tty_io.c linux/drivers/char/tty_io.c
+--- linux-2.2.9-np/drivers/char/tty_io.c	Sat May 22 13:42:58 1999
++++ linux/drivers/char/tty_io.c	Tue May 25 16:53:43 1999
+@@ -119,7 +119,7 @@
+ 
+ static ssize_t tty_read(struct file *, char *, size_t, loff_t *);
+ static ssize_t tty_write(struct file *, const char *, size_t, loff_t *);
+-static unsigned int tty_poll(struct file *, poll_table *);
++static unsigned int tty_poll(struct file *, struct poll_table_entry *);
+ static int tty_open(struct inode *, struct file *);
+ static int tty_release(struct inode *, struct file *);
+ int tty_ioctl(struct inode * inode, struct file * file,
+@@ -327,7 +327,7 @@
+ 	return -EIO;
+ }
+ 
+-static unsigned int hung_up_tty_poll(struct file * filp, poll_table * wait)
++static unsigned int hung_up_tty_poll(struct file * filp, struct poll_table_entry * wait)
+ {
+ 	return POLLIN | POLLOUT | POLLERR | POLLHUP | POLLRDNORM | POLLWRNORM;
+ }
+@@ -1371,7 +1371,7 @@
+ 	return 0;
+ }
+ 
+-static unsigned int tty_poll(struct file * filp, poll_table * wait)
++static unsigned int tty_poll(struct file * filp, struct poll_table_entry * wait)
+ {
+ 	struct tty_struct * tty;
+ 
+diff -ur linux-2.2.9-np/fs/file.c linux/fs/file.c
+--- linux-2.2.9-np/fs/file.c	Sat May 22 14:12:13 1999
++++ linux/fs/file.c	Sat May 22 14:54:23 1999
+@@ -158,11 +158,49 @@
+ }
+ 
+ /*
++ * Allocate high-level bitmap
++ */
++
++unsigned long * alloc_fdbmap(int num)
++{
++	unsigned long *new_fdbmap;
++	int size = (num / FILES_PER_BIT + 7) / 8;
++
++	if (size < PAGE_SIZE)
++		new_fdbmap = (unsigned long *) kmalloc(size, GFP_KERNEL);
++	else if (size == PAGE_SIZE)
++		new_fdbmap = (unsigned long *) __get_free_page(GFP_KERNEL);
++	else
++		new_fdbmap = (unsigned long *) vmalloc(size);
++	return new_fdbmap;
++}
++
++void free_fdbmap(unsigned long *array, int num)
++{
++	int size = (num / FILES_PER_BIT + 7) / 8;
++
++	if (!array) {
++		printk (KERN_ERR __FUNCTION__ "array = 0 (num = %d)\n", num);
++		return;
++	}
++
++	if (num <= __FD_SETSIZE) /* Don't free an embedded fdset */
++		return;
++	else if (size < PAGE_SIZE)
++		kfree(array);
++	else if (size == PAGE_SIZE)
++		free_page((unsigned long) array);
++	else
++		vfree(array);
++}
++
++/*
+  * Expand the fdset in the files_struct.
+  */
+ int expand_fdset(struct files_struct *files, int nr)
+ {
+ 	fd_set *new_openset = 0, *new_execset = 0;
++	unsigned long *new_fdbmap = 0;
+ 	int error, nfds = 0;
+ 
+ 	error = -EMFILE;
+@@ -184,7 +222,8 @@
+ 	error = -ENOMEM;
+ 	new_openset = alloc_fdset(nfds);
+ 	new_execset = alloc_fdset(nfds);
+-	if (!new_openset || !new_execset)
++	new_fdbmap = alloc_fdbmap(nfds);
++	if (!new_openset || !new_execset || !new_fdbmap)
+ 		goto out;
+ 
+ 	error = 0;
+@@ -203,12 +242,20 @@
+ 			memcpy (new_execset, files->close_on_exec, files->max_fdset/8);
+ 			memset (&new_openset->fds_bits[i], 0, count);
+ 			memset (&new_execset->fds_bits[i], 0, count);
++
++			i = (files->max_fdset / FILES_PER_BIT + 7) / 8;
++			count = (nfds / FILES_PER_BIT + 7) / 8 - i;
++			memcpy (new_fdbmap, files->open_fds_bmap,
++				(files->max_fdset / FILES_PER_BIT + 7) / 8);
++			memset ((char *)new_fdbmap + i, 0, count);
+ 		}
+ 
+ 		free_fdset (files->close_on_exec, files->max_fdset);
+ 		free_fdset (files->open_fds, files->max_fdset);
++		free_fdbmap (files->open_fds_bmap, files->max_fdset);
+ 		files->max_fdset = nfds;
+ 		files->open_fds = new_openset;
++		files->open_fds_bmap = new_fdbmap;
+ 		files->close_on_exec = new_execset;
+ 		return 0;
+ 	} 
+@@ -217,8 +264,9 @@
+ out:
+ 	if (new_openset)
+ 		free_fdset(new_openset, nfds);
++	if (new_fdbmap)
++		free_fdbmap(new_fdbmap, nfds);
+ 	if (new_execset)
+ 		free_fdset(new_execset, nfds);
+ 	return error;
+ }
+-
+diff -ur linux-2.2.9-np/fs/open.c linux/fs/open.c
+--- linux-2.2.9-np/fs/open.c	Sat May 22 14:12:13 1999
++++ linux/fs/open.c	Tue May 25 14:26:02 1999
+@@ -9,6 +9,7 @@
+ #include <linux/file.h>
+ #include <linux/smp_lock.h>
+ #include <linux/quotaops.h>
++#include <linux/poll.h>
+ 
+ #include <asm/uaccess.h>
+ 
+@@ -684,6 +685,21 @@
+ 	return ERR_PTR(error);
+ }
+ 
++inline void put_unused_fd(unsigned int fd) 
++{
++	FD_CLR(fd / FILES_PER_BIT, current->files->open_fds_bmap);
++	FD_CLR(fd, current->files->open_fds);
++	if (fd < current->files->next_fd)
++		current->files->next_fd = fd;
++}
++
++inline void put_used_fd(unsigned int fd) 
++{
++	FD_SET(fd, current->files->open_fds);
++	if (current->files->open_fds->fds_bits[fd / FILES_PER_BIT] == ~0UL)
++		FD_SET(fd / FILES_PER_BIT, current->files->open_fds_bmap);
++}
++
+ /*
+  * Find an empty file descriptor entry, and mark it busy.
+  */
+@@ -695,9 +711,17 @@
+ repeat:
+ 	error = -EMFILE;
+ 
+-	fd = find_next_zero_bit(files->open_fds, 
+-				current->files->max_fdset, 
+-				files->next_fd);
++	/*
++	 * Two-level bitmap, search first level for a free bucket, 
++	 * afterwards find free fd in bucket on lower-level bitmap. 
++	 */
++	fd = find_next_zero_bit(files->open_fds_bmap,
++				current->files->max_fdset / FILES_PER_BIT,
++				files->next_fd / FILES_PER_BIT) * FILES_PER_BIT;
++
++	if (fd < current->files->max_fdset)
++		fd += ffz(files->open_fds->fds_bits[fd / (8 * sizeof(unsigned long))]);
++
+ 	/*
+ 	 * N.B. For clone tasks sharing a files structure, this test
+ 	 * will limit the total number of files that can be opened.
+@@ -723,7 +747,7 @@
+ 		goto out;
+ 	}
+ 
+-	FD_SET(fd, files->open_fds);
++	put_used_fd(fd);
+ 	FD_CLR(fd, files->close_on_exec);
+ 	files->next_fd = fd + 1;
+ #if 1
+@@ -743,13 +767,6 @@
+ 	return error;
+ }
+ 
+-inline void put_unused_fd(unsigned int fd)
+-{
+-	FD_CLR(fd, current->files->open_fds);
+-	if (fd < current->files->next_fd)
+-		current->files->next_fd = fd;
+-}
+-
+ asmlinkage int sys_open(const char * filename, int flags, int mode)
+ {
+ 	char * tmp;
+@@ -845,6 +862,11 @@
+ 	filp = fcheck(fd);
+ 	if (filp) {
+ 		struct files_struct * files = current->files;
++		if (fd < files->max_poll && POLLINUSE(files->poll_fds, fd)) {
++			FD_CLR(fd, files->poll_fds);
++			poll_free_wait(&files->poll_wait, fd);
++			poll_remove_backmap(&filp->f_backmap, fd, files);
++		}
+ 		files->fd[fd] = NULL;
+ 		put_unused_fd(fd);
+ 		FD_CLR(fd, files->close_on_exec);
+diff -ur linux-2.2.9-np/fs/pipe.c linux/fs/pipe.c
+--- linux-2.2.9-np/fs/pipe.c	Fri Nov 13 13:07:26 1998
++++ linux/fs/pipe.c	Tue May 25 16:48:54 1999
+@@ -177,7 +177,7 @@
+ 	}
+ }
+ 
+-static unsigned int pipe_poll(struct file * filp, poll_table * wait)
++static unsigned int pipe_poll(struct file * filp, struct poll_table_entry * wait)
+ {
+ 	unsigned int mask;
+ 	struct inode * inode = filp->f_dentry->d_inode;
+@@ -198,7 +198,7 @@
+  * Argh!  Why does SunOS have to have different select() behaviour
+  * for pipes and FIFOs?  Hate, hate, hate!  SunOS lacks POLLHUP.
+  */
+-static unsigned int fifo_poll(struct file * filp, poll_table * wait)
++static unsigned int fifo_poll(struct file * filp, struct poll_table_entry * wait)
+ {
+ 	unsigned int mask;
+ 	struct inode * inode = filp->f_dentry->d_inode;
+@@ -232,7 +232,7 @@
+ 	return pipe_read(filp,buf,count,ppos);
+ }
+ 
+-static unsigned int connect_poll(struct file * filp, poll_table * wait)
++static unsigned int connect_poll(struct file * filp, struct poll_table_entry * wait)
+ {
+ 	struct inode * inode = filp->f_dentry->d_inode;
+ 
+diff -ur linux-2.2.9-np/fs/proc/kmsg.c linux/fs/proc/kmsg.c
+--- linux-2.2.9-np/fs/proc/kmsg.c	Tue Nov 17 13:09:00 1998
++++ linux/fs/proc/kmsg.c	Tue May 25 16:49:11 1999
+@@ -36,7 +36,7 @@
+ 	return do_syslog(2,buf,count);
+ }
+ 
+-static unsigned int kmsg_poll(struct file *file, poll_table * wait)
++static unsigned int kmsg_poll(struct file *file, struct poll_table_entry * wait)
+ {
+ 	poll_wait(file, &log_wait, wait);
+ 	if (log_size)
+diff -ur linux-2.2.9-np/fs/select.c linux/fs/select.c
+--- linux-2.2.9-np/fs/select.c	Sat May 22 14:12:13 1999
++++ linux/fs/select.c	Wed May 26 11:14:44 1999
+@@ -27,90 +27,142 @@
+  * understand what I'm doing here, then you understand how the linux
+  * sleep/wakeup mechanism works.
+  *
+- * Two very simple procedures, poll_wait() and free_wait() make all the
+- * work.  poll_wait() is an inline-function defined in <linux/poll.h>,
+- * as all select/poll functions have to call it to add an entry to the
+- * poll table.
++ * Two very simple procedures, poll_wait() and poll_free_wait() make
++ * all the work.  poll_wait() is an inline-function defined in
++ * <linux/poll.h>, as all select/poll functions have to call it to add
++ * an entry to the poll table.
+  */
+ 
+ /*
+- * I rewrote this again to make the poll_table size variable, take some
+- * more shortcuts, improve responsiveness, and remove another race that
+- * Linus noticed.  -- jrs
++ * Return an area poll_wait() can use to store the wait_queue entry
++ * in. This information is kept for the whole lifetime of the fd.
++ * next will be upated to optimize for ordered fd sets.
+  */
+ 
+-static void free_wait(poll_table * p)
++struct poll_table_entry *get_wait(poll_table **master, 
++				  poll_table **next, int fd)
+ {
+-	struct poll_table_entry * entry;
+-	poll_table *old;
++	poll_table *oldtable = NULL, *table;
++	struct poll_table_entry *entry;
+ 
+-	while (p) {
+-		entry = p->entry + p->nr;
+-		while (p->nr > 0) {
+-			p->nr--;
+-			entry--;
+-			remove_wait_queue(entry->wait_address,&entry->wait);
+-			fput(entry->filp);
++	int off = fd % __MAX_POLL_TABLE_ENTRIES;
++
++	table = (next && *next) ? *next : *master;
++	while (table != NULL && table->basefd < fd - off) {
++		oldtable = table;
++		table = table->next;
++	}
++
++	if (table == NULL || table->basefd > fd) {
++		poll_table *tmp;
++		tmp = (poll_table *) __get_free_page(GFP_KERNEL);
++		if (!tmp) {
++			printk("get_wait: no memory\n");
++			return NULL;
+ 		}
+-		old = p;
+-		p = p->next;
+-		free_page((unsigned long) old);
++		tmp->entry = (struct poll_table_entry *)(tmp + 1);
++		tmp->ref = 0;
++		tmp->basefd = fd - off;
++		tmp->next = table;
++		if (oldtable)
++			oldtable->next = tmp;
++		else
++			*master = tmp;
++
++		table = tmp;
++	}
++
++	table->ref++;
++	if (next)
++		*next = table;
++
++	entry = table->entry + off;
++	entry->wait_address = NULL;
++	entry->next = NULL;
++
++	return entry;
++}
++
++/*
++ * Remove the poll_table_entry corresponding to fd from the poll_table
++ */
++
++void poll_free_wait(poll_table ** p, int fd)
++{
++	poll_table *oldtable = NULL, *table = *p;
++	struct poll_table_entry *entry, *old = NULL;
++
++	int off = fd % __MAX_POLL_TABLE_ENTRIES;
++
++	while (table != NULL && table->basefd < fd - off) {
++		oldtable = table;
++		table = table->next;
++	}
++
++	if (!table || table->basefd > fd) {
++		printk("poll_free_wait: no entry for %d,%p\n", fd, current);
++		return;
++	}
++
++	entry = table->entry + off;
++	while (entry && entry->wait_address) {
++		remove_wait_queue(entry->wait_address, &entry->wait);
++		fput(entry->filp);
++		if (old != NULL)
++			kfree(old);
++		entry = entry->next;
++		old = entry;
++	}
++	table->ref--;
++
++	if (table->ref == 0) {
++		if (oldtable)
++			oldtable->next = table->next;
++		else
++			*p = table->next;
++		
++		free_page((unsigned long) table);
+ 	}
+ }
+ 
+-void __pollwait(struct file * filp, struct wait_queue ** wait_address, poll_table *p)
++void __pollwait(struct file * filp, struct wait_queue ** wait_address, struct poll_table_entry *p)
+ {
+-	for (;;) {
+-		if (p->nr < __MAX_POLL_TABLE_ENTRIES) {
+-			struct poll_table_entry * entry;
+-ok_table:
+-		 	entry = p->entry + p->nr;
+-		 	entry->filp = filp;
+-		 	filp->f_count++;
+-			entry->wait_address = wait_address;
+-			entry->wait.task = current;
+-			entry->wait.next = NULL;
+-			add_wait_queue(wait_address,&entry->wait);
+-			p->nr++;
++	if (p->wait_address) {
++		struct poll_table_entry *tmp;
++		if (!(tmp = kmalloc(sizeof(*p), GFP_KERNEL))) {
++			printk("pollwait: out of memory\n");
+ 			return;
+ 		}
+-		if (p->next == NULL) {
+-			poll_table *tmp = (poll_table *) __get_free_page(GFP_KERNEL);
+-			if (!tmp)
+-				return;
+-			tmp->nr = 0;
+-			tmp->entry = (struct poll_table_entry *)(tmp + 1);
+-			tmp->next = NULL;
+-			p->next = tmp;
+-			p = tmp;
+-			goto ok_table;
+-		}
+-		p = p->next;
+-	}
++		tmp->next = p->next;
++		p->next = tmp;
++		p = tmp;
++	}
++	p->filp = filp;
++	filp->f_count++;
++	p->wait_address = wait_address;
++	p->wait.task = current;
++	p->wait.next = NULL;
++	add_wait_queue(wait_address, &p->wait);
+ }
+ 
+-#define __IN(fds, n)		(fds->in + n)
+-#define __OUT(fds, n)		(fds->out + n)
+-#define __EX(fds, n)		(fds->ex + n)
+-#define __RES_IN(fds, n)	(fds->res_in + n)
+-#define __RES_OUT(fds, n)	(fds->res_out + n)
+-#define __RES_EX(fds, n)	(fds->res_ex + n)
+-
+-#define BITS(fds, n)		(*__IN(fds, n)|*__OUT(fds, n)|*__EX(fds, n))
+-
+ static int max_select_fd(unsigned long n, fd_set_bits *fds)
+ {
+ 	unsigned long *open_fds;
+-	unsigned long set;
++	unsigned long set, *in, *out, *ex;
+ 	int max;
+ 
+ 	/* handle last in-complete long-word first */
+ 	set = ~(~0UL << (n & (__NFDBITS-1)));
+ 	n /= __NFDBITS;
++
++	in = fds->in + n;
++	out = fds->out + n;
++	ex = fds->ex + n;
++
+ 	open_fds = current->files->open_fds->fds_bits+n;
+ 	max = 0;
+ 	if (set) {
+-		set &= BITS(fds, n);
++		set &= (*in | *out | *ex);
+ 		if (set) {
+ 			if (!(set & ~*open_fds))
+ 				goto get_max;
+@@ -120,7 +172,12 @@
+ 	while (n) {
+ 		open_fds--;
+ 		n--;
+-		set = BITS(fds, n);
++
++		in--;
++		out--;
++		ex--;
++
++		set = (*in | *out | *ex);
+ 		if (!set)
+ 			continue;
+ 		if (set & ~*open_fds)
+@@ -147,23 +204,110 @@
+ #define POLLOUT_SET (POLLWRBAND | POLLWRNORM | POLLOUT | POLLERR)
+ #define POLLEX_SET (POLLPRI)
+ 
+-int do_select(int n, fd_set_bits *fds, long *timeout)
++/*
++ * Simply expand a fd_set * structure and copy the content.
++ */
++
++#define COPYSET(np, op, nold, nnew) do { \
++	memcpy(np, op, (nold) / 8); \
++	memset(&(np)->fds_bits[(nold) / __NFDBITS], 0, \
++		((nnew) - (nold)) / 8); \
++	} while (0);
++
++#define POLL_HINTS_IN(x) (fd_set *)(x)->poll_hints
++#define POLL_HINTS_OUT(x) (fd_set *)&(x)->poll_hints->fds_bits[(x)->max_poll / __NFDBITS]
++#define POLL_HINTS_EX(x) (fd_set *)&(x)->poll_hints->fds_bits[2 * (x)->max_poll / __NFDBITS]
++
++#define INH(x)		(in & (inh | poll_in->fds_bits[x]))
++#define OUTH(x)		(out & (outh | poll_out->fds_bits[x]))
++#define EXH(x)		(ex & (exh | poll_ex->fds_bits[x]))
++
++int expand_poll_hints(struct files_struct *files, int newnr)
+ {
+-	poll_table *wait_table, *wait;
+-	int retval, i, off;
+-	long __timeout = *timeout;
++	int npoll, i, retval = 0;
++	fd_set *new_pollset = 0, *new_hintset = 0;
++	unsigned long flags;
++
++	npoll = files->max_poll;
++	do {
++		if (npoll < (PAGE_SIZE * 8))
++			npoll = PAGE_SIZE * 8;
++		else {
++			npoll = npoll * 2;
++			if (npoll > NR_OPEN)
++				npoll = NR_OPEN;
++		}
++	} while (npoll < newnr);
++
++	npoll = ((npoll + __NFDBITS - 1) / __NFDBITS) * __NFDBITS;
++
++	retval = -ENOMEM;
++	if (!(new_pollset = alloc_fdset(npoll)))
++		goto out;
++	if (!(new_hintset = alloc_fdset(3 * npoll)))
++		goto out;
++	retval = 0;
++
++	if (files->max_poll >= npoll) {
++		/* XXX - this has been in other code also */
++		printk("expand_poll_hints: called concurrently\n");
++		goto out;
++	}
+ 
+-	wait = wait_table = NULL;
+-	if (__timeout) {
+-		wait_table = (poll_table *) __get_free_page(GFP_KERNEL);
+-		if (!wait_table)
+-			return -ENOMEM;
+-
+-		wait_table->nr = 0;
+-		wait_table->entry = (struct poll_table_entry *)(wait_table + 1);
+-		wait_table->next = NULL;
+-		wait = wait_table;
++	spin_lock_irqsave(&files->poll_hint_lock, flags);
++	i = npoll / __NFDBITS;
++	if (i) {
++		int nold = files->max_poll;
++		fd_set *oldset, *newset;
++		
++		/* Copy the fds we are interested in */
++		COPYSET(new_pollset, files->poll_fds, nold, npoll);
++		
++		/* Copy the fds we have events for in, our and ex */
++		COPYSET(new_hintset, files->poll_hints, nold, npoll);
++		oldset = (fd_set *)&files->poll_hints->fds_bits[nold / __NFDBITS];
++		newset = (fd_set *)&new_hintset->fds_bits[npoll / __NFDBITS];
++		COPYSET(newset, oldset, nold, npoll);
++		oldset = (fd_set *)&files->poll_hints->fds_bits[2 * nold / __NFDBITS];
++		newset = (fd_set *)&new_hintset->fds_bits[2 * npoll / __NFDBITS];
++		COPYSET(newset, oldset, nold, npoll);
+ 	}
++	
++	/* XXX - free_fdset has built in knowledge. Bah. */
++	if (files->max_poll / 8 > __FD_SETSIZE) {
++		free_fdset(files->poll_fds, files->max_poll);
++		free_fdset(files->poll_hints, 3 * files->max_poll);
++	}
++	files->max_poll = npoll;
++	files->poll_fds = new_pollset;
++	files->poll_hints = new_hintset;
++	spin_unlock_irqrestore(&files->poll_hint_lock, flags);
++
++	return 0;
++
++ out:
++	if (new_pollset)
++		free_fdset(new_pollset, npoll);
++	if (new_hintset)
++		free_fdset(new_hintset, 3 * npoll);
++	return retval;
++}
++
++int do_select(int n, fd_set_bits *fds, long *timeout)
++{
++	struct files_struct *files = current->files;
++	fd_set *poll_in, *poll_out, *poll_ex, *poll_fds;
++	poll_table *wait_table;
++	struct poll_table_entry *wait;
++	int retval, i, j, off, fd;
++	unsigned long newfds;
++	long __timeout = *timeout;
++	unsigned long *inp, *outp, *exp, *rinp, *routp, *rexp;
++	unsigned long in, out, ex, bits, bit;
++	unsigned long inh, outh, exh;
++	unsigned long mask;
++	struct file *file;
++	unsigned long flags;
+ 
+ 	lock_kernel();
+ 
+@@ -172,45 +316,138 @@
+ 		goto out;
+ 	n = retval;
+ 	retval = 0;
++
++	if (n >= files->max_poll) {
++		/*
++		 * We are selecting more fds than before, we need to
++		 * increase our hints.
++		 */
++		retval = expand_poll_hints(files, n);
++		if (retval < 0)
++			goto out;
++		retval = 0;
++	}
++
++	/*
++	 * Now we need to enter the new fds into the hints fdset, so
++	 * that we test them also.
++	 */
++
++	poll_in = POLL_HINTS_IN(files);
++	poll_out = POLL_HINTS_OUT(files);
++	poll_ex = POLL_HINTS_EX(files);
++	poll_fds = files->poll_fds;
++
+ 	for (;;) {
++		inp = fds->in;
++		outp = fds->out;
++		exp = fds->ex;
++		rinp = fds->res_in;
++		routp = fds->res_out;
++		rexp = fds->res_ex;
++
++		wait_table = NULL;
+ 		current->state = TASK_INTERRUPTIBLE;
+-		for (i = 0 ; i < n; i++) {
+-			unsigned long bit = BIT(i);
+-			unsigned long mask;
+-			struct file *file;
++		for (i = 0, off = 0; i < n; i += __NFDBITS, off++,
++			     inp++, outp++, exp++, rinp++, routp++, rexp++) {
++			/* XXX the addition is probably slow */
++			in = *inp;
++			out = *outp;
++			ex = *exp;
++			bits = (in|ex|out);
++
++			newfds = bits & ~poll_fds->fds_bits[off];
++
++			spin_lock_irqsave(&files->poll_hint_lock, flags);
++			/* Reduce calls to spin_lock, update from last loop */
++			if (off > 0) {
++				poll_in->fds_bits[off-1] |= inh;
++				poll_out->fds_bits[off-1] |= outh;
++				poll_ex->fds_bits[off-1] |= exh;
++			}
++			inh = poll_in->fds_bits[off] | newfds;
++			outh = poll_out->fds_bits[off] | newfds;
++			exh = poll_ex->fds_bits[off] | newfds;
++			poll_in->fds_bits[off] = 0;
++			poll_out->fds_bits[off] = 0;
++			poll_ex->fds_bits[off] = 0;
++			spin_unlock_irqrestore(&files->poll_hint_lock, flags);
++
++			while ((j = ffs(bits)) && (fd = i + --j) < n) {
++				bit = (1 << j);
++				bits &= ~bit;
++
++				/*
++				 * The hints can be updated while we are in
++				 * this loop.
++				 */
++				if (!((bit & INH(off)) || (bit & OUTH(off)) ||
++				      (bit & EXH(off))))
++					continue;
++
++				/*
++				 * The poll_wait routine will increment
++				 * f_count if the file is added to the wait
++				 * table, so we don't need to increment it now.
++				 */
++				file = fcheck(fd);
++				if (!file) /* POLLNVAL, but not used */
++					continue;
+ 
+-			off = i / __NFDBITS;
+-			if (!(bit & BITS(fds, off)))
+-				continue;
+-			/*
+-			 * The poll_wait routine will increment f_count if
+-			 * the file is added to the wait table, so we don't
+-			 * need to increment it now.
+-			 */
+-			file = fcheck(i);
+-			mask = POLLNVAL;
+-			if (file) {
+ 				mask = DEFAULT_POLLMASK;
+-				if (file->f_op && file->f_op->poll)
++				if (file->f_op && file->f_op->poll) {
++					poll_fds->fds_bits[off] |= bit;
++					if (newfds & bit) {
++						wait = get_wait(&files->poll_wait,
++								&wait_table, fd);
++						poll_backmap(fd, &file->f_backmap);
++					} else
++						wait = NULL;
++
+ 					mask = file->f_op->poll(file, wait);
+-			}
+-			if ((mask & POLLIN_SET) && ISSET(bit, __IN(fds,off))) {
+-				SET(bit, __RES_IN(fds,off));
+-				retval++;
+-				wait = NULL;
+-			}
+-			if ((mask & POLLOUT_SET) && ISSET(bit, __OUT(fds,off))) {
+-				SET(bit, __RES_OUT(fds,off));
+-				retval++;
+-				wait = NULL;
+-			}
+-			if ((mask & POLLEX_SET) && ISSET(bit, __EX(fds,off))) {
+-				SET(bit, __RES_EX(fds,off));
+-				retval++;
+-				wait = NULL;
++				}
++
++				/*
++				 * Check if the returned poll supports hinting,
++				 * and set the hints accordingly.
++				 */
++				if (mask & POLLHINT) {
++					if (mask & POLLIN_SET)
++						inh |= bit;
++					else
++						inh &= ~bit;
++					if (mask & POLLOUT_SET)
++						outh |= bit;
++					else
++						outh &= ~bit;
++					if (mask & POLLEX_SET)
++						exh |= bit;
++					else
++						exh &= ~bit;
++				}
++
++				if ((mask & POLLIN_SET) && (bit & in)) {
++					*rinp |= bit;
++					retval++;
++				}
++				if ((mask & POLLOUT_SET) && (bit & out)) {
++					*routp |= bit;
++					retval++;
++				}
++				if ((mask & POLLEX_SET) && (bit & ex)) {
++					*rexp |= bit;
++					retval++;
++				}
+ 			}
+ 		}
+-		wait = NULL;
++		/* Last hintset needs to be updated */
++		if (off > 0) {
++			spin_lock_irqsave(&files->poll_hint_lock, flags);
++			poll_in->fds_bits[off-1] |= inh;
++			poll_out->fds_bits[off-1] |= outh;
++			poll_ex->fds_bits[off-1] |= exh;
++			spin_unlock_irqrestore(&files->poll_hint_lock, flags);
++		}
+ 		if (retval || !__timeout || signal_pending(current))
+ 			break;
+ 		__timeout = schedule_timeout(__timeout);
+@@ -218,9 +455,6 @@
+ 	current->state = TASK_RUNNING;
+ 
+ out:
+-	if (*timeout)
+-		free_wait(wait_table);
+-
+ 	/*
+ 	 * Up-to-date the caller timeout.
+ 	 */
+@@ -339,54 +573,144 @@
+ 	return ret;
+ }
+ 
+-static int do_poll(unsigned int nfds, struct pollfd *fds, poll_table *wait,
+-		   long timeout)
++static int do_poll(unsigned int nfds, struct pollfd *fds, long timeout)
+ {
+-	int count = 0;
++	int count = 0, retval = 0, off, bit, inuse;
++	unsigned long inh, outh, exh, flags;
++	int hoff, oldfd, fd;
++	struct files_struct *files = current->files;
++	fd_set *poll_in, *poll_out, *poll_ex;
++	struct file *file;
++	struct poll_table_entry *wait;
+ 
+ 	for (;;) {
+ 		unsigned int j;
+ 		struct pollfd * fdpnt;
+ 
++		hoff = -1;
++		fd = -1;
++		poll_in = POLL_HINTS_IN(files);
++		poll_out = POLL_HINTS_OUT(files);
++		poll_ex = POLL_HINTS_EX(files);
+ 		current->state = TASK_INTERRUPTIBLE;
+ 		for (fdpnt = fds, j = 0; j < nfds; j++, fdpnt++) {
+-			int fd;
+ 			unsigned int mask;
+ 
++			oldfd = fd;
+ 			mask = 0;
++
+ 			fd = fdpnt->fd;
+-			if (fd >= 0) {
+-				/* poll_wait increments f_count if needed */
+-				struct file * file = fcheck(fd);
+-				mask = POLLNVAL;
+-				if (file != NULL) {
+-					mask = DEFAULT_POLLMASK;
+-					if (file->f_op && file->f_op->poll)
+-						mask = file->f_op->poll(file, wait);
+-					mask &= fdpnt->events | POLLERR | POLLHUP;
++			if (fd < 0) {
++				fdpnt->revents = mask;
++				continue;
++			}
++
++			/* poll_wait increments f_count if needed */
++			file = fcheck(fd);
++
++			off = fd / __NFDBITS;
++			bit = BIT(fd);
++
++			if (fd >= files->max_poll) {
++				retval = expand_poll_hints(files, fd);
++				if (retval < 0)
++					goto out;
++				poll_in = POLL_HINTS_IN(files);
++				poll_out = POLL_HINTS_OUT(files);
++				poll_ex = POLL_HINTS_EX(files);
++			}
++			if ((bit & files->poll_fds->fds_bits[off]) && 
++			    !(((fdpnt->events & POLLIN_SET) &&
++			       (bit & poll_in->fds_bits[off])) ||
++			      ((fdpnt->events & POLLOUT_SET) &&
++			       (bit & poll_out->fds_bits[off])) ||
++			      ((fdpnt->events & POLLEX_SET) &&
++			       (bit & poll_ex->fds_bits[off]))))
++				continue;
++			
++			inuse = bit & files->poll_fds->fds_bits[off];
++			
++			if (hoff == -1 || hoff + __NFDBITS <= fd) { 
++				hoff = fd & (~(__NFDBITS-1));
++				spin_lock_irqsave(&files->poll_hint_lock, flags);
++				if (oldfd != -1) {
++					int off = oldfd / __NFDBITS;
++					poll_in->fds_bits[off] |= inh;
++					poll_out->fds_bits[off] |= outh;
++					poll_ex->fds_bits[off] |= exh;
+ 				}
+-				if (mask) {
+-					wait = NULL;
+-					count++;
++				inh = poll_in->fds_bits[off];
++				outh = poll_in->fds_bits[off];
++				exh = poll_in->fds_bits[off];
++				poll_in->fds_bits[off] = 0;
++				poll_out->fds_bits[off] = 0;
++				poll_ex->fds_bits[off] = 0;
++				spin_unlock_irqrestore(&files->poll_hint_lock, flags);
++			}
++
++			mask = POLLNVAL;
++			if (file != NULL) {
++				mask = DEFAULT_POLLMASK;
++				if (file->f_op && file->f_op->poll) {
++					/* Mark fd as being in use */
++					files->poll_fds->fds_bits[off] |= bit;
++					if (!inuse) {
++						wait = get_wait(&files->poll_wait, NULL, fd);
++						poll_backmap(fd, &file->f_backmap);
++					} else
++						wait = NULL;
++					mask = file->f_op->poll(file, wait);
+ 				}
++					mask &= fdpnt->events | POLLERR | POLLHUP | POLLHINT;
+ 			}
++			/* See if device supports hinting */
++			if (mask & POLLHINT) {
++				mask &= ~POLLHINT;
++				if (mask & POLLIN_SET)
++					inh |= bit;
++				else
++					inh &= ~bit;
++				if (mask & POLLOUT_SET)
++					outh |= bit;
++				else
++					outh &= ~bit;
++				if (mask & POLLEX_SET)
++					exh |= bit;
++				else
++					exh &= ~bit;
++			} else if (!inuse) {
++				inh |= bit;
++				outh |= bit;
++				exh |= bit;
++			}
++
++			mask = POLLNVAL;
++			if (mask)
++				count++;
+ 			fdpnt->revents = mask;
+ 		}
++		if (fd != -1) { 
++			spin_lock_irqsave(&files->poll_hint_lock, flags);
++			poll_in->fds_bits[off] |= inh;
++			poll_out->fds_bits[off] |= outh;
++			poll_ex->fds_bits[off] |= exh;
++			spin_unlock_irqrestore(&files->poll_hint_lock, flags);
++		}
+ 
+-		wait = NULL;
+ 		if (count || !timeout || signal_pending(current))
+ 			break;
+ 		timeout = schedule_timeout(timeout);
+ 	}
++	retval = count;
++ out:
+ 	current->state = TASK_RUNNING;
+-	return count;
++	return retval;
+ }
+ 
+ asmlinkage int sys_poll(struct pollfd * ufds, unsigned int nfds, long timeout)
+ {
+ 	int i, fdcount, err, size;
+ 	struct pollfd * fds, *fds1;
+-	poll_table *wait_table = NULL, *wait = NULL;
+ 
+ 	lock_kernel();
+ 	/* Do a sanity check on nfds ... */
+@@ -403,16 +727,6 @@
+ 	}
+ 
+ 	err = -ENOMEM;
+-	if (timeout) {
+-		wait_table = (poll_table *) __get_free_page(GFP_KERNEL);
+-		if (!wait_table)
+-			goto out;
+-		wait_table->nr = 0;
+-		wait_table->entry = (struct poll_table_entry *)(wait_table + 1);
+-		wait_table->next = NULL;
+-		wait = wait_table;
+-	}
+-
+ 	size = nfds * sizeof(struct pollfd);
+ 	fds = (struct pollfd *) kmalloc(size, GFP_KERNEL);
+ 	if (!fds)
+@@ -422,7 +736,7 @@
+ 	if (copy_from_user(fds, ufds, size))
+ 		goto out_fds;
+ 
+-	fdcount = do_poll(nfds, fds, wait, timeout);
++	fdcount = do_poll(nfds, fds, timeout);
+ 
+ 	/* OK, now copy the revents fields back to user space. */
+ 	fds1 = fds;
+@@ -437,8 +751,6 @@
+ out_fds:
+ 	kfree(fds);
+ out:
+-	if (wait)
+-		free_wait(wait_table);
+ 	unlock_kernel();
+ 	return err;
+ }
+diff -ur linux-2.2.9-np/include/linux/fs.h linux/include/linux/fs.h
+--- linux-2.2.9-np/include/linux/fs.h	Sat May 22 14:15:22 1999
++++ linux/include/linux/fs.h	Tue May 25 16:59:10 1999
+@@ -23,7 +23,7 @@
+ #include <asm/bitops.h>
+ #include <asm/cache.h>
+ 
+-struct poll_table_struct;
++struct poll_table_entry;
+ 
+ 
+ /*
+@@ -426,6 +426,7 @@
+ 
+ 	unsigned long		f_version;
+ 
++	struct poll_backmap	*f_backmap;
+ 	/* needed for tty driver, and maybe others */
+ 	void			*private_data;
+ };
+@@ -583,7 +584,7 @@
+ 	ssize_t (*read) (struct file *, char *, size_t, loff_t *);
+ 	ssize_t (*write) (struct file *, const char *, size_t, loff_t *);
+ 	int (*readdir) (struct file *, void *, filldir_t);
+-	unsigned int (*poll) (struct file *, struct poll_table_struct *);
++	unsigned int (*poll) (struct file *, struct poll_table_entry *);
+ 	int (*ioctl) (struct inode *, struct file *, unsigned int, unsigned long);
+ 	int (*mmap) (struct file *, struct vm_area_struct *);
+ 	int (*open) (struct inode *, struct file *);
+diff -ur linux-2.2.9-np/include/linux/net.h linux/include/linux/net.h
+--- linux-2.2.9-np/include/linux/net.h	Sat May 22 14:15:21 1999
++++ linux/include/linux/net.h	Tue May 25 16:54:35 1999
+@@ -20,7 +20,7 @@
+ 
+ #include <linux/socket.h>
+ 
+-struct poll_table_struct;
++struct poll_table_entry;
+ 
+ #define NPROTO		32		/* should be enough for now..	*/
+ 
+@@ -93,7 +93,7 @@
+ 			 int flags);
+   int	(*getname)	(struct socket *sock, struct sockaddr *uaddr,
+ 			 int *usockaddr_len, int peer);
+-  unsigned int (*poll)	(struct file *file, struct socket *sock, struct poll_table_struct *wait);
++  unsigned int (*poll)	(struct file *file, struct socket *sock, struct poll_table_entry *wait);
+   int	(*ioctl)	(struct socket *sock, unsigned int cmd,
+ 			 unsigned long arg);
+   int	(*listen)	(struct socket *sock, int len);
+diff -ur linux-2.2.9-np/include/linux/poll.h linux/include/linux/poll.h
+--- linux-2.2.9-np/include/linux/poll.h	Sat May 22 14:15:23 1999
++++ linux/include/linux/poll.h	Tue May 25 16:59:26 1999
+@@ -8,26 +8,132 @@
+ #include <linux/wait.h>
+ #include <linux/string.h>
+ #include <linux/mm.h>
++#include <linux/malloc.h>
+ #include <asm/uaccess.h>
+ 
++/* Look at <asm/poll.h> - this has not been assigned elsewhere */
++#define POLLHINT	0x8000
++#define POLLHINTEX	1
++#define POLLHINTIN	2
++#define POLLHINTOUT	4	
+ 
+ struct poll_table_entry {
++	struct poll_table_entry *next;
+ 	struct file * filp;
+ 	struct wait_queue wait;
+ 	struct wait_queue ** wait_address;
+ };
+ 
++/*
++ * The poll_table is utilized in blocks of __MAX_POLL_TABLE_ENTRIES and
++ * remains in the state of the process over invocations of select() or
++ * poll().
++ */
++
+ typedef struct poll_table_struct {
+ 	struct poll_table_struct * next;
+-	unsigned int nr;
++	unsigned int ref;
++	unsigned int basefd;
+ 	struct poll_table_entry * entry;
+ } poll_table;
+ 
++struct poll_backmap {
++	struct poll_backmap *next;
++	struct files_struct *files;	/* files which has this file as */
++	int fd;				/* file descriptor number fd */
++};
++
+ #define __MAX_POLL_TABLE_ENTRIES ((PAGE_SIZE - sizeof (poll_table)) / sizeof (struct poll_table_entry))
+ 
+-extern void __pollwait(struct file * filp, struct wait_queue ** wait_address, poll_table *p);
++#define POLLINUSE(x,y) ((x)->fds_bits[(y)/__NFDBITS] & (1UL << ((y)&(__NFDBITS-1))))
++
++extern inline void poll_add_hint(struct poll_backmap ** map, int type)
++{
++	fd_set *hint;
++	struct poll_backmap *entry;
++	struct files_struct *files;
++	unsigned long flags;
++
++	if (!map)
++		return;
++	entry = *map;
++	while (entry) {
++		files = entry->files;
++
++		spin_lock_irqsave(&files->poll_hint_lock, flags);
++		if (type & POLLHINTEX) {
++			hint = (fd_set *)&files->poll_hints->fds_bits[2 * files->max_poll / __NFDBITS];
++			hint->fds_bits[entry->fd / __NFDBITS] |= 1 << (entry->fd & (__NFDBITS - 1));
++		}
++		if (type & POLLHINTOUT) {
++			hint = (fd_set *)&files->poll_hints->fds_bits[files->max_poll / __NFDBITS];
++			hint->fds_bits[entry->fd / __NFDBITS] |= 1 << (entry->fd & (__NFDBITS - 1));
++		}
++		if (type & POLLHINTIN) {
++			hint = files->poll_hints;
++			hint->fds_bits[entry->fd / __NFDBITS] |= 1 << (entry->fd & (__NFDBITS - 1));
++		}
++		spin_unlock_irqrestore(&files->poll_hint_lock, flags);
++
++		entry = entry->next;
++	}
++}
++
++extern inline void poll_backmap(int fd, struct poll_backmap ** entry)
++{
++	struct poll_backmap *tmp;
++
++	if (!entry)
++		return;
++
++	/*
++	 * See if we have an entry in the backmap already, in general
++	 * we expect this linked list to be very short.
++	 */
++	tmp = *entry;
++	while (tmp != NULL) {
++		if (tmp->files == current->files && tmp->fd == fd)
++			return;
++		tmp = tmp->next;
++	}
++
++	tmp = (struct poll_backmap *) kmalloc(sizeof(*entry), GFP_KERNEL);
++	if (tmp == NULL)
++		return;
++
++	tmp->files = current->files;
++	tmp->fd = fd;
++	tmp->next = *entry;
++
++	*entry = tmp;
++}
++
++extern inline void poll_remove_backmap(struct poll_backmap **map, int fd,
++				       struct files_struct *files)
++{
++	struct poll_backmap *tmp = *map, *old = NULL;
++
++	while (tmp != NULL) {
++		if (tmp->files == files && tmp->fd == fd)
++			break;
++		old = tmp;
++		tmp = tmp->next;
++	}
++
++	if (!tmp)
++		return;
++
++	if (old == NULL)
++		*map = tmp->next;
++	else 
++		old->next = tmp->next;
++
++	kfree (tmp);
++}
++
++extern void __pollwait(struct file * filp, struct wait_queue ** wait_address, struct poll_table_entry *p);
+ 
+-extern inline void poll_wait(struct file * filp, struct wait_queue ** wait_address, poll_table *p)
++extern inline void poll_wait(struct file * filp, struct wait_queue ** wait_address, struct poll_table_entry *p)
+ {
+ 	if (p && wait_address)
+ 		__pollwait(filp, wait_address, p);
+@@ -101,6 +207,7 @@
+ }
+ 
+ extern int do_select(int n, fd_set_bits *fds, long *timeout);
++extern void poll_free_wait(poll_table **p, int fd);
+ 
+ #endif /* KERNEL */
+ 
+diff -ur linux-2.2.9-np/include/linux/sched.h linux/include/linux/sched.h
+--- linux-2.2.9-np/include/linux/sched.h	Sat May 22 14:15:22 1999
++++ linux/include/linux/sched.h	Tue May 25 16:59:14 1999
+@@ -130,31 +130,57 @@
+ #define NR_OPEN_DEFAULT BITS_PER_LONG
+ 
+ /*
++ * Two-level bitmap to keep track of open files, one bit
++ * in the higher level bitmap corresponds to FILES_PER_BIT
++ * files in the lower level bitmap.
++ */
++
++#define FILES_PER_BIT  BITS_PER_LONG
++
++/*
+  * Open file table structure
+  */
+ struct files_struct {
+ 	atomic_t count;
++	spinlock_t poll_hint_lock;
+ 	int max_fds;
+ 	int max_fdset;
+ 	int next_fd;
++	int max_poll;
+ 	struct file ** fd;	/* current fd array */
+ 	fd_set *close_on_exec;
+ 	fd_set *open_fds;
++	unsigned long *open_fds_bmap;
++	fd_set *poll_fds;
++	fd_set *poll_hints;
++	struct poll_table_struct *poll_wait;
+ 	fd_set close_on_exec_init;
+ 	fd_set open_fds_init;
++	unsigned long open_fds_bmap_init[__FD_SETSIZE/BITS_PER_LONG/FILES_PER_BIT];
++	fd_set poll_fds_init;
++	fd_set poll_hints_init[3];
+ 	struct file * fd_array[NR_OPEN_DEFAULT];
+ };
+ 
+ #define INIT_FILES { \
+ 	ATOMIC_INIT(1), \
++	SPIN_LOCK_UNLOCKED, \
+ 	NR_OPEN_DEFAULT, \
+ 	__FD_SETSIZE, \
+ 	0, \
++	__FD_SETSIZE, \
+ 	&init_files.fd_array[0], \
+ 	&init_files.close_on_exec_init, \
+ 	&init_files.open_fds_init, \
++	&init_files.open_fds_bmap_init[0], \
++	&init_files.poll_fds_init, \
++	&init_files.poll_hints_init[0], \
++	NULL, \
++	{ { 0, } }, \
+ 	{ { 0, } }, \
++	{ 0, }, \
+ 	{ { 0, } }, \
++	{ { { 0, } }, }, \
+ 	{ NULL, } \
+ }
+ 
+@@ -642,8 +668,10 @@
+ extern void free_fd_array(struct file **, int);
+ 
+ extern fd_set *alloc_fdset(int);
+-extern int expand_fdset(struct files_struct *, int nr);
+ extern void free_fdset(fd_set *, int);
++extern unsigned long *alloc_fdbmap(int);
++extern void free_fdbmap(unsigned long *, int);
++extern int expand_fdset(struct files_struct *, int nr);
+ 
+ /* Expand files.  Return <0 on error; 0 nothing done; 1 files expanded,
+  * we may have blocked. */
+diff -ur linux-2.2.9-np/include/linux/skbuff.h linux/include/linux/skbuff.h
+--- linux-2.2.9-np/include/linux/skbuff.h	Sat May 22 14:15:23 1999
++++ linux/include/linux/skbuff.h	Tue May 25 16:59:26 1999
+@@ -572,7 +572,7 @@
+ }
+ 
+ extern struct sk_buff *		skb_recv_datagram(struct sock *sk,unsigned flags,int noblock, int *err);
+-extern unsigned int		datagram_poll(struct file *file, struct socket *sock, struct poll_table_struct *wait);
++extern unsigned int		datagram_poll(struct file *file, struct socket *sock, struct poll_table_entry *wait);
+ extern int			skb_copy_datagram(struct sk_buff *from, int offset, char *to,int size);
+ extern int			skb_copy_datagram_iovec(struct sk_buff *from, int offset, struct iovec *to,int size);
+ extern void			skb_free_datagram(struct sock * sk, struct sk_buff *skb);
+diff -ur linux-2.2.9-np/include/linux/tty_ldisc.h linux/include/linux/tty_ldisc.h
+--- linux-2.2.9-np/include/linux/tty_ldisc.h	Sat May 22 14:15:22 1999
++++ linux/include/linux/tty_ldisc.h	Tue May 25 16:59:14 1999
+@@ -65,7 +65,7 @@
+  * 	been made to the termios stucture.
+  * 
+  * int	(*poll)(struct tty_struct * tty, struct file * file,
+- * 		  poll_table *wait);
++ * 		  struct poll_table_entry *wait);
+  *
+  * 	This function is called when a user attempts to select/poll on a
+  * 	tty device.  It is solely the responsibility of the line
+@@ -120,7 +120,7 @@
+ 			 unsigned int cmd, unsigned long arg);
+ 	void	(*set_termios)(struct tty_struct *tty, struct termios * old);
+ 	unsigned int (*poll)(struct tty_struct *, struct file *,
+-			     struct poll_table_struct *);
++			     struct poll_table_entry *);
+ 	
+ 	/*
+ 	 * The following routines are called from below.
+diff -ur linux-2.2.9-np/include/net/inet_common.h linux/include/net/inet_common.h
+--- linux-2.2.9-np/include/net/inet_common.h	Thu Feb 26 23:17:58 1998
++++ linux/include/net/inet_common.h	Tue May 25 16:49:52 1999
+@@ -28,7 +28,7 @@
+ 					     struct msghdr *msg, 
+ 					     int size, struct scm_cookie *scm);
+ extern int			inet_shutdown(struct socket *sock, int how);
+-extern unsigned int		inet_poll(struct file * file, struct socket *sock, struct poll_table_struct *wait);
++extern unsigned int		inet_poll(struct file * file, struct socket *sock, struct poll_table_entry *wait);
+ extern int			inet_setsockopt(struct socket *sock, int level,
+ 						int optname, char *optval, 
+ 						int optlen);
+diff -ur linux-2.2.9-np/include/net/sock.h linux/include/net/sock.h
+--- linux-2.2.9-np/include/net/sock.h	Sat May 22 14:16:04 1999
++++ linux/include/net/sock.h	Tue May 25 17:01:13 1999
+@@ -523,6 +523,8 @@
+ 	/* Identd */
+ 	struct socket		*socket;
+ 
++	void			*backmap;
++
+ 	/* RPC layer private data */
+ 	void			*user_data;
+   
+@@ -557,8 +559,9 @@
+ 	void			(*write_wakeup)(struct sock *sk);
+ 	void			(*read_wakeup)(struct sock *sk);
+ 
+-	unsigned int		(*poll)(struct file * file, struct socket *sock,
+-					struct poll_table_struct *wait);
++	unsigned int		(*poll)(struct file * file,
++					struct socket *sock,
++					struct poll_table_entry *wait);
+ 
+ 	int			(*ioctl)(struct sock *sk, int cmd,
+ 					 unsigned long arg);
+@@ -755,8 +758,9 @@
+ 					       struct socket *, int);
+ extern int                      sock_no_getname(struct socket *,
+ 						struct sockaddr *, int *, int);
+-extern unsigned int             sock_no_poll(struct file *, struct socket *,
+-					     struct poll_table_struct *);
++extern unsigned int             sock_no_poll(struct file *,
++					     struct socket *,
++					     struct poll_table_entry *);
+ extern int                      sock_no_ioctl(struct socket *, unsigned int,
+ 					      unsigned long);
+ extern int			sock_no_listen(struct socket *, int);
+diff -ur linux-2.2.9-np/include/net/tcp.h linux/include/net/tcp.h
+--- linux-2.2.9-np/include/net/tcp.h	Sat May 22 14:17:59 1999
++++ linux/include/net/tcp.h	Tue May 25 17:03:40 1999
+@@ -512,7 +512,7 @@
+ extern void			tcp_close(struct sock *sk, 
+ 					  long timeout);
+ extern struct sock *		tcp_accept(struct sock *sk, int flags);
+-extern unsigned int		tcp_poll(struct file * file, struct socket *sock, struct poll_table_struct *wait);
++extern unsigned int		tcp_poll(struct file * file, struct socket *sock, struct poll_table_entry *wait);
+ extern void			tcp_write_space(struct sock *sk); 
+ 
+ extern int			tcp_getsockopt(struct sock *sk, int level, 
+diff -ur linux-2.2.9-np/kernel/exit.c linux/kernel/exit.c
+--- linux-2.2.9-np/kernel/exit.c	Sat May 22 14:12:13 1999
++++ linux/kernel/exit.c	Tue May 25 14:27:56 1999
+@@ -13,6 +13,7 @@
+ #ifdef CONFIG_BSD_PROCESS_ACCT
+ #include <linux/acct.h>
+ #endif
++#include <linux/poll.h>
+ 
+ #include <asm/uaccess.h>
+ #include <asm/pgtable.h>
+@@ -169,6 +170,11 @@
+ 			if (set & 1) {
+ 				struct file * file = files->fd[i];
+ 				if (file) {
++					if (i < files->max_poll &&
++					    POLLINUSE(files->poll_fds, i)) {
++						poll_free_wait(&files->poll_wait, i);
++						poll_remove_backmap(&file->f_backmap, i, files);
++					}
+ 					files->fd[i] = NULL;
+ 					filp_close(file, files);
+ 				}
+@@ -196,7 +202,12 @@
+  				free_fd_array(files->fd, files->max_fds);
+  			if (files->max_fdset > __FD_SETSIZE) {
+  				free_fdset(files->open_fds, files->max_fdset);
++				free_fdbmap(files->open_fds_bmap, files->max_fdset);
+  				free_fdset(files->close_on_exec, files->max_fdset);
++			}
++			if (files->max_poll > __FD_SETSIZE) {
++				free_fdset(files->poll_fds, files->max_poll);
++				free_fdset(files->poll_hints, 3 * files->max_poll);
+  			}
+ 			kmem_cache_free(files_cachep, files);
+ 		}
+diff -ur linux-2.2.9-np/kernel/fork.c linux/kernel/fork.c
+--- linux-2.2.9-np/kernel/fork.c	Sat May 22 14:12:13 1999
++++ linux/kernel/fork.c	Sat May 22 14:54:24 1999
+@@ -450,11 +450,17 @@
+ #endif
+ 	atomic_set(&newf->count, 1);
+ 
++	newf->poll_hint_lock= SPIN_LOCK_UNLOCKED;
+ 	newf->next_fd	    = 0;
+ 	newf->max_fds	    = NR_OPEN_DEFAULT;
+ 	newf->max_fdset	    = __FD_SETSIZE;
++	newf->max_poll	    = __FD_SETSIZE;
+ 	newf->close_on_exec = &newf->close_on_exec_init;
+ 	newf->open_fds	    = &newf->open_fds_init;
++	newf->open_fds_bmap = &newf->open_fds_bmap_init[0];
++	newf->poll_fds	    = &newf->poll_fds_init;
++	newf->poll_hints    = &newf->poll_hints_init[0];
++	newf->poll_wait	    = NULL;
+ 	newf->fd	    = &newf->fd_array[0];
+ 
+ 	/* Even if the old fdset gets grown here, we'll only copy "size" fds */
+@@ -464,7 +470,10 @@
+ 		if (error)
+ 			goto out_release;
+ 	}
++
+ 	memcpy(newf->open_fds->fds_bits, oldf->open_fds->fds_bits, size/8);
++	memcpy(newf->open_fds_bmap, oldf->open_fds_bmap,
++		(size/FILES_PER_BIT + 7)/8);
+ 	memcpy(newf->close_on_exec->fds_bits, oldf->close_on_exec->fds_bits, size/8);
+ 	if (newf->max_fdset > size) {
+ 		int left = (newf->max_fdset-size)/8;
+@@ -472,8 +481,16 @@
+ 		
+ 		memset(&newf->open_fds->fds_bits[start], 0, left);
+ 		memset(&newf->close_on_exec->fds_bits[start], 0, left);
++
++		start = (size/FILES_PER_BIT + 7)/8;
++		left = (newf->max_fdset/FILES_PER_BIT + 7)/8 - start;
++		memset((char *)&newf->open_fds_bmap + start, 0, left);
+ 	}
+ 
++	/* Do not copy hints, they will be recreated on the next poll call */
++	memset(newf->poll_fds, 0, newf->max_poll / 8);
++	memset(newf->poll_hints, 0, 3 * newf->max_poll / 8);
++
+ 	/* Find the last open fd */
+ 	for (i = size/(8*sizeof(long)); i > 0; ) {
+ 		if (newf->open_fds->fds_bits[--i])
+@@ -531,6 +548,7 @@
+ out_release:
+ 	free_fdset (newf->close_on_exec, newf->max_fdset);
+ 	free_fdset (newf->open_fds, newf->max_fdset);
++	free_fdbmap (newf->open_fds_bmap, newf->max_fdset);
+ 	kmem_cache_free(files_cachep, newf);
+ 	goto out;
+ }
+diff -ur linux-2.2.9-np/net/core/datagram.c linux/net/core/datagram.c
+--- linux-2.2.9-np/net/core/datagram.c	Sun Oct  4 13:19:39 1998
++++ linux/net/core/datagram.c	Tue May 25 16:50:41 1999
+@@ -212,12 +212,13 @@
+  *	then please supply your own write_space callback.
+  */
+ 
+-unsigned int datagram_poll(struct file * file, struct socket *sock, poll_table *wait)
++unsigned int datagram_poll(struct file * file, struct socket *sock, struct poll_table_entry *wait)
+ {
+ 	struct sock *sk = sock->sk;
+ 	unsigned int mask;
+ 
+ 	poll_wait(file, sk->sleep, wait);
++	sk->backmap = &file->f_backmap;
+ 	mask = 0;
+ 
+ 	/* exceptional events? */
+@@ -236,7 +237,7 @@
+ 			mask |= POLLHUP;
+ 		/* connection hasn't started yet? */
+ 		if (sk->state == TCP_SYN_SENT)
+-			return mask;
++			return mask | POLLHINT;
+ 	}
+ 
+ 	/* writable? */
+@@ -245,5 +246,5 @@
+ 	else
+ 		sk->socket->flags |= SO_NOSPACE;
+ 
+-	return mask;
++	return mask | POLLHINT;
+ }
+diff -ur linux-2.2.9-np/net/core/sock.c linux/net/core/sock.c
+--- linux-2.2.9-np/net/core/sock.c	Sat May 22 13:43:06 1999
++++ linux/net/core/sock.c	Tue May 25 16:50:52 1999
+@@ -894,7 +894,7 @@
+ 	return -EOPNOTSUPP;
+ }
+ 
+-unsigned int sock_no_poll(struct file * file, struct socket *sock, poll_table *pt)
++unsigned int sock_no_poll(struct file * file, struct socket *sock, struct poll_table_entry *pt)
+ {
+ 	return 0;
+ }
+@@ -981,6 +981,7 @@
+ void sock_def_error_report(struct sock *sk)
+ {
+ 	if (!sk->dead) {
++		poll_add_hint(sk->backmap, POLLHINTEX);
+ 		wake_up_interruptible(sk->sleep);
+ 		sock_wake_async(sk->socket,0); 
+ 	}
+@@ -989,6 +990,7 @@
+ void sock_def_readable(struct sock *sk, int len)
+ {
+ 	if(!sk->dead) {
++		poll_add_hint(sk->backmap, POLLHINTIN);
+ 		wake_up_interruptible(sk->sleep);
+ 		sock_wake_async(sk->socket,1);
+ 	}
+@@ -1001,6 +1003,7 @@
+ 	 */
+ 	if(!sk->dead &&
+ 	   ((atomic_read(&sk->wmem_alloc) << 1) <= sk->sndbuf)) {
++		poll_add_hint(sk->backmap, POLLHINTOUT);
+ 		wake_up_interruptible(sk->sleep);
+ 
+ 		/* Should agree with poll, otherwise some programs break */
+@@ -1030,6 +1033,8 @@
+ 	sk->state 	= 	TCP_CLOSE;
+ 	sk->zapped	=	1;
+ 	sk->socket	=	sock;
++
++	sk->backmap	=	NULL;
+ 
+ 	if(sock)
+ 	{
+diff -ur linux-2.2.9-np/net/ipv4/af_inet.c linux/net/ipv4/af_inet.c
+--- linux-2.2.9-np/net/ipv4/af_inet.c	Sat May 22 13:43:04 1999
++++ linux/net/ipv4/af_inet.c	Tue May 25 16:51:07 1999
+@@ -469,6 +469,7 @@
+ 		/* Begin closedown and wake up sleepers. */
+ 		if (sock->state != SS_UNCONNECTED)
+ 			sock->state = SS_DISCONNECTING;
++		poll_add_hint(sk->backmap, POLLHINTIN|POLLHINTOUT);
+ 		sk->state_change(sk);
+ 
+ 		/* Applications forget to leave groups before exiting */
+@@ -491,6 +492,7 @@
+ 		}
+ 		sock->sk = NULL;
+ 		sk->socket = NULL;
++		sk->backmap = NULL;
+ 		sk->prot->close(sk, timeout);
+ 	}
+ 	return(0);
+@@ -834,12 +836,14 @@
+ 	if (sk->prot->shutdown)
+ 		sk->prot->shutdown(sk, how);
+ 	/* Wake up anyone sleeping in poll. */
++	poll_add_hint(sk->backmap, (how & RCV_SHUTDOWN ? POLLHINTIN : 0) |
++		      (how & SEND_SHUTDOWN ? POLLHINTOUT : 0));
+ 	sk->state_change(sk);
+ 	return(0);
+ }
+ 
+ 
+-unsigned int inet_poll(struct file * file, struct socket *sock, poll_table *wait)
++unsigned int inet_poll(struct file * file, struct socket *sock, struct poll_table_entry *wait)
+ {
+ 	struct sock *sk = sock->sk;
+ 
+diff -ur linux-2.2.9-np/net/ipv4/tcp.c linux/net/ipv4/tcp.c
+--- linux-2.2.9-np/net/ipv4/tcp.c	Sat May 22 13:43:04 1999
++++ linux/net/ipv4/tcp.c	Tue May 25 16:51:28 1999
+@@ -526,7 +526,7 @@
+ /*
+  * LISTEN is a special case for poll..
+  */
+-static unsigned int tcp_listen_poll(struct sock *sk, poll_table *wait)
++static unsigned int tcp_listen_poll(struct sock *sk, struct poll_table_entry *wait)
+ {
+ 	struct open_request *req, *dummy;
+ 
+@@ -551,15 +551,16 @@
+  *	take care of normal races (between the test and the event) and we don't
+  *	go look at any of the socket buffers directly.
+  */
+-unsigned int tcp_poll(struct file * file, struct socket *sock, poll_table *wait)
++unsigned int tcp_poll(struct file * file, struct socket *sock, struct poll_table_entry *wait)
+ {
+ 	unsigned int mask;
+ 	struct sock *sk = sock->sk;
+ 	struct tcp_opt *tp = &(sk->tp_pinfo.af_tcp);
+ 
+ 	poll_wait(file, sk->sleep, wait);
++	sk->backmap = &file->f_backmap;
+ 	if (sk->state == TCP_LISTEN)
+-		return tcp_listen_poll(sk, wait);
++		return tcp_listen_poll(sk, wait) | POLLHINT ;
+ 
+ 	mask = 0;
+ 	if (sk->err)
+@@ -600,7 +601,8 @@
+ 		if (tp->urg_data & URG_VALID)
+ 			mask |= POLLPRI;
+ 	}
+-	return mask;
++
++	return mask | POLLHINT;
+ }
+ 
+ /*
+@@ -612,6 +614,7 @@
+ 	if (sk->dead)
+ 		return; 
+ 
++	poll_add_hint(sk->backmap, POLLHINTOUT);
+ 	wake_up_interruptible(sk->sleep);
+ 	if (sock_wspace(sk) >=
+ 	    tcp_min_write_space(sk))
+@@ -1499,8 +1502,10 @@
+ 	/* sk->keepopen = 1; */
+ 	sk->shutdown = SHUTDOWN_MASK;
+ 
+-	if (!sk->dead)
++	if (!sk->dead) {
++		poll_add_hint(sk->backmap, POLLHINTIN|POLLHINTOUT);
+ 	  	sk->state_change(sk);
++	}
+ 
+ 	/*  We need to flush the recv. buffs.  We do this only on the
+ 	 *  descriptor close, not protocol-sourced closes, because the
+diff -ur linux-2.2.9-np/net/ipv4/tcp_input.c linux/net/ipv4/tcp_input.c
+--- linux-2.2.9-np/net/ipv4/tcp_input.c	Sat May 22 13:43:06 1999
++++ linux/net/ipv4/tcp_input.c	Tue May 25 12:12:10 1999
+@@ -62,6 +62,7 @@
+ #include <linux/sysctl.h>
+ #include <net/tcp.h>
+ #include <linux/ipsec.h>
++#include <linux/poll.h>
+ 
+ #ifdef CONFIG_SYSCTL
+ #define SYNC_INIT 0 /* let the user enable it */
+@@ -288,8 +289,10 @@
+ 	};
+ 	tcp_set_state(sk, TCP_CLOSE);
+ 	sk->shutdown = SHUTDOWN_MASK;
+-	if (!sk->dead) 
++	if (!sk->dead) {
++		poll_add_hint(sk->backmap, POLLHINTIN|POLLHINTOUT);
+ 		sk->state_change(sk);
++	}
+ }
+ 
+ /* This tags the retransmission queue when SACKs arrive. */
+@@ -1072,8 +1075,10 @@
+ 
+ 	/* Prevent rcvmsg/sndmsg calls, and wake people up. */
+ 	sk->shutdown = SHUTDOWN_MASK;
+-	if(!sk->dead)
++	if(!sk->dead) {
++		poll_add_hint(sk->backmap, POLLHINTIN|POLLHINTOUT);
+ 		sk->state_change(sk);
++	}
+ }
+ 
+ /*
+@@ -1098,6 +1103,7 @@
+ 	tcp_send_ack(sk);
+ 
+ 	if (!sk->dead) {
++		poll_add_hint(sk->backmap, POLLHINTIN);
+ 		sk->state_change(sk);
+ 		sock_wake_async(sk->socket, 1);
+ 	}
+@@ -2121,6 +2127,8 @@
+ 			tp->copied_seq = tp->rcv_nxt;
+ 
+ 			if(!sk->dead) {
++				poll_add_hint(sk->backmap, POLLHINTOUT|POLLHINTEX); /* IN and OUT needed ?? */
++
+ 				sk->state_change(sk);
+ 				sock_wake_async(sk->socket, 0);
+ 			}
+@@ -2251,8 +2259,10 @@
+ 				sk->dport = th->source;
+ 				tp->copied_seq = tp->rcv_nxt;
+ 
+-				if(!sk->dead)
++				if(!sk->dead) {
++					poll_add_hint(sk->backmap, POLLHINTOUT);
+ 					sk->state_change(sk);		
++				}
+ 
+ 				tp->snd_una = TCP_SKB_CB(skb)->ack_seq;
+ 				tp->snd_wnd = htons(th->window) << tp->snd_wscale;
+@@ -2269,9 +2279,10 @@
+ 			if (tp->snd_una == tp->write_seq) {
+ 				sk->shutdown |= SEND_SHUTDOWN;
+ 				tcp_set_state(sk, TCP_FIN_WAIT2);
+-				if (!sk->dead)
++				if (!sk->dead) {
++					poll_add_hint(sk->backmap, POLLHINTOUT);
+ 					sk->state_change(sk);
+-				else
++				} else
+ 					tcp_reset_msl_timer(sk, TIME_CLOSE, sysctl_tcp_fin_timeout);
+ 			}
+ 			break;
+@@ -2287,8 +2298,10 @@
+ 			if (tp->snd_una == tp->write_seq) {
+ 				sk->shutdown = SHUTDOWN_MASK;
+ 				tcp_set_state(sk,TCP_CLOSE);
+-				if (!sk->dead)
++				if (!sk->dead) {
++					poll_add_hint(sk->backmap, POLLHINTIN|POLLHINTOUT);
+ 					sk->state_change(sk);
++				}
+ 				goto discard;
+ 			}
+ 			break;
+diff -ur linux-2.2.9-np/net/ipv4/tcp_timer.c linux/net/ipv4/tcp_timer.c
+--- linux-2.2.9-np/net/ipv4/tcp_timer.c	Sat May 22 13:43:06 1999
++++ linux/net/ipv4/tcp_timer.c	Sat May 22 14:54:24 1999
+@@ -21,6 +21,7 @@
+  */
+ 
+ #include <net/tcp.h>
++#include <linux/poll.h>
+ 
+ int sysctl_tcp_syn_retries = TCP_SYN_RETRIES; 
+ int sysctl_tcp_keepalive_time = TCP_KEEPALIVE_TIME;
+@@ -235,8 +236,10 @@
+ 
+ 				tcp_set_state(sk, TCP_CLOSE);
+ 				sk->shutdown = SHUTDOWN_MASK;
+-				if (!sk->dead)
++				if (!sk->dead) {
++					poll_add_hint(sk->backmap, POLLHINTIN|POLLHINTOUT);
+ 					sk->state_change(sk);
++				}
+ 			} else {
+ 				tp->probes_out++;
+ 				tp->pending = TIME_KEEPOPEN;
+diff -ur linux-2.2.9-np/net/ipv4/timer.c linux/net/ipv4/timer.c
+--- linux-2.2.9-np/net/ipv4/timer.c	Sat May 22 13:42:55 1999
++++ linux/net/ipv4/timer.c	Sat May 22 14:54:24 1999
+@@ -37,6 +37,7 @@
+ #include <linux/socket.h>
+ #include <linux/in.h>
+ #include <linux/kernel.h>
++#include <linux/poll.h>
+ #include <linux/sched.h>
+ #include <linux/timer.h>
+ #include <asm/system.h>
+@@ -113,8 +114,10 @@
+ 			/* We've waited long enough, close the socket. */
+ 			tcp_set_state(sk, TCP_CLOSE);
+ 			sk->shutdown = SHUTDOWN_MASK;
+-			if (!sk->dead)
++			if (!sk->dead) {
++				poll_add_hint(sk->backmap, POLLHINTIN|POLLHINTOUT);
+ 				sk->state_change(sk);
++			}
+ 			net_reset_timer (sk, TIME_DONE, TCP_DONE_TIME);
+ 			break;
+ 
+diff -ur linux-2.2.9-np/net/socket.c linux/net/socket.c
+--- linux-2.2.9-np/net/socket.c	Sat May 22 13:43:04 1999
++++ linux/net/socket.c	Tue May 25 16:50:17 1999
+@@ -91,8 +91,7 @@
+ 			  size_t size, loff_t *ppos);
+ 
+ static int sock_close(struct inode *inode, struct file *file);
+-static unsigned int sock_poll(struct file *file,
+-			      struct poll_table_struct *wait);
++static unsigned int sock_poll(struct file *file, struct poll_table_entry *wait);
+ static int sock_ioctl(struct inode *inode, struct file *file,
+ 		      unsigned int cmd, unsigned long arg);
+ static int sock_fasync(int fd, struct file *filp, int on);
+@@ -459,7 +458,7 @@
+ }
+ 
+ 
+-static unsigned int sock_poll(struct file *file, poll_table * wait)
++static unsigned int sock_poll(struct file *file, struct poll_table_entry * wait)
+ {
+ 	struct socket *sock;
+ 
+diff -ur linux-2.2.9-np/net/unix/af_unix.c linux/net/unix/af_unix.c
+--- linux-2.2.9-np/net/unix/af_unix.c	Sat May 22 13:43:06 1999
++++ linux/net/unix/af_unix.c	Tue May 25 16:50:31 1999
+@@ -1453,12 +1453,13 @@
+ 	return(0);
+ }
+ 
+-static unsigned int unix_poll(struct file * file, struct socket *sock, poll_table *wait)
++static unsigned int unix_poll(struct file * file, struct socket *sock, struct poll_table_entry *wait)
+ {
+ 	struct sock *sk = sock->sk;
+ 	unsigned int mask;
+ 
+ 	poll_wait(file, sk->sleep, wait);
++	sk->backmap = &file->f_backmap;
+ 	mask = 0;
+ 
+ 	/* exceptional events? */
+@@ -1489,9 +1490,11 @@
+ {
+ 	if (sk->dead)  
+ 		return;
++	poll_add_hint(sk->backmap, POLLHINTOUT);
+ 	wake_up_interruptible(sk->sleep);
+-	if (sk->sndbuf - (int)atomic_read(&sk->wmem_alloc) >= MIN_WRITE_SPACE)
++	if (sk->sndbuf - (int)atomic_read(&sk->wmem_alloc) >= MIN_WRITE_SPACE){
+ 		sock_wake_async(sk->socket, 2);
++	}
+ }
+ 
+ #ifdef CONFIG_PROC_FS
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

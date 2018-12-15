@@ -1,0 +1,177 @@
+Date: Mon, 11 Sep 2000 08:15:15 -0400
+From: Chris Mason <>
+Subject: Re: More on 2.2.18pre2aa2
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/9/11/22
+
+--On 09/11/00 07:45:16 -0400 Ed Tomlinson <tomlins@cam.org> wrote:
+> Hi Chris,
+>
+>>> Something between bigmem and his big VM changes makes reiserfs
+>>> uncompilable. [..]
+>
+>> It's due LFS. Chris should have a reiserfs patch that compiles on top of
+>> 2.2.18pre2aa2, right? (if not Chris, I can sure find it because the
+>> server that was reproducing the DAC960 SMP lock inversion was running
+>> 2.2.18pre2aa2+IKD on top of an huge reiserfs fs)
+>
+> Chris, is this patch posted anywhere?  Alternately can you take a look
+> at the updated patch brian posted and comment/correct (if required).
+>
+Patch attached.  The patch order should be 2.2.18-prex-aa2, 
+reiserfs-3.5.25, this patch.  I tested against pre3-aa2.
+LFS changes for filldir, reiserfs_readpage, and adds limit checking in 
+file_write to make sure we don't go above 2GB (Andi Kleen).  Also fixes 
+include/linux/fs.h, which does not patch cleanly for 3.5.25 because of usb.
+Note, you might see debugging messages about items moving during 
+copy_from_user.  These are safe, but I'm leaving them in for now as I'd 
+like to find out why copy_from_user is suddenly scheduling much more than 
+it used to.
+> Has the 'atomic' delete code made it into the main reiserfs trees?
+>
+No, it is still only 90% done.
+-chris
+diff -urN diff/linux/fs/reiserfs/dir.c linux/fs/reiserfs/dir.c
+--- diff/linux/fs/reiserfs/dir.c	Sun Sep 10 21:58:07 2000
++++ linux/fs/reiserfs/dir.c	Mon Sep 11 01:04:19 2000
+@@ -177,7 +177,7 @@
+ 		// user space buffer is swapped out. At that time
+ 		// entry can move to somewhere else
+ 		memcpy (local_buf, d_name, d_reclen);
+-		if (filldir (dirent, local_buf, d_reclen, d_off, d_ino) < 0) {
++		if (filldir (dirent, local_buf, d_reclen, d_off, d_ino, DT_UNKNOWN) < 0) {
+ 		    pathrelse (&path_to_entry);
+ 		    filp->f_pos = next_pos;
+ 		    if (local_buf != small_buf) {
+diff -urN diff/linux/fs/reiserfs/file.c linux/fs/reiserfs/file.c
+--- diff/linux/fs/reiserfs/file.c	Sun Sep 10 21:58:07 2000
++++ linux/fs/reiserfs/file.c	Sun Sep 10 22:20:48 2000
+@@ -40,6 +40,8 @@
+ int reiserfs_readpage (struct file * file, struct page * page);
++/* LFS: should we add a open function that gives EINVAL for O_LARGEFILE? The specs
++   are not clear here. -AK */
+ static struct file_operations reiserfs_file_operations = {
+                 NULL,        		/* lseek */
+                 reiserfs_file_read,     /* read */
+@@ -743,40 +745,58 @@
+   int windex ;
+   struct reiserfs_transaction_handle th ;
+   unsigned long	limit = current->rlim[RLIMIT_FSIZE].rlim_cur;
+-  unsigned long pos = *p_n_pos;
+-
+   struct buffer_head *buffer_list[REISERFS_NBUF] ;
+   int buffer_count = 0 ;
+   int n_blocks_flushed = 0 ; /* tracks i/o errors during O_SYNC */
+-
+-/*
+-  if (!p_s_inode->i_op || !p_s_inode->i_op->updatepage)
+-      return -EIO;
+-  */
++
+   if (p_s_filp->f_error) {
+       int error = p_s_filp->f_error;
+       p_s_filp->f_error = 0;
+       return error;
+   }
++  if (n_count == 0)
++      return 0;
++  if ((signed)n_count < 0)
++      return -EINVAL;
++
++/*
++  if (!p_s_inode->i_op || !p_s_inode->i_op->updatepage)
++      return -EIO;
++  */
+   /* Calculate position in the file. */
++  /* Make sure nothing overflows before converting loff_t to unsigned long */
+   if ( p_s_filp->f_flags & O_APPEND ) {
+-    n_pos_in_file = p_s_inode->i_size + 1;
+-    pos = p_s_inode->i_size;
+-  } else
+-    n_pos_in_file = *p_n_pos + 1;
+-
+-  if (pos >= limit)
++    /* notify_change should guard against that */
++    if (p_s_inode->i_size > (0x7fffffff - 1))
++      return -EFBIG;
++    n_pos_in_file = ((unsigned long)p_s_inode->i_size) + 1;
++  } else {
++    if (*p_n_pos > (0x7fffffff - 1))
+       return -EFBIG;
++    n_pos_in_file = ((unsigned long)*p_n_pos) + 1;
++  }
+-  if (n_count > limit - pos)
+-      n_count = limit - pos;
++  if (limit >= 0x7fffffff)
++    limit = 0x7fffffff - 1;
++
++  if (n_pos_in_file + n_count >= limit) {
++    /* Should send SIGXFSZ when above rlim */
++    if (n_pos_in_file - 1 < limit)
++      n_count = limit - n_pos_in_file + 1;
++    else
++      return -EFBIG;
++  }
++
++  if (n_count > limit - n_pos_in_file)
++      n_count = limit - n_pos_in_file;
+   n_written = 0;
+   n_tail_bytes_written = 0;
+   p_s_sb = p_s_inode->i_sb;
+   remove_suid(p_s_inode) ;
++
+   journal_begin(&th, p_s_sb, jbegin_count) ;
+   if (p_s_filp->f_flags & O_SYNC) {
+diff -urN diff/linux/fs/reiserfs/inode.c linux/fs/reiserfs/inode.c
+--- diff/linux/fs/reiserfs/inode.c	Sun Sep 10 21:58:07 2000
++++ linux/fs/reiserfs/inode.c	Mon Sep 11 00:33:07 2000
+@@ -217,10 +217,12 @@
+     inode = file->f_dentry->d_inode;
+     increment_i_read_sync_counter(inode) ;
+-    if (has_tail (inode) && tail_offset (inode) < page->offset + PAGE_SIZE) {
++    if (has_tail (inode) &&
++        tail_offset(inode) < pgoff2ulong(page->index) * PAGE_SIZE + PAGE_SIZE) {
+ 	/* there is a tail and it is in this page */
+ 	memset ((char *)page_address (page), 0, PAGE_SIZE);
+-	read_file_tail (inode, page->offset, (char *)page_address (page), PAGE_SIZE);
++	read_file_tail (inode, pgoff2ulong(page->index) * PAGE_SIZE,
++	                (char *)page_address (page), PAGE_SIZE);
+ 	set_bit (PG_uptodate, &page->flags);
+ 	ret = 0 ;
+     }  else {
+diff -urN diff/linux/include/linux/fs.h linux/include/linux/fs.h
+--- diff/linux/include/linux/fs.h	Sun Sep 10 22:03:53 2000
++++ linux/include/linux/fs.h	Mon Sep 11 00:58:53 2000
+@@ -298,6 +298,7 @@
+ #include <linux/smb_fs_i.h>
+ #include <linux/hfs_fs_i.h>
+ #include <linux/adfs_fs_i.h>
++#include <linux/reiserfs_fs_i.h>
+ #include <linux/qnx4_fs_i.h>
+ #include <linux/usbdev_fs_i.h>
+@@ -412,6 +413,7 @@
+ 		struct smb_inode_info		smbfs_i;
+ 		struct hfs_inode_info		hfs_i;
+ 		struct adfs_inode_info		adfs_i;
++		struct reiserfs_inode_info     reiserfs_i;
+ 		struct qnx4_inode_info		qnx4_i;
+ 		struct usbdev_inode_info	usbdev_i;
+ 		struct socket			socket_i;
+@@ -538,6 +540,7 @@
+ #include <linux/smb_fs_sb.h>
+ #include <linux/hfs_fs_sb.h>
+ #include <linux/adfs_fs_sb.h>
++#include <linux/reiserfs_fs_sb.h>
+ #include <linux/qnx4_fs_sb.h>
+ #include <linux/usbdev_fs_sb.h>
+@@ -582,6 +585,7 @@
+ 		struct smb_sb_info	smbfs_sb;
+ 		struct hfs_sb_info	hfs_sb;
+ 		struct adfs_sb_info	adfs_sb;
++		struct reiserfs_sb_info reiserfs_sb;
+ 		struct qnx4_sb_info	qnx4_sb;
+ 		struct usbdev_sb_info	usbdevfs_sb;
+ 		void			*generic_sbp;

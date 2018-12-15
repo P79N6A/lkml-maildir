@@ -1,0 +1,140 @@
+Date: Mon, 31 Jul 2000 07:49:01 +1000
+From: Andrew Morton <>
+Subject: Re: [PATCH] Update net drivers to new module locking
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/7/30/58
+
+Brian Gerst wrote:
+> 
+> This patch implements the latest module locking scheme for network
+> drivers and starts converting drivers over to it.
+> 
+> 
+http://didntduck.org/~bgerst/linux/net_modules.diff.bz2
+Brian,
+I looked into this a few weeks back.  I came to the conclusion that it
+should not be done for 2.4.  Part of the discussion is at
+http://www.wcug.wwu.edu/lists/netdev/200006/threads.html
+ under "modular
+net drivers".
+There were basically two reasons for this.
+A netdevice is entered into the kernel namespace via
+'register_netdevice'.  For a modular driver, the registration occurs
+from within to module constructor.  Once a driver has been registered,
+all of its entry points are available for calling.
+This means that once a driver has been insmodded, _any_ of its entry
+points can be called while the module refcount is zero!  Current
+practice is to increment the refcount in netdevice.open() and decrement
+it in netdevice.close().  This is quite arbitrary and semi-pointless. 
+It is valid and common to call netdevice functions on a device which has
+not been "opened" - set_multicast_list, change_mtu, do_ioctl, etc.  The
+netdevice open() and close() methods are misnamed - they should be
+called "up" and "down".
+So, given that netdevice methods are called while the module refcount is
+zero, incrementing it in open() isn't a very pointful fix..
+The second reason for leaving this alone is that it's already been taken
+care of.
+If you look carefully at net/core/dev.c and friends you'll see that
+whenever a reference is taken to a netdevice its reference count is
+incremented via dev_hold().  Whenever a reference is released the
+device's refcount is dropped via dev_put().  This is a distinct refcount
+from the module refcount.
+So this is all very nice and correctly tracks when a netdevice is
+"busy".  It is correct for _all_ netdevice methods, not just open() and
+close().
+The linkage between this refcount and the module refcount occurs in
+unregister_netdevice().  This function is called from the module
+destructor.  If it discovers that someone is unloading the driver's
+module when the device is busy, it sleeps for up to ten seconds, waiting
+for all references to be released (yes, it does this _after_ the driver
+has been removed from the namespace).  If, after ten seconds the device
+has not become unbusy we see the "Old style device leaked. Wait for
+crash." message.
+This last bit is pretty ugly, but, I suggest, good enough.
+I agree that hoisting the MOD_INC and MOD_DEC out of the driver and into
+the netdevice layer (as you have done) is preferable to the current way
+of doing things.  It is a cleanup which centralises the knowledge of
+module refcounts.  Be aware, however, that it breaks 2.2 compatibility
+and the eepro100 and acenic maintainers (at least) will be after you
+with a big stick :)  The solution I came up with was:
+- create a new macro `SET_NETDEVICE_OWNER(dev)' for 2.4, and
+  make this a no-op for 2.2 drivers.
+- For 2.2-supporting drivers, leave the existing MOD_INC_USE_COUNT
+  calls in place.  This means that the module refcounts for these
+  drivers would go up and down by two, rather than by one, but this
+  is OK.
+I've attached here the patch which I came up with - you may care to
+compare the dev_open() logic with your implementation.--- linux-2.4.0-test2/include/linux/netdevice.h	Sat Jun 24 15:39:47 2000
++++ linux-akpm/include/linux/netdevice.h	Thu Jun 29 20:40:25 2000
+@@ -136,6 +136,11 @@
+ struct neigh_parms;
+ struct sk_buff;
+ 
++/* Centralised module refcounting for netdevices */
++struct module;
++#define SET_NETDEVICE_OWNER(dev)	\
++	do { dev->owner = THIS_MODULE; } while (0)
++
+ struct netif_rx_stats
+ {
+ 	unsigned total;
+@@ -372,6 +377,9 @@
+ 						     unsigned char *haddr);
+ 	int			(*neigh_setup)(struct net_device *dev, struct neigh_parms *);
+ 	int			(*accept_fastpath)(struct net_device *, struct dst_entry*);
++
++	/* open/release and usage marking */
++	struct module *owner;
+ 
+ 	/* bridge stuff */
+ 	struct net_bridge_port	*br_port;
+--- linux-2.4.0-test2/net/core/dev.c	Sat Jun 24 15:39:47 2000
++++ linux-akpm/net/core/dev.c	Sun Jun 25 20:59:56 2000
+@@ -89,6 +89,7 @@
+ #include <net/profile.h>
+ #include <linux/init.h>
+ #include <linux/kmod.h>
++#include <linux/module.h>
+ #if defined(CONFIG_NET_RADIO) || defined(CONFIG_NET_PCMCIA_RADIO)
+ #include <linux/wireless.h>		/* Note : will define WIRELESS_EXT */
+ #endif	/* CONFIG_NET_RADIO || CONFIG_NET_PCMCIA_RADIO */
+@@ -664,9 +665,19 @@
+ 	 *	Call device private open method
+ 	 */
+ 	 
+-	if (dev->open) 
+-  		ret = dev->open(dev);
+-
++	if (dev->owner == 0) {
++		if (dev->open)
++	  		ret = dev->open(dev);
++	} else {
++		if (try_inc_mod_count(dev->owner)) {
++			if (dev->open) {
++		  		if ((ret = dev->open(dev)) != 0)
++					__MOD_DEC_USE_COUNT(dev->owner);
++			}
++		} else
++			ret = -ENODEV;
++	}
++	
+ 	/*
+ 	 *	If it went open OK then:
+ 	 */
+@@ -780,6 +791,13 @@
+ 	 *	Tell people we are down
+ 	 */
+ 	notifier_call_chain(&netdev_chain, NETDEV_DOWN, dev);
++
++	/*
++	 * Drop the module refcount
++	 */
++	if (dev->owner) {
++		__MOD_DEC_USE_COUNT(dev->owner);
++	}
+ 
+ 	return(0);
+ }

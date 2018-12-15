@@ -1,0 +1,98 @@
+Date: Sun, 18 Feb 2001 20:17:27 +0000 (GMT)
+From: Mark Hemment <>
+Subject: [PATCH] nfsd + scalability
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2001/2/18/69
+
+Hi Neil, all,
+  The nfs daemons run holding the global kernel lock.  They still hold
+this lock over calls to file_op's read and write.
+  The file system kernel interface (FSKI) doesn't require the kernel lock
+to be held over these read/write calls.  The nfs daemons do not require 
+that the reads or writes do not block (would be v silly if they did), so
+they have no guarantee the lock isn't dropped and retaken during
+blocking.  ie. they aren't using it as a guard across the calls.
+  Dropping the kernel lock around read and write in fs/nfsd/vfs.c is a
+_big_ SMP scalability win!
+  Attached patch is against 2.4.1-ac18, but should apply to most recent
+kernel versions.
+Mark
+--- vanilla-2.4.1-ac18/fs/nfsd/vfs.c	Sun Feb 18 15:06:27 2001
++++ markhe-2.4.1-ac18/fs/nfsd/vfs.c	Sun Feb 18 19:32:18 2001
+@@ -30,6 +30,7 @@
+ #include <linux/net.h>
+ #include <linux/unistd.h>
+ #include <linux/slab.h>
++#include <linux/smp_lock.h>
+ #include <linux/in.h>
+ #define __NO_VERSION__
+ #include <linux/module.h>
+@@ -602,12 +603,28 @@
+ 		file.f_ralen = ra->p_ralen;
+ 		file.f_rawin = ra->p_rawin;
+ 	}
++
++	/*
++	 * The nfs daemons run holding the global kernel lock, but
++	 * f_op->read() doesn't need the lock to be held.
++	 * Drop it here to help scalability.
++	 *
++	 * The "kernel_locked()" test isn't perfect (someone else could be
++	 * holding the lock when we're not), but it will eventually catch
++	 * any cases of entering here without the lock held.
++	 */
++	if (!kernel_locked())
++		BUG();
++	unlock_kernel();
++
+ 	file.f_pos = offset;
+ 
+ 	oldfs = get_fs(); set_fs(KERNEL_DS);
+ 	err = file.f_op->read(&file, buf, *count, &file.f_pos);
+ 	set_fs(oldfs);
+ 
++	lock_kernel();
++
+ 	/* Write back readahead params */
+ 	if (ra != NULL) {
+ 		dprintk("nfsd: raparms %ld %ld %ld %ld %ld\n",
+@@ -664,6 +681,22 @@
+ 		goto out_close;
+ #endif
+ 
++	/*
++	 * The nfs daemons run holding the global kernel lock, but
++	 * f_op->write() doesn't need the lock to be held.
++	 * Also, as the struct file is private, the export is read-locked,
++	 * and the inode attached to the dentry cannot change under us, the
++	 * lock can be dropped ahead of the call to write() for even better
++	 * scalability.
++	 *
++	 * The "kernel_locked()" test isn't perfect (someone else could be
++	 * holding the lock when we're not), but it will eventually catch
++	 * any cases of entering here without the lock held.
++	 */
++	if (!kernel_locked())
++		BUG();
++	unlock_kernel();
++
+ 	dentry = file.f_dentry;
+ 	inode = dentry->d_inode;
+ 	exp   = fhp->fh_export;
+@@ -692,9 +725,12 @@
+ 	/* Write the data. */
+ 	oldfs = get_fs(); set_fs(KERNEL_DS);
+ 	err = file.f_op->write(&file, buf, cnt, &file.f_pos);
++	set_fs(oldfs);
++
++	lock_kernel();
++
+ 	if (err >= 0)
+ 		nfsdstats.io_write += cnt;
+-	set_fs(oldfs);
+ 
+ 	/* clear setuid/setgid flag after write */
+ 	if (err >= 0 && (inode->i_mode & (S_ISUID | S_ISGID))) {

@@ -1,0 +1,637 @@
+Date: Mon, 12 Nov 2001 17:59:00 +0100 (CET)
+From: Ingo Molnar <>
+Subject: [patch] arbitrary size memory allocator, memarea-2.4.15-D6
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2001/11/12/323
+
+in the past couple of years the buddy allocator has started to show
+limitations that are hurting performance and flexibility.
+eg. one of the main reasons why we keep MAX_ORDER at an almost obscenely
+high level is the fact that we occasionally have to allocate big,
+physically continuous memory areas. We do not realistically expect to be
+able to allocate such high-order pages after bootup, still every page
+allocation carries the cost of it. And even with MAX_ORDER at 10, large
+RAM boxes have hit this limit and are hurting visibly - as witnessed by
+Anton. Falling back to vmalloc() is not a high-quality option, due to the
+TLB-miss overhead.
+If we had an allocator that could handle large, rare but
+performance-insensitive allocations, then we could decrease MAX_ORDER back
+to 5 or 6, which would result in less cache-footprint and faster operation
+of the page allocator.
+the attached memarea-2.4.15-D6 patch does just this: it implements a new
+'memarea' allocator which uses the buddy allocator data structures without
+impacting buddy allocator performance. It has two main entry points:
+	struct page * alloc_memarea(unsigned int gfp_mask, unsigned int pages);
+	void free_memarea(struct page *area, unsigned int pages);
+the main properties of the memarea allocator are:
+ - to be an 'unlimited size' allocator: it will find and allocate 100 GB
+   of physically continuous memory if that much RAM is available.
+ - no alignment or size limitations either, size does not have to be a
+   power of 2 like for the buddy allocator, and alignment will be whatever
+   constellation the allocator finds. This property ensures that if there
+   is a sufficiently sized physically continous piece of RAM available,
+   the allocator will find it. The buddy allocator only finds order-2
+   aligned and order-2 sized pages.
+ - no impact on the performance of the page allocator. (The only (very
+   small) effect is the use of list_del_init() instead of list_del() when
+   allocating pages. This is insignificant as the initialization will be
+   done in two assembly instructions, touching an already present and
+   dirty cacheline.)
+Obviously, alloc_memarea() can be pretty slow if RAM is getting full, nor
+does it guarantee allocation, so for non-boot allocations other backup
+mechanizms have to be used, such as vmalloc(). It is not a replacement for
+the buddy allocator - it's not intended for frequent use.
+right now the memarea allocator is used in one place: to allocate the
+pagecache hash table at boot time. [ Anton, it would be nice if you could
+check it out on your large-RAM box, does it improve the hash chain
+situation? ]
+other candidates of alloc_memarea() usage are:
+  - module code segment allocation, fall back to vmalloc() if failure.
+  - swap map allocation, it uses vmalloc() now.
+  - buffer, inode, dentry, TCP hash allocations. (in case we decrease
+    MAX_ORDER, which the patch does not do yet.)
+  - those funky PCI devices that need some big chunk of physical memory.
+  - other uses?
+alloc_memarea() tries to optimize away as much as possible from linear
+scanning of zone mem-maps, but the worst-case scenario is that it has to
+iterate over all pages - which can be ~256K iterations if eg. we search on
+a 1 GB box.
+possible future improvements:
+- alloc_memarea() could zap clean pagecache pages as well.
+- if/once reverse pte mappings are added, alloc_memarea() could also
+  initiate the swapout of anonymous & dirty pages. These modifications
+  would make it pretty likely to succeed if the allocation size is
+  realistic.
+- possibly add 'alignment' and 'offset' to the __alloc_memarea()
+  arguments, to possibly create a given alignment for the memarea, to
+  handle really broken hardware and possibly result in better page
+  coloring as well.
+- if we extended the buddy allocator to have a page-granularity bitmap as
+  well, then alloc_memarea() could search for physically continuous page
+  areas *much* faster. But this creates a real runtime (and cache
+  footprint) overhead in the buddy allocator.
+the patch also cleans up the buddy allocator code:
+  - cleaned up the zone structure namespace
+  - removed the memlist_ defines. (I originally added them to play
+    with FIFO vs. LIFO allocation, but now we have settled for the later.)
+  - simplified code
+  - ( fixed index to be unsigned long in rmqueue(). This enables 64-bit
+    systems to have more than 32 TB of RAM in a single zone. [not quite
+    realistic, yet, but hey.] )
+NOTE: the memarea allocator pieces are in separate chunks and are
+completely non-intrusive if the filemap.c change is omitted.
+i've tested the patch pretty thoroughly on big and small RAM boxes. The
+patch is against 2.4.15-pre3.
+Reports, comments, suggestions welcome,
+	Ingo
+--- linux/kernel/ksyms.c.orig	Mon Nov 12 15:24:28 2001
++++ linux/kernel/ksyms.c	Mon Nov 12 15:31:59 2001
+@@ -91,6 +91,9 @@
+ /* internal kernel memory management */
+ EXPORT_SYMBOL(_alloc_pages);
+ EXPORT_SYMBOL(__alloc_pages);
++EXPORT_SYMBOL(__alloc_memarea);
++EXPORT_SYMBOL(alloc_memarea);
++EXPORT_SYMBOL(free_memarea);
+ EXPORT_SYMBOL(alloc_pages_node);
+ EXPORT_SYMBOL(__get_free_pages);
+ EXPORT_SYMBOL(get_zeroed_page);
+--- linux/mm/page_alloc.c.orig	Mon Nov 12 15:05:21 2001
++++ linux/mm/page_alloc.c	Mon Nov 12 15:57:09 2001
+@@ -43,18 +43,10 @@
+  * for the normal case, giving better asm-code.
+  */
+ 
+-#define memlist_init(x) INIT_LIST_HEAD(x)
+-#define memlist_add_head list_add
+-#define memlist_add_tail list_add_tail
+-#define memlist_del list_del
+-#define memlist_entry list_entry
+-#define memlist_next(x) ((x)->next)
+-#define memlist_prev(x) ((x)->prev)
+-
+ /*
+  * Temporary debugging check.
+  */
+-#define BAD_RANGE(zone,x) (((zone) != (x)->zone) || (((x)-mem_map) < (zone)->zone_start_mapnr) || (((x)-mem_map) >= (zone)->zone_start_mapnr+(zone)->size))
++#define BAD_RANGE(zone,x) (((zone) != (x)->zone) || (((x)-mem_map) < (zone)->start_mapnr) || (((x)-mem_map) >= (zone)->start_mapnr+(zone)->size))
+ 
+ /*
+  * Buddy system. Hairy. You really aren't expected to understand this
+@@ -92,8 +84,8 @@
+ 
+ 	zone = page->zone;
+ 
+-	mask = (~0UL) << order;
+-	base = zone->zone_mem_map;
++	mask = ~0UL << order;
++	base = zone->mem_map;
+ 	page_idx = page - base;
+ 	if (page_idx & ~mask)
+ 		BUG();
+@@ -105,7 +97,7 @@
+ 
+ 	zone->free_pages -= mask;
+ 
+-	while (mask + (1 << (MAX_ORDER-1))) {
++	while (mask != ((~0UL) << (MAX_ORDER-1))) {
+ 		struct page *buddy1, *buddy2;
+ 
+ 		if (area >= zone->free_area + MAX_ORDER)
+@@ -125,14 +117,13 @@
+ 		if (BAD_RANGE(zone,buddy2))
+ 			BUG();
+ 
+-		memlist_del(&buddy1->list);
++		list_del_init(&buddy1->list);
+ 		mask <<= 1;
+ 		area++;
+ 		index >>= 1;
+ 		page_idx &= mask;
+ 	}
+-	memlist_add_head(&(base + page_idx)->list, &area->free_list);
+-
++	list_add(&(base + page_idx)->list, &area->free_list);
+ 	spin_unlock_irqrestore(&zone->lock, flags);
+ 	return;
+ 
+@@ -142,6 +133,11 @@
+ 	if (in_interrupt())
+ 		goto back_local_freelist;		
+ 
++	/*
++	 * Set the page count to 1 here, so that we can
++	 * distinguish local pages from free buddy pages.
++	 */
++	set_page_count(page, 1);
+ 	list_add(&page->list, &current->local_pages);
+ 	page->index = order;
+ 	current->nr_local_pages++;
+@@ -150,7 +146,7 @@
+ #define MARK_USED(index, order, area) \
+ 	__change_bit((index) >> (1+(order)), (area)->map)
+ 
+-static inline struct page * expand (zone_t *zone, struct page *page,
++static inline struct page * expand(zone_t *zone, struct page *page,
+ 	 unsigned long index, int low, int high, free_area_t * area)
+ {
+ 	unsigned long size = 1 << high;
+@@ -161,7 +157,7 @@
+ 		area--;
+ 		high--;
+ 		size >>= 1;
+-		memlist_add_head(&(page)->list, &(area)->free_list);
++		list_add(&page->list, &area->free_list);
+ 		MARK_USED(index, high, area);
+ 		index += size;
+ 		page += size;
+@@ -183,16 +179,16 @@
+ 	spin_lock_irqsave(&zone->lock, flags);
+ 	do {
+ 		head = &area->free_list;
+-		curr = memlist_next(head);
++		curr = head->next;
+ 
+ 		if (curr != head) {
+-			unsigned int index;
++			unsigned long index;
+ 
+-			page = memlist_entry(curr, struct page, list);
++			page = list_entry(curr, struct page, list);
+ 			if (BAD_RANGE(zone,page))
+ 				BUG();
+-			memlist_del(curr);
+-			index = page - zone->zone_mem_map;
++			list_del_init(curr);
++			index = page - zone->mem_map;
+ 			if (curr_order != MAX_ORDER-1)
+ 				MARK_USED(index, curr_order, area);
+ 			zone->free_pages -= 1UL << order;
+@@ -256,9 +252,8 @@
+ 			do {
+ 				tmp = list_entry(entry, struct page, list);
+ 				if (tmp->index == order && memclass(tmp->zone, classzone)) {
+-					list_del(entry);
++					list_del_init(entry);
+ 					current->nr_local_pages--;
+-					set_page_count(tmp, 1);
+ 					page = tmp;
+ 
+ 					if (page->buffers)
+@@ -286,7 +281,7 @@
+ 		nr_pages = current->nr_local_pages;
+ 		/* free in reverse order so that the global order will be lifo */
+ 		while ((entry = local_pages->prev) != local_pages) {
+-			list_del(entry);
++			list_del_init(entry);
+ 			tmp = list_entry(entry, struct page, list);
+ 			__free_pages_ok(tmp, tmp->index);
+ 			if (!nr_pages--)
+@@ -399,6 +394,232 @@
+ 	goto rebalance;
+ }
+ 
++#ifndef CONFIG_DISCONTIGMEM
++
++/*
++ * Return the order if a page is part of a free page, or
++ * return -1 otherwise.
++ *
++ * (This function relies on the fact that the only zero-count pages that
++ * have a non-empty page->list are pages of the buddy allocator.)
++ */
++static inline int free_page_order(zone_t *zone, struct page *p)
++{
++	free_area_t *area;
++	struct page *page, *base;
++	unsigned long index0, index, mask;
++	int order;
++
++	base = zone->mem_map;
++	index0 = p - base;
++
++	/*
++	 * First find the highest order free page which this page is part of.
++	 */
++	for (order = MAX_ORDER-1; order >= 0; order--) {
++		area = zone->free_area + order - 1;
++		/*
++		 * eg. for order 4, mask is 0xfffffff0
++		 */
++		mask = ~((1 << order) - 1);
++		index = index0 & mask;
++		page = base + index;
++
++		if (!page_count(page) && !list_empty(&page->list))
++			break;
++	}
++	return order;
++}
++
++/*
++ * Expand a specific page. The normal expand() function returns the
++ * last low-order page from the high-order page.
++ */
++static inline void expand_specific(struct page *page0, zone_t *zone, struct page *bigpage, const int start, free_area_t * area)
++{
++	unsigned long index0, page_idx;
++	struct page *base, *page = NULL;
++	int order = start;
++
++	base = zone->mem_map;
++	index0 = page0 - base;
++	if (!start)
++		BUG();
++	while (order) {
++		struct page *buddy1, *buddy2;
++		area--;
++		order--;
++
++		page_idx = index0 & ~((1 << order)-1);
++		buddy1 = base + (page_idx ^ (1 << order));
++		buddy2 = base + page_idx;
++
++		if (BAD_RANGE(zone,buddy1))
++			BUG();
++		if (BAD_RANGE(zone,buddy2))
++			BUG();
++
++		list_add(&buddy1->list, &area->free_list);
++		MARK_USED(page_idx, order, area);
++		page = buddy2;
++	}
++	if (page != page0)
++		BUG();
++}
++
++/*
++ * Allocate a specific page at a given physical address and update
++ * the buddy allocator data structures accordingly.
++ */
++static void alloc_page_ptr(zone_t *zone, struct page *p)
++{
++	free_area_t *area;
++	struct page *page, *base;
++	unsigned long index0, index, mask;
++	int order;
++
++	base = zone->mem_map;
++	index0 = p - base;
++
++	/*
++	 * First find the highest order free page which this page is part of.
++	 */
++	for (order = MAX_ORDER-1; order >= 1; order--) {
++		area = zone->free_area + order - 1;
++		/*
++		 * eg. for order 4, mask is 0xfffffff0
++		 */
++		mask = ~((1 << order) - 1);
++		index = index0 & mask;
++		page = base + index;
++
++		if (!page_count(page) && !list_empty(&page->list))
++			break;
++	}
++	if (order < 0)
++		BUG();
++	/*
++	 * Break up any possible higher order page the free
++	 * page might be part of.
++	 */
++	if (order > 0) {
++		area = zone->free_area + order;
++		index = index0 & ~((1 << order) -1);
++		page = base + index;
++
++		if (list_empty(&page->list))
++			BUG();
++		list_del_init(&page->list);
++		if (!list_empty(&page->list))
++			BUG();
++		if (order != MAX_ORDER-1)
++			MARK_USED(index, order, area);
++		expand_specific(p, zone, page, order, area);
++	} else {
++		MARK_USED(index0, 0, zone->free_area);
++		list_del_init(&p->list);
++	}
++	zone->free_pages--;
++	if (!list_empty(&p->list))
++		BUG();
++	set_page_count(p, 1);
++}
++
++struct page * __alloc_memarea(unsigned int gfp_mask, unsigned int pages, zonelist_t *zonelist)
++{
++	struct page *p, *p_found = NULL;
++	unsigned int found = 0, order;
++	unsigned long flags;
++	zone_t **z, *zone;
++
++	z = zonelist->zones;
++	zone = *z;
++repeat:
++	spin_lock_irqsave(&zone->lock, flags);
++	if (zone->free_pages < pages)
++		goto next_zone;
++	/*
++	 * We search the zone's mem_map for a range of empty pages:
++	 */
++	for (p = zone->mem_map; p < zone->mem_map + zone->size; p += 1 << order) {
++		order = free_page_order(zone, p);
++		if (order == -1) {
++			found = 0;
++			p_found = NULL;
++			order = 0;
++			continue;
++		}
++		if (!found)
++			p_found = p;
++		found += 1 << order;
++
++		if (found < pages)
++			continue;
++		/*
++		 * Got the area, now remove every page from the
++		 * buddy structures:
++		 */
++		for (p = p_found; p != p_found + pages; p++) {
++			alloc_page_ptr(zone, p);
++			if (free_page_order(zone, p) != -1)
++				BUG();
++		}
++		spin_unlock_irqrestore(&zone->lock, flags);
++
++		return p_found;
++	}
++next_zone:
++	spin_unlock_irqrestore(&zone->lock, flags);
++
++	zone = *(++z);
++	if (zone)
++		goto repeat;
++	return NULL;
++}
++
++/**
++ * alloc_memarea - allocate physically continuous pages.
++ *
++ * The memory area will be PAGE_SIZE aligned. This allocator is able to
++ * allocate arbitrary number of physically continuous pages (which does
++ * not have to be a power of 2), as long as such a free area is available.
++ *
++ * The returned address is a struct page pointer, the allocator is able
++ * to allocate highmem, lowmem and DMA pages as well.
++ *
++ * NOTE: while the allocator is always atomic, it has to search the whole
++ * memory map, so it can be quite slow and is thus not suited for use in
++ * interrupt handlers. It should only be used for initialization-time
++ * allocation of larger memory areas. Also, since the allocator does not
++ * attempt to free any memory to be able to fulfill the allocation request,
++ * the caller either has to make sure the call happens at boot-time, or that
++ * he can fall back to other means of allocation such as vmalloc().
++ *
++ * @gfp_mask: allocation type
++ * @pages: the number of pages to be allocated
++ */
++struct page * alloc_memarea(unsigned int gfp_mask, unsigned int pages)
++{
++	return __alloc_memarea(gfp_mask, pages,
++		contig_page_data.node_zonelists+(gfp_mask & GFP_ZONEMASK));
++}
++
++/**
++ * free_memarea - free a set of physically continuous pages.
++ *
++ * @area: the first page in the area
++ * @pages: size of the area, in pages
++ */
++void free_memarea(struct page *area, unsigned int pages)
++{
++	int i;
++
++	for (i = 0; i < pages; i++)
++		__free_page(area + i);
++}
++
++#endif
++
+ /*
+  * Common helper functions.
+  */
+@@ -554,7 +775,7 @@
+ 				curr = head;
+ 				nr = 0;
+ 				for (;;) {
+-					curr = memlist_next(curr);
++					curr = curr->next;
+ 					if (curr == head)
+ 						break;
+ 					nr++;
+@@ -689,7 +910,7 @@
+ 		set_page_count(p, 0);
+ 		SetPageReserved(p);
+ 		init_waitqueue_head(&p->wait);
+-		memlist_init(&p->list);
++		INIT_LIST_HEAD(&p->list);
+ 	}
+ 
+ 	offset = lmem_map - mem_map;	
+@@ -706,7 +927,7 @@
+ 		zone->size = size;
+ 		zone->name = zone_names[j];
+ 		zone->lock = SPIN_LOCK_UNLOCKED;
+-		zone->zone_pgdat = pgdat;
++		zone->pgdat = pgdat;
+ 		zone->free_pages = 0;
+ 		zone->need_balance = 0;
+ 		if (!size)
+@@ -723,9 +944,9 @@
+ 		zone->pages_low = mask*2;
+ 		zone->pages_high = mask*3;
+ 
+-		zone->zone_mem_map = mem_map + offset;
+-		zone->zone_start_mapnr = offset;
+-		zone->zone_start_paddr = zone_start_paddr;
++		zone->mem_map = mem_map + offset;
++		zone->start_mapnr = offset;
++		zone->start_paddr = zone_start_paddr;
+ 
+ 		if ((zone_start_paddr >> PAGE_SHIFT) & (zone_required_alignment-1))
+ 			printk("BUG: wrong zone alignment, it will crash\n");
+@@ -742,7 +963,7 @@
+ 		for (i = 0; ; i++) {
+ 			unsigned long bitmap_size;
+ 
+-			memlist_init(&zone->free_area[i].free_list);
++			INIT_LIST_HEAD(&zone->free_area[i].free_list);
+ 			if (i == MAX_ORDER-1) {
+ 				zone->free_area[i].map = NULL;
+ 				break;
+--- linux/mm/filemap.c.orig	Mon Nov 12 15:05:21 2001
++++ linux/mm/filemap.c	Mon Nov 12 15:25:21 2001
+@@ -2931,23 +2931,29 @@
+ 
+ void __init page_cache_init(unsigned long mempages)
+ {
+-	unsigned long htable_size, order;
++	unsigned long htable_size, order, tmp;
++	struct page *area;
+ 
+ 	htable_size = mempages;
+ 	htable_size *= sizeof(struct page *);
+ 	for(order = 0; (PAGE_SIZE << order) < htable_size; order++)
+ 		;
+ 
+-	do {
+-		unsigned long tmp = (PAGE_SIZE << order) / sizeof(struct page *);
++	tmp = (PAGE_SIZE << order) / sizeof(struct page *);
+ 
+-		page_hash_bits = 0;
+-		while((tmp >>= 1UL) != 0UL)
+-			page_hash_bits++;
++	page_hash_bits = 0;
++	while((tmp >>= 1UL) != 0UL)
++		page_hash_bits++;
+ 
+-		page_hash_table = (struct page **)
+-			__get_free_pages(GFP_ATOMIC, order);
+-	} while(page_hash_table == NULL && --order > 0);
++	/*
++	 * We allocate the optimal-size structure.
++	 * There is something seriously bad wrt. the sizing of the
++	 * hash table if this allocation does not succeed, and we
++	 * want to know about those cases!
++	 */
++	area = alloc_memarea(GFP_KERNEL, 1 << order);
++	if (area)
++		page_hash_table = page_address(area);
+ 
+ 	printk("Page-cache hash table entries: %d (order: %ld, %ld bytes)\n",
+ 	       (1 << page_hash_bits), order, (PAGE_SIZE << order));
+--- linux/mm/vmscan.c.orig	Mon Nov 12 15:05:21 2001
++++ linux/mm/vmscan.c	Mon Nov 12 15:25:21 2001
+@@ -608,7 +608,7 @@
+ {
+ 	zone_t * first_classzone;
+ 
+-	first_classzone = classzone->zone_pgdat->node_zones;
++	first_classzone = classzone->pgdat->node_zones;
+ 	while (classzone >= first_classzone) {
+ 		if (classzone->free_pages > classzone->pages_high)
+ 			return 0;
+--- linux/include/linux/mm.h.orig	Mon Nov 12 15:05:21 2001
++++ linux/include/linux/mm.h	Mon Nov 12 15:25:02 2001
+@@ -369,6 +369,11 @@
+ extern unsigned long FASTCALL(__get_free_pages(unsigned int gfp_mask, unsigned int order));
+ extern unsigned long FASTCALL(get_zeroed_page(unsigned int gfp_mask));
+ 
++extern struct page * FASTCALL(__alloc_memarea(unsigned int gfp_mask, unsigned int pages, zonelist_t *zonelist));
++extern struct page * FASTCALL(alloc_memarea(unsigned int gfp_mask, unsigned int pages));
++extern void FASTCALL(free_memarea(struct page *area, unsigned int pages));
++
++
+ #define __get_free_page(gfp_mask) \
+ 		__get_free_pages((gfp_mask),0)
+ 
+--- linux/include/linux/mmzone.h.orig	Mon Nov 12 15:05:12 2001
++++ linux/include/linux/mmzone.h	Mon Nov 12 15:13:23 2001
+@@ -50,10 +50,10 @@
+ 	/*
+ 	 * Discontig memory support fields.
+ 	 */
+-	struct pglist_data	*zone_pgdat;
+-	struct page		*zone_mem_map;
+-	unsigned long		zone_start_paddr;
+-	unsigned long		zone_start_mapnr;
++	struct pglist_data	*pgdat;
++	struct page		*mem_map;
++	unsigned long		start_paddr;
++	unsigned long		start_mapnr;
+ 
+ 	/*
+ 	 * rarely used fields:
+@@ -113,7 +113,7 @@
+ extern int numnodes;
+ extern pg_data_t *pgdat_list;
+ 
+-#define memclass(pgzone, classzone)	(((pgzone)->zone_pgdat == (classzone)->zone_pgdat) \
++#define memclass(pgzone, classzone)	(((pgzone)->pgdat == (classzone)->pgdat) \
+ 			&& ((pgzone) <= (classzone)))
+ 
+ /*
+--- linux/include/asm-alpha/pgtable.h.orig	Mon Nov 12 15:05:19 2001
++++ linux/include/asm-alpha/pgtable.h	Mon Nov 12 15:12:24 2001
+@@ -194,7 +194,7 @@
+ #define PAGE_TO_PA(page)	((page - mem_map) << PAGE_SHIFT)
+ #else
+ #define PAGE_TO_PA(page) \
+-		((((page)-(page)->zone->zone_mem_map) << PAGE_SHIFT) \
++		((((page)-(page)->zone->mem_map) << PAGE_SHIFT) \
+ 		+ (page)->zone->zone_start_paddr)
+ #endif
+ 
+@@ -213,7 +213,7 @@
+ 	pte_t pte;								\
+ 	unsigned long pfn;							\
+ 										\
+-	pfn = ((unsigned long)((page)-(page)->zone->zone_mem_map)) << 32;	\
++	pfn = ((unsigned long)((page)-(page)->zone->mem_map)) << 32;	\
+ 	pfn += (page)->zone->zone_start_paddr << (32-PAGE_SHIFT);		\
+ 	pte_val(pte) = pfn | pgprot_val(pgprot);				\
+ 										\
+--- linux/include/asm-mips64/pgtable.h.orig	Mon Nov 12 15:05:12 2001
++++ linux/include/asm-mips64/pgtable.h	Mon Nov 12 15:12:24 2001
+@@ -485,7 +485,7 @@
+ #define PAGE_TO_PA(page)	((page - mem_map) << PAGE_SHIFT)
+ #else
+ #define PAGE_TO_PA(page) \
+-		((((page)-(page)->zone->zone_mem_map) << PAGE_SHIFT) \
++		((((page)-(page)->zone->mem_map) << PAGE_SHIFT) \
+ 		+ ((page)->zone->zone_start_paddr))
+ #endif
+ #define mk_pte(page, pgprot)						\

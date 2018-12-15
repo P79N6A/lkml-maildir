@@ -1,0 +1,470 @@
+Date: Wed, 26 Sep 2001 18:44:03 +0200 (CEST)
+From: Ingo Molnar <>
+Subject: [patch] softirq performance fixes, cleanups, 2.4.10.
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2001/9/26/110
+
+the Linux softirq code still has a number of performance and latency
+problems as of 2.4.10.
+one issue is that there are still places in the kernel that disable/enable
+softirq processing, but do not restart softirqs. This creates softirq
+processing latencies, which can show up eg. as 'stuttering' packet
+processing. Longer latencies between hard interrupts and soft interrupt
+processing also decreases caching efficiency - if eg. a socket buffer was
+touched in a network driver, it might get dropped from the cache by the
+time the skb is processed by its softirq handler.
+another problem is increased scheduling and softirq handling overhead due
+to ksoftirqd, and related performance degradation in high-speed network
+environments. (Performance drops of more than 10% were reported with
+certain gigabit cards.) Under various multi-process networking loads
+ksoftirqd is very active.
+the attached softirq-2.4.10-A5 patch solves these two main problems and
+also cleans up softirq.c.
+main changes in softirq handling:
+ - softirq handling can now be restarted N times within do_softirq(), if a
+   softirq gets reactivated while it's being handled.
+ - implemented a new scheduler mechanizm, 'unwakeup()', to undo ksoftirqd
+   wakeups if softirqs happen to be fully handled before ksoftirqd runs.
+   (unwakeup() does not touch the runqueue lock if the task in question is
+   already running.)
+ - cpu_raise_softirq() used to wake ksoftirqd up - instead of handling
+   softirqs immediately. All softirq users are using __cpu_raise_softirq()
+   now, and have to call rerun_softirqs() after the softirq-atomic section
+   has finished.
+none of these changes results in any change of tasklet or bottom-half
+semantics.
+the HTTP load situation i tested shows the following changes in scheduling
+frequency:
+                         context switches per second
+                         (measured over a period of 10 seconds,
+                          repeated 10 times and averaged.)
+ 2.4.10-vanilla:         39299
+ 2.4.10-softirq-A6:      35552
+a 10.5% improvement. HTTP performance increased by 2%, but the system had
+idle time left. Kernels with the softirq-A6 patch applied show almost no
+ksoftirqd activity, while vanilla 2.4.10 shows frequent ksoftirqd
+activation.
+other fixes/cleanups to softirq.c:
+ - removed 'mask' handling from do_softirq() - it's unnecessery due to the
+   restarts. this further simplifies the code.
+ - tasklet_hi_schedule() and tasklet_lo_schedule() are now rerunning
+   softirqs, instead of just kicking ksoftirqd.
+ - removed raise_softirq() and cpu_raise_softirq(), they are not used by
+   any other code anymore. unexported them.
+ - simplified argument passing between spawn_ksoftirqd() and ksoftirqd(),
+   passing an argument by pointer and waiting for ksoftirqd tasks to start
+   up is unnecessery.
+ - it's unnecessary to spin scheduling in ksoftirqd() startup, waiting for
+   the process to migrate - it's enough to call schedule() once, the
+   scheduler will not run the task on the wrong CPU.
+ - '[ksoftirqd_CPU0]' is confusing on UP systems, changed it to
+   '[ksoftirqd]' instead.
+ - simplified ksoftirqd()'s loop, it's both shorter and faster by a few
+   instructions now.
+ - __netif_schedule() is using __cpu_raise_softirq(), instead of
+   cpu_raise_softirq() [which did not restart softirq handling, it only
+   woke ksoftirqd up].
+ - dev_kfree_skb_irq() ditto. (although this function is mostly called
+   from IRQ contexts, where softirq restarts are not possible - but the
+   IRQ code will restart them nevertheless, on IRQ exit.)
+ - the generic definition of __cpu_raise_softirq() used to override
+   any lowlevel definitions done in asm/softirq.h. It's now conditional so
+   the architecture definitions should actually be used.
+i've tested the patch both on UP and SMP systems, and saw no problems at
+all. The changes decrease the size of softirq object code by ~8%. Network
+packet handling appears to be smoother. (this is subjective, it's hard to
+measure it). Ben, does this patch fix gigabit performance in your test, or
+is still something else going on as well?
+(The patch also applies cleanly to the -ac tree.)
+	Ingo
+--- linux/kernel/ksyms.c.orig	Wed Sep 26 17:04:40 2001
++++ linux/kernel/ksyms.c	Wed Sep 26 17:04:48 2001
+@@ -538,8 +538,6 @@
+ EXPORT_SYMBOL(tasklet_kill);
+ EXPORT_SYMBOL(__run_task_queue);
+ EXPORT_SYMBOL(do_softirq);
+-EXPORT_SYMBOL(raise_softirq);
+-EXPORT_SYMBOL(cpu_raise_softirq);
+ EXPORT_SYMBOL(__tasklet_schedule);
+ EXPORT_SYMBOL(__tasklet_hi_schedule);
+ 
+--- linux/kernel/sched.c.orig	Wed Sep 26 17:04:40 2001
++++ linux/kernel/sched.c	Wed Sep 26 17:04:48 2001
+@@ -366,6 +366,28 @@
+ }
+ 
+ /**
++ * unwakeup - undo wakeup if possible.
++ * @p: task
++ * @state: new task state
++ *
++ * Undo a previous wakeup of the specified task - if the process
++ * is not running already. The main interface to be used is
++ * unwakeup_process(), it will do a lockless test whether the task
++ * is on the runqueue.
++ */
++void __unwakeup_process(struct task_struct * p, long state)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&runqueue_lock, flags);
++	if (!p->has_cpu && (p != current) && task_on_runqueue(p)) {
++		del_from_runqueue(p);
++		p->state = state;
++	}
++	spin_unlock_irqrestore(&runqueue_lock, flags);
++}
++
++/**
+  * schedule_timeout - sleep until timeout
+  * @timeout: timeout value in jiffies
+  *
+--- linux/kernel/softirq.c.orig	Wed Sep 26 17:04:40 2001
++++ linux/kernel/softirq.c	Wed Sep 26 17:45:00 2001
+@@ -58,12 +58,35 @@
+ 		wake_up_process(tsk);
+ }
+ 
++/*
++ * If a softirqs were fully handled after ksoftirqd was woken
++ * up then try to undo the wakeup.
++ */
++static inline void unwakeup_softirqd(unsigned cpu)
++{
++	struct task_struct * tsk = ksoftirqd_task(cpu);
++
++	if (tsk)
++		unwakeup_process(tsk, TASK_INTERRUPTIBLE);
++}
++
++/*
++ * We restart softirq processing MAX_SOFTIRQ_RESTART times,
++ * and we fall back to softirqd after that.
++ *
++ * This number has been established via experimentation.
++ * The two things to balance is latency against fairness -
++ * we want to handle softirqs as soon as possible, but they
++ * should not be able to lock up the box.
++ */
++#define MAX_SOFTIRQ_RESTART 10
++
+ asmlinkage void do_softirq()
+ {
++	int max_restart = MAX_SOFTIRQ_RESTART;
+ 	int cpu = smp_processor_id();
+-	__u32 pending;
++	__u32 pending, mask;
+ 	long flags;
+-	__u32 mask;
+ 
+ 	if (in_interrupt())
+ 		return;
+@@ -95,55 +118,37 @@
+ 		local_irq_disable();
+ 
+ 		pending = softirq_pending(cpu);
+-		if (pending & mask) {
+-			mask &= ~pending;
++		if (pending && --max_restart)
+ 			goto restart;
+-		}
+ 		__local_bh_enable();
+ 
+ 		if (pending)
++			/*
++			 * In the normal case ksoftirqd is rarely activated,
++			 * increased scheduling hurts performance.
++			 * It's a safety measure: if external load starts
++			 * to flood the system with softirqs then we
++			 * will mitigate softirq work to the softirq thread.
++			 */
+ 			wakeup_softirqd(cpu);
++		else
++			/*
++			 * All softirqs are handled - undo any possible
++			 * wakeup of softirqd. This reduces context switch
++			 * overhead.
++			 */
++			unwakeup_softirqd(cpu);
+ 	}
+ 
+ 	local_irq_restore(flags);
+ }
+ 
+-/*
+- * This function must run with irq disabled!
+- */
+-inline void cpu_raise_softirq(unsigned int cpu, unsigned int nr)
+-{
+-	__cpu_raise_softirq(cpu, nr);
+-
+-	/*
+-	 * If we're in an interrupt or bh, we're done
+-	 * (this also catches bh-disabled code). We will
+-	 * actually run the softirq once we return from
+-	 * the irq or bh.
+-	 *
+-	 * Otherwise we wake up ksoftirqd to make sure we
+-	 * schedule the softirq soon.
+-	 */
+-	if (!(local_irq_count(cpu) | local_bh_count(cpu)))
+-		wakeup_softirqd(cpu);
+-}
+-
+-void raise_softirq(unsigned int nr)
+-{
+-	long flags;
+-
+-	local_irq_save(flags);
+-	cpu_raise_softirq(smp_processor_id(), nr);
+-	local_irq_restore(flags);
+-}
+-
+ void open_softirq(int nr, void (*action)(struct softirq_action*), void *data)
+ {
+ 	softirq_vec[nr].data = data;
+ 	softirq_vec[nr].action = action;
+ }
+ 
+-
+ /* Tasklets */
+ 
+ struct tasklet_head tasklet_vec[NR_CPUS] __cacheline_aligned;
+@@ -157,8 +162,9 @@
+ 	local_irq_save(flags);
+ 	t->next = tasklet_vec[cpu].list;
+ 	tasklet_vec[cpu].list = t;
+-	cpu_raise_softirq(cpu, TASKLET_SOFTIRQ);
++	__cpu_raise_softirq(cpu, TASKLET_SOFTIRQ);
+ 	local_irq_restore(flags);
++	rerun_softirqs(cpu);
+ }
+ 
+ void __tasklet_hi_schedule(struct tasklet_struct *t)
+@@ -169,8 +175,9 @@
+ 	local_irq_save(flags);
+ 	t->next = tasklet_hi_vec[cpu].list;
+ 	tasklet_hi_vec[cpu].list = t;
+-	cpu_raise_softirq(cpu, HI_SOFTIRQ);
++	__cpu_raise_softirq(cpu, HI_SOFTIRQ);
+ 	local_irq_restore(flags);
++	rerun_softirqs(cpu);
+ }
+ 
+ static void tasklet_action(struct softirq_action *a)
+@@ -241,7 +248,6 @@
+ 	}
+ }
+ 
+-
+ void tasklet_init(struct tasklet_struct *t,
+ 		  void (*func)(unsigned long), unsigned long data)
+ {
+@@ -268,8 +274,6 @@
+ 	clear_bit(TASKLET_STATE_SCHED, &t->state);
+ }
+ 
+-
+-
+ /* Old style BHs */
+ 
+ static void (*bh_base[32])(void);
+@@ -325,7 +329,7 @@
+ {
+ 	int i;
+ 
+-	for (i=0; i<32; i++)
++	for (i = 0; i < 32; i++)
+ 		tasklet_init(bh_task_vec+i, bh_action, i);
+ 
+ 	open_softirq(TASKLET_SOFTIRQ, tasklet_action, NULL);
+@@ -361,56 +365,52 @@
+ 
+ static int ksoftirqd(void * __bind_cpu)
+ {
+-	int bind_cpu = *(int *) __bind_cpu;
+-	int cpu = cpu_logical_map(bind_cpu);
++	int cpu = cpu_logical_map((int)__bind_cpu);
+ 
+ 	daemonize();
+-	current->nice = 19;
++
+ 	sigfillset(&current->blocked);
+ 
+ 	/* Migrate to the right CPU */
+-	current->cpus_allowed = 1UL << cpu;
+-	while (smp_processor_id() != cpu)
+-		schedule();
++	current->cpus_allowed = 1 << cpu;
+ 
+-	sprintf(current->comm, "ksoftirqd_CPU%d", bind_cpu);
++#if CONFIG_SMP
++	sprintf(current->comm, "ksoftirqd CPU%d", cpu);
++#else
++	sprintf(current->comm, "ksoftirqd");
++#endif
+ 
++	current->nice = 19;
++	schedule();
+ 	__set_current_state(TASK_INTERRUPTIBLE);
+-	mb();
+-
+ 	ksoftirqd_task(cpu) = current;
+ 
+ 	for (;;) {
+-		if (!softirq_pending(cpu))
+-			schedule();
+-
+-		__set_current_state(TASK_RUNNING);
+-
+-		while (softirq_pending(cpu)) {
++back:
++		do {
+ 			do_softirq();
+ 			if (current->need_resched)
+-				schedule();
+-		}
+-
++				goto preempt;
++		} while (softirq_pending(cpu));
++		schedule();
+ 		__set_current_state(TASK_INTERRUPTIBLE);
+ 	}
++
++preempt:
++	__set_current_state(TASK_RUNNING);
++	schedule();
++	__set_current_state(TASK_INTERRUPTIBLE);
++	goto back;
+ }
+ 
+ static __init int spawn_ksoftirqd(void)
+ {
+ 	int cpu;
+ 
+-	for (cpu = 0; cpu < smp_num_cpus; cpu++) {
+-		if (kernel_thread(ksoftirqd, (void *) &cpu,
++	for (cpu = 0; cpu < smp_num_cpus; cpu++)
++		if (kernel_thread(ksoftirqd, (void *) cpu,
+ 				  CLONE_FS | CLONE_FILES | CLONE_SIGNAL) < 0)
+-			printk("spawn_ksoftirqd() failed for cpu %d\n", cpu);
+-		else {
+-			while (!ksoftirqd_task(cpu_logical_map(cpu))) {
+-				current->policy |= SCHED_YIELD;
+-				schedule();
+-			}
+-		}
+-	}
++			BUG();
+ 
+ 	return 0;
+ }
+--- linux/include/linux/netdevice.h.orig	Wed Sep 26 17:04:36 2001
++++ linux/include/linux/netdevice.h	Wed Sep 26 17:08:20 2001
+@@ -486,8 +486,9 @@
+ 		local_irq_save(flags);
+ 		dev->next_sched = softnet_data[cpu].output_queue;
+ 		softnet_data[cpu].output_queue = dev;
+-		cpu_raise_softirq(cpu, NET_TX_SOFTIRQ);
++		__cpu_raise_softirq(cpu, NET_TX_SOFTIRQ);
+ 		local_irq_restore(flags);
++		rerun_softirqs(cpu);
+ 	}
+ }
+ 
+@@ -535,8 +536,9 @@
+ 		local_irq_save(flags);
+ 		skb->next = softnet_data[cpu].completion_queue;
+ 		softnet_data[cpu].completion_queue = skb;
+-		cpu_raise_softirq(cpu, NET_TX_SOFTIRQ);
++		__cpu_raise_softirq(cpu, NET_TX_SOFTIRQ);
+ 		local_irq_restore(flags);
++		rerun_softirqs(cpu);
+ 	}
+ }
+ 
+--- linux/include/linux/interrupt.h.orig	Wed Sep 26 17:04:40 2001
++++ linux/include/linux/interrupt.h	Wed Sep 26 17:45:23 2001
+@@ -74,9 +74,16 @@
+ asmlinkage void do_softirq(void);
+ extern void open_softirq(int nr, void (*action)(struct softirq_action*), void *data);
+ extern void softirq_init(void);
+-#define __cpu_raise_softirq(cpu, nr) do { softirq_pending(cpu) |= 1UL << (nr); } while (0)
+-extern void FASTCALL(cpu_raise_softirq(unsigned int cpu, unsigned int nr));
+-extern void FASTCALL(raise_softirq(unsigned int nr));
++#ifndef __cpu_raise_softirq
++#define __cpu_raise_softirq(cpu, nr) \
++		do { softirq_pending(cpu) |= 1UL << (nr); } while (0)
++#endif
++
++#define rerun_softirqs(cpu) 					\
++do {								\
++	if (!(local_irq_count(cpu) | local_bh_count(cpu)))	\
++		do_softirq();					\
++} while (0);
+ 
+ 
+ 
+--- linux/include/linux/sched.h.orig	Wed Sep 26 17:04:40 2001
++++ linux/include/linux/sched.h	Wed Sep 26 17:08:16 2001
+@@ -556,6 +556,7 @@
+ 
+ extern void FASTCALL(__wake_up(wait_queue_head_t *q, unsigned int mode, int nr));
+ extern void FASTCALL(__wake_up_sync(wait_queue_head_t *q, unsigned int mode, int nr));
++extern void FASTCALL(__unwakeup_process(struct task_struct * p, long state));
+ extern void FASTCALL(sleep_on(wait_queue_head_t *q));
+ extern long FASTCALL(sleep_on_timeout(wait_queue_head_t *q,
+ 				      signed long timeout));
+@@ -574,6 +575,13 @@
+ #define wake_up_interruptible_all(x)	__wake_up((x),TASK_INTERRUPTIBLE, 0)
+ #define wake_up_interruptible_sync(x)	__wake_up_sync((x),TASK_INTERRUPTIBLE, 1)
+ #define wake_up_interruptible_sync_nr(x) __wake_up_sync((x),TASK_INTERRUPTIBLE,  nr)
++
++#define unwakeup_process(tsk,state)		\
++do {						\
++	if (task_on_runqueue(tsk))		\
++		__unwakeup_process(tsk,state);	\
++} while (0)
++
+ asmlinkage long sys_wait4(pid_t pid,unsigned int * stat_addr, int options, struct rusage * ru);
+ 
+ extern int in_group_p(gid_t);
+--- linux/include/asm-i386/softirq.h.orig	Wed Sep 26 17:04:40 2001
++++ linux/include/asm-i386/softirq.h	Wed Sep 26 17:08:16 2001
+@@ -45,4 +45,9 @@
+ 		/* no registers clobbered */ );				\
+ } while (0)
+ 
++
++/* It's using __set_bit() because it only needs to be IRQ-atomic. */
++
++#define __cpu_raise_softirq(cpu, nr) __set_bit(nr, &softirq_pending(cpu))
++
+ #endif	/* __ASM_SOFTIRQ_H */
+--- linux/net/core/dev.c.orig	Wed Sep 26 17:04:41 2001
++++ linux/net/core/dev.c	Wed Sep 26 17:04:48 2001
+@@ -1218,8 +1218,9 @@
+ 			dev_hold(skb->dev);
+ 			__skb_queue_tail(&queue->input_pkt_queue,skb);
+ 			/* Runs from irqs or BH's, no need to wake BH */
+-			cpu_raise_softirq(this_cpu, NET_RX_SOFTIRQ);
++			__cpu_raise_softirq(this_cpu, NET_RX_SOFTIRQ);
+ 			local_irq_restore(flags);
++			rerun_softirqs(this_cpu);
+ #ifndef OFFLINE_SAMPLE
+ 			get_sample_stats(this_cpu);
+ #endif
+@@ -1529,8 +1530,9 @@
+ 	local_irq_disable();
+ 	netdev_rx_stat[this_cpu].time_squeeze++;
+ 	/* This already runs in BH context, no need to wake up BH's */
+-	cpu_raise_softirq(this_cpu, NET_RX_SOFTIRQ);
++	__cpu_raise_softirq(this_cpu, NET_RX_SOFTIRQ);
+ 	local_irq_enable();
++	rerun_softirqs(this_cpu);
+ 
+ 	NET_PROFILE_LEAVE(softnet_process);
+ 	return;

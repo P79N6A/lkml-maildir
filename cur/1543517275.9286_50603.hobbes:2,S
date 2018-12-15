@@ -1,0 +1,171 @@
+Date: Mon, 29 Nov 1999 06:03:54 +0100 (CET)
+From: Mike Galbraith <>
+Subject: Re: 2.3.29: ramdisk still broken.
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/11/29/2
+
+On Fri, 26 Nov 1999, Stephen C. Tweedie wrote:
+> Hi,
+> 
+> On Thu, 25 Nov 1999 06:17:39 +0100 (CET), Mike Galbraith
+> <mikeg@weiden.de> said:
+> 
+> > The way I see it, the ramdisk used to work by making it's data persistent
+> > in the buffer cache.  Today, data doesn't live in the buffer cache, it
+> > lives in the page cache.  Ergo, the task at hand is to figure out how
+> > to make data in the page cache persistent rather than copying that data
+> > back and forth.
+> 
+> No.  It needs to do more than just behave as an in-memory filesystem: it
+> needs to behave like a block device.  That means that buffer cache
+> aliases of page cache data still need to work: you need to be able to
+> run dump or fsck on the ramdisk of a mounted filesystem, for example.
+> Using a ramdisk to test fs utilities is a legitimate use, and if you
+> move the ramdisk out of the buffer cache it will just break this (as
+> well as polluting the page cache semantics).
+Thanks for the reply Stephen.
+(when I said I'd taken the ramdisk out of the buffer cache, I meant only
+the persistent data.. copied that unconditionally to/from vmalloc'd area
+instead of pegging down buffers.  works fine but is slooo)
+The attached against 2.3.28 is faster, but I _hate_ the copy on write.
+I tried (like hell) to avoid it by looking to see if a stale buffer
+existed, bforget() the old data and peg down the new data.  That didn't
+work worth spit (corruption/oops/OOM/hardlock/softlock.. pick one:) and
+I wish I knew why.
+For blocksize = PAGE_SIZE ramdisks, I _think_ I could avoid the copy by
+keeping track of allocated blocks and when a write request comes in do
+something like..
+	if (block_table[blk] != request_bh->b_page) {
+		if (block_table[blk])
+			put_page(block_table[blk]);
+		get_page(request_bh->b_page);
+		block_table[blk] = request_bh->b_page;
+	}
+..and only (always) have to copy out for a read.  Trouble is, it could
+only work for 4k blocksize.. and is probably pretty gross.
+(so off we go to filemap.c..)
+What I'd like to do is to set up an address space (still have to figure
+out exactly howto.. swap_state.c) and use page cache functions to map
+and unmap the incoming data into the ramdisk's address space.  Trouble
+is, it looks like a page can only be in one address space.. correct?
+Is it possible to use page cache functionality to do correctly what
+the above pseudo code tries to accomplish?  If so, a subtle hint (and
+maybe a 2x4 to rub it in with) would be much appreciated.
+	TIA for any advice,
+	-Mike
+--- drivers/block/rd.c.org	Sun Oct 31 05:57:29 1999
++++ drivers/block/rd.c	Mon Nov 29 03:49:45 1999
+@@ -95,8 +95,8 @@
+ 
+ static unsigned long rd_length[NUM_RAMDISKS];	/* Size of RAM disks in bytes   */
+ static int rd_hardsec[NUM_RAMDISKS];		/* Size of real blocks in bytes */
+-static int rd_blocksizes[NUM_RAMDISKS];		/* Size of 1024 byte blocks :)  */
+-static int rd_kbsize[NUM_RAMDISKS];		/* Size in blocks of 1024 bytes */
++static int rd_blocksizes[NUM_RAMDISKS];		/* Size of logical blocks in bytes*/
++static int rd_kbsize[NUM_RAMDISKS];		/* Size of device in KB */
+ 
+ /*
+  * Parameters for the boot-loading of the RAM disk.  These are set by
+@@ -104,19 +104,8 @@
+  * architecture-specific setup routine (from the stored boot sector
+  * information). 
+  */
+-int rd_size = 4096;		/* Size of the RAM disks */
+-/*
+- * It would be very desiderable to have a soft-blocksize (that in the case
+- * of the ramdisk driver is also the hardblocksize ;) of PAGE_SIZE because
+- * doing that we'll achieve a far better MM footprint. Using a rd_blocksize of
+- * BLOCK_SIZE in the worst case we'll make PAGE_SIZE/BLOCK_SIZE buffer-pages
+- * unfreeable. With a rd_blocksize of PAGE_SIZE instead we are sure that only
+- * 1 page will be protected. Depending on the size of the ramdisk you
+- * may want to change the ramdisk blocksize to achieve a better or worse MM
+- * behaviour. The default is still BLOCK_SIZE (needed by rd_load_image that
+- * supposes the filesystem in the image uses a BLOCK_SIZE blocksize).
+- */
+-int rd_blocksize = BLOCK_SIZE;	/* Size of the RAM disks */
++int rd_size = 4096;		/* Default size of the RAM disks */
++int rd_blocksize = BLOCK_SIZE;	/* Default blocksize of the RAM disks */
+ 
+ #ifndef MODULE
+ 
+@@ -167,11 +156,18 @@
+ 	return ramdisk_size(str);
+ }
+ 
++static int __init ramdisk_blocksize(char *str)
++{
++	rd_blocksize = simple_strtol(str,NULL,0);
++	return 1;
++}
++
+ __setup("ramdisk_start=", ramdisk_start_setup);
+ __setup("load_ramdisk=", load_ramdisk);
+ __setup("prompt_ramdisk=", prompt_ramdisk);
+ __setup("ramdisk=", ramdisk_size);
+ __setup("ramdisk_size=", ramdisk_size2);
++__setup("ramdisk_blocksize=", ramdisk_blocksize);
+ 
+ #endif
+ 
+@@ -185,6 +181,7 @@
+ {
+ 	unsigned int minor;
+ 	unsigned long offset, len;
++	struct buffer_head *buf, *rd_data;
+ 
+ repeat:
+ 	INIT_REQUEST;
+@@ -196,6 +193,12 @@
+ 		goto repeat;
+ 	}
+ 	
++	if ((CURRENT->cmd != READ) && (CURRENT->cmd != WRITE)) {
++		printk(KERN_INFO "RAMDISK: bad command: %d\n", CURRENT->cmd);
++		end_request(0);
++		goto repeat;
++	}
++
+ 	offset = CURRENT->sector << 9;
+ 	len = CURRENT->current_nr_sectors << 9;
+ 
+@@ -204,24 +207,20 @@
+ 		goto repeat;
+ 	}
+ 
+-	if ((CURRENT->cmd != READ) && (CURRENT->cmd != WRITE)) {
+-		printk(KERN_INFO "RAMDISK: bad command: %d\n", CURRENT->cmd);
+-		end_request(0);
+-		goto repeat;
++	buf = CURRENT->bh;
++	if (CURRENT->cmd == READ) {
++		rd_data = get_hash_table(buf->b_dev, buf->b_blocknr, len);
++		if (!rd_data)
++			memset(CURRENT->buffer, 0, len);
++		else if (rd_data != buf)
++			memcpy(CURRENT->buffer, rd_data->b_data, len);
++	} else {
++		rd_data = getblk(buf->b_dev, buf->b_blocknr, len);
++		set_bit(BH_Protected, &rd_data->b_state);
++		if (rd_data != buf)
++			memcpy(rd_data->b_data, CURRENT->buffer, len);
+ 	}
+-
+-	/*
+-	 * If we're reading, fill the buffer with 0's.  This is okay since
+-         * we're using protected buffers which should never get freed...
+-	 *
+-	 * If we're writing, we protect the buffer.
+-  	 */
+-
+-	if (CURRENT->cmd == READ) 
+-		memset(CURRENT->buffer, 0, len); 
+-	else
+-		set_bit(BH_Protected, &CURRENT->bh->b_state);
+-
++	brelse(rd_data);
+ 	end_request(1);
+ 	goto repeat;
+ } 

@@ -1,0 +1,154 @@
+Date: Thu, 26 Jan 2006 09:02:06 -0800
+From: "Wei Yongjun" <>
+Subject: [PATCH]ip_options_fragment() has no effect on fragmentation
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2006/1/25/304
+
+[1]Summary of the problem:
+ip_options_fragment() has no effect on fragmentation
+[2]Full description of the problem:
+When I send IPv4 packet(contain Record Route Option) which need to be 
+fragmented to the router, the router can not fragment it correctly.
+After fragmented by router, the second fragmentation still contain Record 
+Route Option. Refer to RFC791, Record Route Option must Not be copied on 
+fragmentation, goes in first fragment only.
+ip_options_fragment() is the implemental function, but there are some BUGs 
+in it:
+ip_option.c: line 207:
+void ip_options_fragment(struct sk_buff * skb)
+{
+ unsigned char * optptr = skb->nh.raw;
+ struct ip_options * opt = &(IPCB(skb)->opt);
+...
+optptr get a error pointer to the ipv4 options, correct is as following:
+unsigned char * optptr = skb->nh.raw + sizeof(struct iphdr);
+By the way, ip_options_fragment() just fill options not allowed in fragments 
+with NOOPs, does not delete the space of the options, following patch has 
+corrected the problem.
+--- linux-2.6.15.1/net/ipv4/ip_options.c.orig 2006-01-23 08:55:15.045904912 
++0900
++++ linux-2.6.15.1/net/ipv4/ip_options.c 2006-01-23 09:04:28.885708464 +0900
+@@ -207,33 +207,63 @@
+ void ip_options_fragment(struct sk_buff * skb)
+ {
+- unsigned char * optptr = skb->nh.raw;
++ unsigned char * optptr = skb->nh.raw + sizeof(struct iphdr);
+  struct ip_options * opt = &(IPCB(skb)->opt);
+  int  l = opt->optlen;
+  int  optlen;
++ int  optneed = 0;
++ unsigned char * pp_ptr = optptr;
+  while (l > 0) {
+   switch (*optptr) {
+   case IPOPT_END:
+-   return;
++   goto end;
+   case IPOPT_NOOP:
+    l--;
++   if(optptr != pp_ptr)
++    memcpy(pp_ptr, optptr, 1);
+    optptr++;
++   pp_ptr++;
+    continue;
+   }
+   optlen = optptr[1];
+-  if (optlen<2 || optlen>l)
+-    return;
+-  if (!IPOPT_COPIED(*optptr))
+-   memset(optptr, IPOPT_NOOP, optlen);
++  if (optlen<2 || optlen>l) {
++   if(optptr != pp_ptr)
++    memcpy(pp_ptr, optptr, l);
++   optptr += l;
++   pp_ptr += l;
++   optneed = 1;
++   goto error;
++  }
++  if (IPOPT_COPIED(*optptr)) {
++   if(optptr != pp_ptr)
++    memcpy(pp_ptr, optptr, optlen);
++   pp_ptr += optlen;
++   optneed = 1;
++  }
+   l -= optlen;
+   optptr += optlen;
+  }
++end:
+  opt->ts = 0;
+  opt->rr = 0;
+  opt->rr_needaddr = 0;
+  opt->ts_needaddr = 0;
+  opt->ts_needtime = 0;
++error:
++ if (pp_ptr != optptr) {
++  if (optneed == 1) {
++   opt->optlen -= optptr - pp_ptr;
++   if (opt->optlen & 0x03) {
++    for (l = 0; l < 4 - (opt->optlen & 0x03); l++)
++     *pp_ptr++ = IPOPT_END;
++    opt->optlen = (opt->optlen + 3) & ~3;
++   }
++  } else {
++   opt->optlen = 0;
++  }
++  skb->nh.iph->ihl = 5 + (opt->optlen >> 2);
++ }
+  return;
+ }
+--- linux-2.6.15.1/net/ipv4/ip_output.c.orig 2006-01-23 08:54:57.516569776 
++0900
++++ linux-2.6.15.1/net/ipv4/ip_output.c 2006-01-23 09:09:13.531435736 +0900
+@@ -503,12 +503,19 @@
+     frag->h.raw = frag->data;
+     frag->nh.raw = __skb_push(frag, hlen);
+     memcpy(frag->nh.raw, iph, hlen);
++    offset += skb->len - hlen;
++    if (offset == skb->len - hlen) {
++     ip_options_fragment(frag);
++     len = frag->nh.iph->ihl * 4;
++     if (hlen != len) {
++      memmove(frag->nh.raw, frag->h.raw - len, len);
++      frag->nh.raw = __skb_pull(frag, hlen - len);
++      hlen = len;
++     }
++    }
+     iph = frag->nh.iph;
+     iph->tot_len = htons(frag->len);
+     ip_copy_metadata(frag, skb);
+-    if (offset == 0)
+-     ip_options_fragment(frag);
+-    offset += skb->len - hlen;
+     iph->frag_off = htons(offset>>3);
+     if (frag->next != NULL)
+      iph->frag_off |= htons(IP_MF);
+@@ -619,6 +626,7 @@
+    */
+   iph = skb2->nh.iph;
+   iph->frag_off = htons((offset >> 3));
++  iph->tot_len = htons(len + hlen);
+   /* ANK: dirty, but effective trick. Upgrade options only if
+    * the segment to be fragmented was THE FIRST (otherwise,
+@@ -626,8 +634,11 @@
+    * on the initial skb, so that all the following fragments
+    * will inherit fixed options.
+    */
+-  if (offset == 0)
++  if (offset == 0) {
+    ip_options_fragment(skb);
++   hlen = skb->nh.iph->ihl * 4;
++   mtu = dst_pmtu(&rt->u.dst) - hlen;
++  }
+   /*
+    * Added AC : If we are fragmenting a fragment that's not the
+@@ -644,8 +655,6 @@
+   IP_INC_STATS(IPSTATS_MIB_FRAGCREATES);
+-  iph->tot_len = htons(len + hlen);
+-
+   ip_send_check(iph);
+   err = output(skb2);
+Best Regard
+Wei Yongjun
+[unhandled content-type:application/octet-stream]

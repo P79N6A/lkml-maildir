@@ -1,0 +1,198 @@
+Date: Fri, 25 Aug 2000 03:36:18 +0200
+From: Jens Axboe <>
+Subject: Re: ll_rw_blk.c fails to merge requests. Help!
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/8/24/112
+
+On Thu, Aug 24 2000, David Mansfield wrote:
+> Technically speaking, however, the completion of a request that was
+> taken from the read list doesn't guarantee that there are still free
+> slots in the read list, but rather that there *were* free slots in the
+> read list at the time the request was made.
+> 
+> If between that time and now a slew of requests were made, enough to use
+> all available requests, plus one more read for the sake of argument,
+> which will be put onto the wait queue.  Now this new free request is put
+> onto the read free_list, but the queue is not activated.  Then another
+> read request comes in, it will use the free request while the one on the
+> wait queue starves.  
+That is true, doing otherwise is just too painful with the split
+freelist. However, just doing a single free list and keeping count
+of the entries (like we did earlier), makes this much easier to do
+correctly.
+-- 
+* Jens Axboe <axboe@suse.de>
+* SuSE Labs
+--- /opt/kernel/linux-2.4.0-test7/drivers/block/ll_rw_blk.c	Thu Aug 24 05:12:54 2000
++++ drivers/block/ll_rw_blk.c	Fri Aug 25 03:34:07 2000
+@@ -189,8 +189,7 @@
+ {
+ 	int count = QUEUE_NR_REQUESTS;
+ 
+-	count -= __blk_cleanup_queue(&q->request_freelist[READ]);
+-	count -= __blk_cleanup_queue(&q->request_freelist[WRITE]);
++	count -= __blk_cleanup_queue(&q->request_freelist);
+ 
+ 	if (count)
+ 		printk("blk_cleanup_queue: leaked requests (%d)\n", count);
+@@ -377,7 +376,7 @@
+ 	for (i = 0; i < QUEUE_NR_REQUESTS; i++) {
+ 		rq = kmem_cache_alloc(request_cachep, SLAB_KERNEL);
+ 		rq->rq_status = RQ_INACTIVE;
+-		list_add(&rq->table, &q->request_freelist[i & 1]);
++		list_add(&rq->table, &q->request_freelist);
+ 	}
+ 
+ 	init_waitqueue_head(&q->wait_for_request);
+@@ -421,8 +420,8 @@
+ void blk_init_queue(request_queue_t * q, request_fn_proc * rfn)
+ {
+ 	INIT_LIST_HEAD(&q->queue_head);
+-	INIT_LIST_HEAD(&q->request_freelist[READ]);
+-	INIT_LIST_HEAD(&q->request_freelist[WRITE]);
++	INIT_LIST_HEAD(&q->request_freelist);
++	INIT_LIST_HEAD(&q->pending_freelist);
+ 	elevator_init(&q->elevator, ELEVATOR_LINUS);
+ 	blk_init_free_list(q);
+ 	q->request_fn     	= rfn;
+@@ -442,6 +441,8 @@
+ 	 */
+ 	q->plug_device_fn 	= generic_plug_device;
+ 	q->head_active    	= 1;
++	q->pending_free		= 0;
++	q->queue_requests	= 0;
+ }
+ 
+ 
+@@ -452,38 +453,22 @@
+  */
+ static inline struct request *get_request(request_queue_t *q, int rw)
+ {
+-	struct list_head *list = &q->request_freelist[rw];
+ 	struct request *rq;
+ 
+-	/*
+-	 * Reads get preferential treatment and are allowed to steal
+-	 * from the write free list if necessary.
+-	 */
+-	if (!list_empty(list)) {
+-		rq = blkdev_free_rq(list);
+-		goto got_rq;
+-	}
++	if ((q->queue_requests > (QUEUE_NR_REQUESTS >> 1)) && (rw == WRITE))
++		return NULL;
+ 
+-	/*
+-	 * if the WRITE list is non-empty, we know that rw is READ
+-	 * and that the READ list is empty. allow reads to 'steal'
+-	 * from the WRITE list.
+-	 */
+-	if (!list_empty(&q->request_freelist[WRITE])) {
+-		list = &q->request_freelist[WRITE];
+-		rq = blkdev_free_rq(list);
+-		goto got_rq;
++	if (!list_empty(&q->request_freelist)) {
++		q->queue_requests++;
++		rq = blkdev_free_rq(&q->request_freelist);
++		list_del(&rq->table);
++		rq->rq_status = RQ_ACTIVE;
++		rq->special = NULL;
++		rq->q = q;
++		return rq;
+ 	}
+ 
+ 	return NULL;
+-
+-got_rq:
+-	list_del(&rq->table);
+-	rq->free_list = list;
+-	rq->rq_status = RQ_ACTIVE;
+-	rq->special = NULL;
+-	rq->q = q;
+-	return rq;
+ }
+ 
+ /*
+@@ -494,9 +479,9 @@
+ 	register struct request *rq;
+ 	DECLARE_WAITQUEUE(wait, current);
+ 
+-	add_wait_queue_exclusive(&q->wait_for_request, &wait);
++	add_wait_queue(&q->wait_for_request, &wait);
+ 	for (;;) {
+-		__set_current_state(TASK_UNINTERRUPTIBLE | TASK_EXCLUSIVE);
++		__set_current_state(TASK_UNINTERRUPTIBLE);
+ 		spin_lock_irq(&io_request_lock);
+ 		rq = get_request(q, rw);
+ 		spin_unlock_irq(&io_request_lock);
+@@ -609,16 +594,29 @@
+  */
+ void inline blkdev_release_request(struct request *req)
+ {
++	request_queue_t *q = req->q;
++
+ 	req->rq_status = RQ_INACTIVE;
+ 
+ 	/*
+ 	 * Request may not have originated from ll_rw_blk
+ 	 */
+-	if (req->free_list) {
+-		list_add(&req->table, req->free_list);
+-		req->free_list = NULL;
+-		wake_up(&req->q->wait_for_request);
++	if (req->q == NULL)
++		return;
++
++	if (!waitqueue_active(&q->wait_for_request))
++		list_add(&req->table, &q->request_freelist);
++	else {
++		list_add(&req->table, &q->pending_freelist);
++		if (++q->pending_free > 64) {
++			list_splice(&q->pending_freelist, &q->request_freelist);
++			INIT_LIST_HEAD(&q->pending_freelist);
++			q->pending_free = 0;
++			wake_up(&q->wait_for_request);
++		}
+ 	}
++	q->queue_requests--;
++	req->q = NULL;
+ }
+ 
+ /*
+--- /opt/kernel/linux-2.4.0-test7/drivers/scsi/scsi_lib.c	Wed Jul  5 22:18:05 2000
++++ drivers/scsi/scsi_lib.c	Fri Aug 25 02:56:32 2000
+@@ -87,7 +87,6 @@
+ 	SCpnt->request.cmd = SPECIAL;
+ 	SCpnt->request.special = (void *) SCpnt;
+ 	SCpnt->request.q = NULL;
+-	SCpnt->request.free_list = NULL;
+ 	SCpnt->request.nr_segments = 0;
+ 
+ 	/*
+--- /opt/kernel/linux-2.4.0-test7/include/linux/blkdev.h	Thu Aug 10 14:28:06 2000
++++ include/linux/blkdev.h	Fri Aug 25 02:48:11 2000
+@@ -23,8 +23,6 @@
+ 	int elevator_sequence;
+ 	struct list_head table;
+ 
+-	struct list_head *free_list;
+-
+ 	volatile int rq_status;	/* should split this into a few status bits */
+ #define RQ_INACTIVE		(-1)
+ #define RQ_ACTIVE		1
+@@ -76,7 +74,11 @@
+ 	/*
+ 	 * the queue request freelist, one for reads and one for writes
+ 	 */
+-	struct list_head	request_freelist[2];
++	struct list_head	request_freelist;
++	int			queue_requests;
++
++	struct list_head	pending_freelist;
++	int			pending_free;
+ 
+ 	/*
+ 	 * Together with queue_head for cacheline sharing

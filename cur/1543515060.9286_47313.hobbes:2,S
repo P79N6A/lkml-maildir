@@ -1,0 +1,214 @@
+Date: Wed, 3 Nov 1999 17:01:09 -0500 (EST)
+From: Chuck Lever <>
+Subject: same patch, different day
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/11/3/187
+
+linus-
+here's the minor clean-up patch, redriven against 2.3.25, that fixes:
++  filemap_nopage can loop unnecessarily if OOM occurs
++  OOM in generic_file_readahead or read_cluster_nonblocking will break
+    out of these loops immediately
++  error reporting from underlying layers gets back to filemap_nopage
+    properly
+please consider this for 2.3.26; i'd like it applied before i continue
+working on madvise/mmap-readahead.  thanks!
+diff -ruN linux-2.3.25-ref/include/linux/mm.h linux/include/linux/mm.h
+--- linux-2.3.25-ref/include/linux/mm.h	Tue Nov  2 14:22:20 1999
++++ linux/include/linux/mm.h	Wed Nov  3 15:13:05 1999
+@@ -202,6 +202,12 @@
+ #define SetPageReserved(page)		set_bit(PG_reserved, &(page)->flags)
+ #define ClearPageReserved(page)		clear_bit(PG_reserved, &(page)->flags)
+ 
++/*
++ * Error return values for the *_nopage functions
++ */
++#define NOPAGE_SIGBUS	(NULL)
++#define NOPAGE_OOM	((struct page *) (-1))
++
+ 
+ /*
+  * Various page->flags bits:
+diff -ruN linux-2.3.25-ref/ipc/shm.c linux/ipc/shm.c
+--- linux-2.3.25-ref/ipc/shm.c	Tue Nov  2 14:22:20 1999
++++ linux/ipc/shm.c	Tue Nov  2 14:37:35 1999
+@@ -719,7 +719,7 @@
+ 		free_page_and_swap_cache(page);
+ 	goto done;
+ oom:
+-	return (struct page *)(-1);
++	return NOPAGE_OOM;
+ }
+ 
+ /*
+diff -ruN linux-2.3.25-ref/mm/filemap.c linux/mm/filemap.c
+--- linux-2.3.25-ref/mm/filemap.c	Tue Nov  2 14:22:20 1999
++++ linux/mm/filemap.c	Wed Nov  3 15:15:05 1999
+@@ -519,7 +519,7 @@
+  * This adds the requested page to the page cache if it isn't already there,
+  * and schedules an I/O to read in its contents from disk.
+  */
+-static inline void page_cache_read(struct file * file, unsigned long offset) 
++static inline int page_cache_read(struct file * file, unsigned long offset) 
+ {
+ 	struct inode *inode = file->f_dentry->d_inode;
+ 	struct page **hash = page_hash(&inode->i_data, offset);
+@@ -529,38 +529,42 @@
+ 	page = __find_page_nolock(&inode->i_data, offset, *hash); 
+ 	spin_unlock(&pagecache_lock);
+ 	if (page)
+-		return;
++		return 0;
+ 
+ 	page = page_cache_alloc();
+ 	if (!page)
+-		return;
++		return -ENOMEM;
+ 
+ 	if (!add_to_page_cache_unique(page, &inode->i_data, offset, hash)) {
+-		inode->i_op->readpage(file, page);
++		int error = inode->i_op->readpage(file, page);
+ 		page_cache_release(page);
+-		return;
++		return error;
+ 	}
+ 	/*
+ 	 * We arrive here in the unlikely event that someone 
+ 	 * raced with us and added our page to the cache first.
+ 	 */
+ 	page_cache_free(page);
+-	return;
++	return 0;
+ }
+ 
+ /*
+  * Read in an entire cluster at once.  A cluster is usually a 64k-
+  * aligned block that includes the address requested in "offset."
+  */
+-static void read_cluster_nonblocking(struct file * file, unsigned long offset)
++static int read_cluster_nonblocking(struct file * file, unsigned long offset)
+ {
++	int error = 0;
+ 	unsigned long filesize = (file->f_dentry->d_inode->i_size + PAGE_CACHE_SIZE - 1) >> PAGE_CACHE_SHIFT;
+ 	unsigned long pages = CLUSTER_PAGES;
+ 
+ 	offset = CLUSTER_OFFSET(offset);
+ 	while ((pages-- > 0) && (offset < filesize)) {
+-		page_cache_read(file, offset);
+-		offset ++;
++		error = page_cache_read(file, offset);
++		if (error >= 0)
++			offset ++;
++		else
++			break;
+ 	}
+ 
+ 	return;
+@@ -899,7 +903,8 @@
+ 		ahead += PAGE_CACHE_SIZE;
+ 		if ((raend + ahead) >= inode->i_size)
+ 			break;
+-		page_cache_read(filp, (raend + ahead) >> PAGE_CACHE_SHIFT);
++		if (page_cache_read(filp, (raend + ahead) >> PAGE_CACHE_SHIFT) < 0)
++			break;
+ 	}
+ /*
+  * If we tried to read ahead some pages,
+@@ -1292,13 +1297,11 @@
+  * The goto's are kind of ugly, but this streamlines the normal case of having
+  * it in the page cache, and handles the special cases reasonably without
+  * having a lot of duplicated code.
+- *
+- * XXX - at some point, this should return unique values to indicate to
+- *       the caller whether this is EIO, OOM, or SIGBUS.
+  */
+ static struct page * filemap_nopage(struct vm_area_struct * area,
+ 	unsigned long address, int no_share)
+ {
++	int error;
+ 	struct file *file = area->vm_file;
+ 	struct dentry *dentry = file->f_dentry;
+ 	struct inode *inode = dentry->d_inode;
+@@ -1347,7 +1350,8 @@
+ 				BUG();
+ 			copy_highpage(new_page, old_page);
+ 			flush_page_to_ram(new_page);
+-		}
++		} else
++			new_page = NOPAGE_OOM;
+ 		page_cache_release(page);
+ 		return new_page;
+ 	}
+@@ -1364,16 +1368,26 @@
+ 	 * so we need to map a zero page.
+ 	 */
+ 	if (pgoff < size)
+-		read_cluster_nonblocking(file, pgoff);
++		error = read_cluster_nonblocking(file, pgoff);
+ 	else
+-		page_cache_read(file, pgoff);
++		error = page_cache_read(file, pgoff);
+ 
+ 	/*
+ 	 * The page we want has now been added to the page cache.
+ 	 * In the unlikely event that someone removed it in the
+ 	 * meantime, we'll just come back here and read it again.
+ 	 */
+-	goto retry_find;
++	if (error >= 0)
++		goto retry_find;
++
++	/*
++	 * An error return from page_cache_read can result if the
++	 * system is low on memory, or a problem occurs while trying
++	 * to schedule I/O.
++	 */
++	if (error == -ENOMEM)
++		return NOPAGE_OOM;
++	return NULL;
+ 
+ page_not_uptodate:
+ 	lock_page(page);
+diff -ruN linux-2.3.25-ref/mm/memory.c linux/mm/memory.c
+--- linux-2.3.25-ref/mm/memory.c	Tue Nov  2 14:22:20 1999
++++ linux/mm/memory.c	Wed Nov  3 15:16:54 1999
+@@ -1051,8 +1051,7 @@
+  * As this is called only for pages that do not currently exist, we
+  * do not need to flush old virtual caches or the TLB.
+  *
+- * This is called with the MM semaphore and the kernel lock held.
+- * We need to release the kernel lock as soon as possible..
++ * This is called with the MM semaphore held.
+  */
+ static int do_no_page(struct task_struct * tsk, struct vm_area_struct * vma,
+ 	unsigned long address, int write_access, pte_t *page_table)
+@@ -1069,10 +1068,10 @@
+ 	 * essentially an early COW detection.
+ 	 */
+ 	new_page = vma->vm_ops->nopage(vma, address & PAGE_MASK, (vma->vm_flags & VM_SHARED)?0:write_access);
+-	if (!new_page)
+-		return 0;	/* SIGBUS - but we _really_ should know whether it is OOM or SIGBUS */
+-	if (new_page == (struct page *)-1)
+-		return -1;	/* OOM */
++	if (new_page == NULL)	/* no page was available -- SIGBUS */
++		return 0;
++	if (new_page == NOPAGE_OOM)
++		return -1;
+ 	++tsk->maj_flt;
+ 	++vma->vm_mm->rss;
+ 	/*
+	- Chuck Lever
+--
+corporate:	<chuckl@netscape.com>
+personal:	<chucklever@netscape.net> or <cel@monkey.org>
+The Linux Scalability project:
+	
+http://www.citi.umich.edu/projects/linux-scalability/
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

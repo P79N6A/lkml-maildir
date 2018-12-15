@@ -1,0 +1,130 @@
+Date: Sun, 01 May 2005 13:30:32 +1000
+From: Nick Piggin <>
+Subject: [patch] alternative fix for VFS race (was Re: 2.6.12-rc3-mm2)
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2005/4/30/181
+
+Andrew Morton wrote:
+> 
+ftp://ftp.kernel.org/pub/linux/kernel/people/akpm/patches/2.6/2.6.12-rc3/2.6.12-rc3-mm2/
+> 
+http://www.kernel.org/pub/linux/kernel/people/akpm/patches/2.6/2.6.12-rc3/2.6.12-rc3-mm2/broken-out/fix-race-in-block_write_full_page.patch
+While this patch does fix the problem, I would like to propose the
+following attached patch instead, which is a minimal fix for the
+specific race identified.
+I have the following concerns about extending the lock page coverage:
+Extending lock_page coverage 1) doesn't appear to protect from any other
+races; 2) doesn't seem to be how the rest of the kernel submits asynch
+writes; 3) isn't how this path used to do locking; and 4) can hold the
+page lock for a long time while a request slot and memory is allocated.
+What's more, if there *is* a good reason to extend lock page coverage,
+then that should probably be sumbmitted as a seperate changeset on top
+of this minimal patch, with a seperate rationale. It would help future
+work on this code identify why the locking is the way it is.
+Thanks,
+Nick
+-- 
+SUSE Labs, Novell Inc.
+When running
+	fsstress -v -d $DIR/tmp -n 1000 -p 1000 -l 2
+on an ext2 filesystem with 1024 byte block size, on SMP i386 with 4096 byte
+page size over loopback to an image file on a tmpfs filesystem, I would
+very quickly hit
+	BUG_ON(!buffer_async_write(bh));
+in fs/buffer.c:end_buffer_async_write
+It seems that more than one request would be submitted for a given bh
+at a time.
+What would happen is the following:
+2 threads doing __mpage_writepages on the same page.
+Thread 1 - lock the page first, and enter __block_write_full_page.
+Thread 1 - (eg.) mark_buffer_async_write on the first 2 buffers.
+Thread 1 - set page writeback, unlock page.
+Thread 2 - lock page, wait on page writeback
+Thread 1 - submit_bh on the first 2 buffers.
+=> both requests complete, none of the page buffers are async_write,
+   end_page_writeback is called.
+Thread 2 - wakes up. enters __block_write_full_page.
+Thread 2 - mark_buffer_async_write on (eg.) the last buffer
+Thread 1 - finds the last buffer has async_write set, submit_bh on that.
+Thread 2 - submit_bh on the last buffer.
+=> oops.
+So change __block_write_full_page to explicitly keep track of the last
+bh we need to issue, so we don't touch anything after issuing the last
+request.
+Signed-off-by: Nick Piggin <nickpiggin@yahoo.com.au>
+Index: linux-2.6/fs/buffer.c
+===================================================================
+--- linux-2.6.orig/fs/buffer.c	2005-04-27 22:43:05.000000000 +1000
++++ linux-2.6/fs/buffer.c	2005-05-01 12:44:08.000000000 +1000
+@@ -1750,7 +1750,7 @@ static int __block_write_full_page(struc
+ 	int err;
+ 	sector_t block;
+ 	sector_t last_block;
+-	struct buffer_head *bh, *head;
++	struct buffer_head *bh, *head, *last_bh = NULL;
+ 	int nr_underway = 0;
+ 
+ 	BUG_ON(!PageLocked(page));
+@@ -1808,7 +1808,6 @@ static int __block_write_full_page(struc
+ 	} while (bh != head);
+ 
+ 	do {
+-		get_bh(bh);
+ 		if (!buffer_mapped(bh))
+ 			continue;
+ 		/*
+@@ -1826,6 +1825,8 @@ static int __block_write_full_page(struc
+ 		}
+ 		if (test_clear_buffer_dirty(bh)) {
+ 			mark_buffer_async_write(bh);
++			get_bh(bh);
++			last_bh = bh;
+ 		} else {
+ 			unlock_buffer(bh);
+ 		}
+@@ -1844,10 +1845,13 @@ static int __block_write_full_page(struc
+ 		if (buffer_async_write(bh)) {
+ 			submit_bh(WRITE, bh);
+ 			nr_underway++;
++			put_bh(bh);
++			if (bh == last_bh)
++				break;
+ 		}
+-		put_bh(bh);
+ 		bh = next;
+ 	} while (bh != head);
++	bh = head;
+ 
+ 	err = 0;
+ done:
+@@ -1886,10 +1890,11 @@ recover:
+ 	bh = head;
+ 	/* Recovery: lock and submit the mapped buffers */
+ 	do {
+-		get_bh(bh);
+ 		if (buffer_mapped(bh) && buffer_dirty(bh)) {
+ 			lock_buffer(bh);
+ 			mark_buffer_async_write(bh);
++			get_bh(bh);
++			last_bh = bh;
+ 		} else {
+ 			/*
+ 			 * The buffer may have been set dirty during
+@@ -1908,10 +1913,13 @@ recover:
+ 			clear_buffer_dirty(bh);
+ 			submit_bh(WRITE, bh);
+ 			nr_underway++;
++			put_bh(bh);
++			if (bh == last_bh)
++				break;
+ 		}
+-		put_bh(bh);
+ 		bh = next;
+ 	} while (bh != head);
++	bh = head;
+ 	goto done;
+ }
+ 

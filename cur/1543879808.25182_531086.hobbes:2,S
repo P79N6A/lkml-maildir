@@ -1,0 +1,200 @@
+Date: Mon, 16 Apr 2007 11:16:24 +0900
+From: Satoru Takeuchi <>
+Subject: [PATCH] scheduler: fix the return of the first time_slice
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2007/4/15/174
+
+At Sat, 14 Apr 2007 01:31:12 +1000,
+Con Kolivas wrote:
+> 
+> On Monday 09 April 2007 16:09, Andrew Morton wrote:
+> > On Sat, 07 Apr 2007 16:31:39 +0900 Satoru Takeuchi 
+> <takeuchi_satoru@jp.fujitsu.com> wrote:
+> > > When I was examining the following program ...
+> > >
+> > >   1. There are a large amount of small jobs takes several msecs,
+> > >      and the number of job increases constantly.
+> > >   2. The process creates a thread or a process per job (I examined both
+> > >      the thread model and the process model).
+> > >   3. Each child process/thread does the assigned job and exit
+> > > immediately.
+> > >
+> > > ... I found that the thread model's latency is longer than proess
+> > > model's one against my expectation. It's because of the current
+> > > sched_fork()/sched_exit() implementation as follows:
+> > >
+> > >   a) On sched_fork, the creator share its timeslice with new process.
+> > >   b) On sched_exit, if the exiting process didn't exhaust its first
+> > >      timeslice yet, it gives its timeslice to the parent.
+> > >
+> > > It has no problem on the process model since the creator is the parent.
+> > > However, on the thread model, the creator is not the parent, it is same
+> > > as the creator's parent. Hence, on this kind of program, the creator
+> > > can't retrieve shared timeslice and exausts its timeslice at a rate of
+> > > knots. In addition, somehow, the parent (typically shell?) gets extra
+> > > timeslice.
+> > >
+> > > I believe it's a bug and the exiting process should give its timeslice
+> > > to the creator. Now I have some patch plan to fix this problem as follow:
+> > >
+> > >  a) Add the field for the creator to task_struct. It needs extra memory.
+> > >  b) Doesn't add extra field and have thread's parent the creater, which
+> > > is same as process creation. However it has many side effects, for
+> > > example, we also need to change sys_getppid() implementation.
+> > >
+> > > What do you think? Any comments are welcome.
+> >
+> > This comes at an awkward time, because we might well merge the
+> > staircase/deadline work into 2.6.22, and I think it rewrites the part of
+> > the scheduler which is causing the problems you're observing.
+> >
+> > Has anyone verified that SD fixes this problem and the one at
+> > 
+http://lkml.org/lkml/2007/4/7/21
+ ?
+> 
+> No, SD does nothing different in this regard. There is no notion of who made 
+> the thread and who the remaining timeslice should go to. As you say, some 
+> decision on sched_exit should probably be used to decide where to send it. In 
+> the absence of yet more fields in task_struct, the easiest thing to do would 
+> be to check if the the thread id is equal to the pid and if not, send it to 
+> the pid (or any parent of that if it no longer exists). Whether it's worth 
+> adding yet another field to task_struct to track this or not I do not have 
+> enough information to make an informed choice in this regard. Either way I'm 
+> low on patch-creation cycles so please feel free to provide your solution.
+I wrote the patch fixing this problem. It's for 2.6.21-rc6 and works well.
+I also examined the following load tests:
+ - Compile kernel with -j4 option continuously for 8 hours on i386 UP box.
+ - Compile kernel with -j48 option continuously for 2 hours on ia64 12 CPU
+   box.
+Now I'm testing its 2.6.21-rc6-mm1(with SD) version and would submit it soon.
+Thanks,
+Satoru
+---
+Fix the return of the first time_slice
+Currently exiting process takes back its first_time_slice to its
+parent. If the task is created with CLONE_PARENT or CLONE_THREAD
+flag, the parent is not the creator. Hence the creator can't
+collect the time_slice and time_slice leak occurs.
+To fix this problem, remove first_time_slice field of task_struct
+and introduce time_slice_reaper field instead. The new field means
+the task which exiting task should return its first_time_slice to,
+and is NULL after exhausting its first time_slice.
+Signed-off-by: Satoru Takeuchi <takeuchi_satoru@jp.fujitsu.com>
+Index: linux-2.6.21-rc6.tsfix/kernel/exit.c
+===================================================================
+--- linux-2.6.21-rc6.tsfix.orig/kernel/exit.c	2007-04-13 20:53:11.000000000 +0900
++++ linux-2.6.21-rc6.tsfix/kernel/exit.c	2007-04-14 13:58:29.000000000 +0900
+@@ -679,6 +679,8 @@
+ 			reaper = child_reaper(father);
+ 			break;
+ 		}
++		if (reaper->time_slice_reaper == father)
++			p->time_slice_reaper = NULL;
+ 	} while (reaper->exit_state);
+ 
+ 	/*
+@@ -700,6 +702,8 @@
+ 
+ 		if (father == p->real_parent) {
+ 			/* reparent with a reaper, real father it's us */
++			if (p->time_slice_reaper == father)
++				p->time_slice_reaper = NULL;
+ 			choose_new_parent(p, reaper);
+ 			reparent_thread(p, father, 0);
+ 		} else {
+@@ -721,6 +725,8 @@
+ 	}
+ 	list_for_each_safe(_p, _n, &father->ptrace_children) {
+ 		p = list_entry(_p, struct task_struct, ptrace_list);
++		if (p->time_slice_reaper == father)
++			p->time_slice_reaper = NULL;
+ 		choose_new_parent(p, reaper);
+ 		reparent_thread(p, father, 1);
+ 	}
+Index: linux-2.6.21-rc6.tsfix/kernel/sched.c
+===================================================================
+--- linux-2.6.21-rc6.tsfix.orig/kernel/sched.c	2007-04-13 20:53:11.000000000 +0900
++++ linux-2.6.21-rc6.tsfix/kernel/sched.c	2007-04-14 01:27:20.000000000 +0900
+@@ -1628,7 +1628,7 @@
+ 	 * The remainder of the first timeslice might be recovered by
+ 	 * the parent if the child exits early enough.
+ 	 */
+-	p->first_time_slice = 1;
++	p->time_slice_reaper = current;
+ 	current->time_slice >>= 1;
+ 	p->timestamp = sched_clock();
+ 	if (unlikely(!current->time_slice)) {
+@@ -1739,19 +1739,23 @@
+ {
+ 	unsigned long flags;
+ 	struct rq *rq;
++	struct task_struct *reaper = p->time_slice_reaper;
+ 
+ 	/*
+ 	 * If the child was a (relative-) CPU hog then decrease
+ 	 * the sleep_avg of the parent as well.
+ 	 */
+-	rq = task_rq_lock(p->parent, &flags);
+-	if (p->first_time_slice && task_cpu(p) == task_cpu(p->parent)) {
+-		p->parent->time_slice += p->time_slice;
+-		if (unlikely(p->parent->time_slice > task_timeslice(p)))
+-			p->parent->time_slice = task_timeslice(p);
++	if (!reaper)
++		return;
++
++	rq = task_rq_lock(reaper, &flags);
++	if (task_cpu(p) == task_cpu(reaper)) {
++		reaper->time_slice += p->time_slice;
++		if (unlikely(reaper->time_slice > task_timeslice(reaper)))
++			reaper->time_slice = task_timeslice(reaper);
+ 	}
+-	if (p->sleep_avg < p->parent->sleep_avg)
+-		p->parent->sleep_avg = p->parent->sleep_avg /
++	if (p->sleep_avg < reaper->sleep_avg)
++		reaper->sleep_avg = reaper->sleep_avg /
+ 		(EXIT_WEIGHT + 1) * EXIT_WEIGHT + p->sleep_avg /
+ 		(EXIT_WEIGHT + 1);
+ 	task_rq_unlock(rq, &flags);
+@@ -3153,7 +3157,7 @@
+ 		 */
+ 		if ((p->policy == SCHED_RR) && !--p->time_slice) {
+ 			p->time_slice = task_timeslice(p);
+-			p->first_time_slice = 0;
++			p->time_slice_reaper = NULL;
+ 			set_tsk_need_resched(p);
+ 
+ 			/* put it at the end of the queue: */
+@@ -3166,7 +3170,7 @@
+ 		set_tsk_need_resched(p);
+ 		p->prio = effective_prio(p);
+ 		p->time_slice = task_timeslice(p);
+-		p->first_time_slice = 0;
++		p->time_slice_reaper = NULL;
+ 
+ 		if (!rq->expired_timestamp)
+ 			rq->expired_timestamp = jiffies;
+Index: linux-2.6.21-rc6.tsfix/include/linux/sched.h
+===================================================================
+--- linux-2.6.21-rc6.tsfix.orig/include/linux/sched.h	2007-04-13 20:58:27.000000000 +0900
++++ linux-2.6.21-rc6.tsfix/include/linux/sched.h	2007-04-13 20:59:03.000000000 +0900
+@@ -827,7 +827,8 @@
+ 
+ 	unsigned long policy;
+ 	cpumask_t cpus_allowed;
+-	unsigned int time_slice, first_time_slice;
++	unsigned int time_slice;
++	struct task_struct *time_slice_reaper;
+ 
+ #if defined(CONFIG_SCHEDSTATS) || defined(CONFIG_TASK_DELAY_ACCT)
+ 	struct sched_info sched_info;
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+More majordomo info at  
+http://vger.kernel.org/majordomo-info.html
+Please read the FAQ at  
+http://www.tux.org/lkml/

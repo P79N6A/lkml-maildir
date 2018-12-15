@@ -1,0 +1,391 @@
+Date: Sun, 6 Oct 2002 22:18:55 -0500
+From: Bob McElrath <>
+Subject: Re: nvidia 2.5.40+ patch? (& work queues)
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2002/10/6/301
+
+Chris Wedgwood [cw@f00f.org] wrote:
+> My changes are pretty small and don't oops.  Like I said though,
+> something just isn't quite right though :)
+Yes indeed, your patch works fine, but as you observed, it hangs
+sometimes.  My guess is the work queue work isn't getting done on time.
+If you give the [nvisr/0] process a negative priority, the stalls go
+away.  I just played through a level of Chromium BSU and it performed
+flawlessly (with the nvisr process at -20 priority).  With the latest bk
+tree there are also no oopses.
+I'm not sure how to solve this in a general way.  But the nvisr work
+isn't getting done quickly enough.  I think under the task queue system
+the bottom-half interrupt work got scheduled as immediate (i.e. it's
+guaranteed to be the next work run).  But under work queues it enters
+the scheduler like any other process, so several timeslices can pass
+before it gets done.
+Really, the nvisr process should be SCHED_FIFO.  (i think)  Or whatever
+it takes to ensure that when it is given work, it gets scheduled
+immediately.
+Correct me if I'm wrong...I know diddly squat about task/work queues/bh
+isr's...
+I'm re-sending your patch against the nvidia driver with this post and
+copying it to lkml, since it works great and others might want to see
+what the code does.
+Cheers,
+-- Bob
+Bob McElrath
+Univ. of Wisconsin at Madison, Department of Physics
+    "The purpose of separation of church and state is to keep forever from
+    these shores the ceaseless strife that has soaked the soil of Europe in
+    blood for centuries." -- James Madison
+Index: Makefile
+===================================================================
+RCS file: /var/cvs/nvkern/Makefile,v
+retrieving revision 1.1.1.1
+retrieving revision 1.2
+diff -u -r1.1.1.1 -r1.2
+--- Makefile	5 Oct 2002 08:18:46 -0000	1.1.1.1
++++ Makefile	5 Oct 2002 09:03:54 -0000	1.2
+@@ -57,9 +57,9 @@
+ 
+ # allow specification of alternate include file tree on command line and extra defines
+ ifdef SYSINCLUDE
+-INCLUDES += -I$(SYSINCLUDE)
++INCLUDES += -I$(SYSINCLUDE) -I$(KERNINC)/../arch/i386/mach-generic
+ else
+-INCLUDES += -I$(KERNINC)
++INCLUDES += -I$(KERNINC) -I$(KERNINC)/../arch/i386/mach-generic
+ endif
+ 
+ DEFINES+=$(EXTRA_DEFINES)
+Index: nv-linux.h
+===================================================================
+RCS file: /var/cvs/nvkern/nv-linux.h,v
+retrieving revision 1.1.1.1
+retrieving revision 1.2
+diff -u -r1.1.1.1 -r1.2
+--- nv-linux.h	5 Oct 2002 08:18:46 -0000	1.1.1.1
++++ nv-linux.h	5 Oct 2002 09:03:55 -0000	1.2
+@@ -36,11 +36,6 @@
+ #  error This driver does not support 2.3.x development kernels!
+ #elif LINUX_VERSION_CODE < KERNEL_VERSION(2, 5, 0)
+ #  define KERNEL_2_4
+-#elif LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 0)
+-#  error This driver does not support 2.5.x development kernels!
+-#  define KERNEL_2_5
+-#else
+-#  error This driver does not support 2.6.x or newer kernels!
+ #endif
+ 
+ #if defined (CONFIG_SMP) && !defined (__SMP__)
+@@ -51,7 +46,7 @@
+ #include <linux/errno.h>            /* error codes                      */
+ #include <linux/stddef.h>           /* NULL, offsetof                   */
+ #include <linux/wait.h>             /* wait queues                      */
+-#include <linux/tqueue.h>           /* struct tq_struct                 */
++#include <linux/workqueue.h>
+ 
+ #include <linux/slab.h>             /* kmalloc, kfree, etc              */
+ #include <linux/vmalloc.h>          /* vmalloc, vfree, etc              */
+@@ -194,7 +189,7 @@
+     nv_alloc_t *alloc_queue;
+ 
+     // bottom half interrupt handler info; per device
+-    struct tq_struct *bh;
++    struct work_struct *work;
+ 
+     U032 vblank_notifier;
+     U032 waiting_for_vblank;
+Index: nv.c
+===================================================================
+RCS file: /var/cvs/nvkern/nv.c,v
+retrieving revision 1.1.1.1
+retrieving revision 1.2
+diff -u -r1.1.1.1 -r1.2
+--- nv.c	5 Oct 2002 08:18:46 -0000	1.1.1.1
++++ nv.c	5 Oct 2002 09:03:55 -0000	1.2
+@@ -17,6 +17,15 @@
+ #include "nv_compiler.h"
+ 
+ /*
++ * Queue for delayed I/O completion.
++ *
++ * CW:XXX the way the driver is presently structures, we want on of
++ * these per device (card) which rather than something global.
++ *
++ */
++struct workqueue_struct *isr_workqueue;
++
++/*
+  * our global state; one per device
+  */
+ 
+@@ -36,7 +45,7 @@
+ // keep track of opened clients and their process id so they
+ //   can be free'd up on abnormal close
+ nv_client_t       nv_clients[NV_MAX_CLIENTS];
+-struct tq_struct  nv_bottom_halves[NV_MAX_CLIENTS];
++struct work_struct  nv_work[NV_MAX_CLIENTS];
+ 
+ 
+ #ifdef CONFIG_DEVFS_FS
+@@ -838,6 +847,13 @@
+     int rc;
+     int num_devices;
+ 
++    /* create a workqueue */
++    isr_workqueue = create_workqueue("nvisr");
++    if (!isr_workqueue) {
++	printk("Unable to create workqueue for NV\n");
++	return -EIO;
++    }
++
+     memset(nv_linux_devices, 0, sizeof(nv_linux_devices));
+     num_devices = nvos_probe_devices();
+ 
+@@ -885,10 +901,8 @@
+     // init all the bottom half structures
+     for (nvl = nv_linux_devices; nvl < nv_linux_devices + NV_MAX_DEVICES; nvl++)
+     {
+-        nvl->bh = &nv_bottom_halves[nvl - nv_linux_devices];
+-        nvl->bh->routine = rm_isr_bh;
+-        nvl->bh->data = (void *) 0;
+-        nvl->bh->sync = 0;
++	nvl->work = &nv_work[nvl - nv_linux_devices];
++	INIT_WORK(nvl->work, rm_isr_bh, NULL);
+     }
+ 
+     // init the control device
+@@ -984,6 +998,8 @@
+     } while(0);
+     devfs_unregister(nv_ctl_handle);
+ #endif
++
++    destroy_workqueue(isr_workqueue);
+ }
+ 
+ 
+@@ -1068,11 +1084,11 @@
+ 
+     /* for control device, just jump to its open routine */
+     /* after setting up the private data */
+-    if (NV_DEVICE_IS_CONTROL_DEVICE(inode->i_rdev))
++    if (NV_DEVICE_IS_CONTROL_DEVICE(kdev_val(inode->i_rdev)))
+         return nv_kern_ctl_open(inode, file);
+ 
+     /* what device are we talking about? */
+-    devnum = NV_DEVICE_NUMBER(inode->i_rdev);
++    devnum = NV_DEVICE_NUMBER(kdev_val(inode->i_rdev));
+     if (devnum >= NV_MAX_DEVICES)
+     {
+         rc = -ENODEV;
+@@ -1178,9 +1194,9 @@
+ 
+     /* for control device, just jump to its open routine */
+     /* after setting up the private data */
+-    if (NV_DEVICE_IS_CONTROL_DEVICE(inode->i_rdev))
+-        return nv_kern_ctl_close(inode, file);
+ 
++    if(NV_DEVICE_IS_CONTROL_DEVICE(kdev_val(inode->i_rdev)))
++        return nv_kern_ctl_close(inode, file);
+     NV_DMSG(nv, "close");
+ 
+     rm_free_unused_clients(nv, current->pid, (void *) file);
+@@ -1188,8 +1204,6 @@
+     nv_lock_ldata(nv);
+     if (--nv->usage_count == 0)
+     {
+-        int counter = 0;
+-
+         /* turn off interrupts.
+         ** be careful to make sure any pending bottom half gets run
+         **  or disabled before calling rm_shutdown_adapter() since
+@@ -1200,20 +1214,14 @@
+         rm_disable_adapter(nv);
+ 
+         /* give it a moment to allow any bottom half to run */
+-
+-#define MAX_BH_TASKS 10
+-        while ((nv->bh_count) && (counter < MAX_BH_TASKS))
+-        {
+-            current->state = TASK_INTERRUPTIBLE;
+-            schedule_timeout(HZ/50);
+-            counter++;
+-        }
++	flush_workqueue(isr_workqueue);
++	/* destroy_workqueue(isr_workqueue); */ /* CW:XXX */
+ 
+         /* free the irq, which may block until any pending interrupts */
+         /* are done being processed. */
+         free_irq(nv->interrupt_line, (void *) nv);
+ 
+-        nvl->bh->data = (void *) 0;
++	INIT_WORK(nvl->work, NULL, NULL);
+ 
+         rm_shutdown_adapter(nv);
+ 
+@@ -1299,7 +1307,7 @@
+ #if defined(NVCPU_IA64)
+         vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
+ #endif
+-        if (remap_page_range(vma->vm_start,
++        if (remap_page_range(vma, vma->vm_start,
+                              (u32)(nv->regs.address) + LINUX_VMA_OFFS(vma) - NV_MMAP_REG_OFFSET,
+                              vma->vm_end - vma->vm_start,
+                              vma->vm_page_prot))
+@@ -1316,7 +1324,7 @@
+ #if defined(NVCPU_IA64)
+         vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
+ #endif
+-        if (remap_page_range(vma->vm_start,
++        if (remap_page_range(vma, vma->vm_start,
+                              (u32)(nv->fb.address) + LINUX_VMA_OFFS(vma) - NV_MMAP_FB_OFFSET,
+                              vma->vm_end - vma->vm_start,
+                              vma->vm_page_prot))
+@@ -1350,7 +1358,7 @@
+         while (pages--)
+         {
+             page = (unsigned long) at->page_table[i++];
+-            if (remap_page_range(start, page, PAGE_SIZE, PAGE_SHARED))
++            if (remap_page_range(vma, start, page, PAGE_SIZE, PAGE_SHARED))
+               	return -EAGAIN;
+             start += PAGE_SIZE;
+             pos += PAGE_SIZE;
+@@ -1626,9 +1634,8 @@
+     {
+         nv_lock_bh(nv);
+         nv->bh_count++;
+-        nvl->bh->data = nv->pdev;
+-        queue_task(nvl->bh, &tq_immediate);
+-        mark_bh(IMMEDIATE_BH);
++        INIT_WORK(nvl->work, rm_isr_bh, nv->pdev);
++        queue_work(isr_workqueue, nvl->work);
+         nv_unlock_bh(nv);
+     }
+ }
+@@ -2179,7 +2186,7 @@
+     pte_kunmap(pte__);
+ #else
+     pte__ = NULL;
+-    pte = *pte_offset(pg_mid_dir, address);
++    pte = *pte_offset_map(pg_mid_dir, address);
+ #endif
+ 
+     if (!pte_present(pte)) 
+@@ -2681,7 +2688,6 @@
+     spin_unlock_irqrestore(&nvl->at_lock, nvl->at_pflags);
+ }
+ 
+-
+ void nv_lock_bh(
+     nv_state_t *nv
+ )
+@@ -2695,7 +2701,7 @@
+ 
+     if (locking_debuglevel && nvl->bh_locked)
+     {
+-        nv_printf("(%d) %d wait on bh\n", cpu, me);
++        nv_printf("(%d) %d wait on work\n", cpu, me);
+         if (nvl->bh_locked == -1)
+             nv_printf("  ISR owns the lock!!\n");
+         if (nvl->bh_locked == -2)
+@@ -2732,14 +2738,12 @@
+ 
+ #if defined(NV_DEBUG_LOCKS)
+     if (locking_debuglevel >= DEBUG_ISR_LOCKING)
+-        nv_printf("(%d): %d drop bh\n", cpu, nvl->bh_locked);
++        nv_printf("(%d): %d drop work\n", cpu, nvl->bh_locked);
+     nvl->bh_locked = 0;
+ #endif
+ 
+     spin_unlock_irqrestore(&nvl->bh_lock, nvl->bh_pflags);
+ }
+-
+-
+ 
+ /*
+ ** post the event
+Index: nv.h
+===================================================================
+RCS file: /var/cvs/nvkern/nv.h,v
+retrieving revision 1.1.1.1
+retrieving revision 1.2
+diff -u -r1.1.1.1 -r1.2
+--- nv.h	5 Oct 2002 08:18:46 -0000	1.1.1.1
++++ nv.h	5 Oct 2002 09:03:55 -0000	1.2
+@@ -195,6 +195,11 @@
+     U032 agp_buffers;
+     U032 agp_teardown;
+ 
++    /*
++     * CW:XXX.  I'm not sure *how* the value below ever gets
++     * decremented, perhaps inside the magic binary logic in which case
++     * we need to keep it about
++     */
+     /* keep track of any pending bottom-halves */
+     int bh_count;
+ 
+Index: os-interface.c
+===================================================================
+RCS file: /var/cvs/nvkern/os-interface.c,v
+retrieving revision 1.1.1.1
+retrieving revision 1.2
+diff -u -r1.1.1.1 -r1.2
+--- os-interface.c	5 Oct 2002 08:18:46 -0000	1.1.1.1
++++ os-interface.c	5 Oct 2002 09:03:55 -0000	1.2
+@@ -27,7 +27,7 @@
+ 
+ BOOL os_is_administrator(PHWINFO pDev)
+ {
+-    return suser();
++    return (capable(CAP_SYS_ADMIN) != 0);
+ }
+ 
+ U032 os_get_page_size(VOID)
+@@ -1141,7 +1141,7 @@
+     uaddr = *priv;
+ 
+     /* finally, let's do it! */
+-    err = remap_page_range( (size_t) uaddr, (size_t) paddr, size_bytes, 
++    err = remap_page_range( kaddr, (size_t) uaddr, (size_t) paddr, size_bytes,
+                             PAGE_SHARED);
+ 
+     if (err != 0)
+@@ -1177,7 +1177,7 @@
+     uaddr = *priv;
+ 
+     /* finally, let's do it! */
+-    err = remap_page_range( (size_t) uaddr, (size_t) start, size_bytes, 
++    err = remap_page_range( *priv, (size_t) uaddr, (size_t) start, size_bytes, 
+                             PAGE_SHARED);
+ 
+     if (err != 0)
+@@ -1560,8 +1560,10 @@
+ 
+     *pPriv_data = data;
+     
++#if 0 /* CW:XXX silence */
+     printk(KERN_INFO "NVRM: AGPGART: allocated %lu pages\n",
+            (unsigned long) PageCount);
++#endif
+     return RM_OK;
+ 
+ fail:
+@@ -1593,7 +1595,7 @@
+ 
+     agp_addr = agpinfo.aper_base + (agp_data->offset << PAGE_SHIFT);
+ 
+-    err = remap_page_range(vma->vm_start, (size_t) agp_addr, 
++    err = remap_page_range(vma, vma->vm_start, (size_t) agp_addr, 
+                            agp_data->num_pages << PAGE_SHIFT,
+ #if defined(NVCPU_IA64)
+                            vma->vm_page_prot);
+@@ -1686,7 +1688,9 @@
+         (*(agp_ops.unbind_memory))(ptr);
+         (*(agp_ops.free_memory))(ptr);
+ 
++#if 0 /* CW:XXX silence */
+         printk(KERN_INFO "NVRM: AGPGART: freed %ld pages\n", (unsigned long)pages);
++#endif
+         PRINT_AGPGART_TABLE();
+         return RM_OK;
+     }[unhandled content-type:application/pgp-signature]

@@ -1,0 +1,191 @@
+Date: Wed, 2 Jan 2002 23:02:42 +0100 (CET)
+From: kees <>
+Subject: [PATCH] solves freeze due to serial comm. on SMP
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2002/1/2/146
+
+Hi,
+In the beginning of last year I reported a solid freeze problem with Linux
+when I moved from UP to SMP. Some bughunting especially with kdb an hints
+from AM I was able to nail it down to some SMP unsafe irq table handling
+in serial.c.
+I submitted the attached patch to Ted but that never made it to the
+kernel. It _really_ solved the problem as I had a crash sometimes within
+15 minutes and after applying it I reached uptimes over 100 days.
+The problem is however that this patch applies to Linux-2.4.4 and serial.c
+has had some tweaks in the  meantime. Please merge it.
+Kees
+--- linux244.org/drivers/char/serial.c	Sat Apr 14 05:26:07 2001
++++ linux/drivers/char/serial.c	Thu Jun 28 15:13:58 2001
+@@ -189,6 +189,7 @@
+ #include <linux/ioport.h>
+ #include <linux/mm.h>
+ #include <linux/slab.h>
++#include <linux/spinlock.h>
+ #if (LINUX_VERSION_CODE >= 131343)
+ #include <linux/init.h>
+ #endif
+@@ -1196,7 +1197,7 @@
+ 	if (!page)
+ 		return -ENOMEM;
+ 
+-	save_flags(flags); cli();
++	spin_lock_irqsave( &info->irq_spinlock, flags);
+ 
+ 	if (info->flags & ASYNC_INITIALIZED) {
+ 		free_page(page);
+@@ -1434,11 +1435,11 @@
+ 	change_speed(info, 0);
+ 
+ 	info->flags |= ASYNC_INITIALIZED;
+-	restore_flags(flags);
++	spin_unlock_irqrestore( &info->irq_spinlock, flags);
+ 	return 0;
+ 	
+ errout:
+-	restore_flags(flags);
++	spin_unlock_irqrestore( &info->irq_spinlock, flags);
+ 	return retval;
+ }
+ 
+@@ -1462,7 +1463,7 @@
+ 	       state->irq);
+ #endif
+ 	
+-	save_flags(flags); cli(); /* Disable interrupts */
++	spin_lock_irqsave( &info->irq_spinlock, flags);
+ 
+ 	/*
+ 	 * clear delta_msr_wait queue to avoid mem leaks: we may free the irq
+@@ -1470,41 +1471,6 @@
+ 	 */
+ 	wake_up_interruptible(&info->delta_msr_wait);
+ 	
+-	/*
+-	 * First unlink the serial port from the IRQ chain...
+-	 */
+-	if (info->next_port)
+-		info->next_port->prev_port = info->prev_port;
+-	if (info->prev_port)
+-		info->prev_port->next_port = info->next_port;
+-	else
+-		IRQ_ports[state->irq] = info->next_port;
+-	figure_IRQ_timeout(state->irq);
+-	
+-	/*
+-	 * Free the IRQ, if necessary
+-	 */
+-	if (state->irq && (!IRQ_ports[state->irq] ||
+-			  !IRQ_ports[state->irq]->next_port)) {
+-		if (IRQ_ports[state->irq]) {
+-			free_irq(state->irq, &IRQ_ports[state->irq]);
+-			retval = request_irq(state->irq, rs_interrupt_single,
+-					     SA_SHIRQ, "serial",
+-					     &IRQ_ports[state->irq]);
+-			
+-			if (retval)
+-				printk("serial shutdown: request_irq: error %d"
+-				       "  Couldn't reacquire IRQ.\n", retval);
+-		} else
+-			free_irq(state->irq, &IRQ_ports[state->irq]);
+-	}
+-
+-	if (info->xmit.buf) {
+-		unsigned long pg = (unsigned long) info->xmit.buf;
+-		info->xmit.buf = 0;
+-		free_page(pg);
+-	}
+-
+ 	info->IER = 0;
+ 	serial_outp(info, UART_IER, 0x00);	/* disable all intrs */
+ #ifdef CONFIG_SERIAL_MANY_PORTS
+@@ -1561,7 +1527,43 @@
+ 		serial_outp(info, UART_IER, UART_IERX_SLEEP);
+ 	}
+ 	info->flags &= ~ASYNC_INITIALIZED;
+-	restore_flags(flags);
++
++	/*
++	 * First unlink the serial port from the IRQ chain...
++	 */
++	if (info->next_port)
++		info->next_port->prev_port = info->prev_port;
++	if (info->prev_port)
++		info->prev_port->next_port = info->next_port;
++	else
++		IRQ_ports[state->irq] = info->next_port;
++	figure_IRQ_timeout(state->irq);
++	
++	/*
++	 * Free the IRQ, if necessary
++	 */
++	if (state->irq && (!IRQ_ports[state->irq] ||
++			  !IRQ_ports[state->irq]->next_port)) {
++		if (IRQ_ports[state->irq]) {
++			free_irq(state->irq, &IRQ_ports[state->irq]);
++			retval = request_irq(state->irq, rs_interrupt_single,
++					     SA_SHIRQ, "serial",
++					     &IRQ_ports[state->irq]);
++			
++			if (retval)
++				printk("serial shutdown: request_irq: error %d"
++				       "  Couldn't reacquire IRQ.\n", retval);
++		} else
++			free_irq(state->irq, &IRQ_ports[state->irq]);
++	}
++
++	if (info->xmit.buf) {
++		unsigned long pg = (unsigned long) info->xmit.buf;
++		info->xmit.buf = 0;
++		free_page(pg);
++	}
++
++	spin_unlock_irqrestore( &info->irq_spinlock, flags);
+ }
+ 
+ #if (LINUX_VERSION_CODE < 131394) /* Linux 2.1.66 */
+@@ -3105,6 +3107,7 @@
+ 	info->tqueue.routine = do_softint;
+ 	info->tqueue.data = info;
+ 	info->state = sstate;
++	info->irq_spinlock= (spinlock_t) SPIN_LOCK_UNLOCKED;
+ 	if (sstate->info) {
+ 		kfree(info);
+ 		*ret_info = sstate->info;
+@@ -3611,6 +3614,7 @@
+ 	info->io_type = state->io_type;
+ 	info->iomem_base = state->iomem_base;
+ 	info->iomem_reg_shift = state->iomem_reg_shift;
++	info->irq_spinlock= (spinlock_t) SPIN_LOCK_UNLOCKED;
+ 
+ 	save_flags(flags); cli();
+ 	
+@@ -5433,6 +5437,7 @@
+ 		info->io_type = req->io_type;
+ 		info->iomem_base = req->iomem_base;
+ 		info->iomem_reg_shift = req->iomem_reg_shift;
++		info->irq_spinlock= (spinlock_t) SPIN_LOCK_UNLOCKED;
+ 	}
+ 	autoconfig(state);
+ 	if (state->type == PORT_UNKNOWN) {
+@@ -5768,6 +5773,7 @@
+ 	info->io_type = state->io_type;
+ 	info->iomem_base = state->iomem_base;
+ 	info->iomem_reg_shift = state->iomem_reg_shift;
++	info->irq_spinlock= (spinlock_t) SPIN_LOCK_UNLOCKED;
+ 	quot = state->baud_base / baud;
+ 	cval = cflag & (CSIZE | CSTOPB);
+ #if defined(__powerpc__) || defined(__alpha__)
+--- linux244.org/include/linux/serialP.h	Sat Apr 28 00:50:21 2001
++++ linux/include/linux/serialP.h	Thu Jun 28 15:07:54 2001
+@@ -83,6 +83,7 @@
+ 	long			pgrp; /* pgrp of opening process */
+  	struct circ_buf		xmit;
+  	spinlock_t		xmit_lock;
++ 	spinlock_t		irq_spinlock;
+ 	u8			*iomem_base;
+ 	u16			iomem_reg_shift;
+ 	int			io_type;

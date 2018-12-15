@@ -1,0 +1,157 @@
+Date: Sat, 08 Jul 2000 15:36:45 +1000
+From: Andrew Morton <>
+Subject: lowish-latency patch and toolchain
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/7/8/2
+
+I now have six fs-related rescheduling points and as long as one avoids
+doing silly things, the scheduling latency is reliably 4 milliseconds on
+a 500MHz machine.  Very occasionally reaches 7 millisecs. It has been
+tested during kernel builds, netperf, lmbench, mmap001, mmap002,
+x11perf, general ext2 and NFS hammering, general usage.
+So I'll now ask interested parties to apply the attached patch to
+2.4.0-test3-pre4 or later (the ones with Roger's VM patches) and try to
+break it.
+Prove to me that there are any remaining scheduling problems which don't
+have simple DDT ("Don't do that") workarounds.
+Here's the current DDT list:
+- Don't futz with fbcon.  This was covered today on the
+  kernel mailing list.
+- Don't delete huge files (100 megs).  There's a hungry
+  loop in zap_page_range which has no clear-and-easy fix.
+  There _was_ a fix in Ingo's patch, but additional 2.4
+  threading has made that unviable.
+- Don't munmap() huge files.  zap_page_range() will zap ya!
+- Don't run out of memory.  If you push kswapd hard it
+  will steal 50 milliseconds from you.
+- Don't run `hdparm'.  Tens of millisecs while setting
+  IDE disk parameters.
+- Don't use blkdev_close().  This function is used when
+  raw block devices are closed and it soaks tens of
+  milliseconds.  This will be used by LILO and fdisk, etc.
+- Don't run mmap002!
+- Don't load/unload kernel modules
+Now, dear testers:  if you _do_ find some scheduling bumps I've put up
+some diagnostic tools which can be used to quantify them and to identify
+their sources.  They're at
+	
+http://www.uow.edu.au/~andrewm/linux/schedlat.html
+These include:
+timepegs
+   A general purpose tool for measuring point-to-point time
+   intervals in the kernel.
+tpt
+   Tool for generating reports from /proc/timepeg
+schedlat  (aka syscall-timer.patch)
+   Tool which uses timepegs to measure the duration of kernel
+   scheduling blackouts.
+amlat
+   A usermode program which puts "scheduling pressure" onto the
+   kernel, and allows rtc-debug to measure scheduling latencies.
+   (There's some of Benno's stuff in here)
+rtc-debug
+   A patch against drivers/char/rtc.c which allows you to:
+    - Generate scheduling latency histograms
+    - Identify and generate a stack trace on "piggy processes".
+      You can then walk this backtrace to work out where in the
+      kernel the pigginess is happening.
+    - Identify a possible kernel priority-perversion bug.  Still
+      looking into this.
+   rtc-debug currently goes a bit silly when used with CONFIG_SMP.
+   It doesn't crash, but it reports bogus priority perversion events.
+   It needs a #ifndef CONFIG_SMP...
+If you think you've found something which causes a scheduling
+dropout please take the following steps:
+- Apply the timepeg patch
+- Apply the schedlat patch (syscall-timer.patch)
+- run `tpt -s'
+- Run amlat
+- Do whatever it is that causes the problem
+- Kill amlat
+- run `tpt -s | sort -nr +5 | tee tpt.log | more'
+- Tell me.
+Thanks.--- linux-2.4.0-test3-pre4/mm/filemap.c	Thu Jul  6 20:23:47 2000
++++ linux-akpm/mm/filemap.c	Sat Jul  8 14:33:54 2000
+@@ -160,6 +160,7 @@
+ 	start = (lstart + PAGE_CACHE_SIZE - 1) >> PAGE_CACHE_SHIFT;
+ 
+ repeat:
++	conditional_schedule();		/* sys_unlink() */
+ 	head = &mapping->pages;
+ 	spin_lock(&pagecache_lock);
+ 	curr = head->next;
+@@ -450,6 +451,7 @@
+ 
+ 		page_cache_get(page);
+ 		spin_unlock(&pagecache_lock);
++		conditional_schedule();		/* sys_sync() */
+ 		lock_page(page);
+ 
+ 		/* The buffers could have been free'd while we waited for the page lock */
+@@ -1081,6 +1083,8 @@
+ 		 * "pos" here (the actor routine has to update the user buffer
+ 		 * pointers and the remaining count).
+ 		 */
++		conditional_schedule();		/* sys_read() */
++
+ 		nr = actor(desc, page, offset, nr);
+ 		offset += nr;
+ 		index += offset >> PAGE_CACHE_SHIFT;
+@@ -1533,6 +1537,7 @@
+ 	 * vma/file is guaranteed to exist in the unmap/sync cases because
+ 	 * mmap_sem is held.
+ 	 */
++	conditional_schedule();		/* sys_msync() */
+ 	return page->mapping->a_ops->writepage(file, page);
+ }
+ 
+@@ -2486,6 +2491,8 @@
+ 	while (count) {
+ 		unsigned long bytes, index, offset;
+ 		char *kaddr;
++
++		conditional_schedule();		/* sys_write() */
+ 
+ 		/*
+ 		 * Try to find the page in the cache. If it isn't there,
+--- linux-2.4.0-test3-pre4/fs/buffer.c	Thu Jul  6 20:23:47 2000
++++ linux-akpm/fs/buffer.c	Sat Jul  8 14:34:08 2000
+@@ -2123,6 +2123,7 @@
+ 				__wait_on_buffer(p);
+ 		} else if (buffer_dirty(p))
+ 			ll_rw_block(WRITE, 1, &p);
++		conditional_schedule();		/* sys_msync() */
+ 	} while (tmp != bh);
+ }
+ 
+--- linux-2.4.0-test3-pre4/include/linux/sched.h	Thu Jul  6 20:23:47 2000
++++ linux-akpm/include/linux/sched.h	Sat Jul  8 15:15:03 2000
+@@ -146,6 +146,8 @@
+ extern signed long FASTCALL(schedule_timeout(signed long timeout));
+ asmlinkage void schedule(void);
+ 
++#define conditional_schedule() do { if (current->need_resched) schedule(); } while (0)
++
+ /*
+  * The default fd array needs to be at least BITS_PER_LONG,
+  * as this is the granularity returned by copy_fdset().
+@@ -348,6 +350,8 @@
+    	u32 self_exec_id;
+ /* Protection of (de-)allocation: mm, files, fs, tty */
+ 	spinlock_t alloc_lock;
++
++	int curr_syscall;
+ };
+ 
+ /*
+@@ -423,6 +427,7 @@
+     blocked:		{{0}},						\
+     sigqueue:		NULL,						\
+     sigqueue_tail:	&tsk.sigqueue,					\
++    curr_syscall:	0,						\
+     alloc_lock:		SPIN_LOCK_UNLOCKED				\
+ }
+ 

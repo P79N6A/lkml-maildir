@@ -1,0 +1,160 @@
+Date: Thu, 1 Jul 2004 08:32:37 +0200
+From: Ingo Molnar <>
+Subject: Re: Do x86 NX and AMD prefetch check cause page fault infinite loop?
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2004/7/1/20
+
+* Jamie Lokier <jamie@shareable.org> wrote:
+> Ingo, I think I now know what must be added to your 32-bit NX patch to
+> prevent the "infinite loop without a signal" problem.
+> 
+> It appears the correct way to prevent that one possibility I thought
+> of, with no side effects, is to add this test in
+> i386/mm/fault.c:is_prefetch():
+> 
+>         /* Catch an obscure case of prefetch inside an NX page. */
+>         if (error_code & 16)
+>                 return 0;
+> 
+> That means that it doesn't count as a prefetch fault if it's an
+> _instruction_ fault.  I.e. an instruction fault will always raise a
+> signal.  Bit 4 of error_code was kindly added alongside the NX feature
+> by AMD.
+> 
+> (Tweak: Because early Intel 64-bit chips don't have NX, perhaps it
+> should say "if ((error_code & 16) && boot_cpu_has(X86_FEATURE_NX))"
+> instead -- if we find the bit isn't architecturally set to 0 for those
+> chips).
+Thanks for the analysis Jamie, this should certainly solve the problem.
+I've attached a patch against BK that implements this. I've tested the
+patched x86 kernel on an athlon64 box and on a non-NX box - it works
+fine. Bit 4 also simplifies the detection of illegal code execution
+within the kernel - i retested that too and it still works fine.
+	Ingo
+- fix possible prefetch-fault loop on NX page, based on suggestions
+  from Jamie Lokier.
+- clean up nx feature dependencies
+- simplify detection of NX-violations when the kernel executes code
+Signed-off-by: Ingo Molnar <mingo@elte.hu>
+--- linux/arch/i386/mm/fault.c.orig	
++++ linux/arch/i386/mm/fault.c	
+@@ -188,11 +188,16 @@ static int __is_prefetch(struct pt_regs 
+ 	return prefetch;
+ }
+ 
+-static inline int is_prefetch(struct pt_regs *regs, unsigned long addr)
++static inline int is_prefetch(struct pt_regs *regs, unsigned long addr,
++			      unsigned long error_code)
+ {
+ 	if (unlikely(boot_cpu_data.x86_vendor == X86_VENDOR_AMD &&
+-		     boot_cpu_data.x86 >= 6))
++		     boot_cpu_data.x86 >= 6)) {
++		/* Catch an obscure case of prefetch inside an NX page. */
++		if (nx_enabled && (error_code & 16))
++			return 0;
+ 		return __is_prefetch(regs, addr);
++	}
+ 	return 0;
+ } 
+ 
+@@ -374,7 +379,7 @@ bad_area_nosemaphore:
+ 		 * Valid to do another page fault here because this one came 
+ 		 * from user space.
+ 		 */
+-		if (is_prefetch(regs, address))
++		if (is_prefetch(regs, address, error_code))
+ 			return;
+ 
+ 		tsk->thread.cr2 = address;
+@@ -415,7 +420,7 @@ no_context:
+ 	 * had been triggered by is_prefetch fixup_exception would have 
+ 	 * handled it.
+ 	 */
+- 	if (is_prefetch(regs, address))
++ 	if (is_prefetch(regs, address, error_code))
+  		return;
+ 
+ /*
+@@ -425,21 +430,8 @@ no_context:
+ 
+ 	bust_spinlocks(1);
+ 
+-#ifdef CONFIG_X86_PAE
+-	{
+-		pgd_t *pgd;
+-		pmd_t *pmd;
+-
+-
+-
+-		pgd = init_mm.pgd + pgd_index(address);
+-		if (pgd_present(*pgd)) {
+-			pmd = pmd_offset(pgd, address);
+-			if (pmd_val(*pmd) & _PAGE_NX)
+-				printk(KERN_CRIT "kernel tried to access NX-protected page - exploit attempt? (uid: %d)\n", current->uid);
+-		}
+-	}
+-#endif
++	if (nx_enabled && (error_code & 16))
++		printk(KERN_CRIT "kernel tried to execute NX-protected page - exploit attempt? (uid: %d)\n", current->uid);
+ 	if (address < PAGE_SIZE)
+ 		printk(KERN_ALERT "Unable to handle kernel NULL pointer dereference");
+ 	else
+@@ -492,7 +484,7 @@ do_sigbus:
+ 		goto no_context;
+ 
+ 	/* User space => ok to do another page fault */
+-	if (is_prefetch(regs, address))
++	if (is_prefetch(regs, address, error_code))
+ 		return;
+ 
+ 	tsk->thread.cr2 = address;
+--- linux/arch/i386/mm/init.c.orig	
++++ linux/arch/i386/mm/init.c	
+@@ -437,7 +437,7 @@ static int __init noexec_setup(char *str
+ __setup("noexec=", noexec_setup);
+ 
+ #ifdef CONFIG_X86_PAE
+-static int use_nx = 0;
++int nx_enabled = 0;
+ 
+ static void __init set_nx(void)
+ {
+@@ -449,7 +449,7 @@ static void __init set_nx(void)
+ 			rdmsr(MSR_EFER, l, h);
+ 			l |= EFER_NX;
+ 			wrmsr(MSR_EFER, l, h);
+-			use_nx = 1;
++			nx_enabled = 1;
+ 			__supported_pte_mask |= _PAGE_NX;
+ 		}
+ 	}
+@@ -468,7 +468,7 @@ void __init paging_init(void)
+ {
+ #ifdef CONFIG_X86_PAE
+ 	set_nx();
+-	if (use_nx)
++	if (nx_enabled)
+ 		printk("NX (Execute Disable) protection: active\n");
+ #endif
+ 
+--- linux/include/asm-i386/page.h.orig	
++++ linux/include/asm-i386/page.h	
+@@ -41,6 +41,7 @@
+  */
+ #ifdef CONFIG_X86_PAE
+ extern unsigned long long __supported_pte_mask;
++extern int nx_enabled;
+ typedef struct { unsigned long pte_low, pte_high; } pte_t;
+ typedef struct { unsigned long long pmd; } pmd_t;
+ typedef struct { unsigned long long pgd; } pgd_t;
+@@ -48,6 +49,7 @@ typedef struct { unsigned long long pgpr
+ #define pte_val(x)	((x).pte_low | ((unsigned long long)(x).pte_high << 32))
+ #define HPAGE_SHIFT	21
+ #else
++#define nx_enabled 0
+ typedef struct { unsigned long pte_low; } pte_t;
+ typedef struct { unsigned long pmd; } pmd_t;
+ typedef struct { unsigned long pgd; } pgd_t;

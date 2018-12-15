@@ -1,0 +1,129 @@
+Date: Thu, 28 Feb 2008 16:57:02 -0800 (PST)
+From: Christoph Lameter <>
+Subject: Re: [PATCH] Implement slub fastpath in terms of freebase and freeoffset
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2008/2/28/512
+
+On Thu, 28 Feb 2008, Mathieu Desnoyers wrote:
+> static inline void set_freelist_ptr(struct kmem_cache_cpu *c, void **freelist)
+> {
+>         unsigned long offset;
+> 
+>         offset = c->freeoffset + c->off_mask + 1;
+>         offset &= ~c->off_mask;
+>         offset |= (unsigned long)freelist & c->off_mask;
+>         c->freeoffset = offset;
+> }
+> 
+> Which will insure c->freeoffset is always in a valid state, therefore
+> allowing interrupts to nest over it.
+Ok.
+> Should be ok now since we allow interrupts to nest over
+> set_freelist_ptr. But I think this is also protected by slab_lock, taken
+> both in the slow path and in deactivate_slab.
+The slab locks can only be taken with interrupts disabled.
+> In any case, doing a 
+> 
+>                 object = get_freelist_ptr(c);
+>                 set_freelist_ptr(c, object[c->offset]);
+> 
+> Like deactivate_slab does should be either protected by disabling
+> interrupts or by the slab_lock. Am I right ?
+Correct.
+> Ah! I think I found the issue. It should become :
+> 
+> 
+>                 newoffset = freeoffset;
+>                 newoffset &= ~c->off_mask;
+>                 newoffset |= (unsigned long)(object[c->offset]) & c->off_mask;
+>         } while (cmpxchg_local(&c->freeoffset, freeoffset, newoffset)
+>                         != freeoffset);
+Looks okay.
+> Index: linux-2.6-lttng/mm/slub.c
+> ===================================================================
+> --- linux-2.6-lttng.orig/mm/slub.c	2008-02-27 20:41:14.000000000 -0500
+> +++ linux-2.6-lttng/mm/slub.c	2008-02-28 18:22:14.000000000 -0500
+> @@ -138,6 +138,22 @@ static inline void ClearSlabDebug(struct
+>  	page->flags &= ~SLABDEBUG;
+>  }
+> 
+> +static inline void **get_freelist_ptr(struct kmem_cache_cpu *c)
+> +{
+> +	return (void **)((unsigned long)page_address(c->page)
+> +		| (c->freeoffset & c->off_mask));
+> +}
+Hmmmm... page_address() is an expensive operation.
+> @@ -1636,28 +1652,48 @@ static __always_inline void *slab_alloc(
+>   */
+>  
+>  #ifdef SLUB_FASTPATH
+> +	unsigned long freeoffset, newoffset;
+> +
+>  	c = get_cpu_slab(s, raw_smp_processor_id());
+>  	do {
+> -		object = c->freelist;
+> -		if (unlikely(is_end(object) || !node_match(c, node))) {
+> +		freeoffset = c->freeoffset;
+> +		/*
+> +		 * If c->page is changed, freeoffset _must_ have its
+> +		 * counter incremented.
+> +		 * read freeoffset before c->page (wrt interrupts).
+> +		 */
+> +		barrier();
+> +		if (unlikely(is_end(freeoffset) || !node_match(c, node))) {
+>  			object = __slab_alloc(s, gfpflags, node, addr, c);
+>  			break;
+>  		}
+> +		object = (void **)((unsigned long)page_address(c->page)
+Expensive op page_address().
+> @@ -1779,21 +1815,21 @@ static __always_inline void slab_free(st
+>  	struct kmem_cache_cpu *c;
+>  
+>  #ifdef SLUB_FASTPATH
+> -	void **freelist;
+> +	unsigned long freeoffset, newoffset;
+>  
+>  	c = get_cpu_slab(s, raw_smp_processor_id());
+>  	debug_check_no_locks_freed(object, s->objsize);
+>  	do {
+> -		freelist = c->freelist;
+> +		freeoffset = c->freeoffset;
+>  		barrier();
+>  		/*
+>  		 * If the compiler would reorder the retrieval of c->page to
+> -		 * come before c->freelist then an interrupt could
+> -		 * change the cpu slab before we retrieve c->freelist. We
+> -		 * could be matching on a page no longer active and put the
+> -		 * object onto the freelist of the wrong slab.
+> +		 * come before c->freeoffset then an interrupt could change the
+> +		 * cpu slab before we retrieve c->freelist. We could be matching
+> +		 * on a page no longer active and put the object onto the
+> +		 * freelist of the wrong slab.
+>  		 *
+> -		 * On the other hand: If we already have the freelist pointer
+> +		 * On the other hand: If we already have the freeoffset
+>  		 * then any change of cpu_slab will cause the cmpxchg to fail
+>  		 * since the freelist pointers are unique per slab.
+>  		 */
+> @@ -1801,9 +1837,15 @@ static __always_inline void slab_free(st
+>  			__slab_free(s, page, x, addr, c->offset);
+>  			break;
+>  		}
+> -		object[c->offset] = freelist;
+> +		object[c->offset] =
+> +			(void **)((unsigned long)page_address(c->page) |
+> +					(freeoffset & c->off_mask));
+>  		stat(c, FREE_FASTPATH);
+> -	} while (cmpxchg_local(&c->freelist, freelist, object) != freelist);
+> +		newoffset = freeoffset + PAGE_SIZE;
+> +		newoffset &= ~c->off_mask;
+> +		newoffset |= (unsigned long)object & c->off_mask;
+> +	} while (cmpxchg_local(&c->freeoffset, freeoffset, newoffset)
+> +			!= freeoffset);
+Hmmm.. The cmpxchg_local was intended to check for a change of slab too 
+(addresses from different slabs are disjunct). 
+That is no longer possible since the upper bits are used by the 
+versioning? (Same issue in slab_alloc).

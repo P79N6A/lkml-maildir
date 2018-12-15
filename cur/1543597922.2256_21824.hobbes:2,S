@@ -1,0 +1,510 @@
+Date: Thu, 16 Aug 2001 20:46:17 +0100 (BST)
+From: Mark Hemment <>
+Subject: Re: [PATCH] Align VM locks
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2001/8/16/97
+
+On Thu, 16 Aug 2001, Andrea Arcangeli wrote:
+> On Thu, Aug 16, 2001 at 07:44:04PM +0100, Mark Hemment wrote:
+> >   KM_BOUNCE_WRITE may waste virtual address-space, but it saves on
+> > expensive shootdowns.
+>
+> I believe the slowdown is more a sign that kmap is not fast enoguh, not
+> that you really need the BOUNCE_WRITE.
+  I did knock up a patch where the shooter didn't need to busy-wait.  It
+worked, but it assumed an IPI would be delivered as soon as a processor
+re-enabled interrupts.
+  After posting the patch, I was also made unsure that it would cover all
+conditions after seeing a comment in arch/i386/kernel/smp.c;
+	/*
+	 * This was a BUG() but until someone can quote me the
+	 * line from the intel manual that guarantees an IPI to
+	 * multiple CPUs is retried _only_ on the erroring CPUs
+	 * its staying as a return
+	 */
+  Can't remember now why I thought this might cause my patch problems
+...but I sure it does.
+  Any, I've attached my posting to lse and the patch I sent.  I think Andi
+Kleen replied saying you had played with using the NMI for shootdowns?
+  I do believe that improving the shootdown code won't remove the need for
+BOUNCE_WRITE.  Only a local, temporary, mapping is need and the lighter
+mapping is, the better.
+Mark
+diff -urN -X dontdiff linux-2.4.5/arch/i386/kernel/i8259.c high-2.4.5/arch/i386/kernel/i8259.c
+--- linux-2.4.5/arch/i386/kernel/i8259.c	Fri Feb  9 19:29:44 2001
++++ high-2.4.5/arch/i386/kernel/i8259.c	Tue Jul  3 11:20:38 2001
+@@ -80,6 +80,7 @@
+ BUILD_SMP_INTERRUPT(reschedule_interrupt,RESCHEDULE_VECTOR)
+ BUILD_SMP_INTERRUPT(invalidate_interrupt,INVALIDATE_TLB_VECTOR)
+ BUILD_SMP_INTERRUPT(call_function_interrupt,CALL_FUNCTION_VECTOR)
++BUILD_SMP_INTERRUPT(flush_all_interrupt,FLUSH_TLB_VECTOR)
+ #endif
+ 
+ /*
+@@ -473,6 +474,9 @@
+ 
+ 	/* IPI for generic function call */
+ 	set_intr_gate(CALL_FUNCTION_VECTOR, call_function_interrupt);
++
++	/* IPI for flush all TLB function call */
++	set_intr_gate(FLUSH_TLB_VECTOR, flush_all_interrupt);
+ #endif	
+ 
+ #ifdef CONFIG_X86_LOCAL_APIC
+diff -urN -X dontdiff linux-2.4.5/arch/i386/kernel/smp.c high-2.4.5/arch/i386/kernel/smp.c
+--- linux-2.4.5/arch/i386/kernel/smp.c	Tue Feb 13 22:13:43 2001
++++ high-2.4.5/arch/i386/kernel/smp.c	Tue Jul  3 12:04:08 2001
+@@ -394,14 +394,45 @@
+ 		leave_mm(cpu);
+ }
+ 
+-static void flush_tlb_all_ipi(void* info)
++/*
++ * Flush the TLBs on all engines.
++ * 
++ * This does not wait for the other engines to ack the TLB flush.
++ * This is OK (I think), but needs some explaination.
++ *
++ * For all cases of flush_tlb_all(), we do not need to sync with the
++ * flush on all engines.  I should explain each case, but for now there
++ * is just a simple description of the highmem case. XXX
++ *
++ * For highmem, the TLBs are flushed under the kmap lock.  This lock is taken
++ * without blocking interrupts, and _cannot_ be taken with interrupts disabled
++ * (else the system will deadlock - at least with the sync'ing version of
++ * flush_tlb_all()).  New highmem virtual mappings are only created under the
++ * kmap_lock, and mappings are "released" under this lock.
++ * As new mappings cannot be created with ints disabled, or inside an
++ * interrupt context, if an engine is in either of these states it doesn't
++ * have to flush its TLB until it leaves the state (ie. interrupts become
++ * enabled).
++ */
++static void flush_tlb_all_ipi(void)
+ {
+ 	do_flush_tlb_all_local();
+ }
+ 
++static void inline smp_call_flush_all(void)
++{
++	int cpus = smp_num_cpus-1;
++
++	if (!cpus)
++		return;
++
++	/* Send a message to all other CPUs */
++	send_IPI_allbutself(FLUSH_TLB_VECTOR);
++}
++
+ void flush_tlb_all(void)
+ {
+-	smp_call_function (flush_tlb_all_ipi,0,1,1);
++	smp_call_flush_all();
+ 
+ 	do_flush_tlb_all_local();
+ }
+@@ -483,6 +514,7 @@
+ 	return 0;
+ }
+ 
++
+ static void stop_this_cpu (void * dummy)
+ {
+ 	/*
+@@ -538,5 +570,12 @@
+ 	(*func)(info);
+ 	if (wait)
+ 		atomic_inc(&call_data->finished);
++}
++
++asmlinkage void smp_flush_all_interrupt(void)
++{
++	ack_APIC_irq();
++
++	flush_tlb_all_ipi();
+ }
+ 
+diff -urN -X dontdiff linux-2.4.5/include/asm-i386/highmem.h high-2.4.5/include/asm-i386/highmem.h
+--- linux-2.4.5/include/asm-i386/highmem.h	Sat May 26 02:01:27 2001
++++ high-2.4.5/include/asm-i386/highmem.h	Tue Jul  3 12:07:44 2001
+@@ -53,6 +53,11 @@
+ #define PKMAP_NR(virt)  ((virt-PKMAP_BASE) >> PAGE_SHIFT)
+ #define PKMAP_ADDR(nr)  (PKMAP_BASE + ((nr) << PAGE_SHIFT))
+ 
++/*
++ * Should only be used in highmem.c.
++ */
++#define	PKMAP_VIRT_TO_PKP(virt)	&pkmap[(((virt)-PKMAP_BASE) >> PAGE_SHIFT)]
++
+ extern void * FASTCALL(kmap_high(struct page *page));
+ extern void FASTCALL(kunmap_high(struct page *page));
+ 
+diff -urN -X dontdiff linux-2.4.5/include/asm-i386/hw_irq.h high-2.4.5/include/asm-i386/hw_irq.h
+--- linux-2.4.5/include/asm-i386/hw_irq.h	Sat May 26 02:01:26 2001
++++ high-2.4.5/include/asm-i386/hw_irq.h	Tue Jul  3 12:07:44 2001
+@@ -41,6 +41,8 @@
+ #define INVALIDATE_TLB_VECTOR	0xfd
+ #define RESCHEDULE_VECTOR	0xfc
+ #define CALL_FUNCTION_VECTOR	0xfb
++/* kdb uses 0xfa, so use 0xf9 for the global TLB shootdown */
++#define	FLUSH_TLB_VECTOR	0xf9
+ 
+ /*
+  * Local APIC timer IRQ vector is on a different priority level,
+diff -urN -X dontdiff linux-2.4.5/init/main.c high-2.4.5/init/main.c
+--- linux-2.4.5/init/main.c	Tue May 22 17:35:42 2001
++++ high-2.4.5/init/main.c	Tue Jul  3 11:20:38 2001
+@@ -555,6 +555,14 @@
+ 		initrd_start = 0;
+ 	}
+ #endif
++
++#ifdef	CONFIG_HIGHMEM
++	{
++		extern void init_highmem(void);
++		init_highmem();
++	}
++#endif
++
+ 	mem_init();
+ 	kmem_cache_sizes_init();
+ 	mempages = num_physpages;
+diff -urN -X dontdiff linux-2.4.5/mm/highmem.c high-2.4.5/mm/highmem.c
+--- linux-2.4.5/mm/highmem.c	Sat May 26 01:57:46 2001
++++ high-2.4.5/mm/highmem.c	Tue Jul  3 12:51:52 2001
+@@ -20,7 +20,9 @@
+ #include <linux/pagemap.h>
+ #include <linux/highmem.h>
+ #include <linux/swap.h>
++#include <linux/cache.h>
+ #include <linux/slab.h>
++#include <linux/interrupt.h>
+ 
+ /*
+  * Virtual_count is not a pure "count".
+@@ -30,92 +32,153 @@
+  *    since the last TLB flush - so we can't use it.
+  *  n means that there are (n-1) current users of it.
+  */
+-static int pkmap_count[LAST_PKMAP];
+-static unsigned int last_pkmap_nr;
+-static spinlock_t kmap_lock = SPIN_LOCK_UNLOCKED;
+ 
+-pte_t * pkmap_page_table;
++/*
++ * Use a structure so we can keep the "count" next to the linkage (ie. on the
++ * same L1 cache line).
++ * This may seem like overkill, but we really want to avoid linear searches.
++ * Could caculate the index (offset from pkmap), but including it doesn't
++ * hurt and gives us a nice power-of-2 sized structure (could ptr directly
++ * into pagetable? XXX).
++ */
++typedef struct pkmap_s {
++	unsigned int		 pk_count;
++	struct pkmap_s		*pk_next;
++} pkmap_t;
++
++static pkmap_t	pkmap[LAST_PKMAP];
++
++
++/*
++ * We don't want this lock false sharing with anything else, so L1
++ * cache align it.
++ */
++static spinlock_t kmap_lock __cacheline_aligned;
++
++/*
++ * Hopefully, these two will fall on the same L1 line.
++ */
++pte_t *pkmap_page_table;
++static pkmap_t *pkmap_free;
+ 
+ static DECLARE_WAIT_QUEUE_HEAD(pkmap_map_wait);
+ 
++void
++init_highmem(void)
++{
++	int	i;
++
++	spin_lock_init(&kmap_lock);
++
++	pkmap_free = &pkmap[0];
++
++	for (i=1; i < LAST_PKMAP; i++)
++		pkmap[i-1].pk_next = &pkmap[i];
++	pkmap[i-1].pk_next = NULL;
++}
++
+ static void flush_all_zero_pkmaps(void)
+ {
+-	int i;
++	pkmap_t		*pkp;
++	int	i;
+ 
+ 	flush_cache_all();
+ 
+-	for (i = 0; i < LAST_PKMAP; i++) {
+-		struct page *page;
+-		pte_t pte;
+-		/*
+-		 * zero means we don't have anything to do,
+-		 * >1 means that it is still in use. Only
+-		 * a count of 1 means that it is free but
+-		 * needs to be unmapped
+-		 */
+-		if (pkmap_count[i] != 1)
++	pkp = &pkmap[0];
++	for (i=0; i < LAST_PKMAP; i++, pkp++) {
++		pte_t	*pte;
++
++		/* re-instate comment! */
++		if (pkp->pk_count != 1)
+ 			continue;
+-		pkmap_count[i] = 0;
+-		pte = ptep_get_and_clear(pkmap_page_table+i);
+-		if (pte_none(pte))
++		pkp->pk_count = 0;
++
++		pkp->pk_next = pkmap_free;
++		pkmap_free = pkp;
++
++		pte = &pkmap_page_table[i];
++
++		/* sanity check */
++		if (pte_none(*pte))
+ 			BUG();
+-		page = pte_page(pte);
+-		page->virtual = NULL;
++
++		/*
++		 * Don't need an atomic fetch-and-clear op here;
++		 * no-one has the page mapped, and cannot get at
++		 * its virtual address (and hence PTE) without first
++		 * getting the kmap_lock (which is held here).
++		 * So no dangers, even with speculative execution.
++		 */
++		pte_page(*pte)->virtual = NULL;
++		pte_clear(pte);
+ 	}
++
+ 	flush_tlb_all();
+ }
+ 
+-static inline unsigned long map_new_virtual(struct page *page)
++static void fill_pkmap_free(void)
+ {
+-	unsigned long vaddr;
+-	int count;
++	/*
++	 * Try to free entries.
++	 */
++	flush_all_zero_pkmaps();
+ 
+-start:
+-	count = LAST_PKMAP;
+-	/* Find an empty entry */
+-	for (;;) {
+-		last_pkmap_nr = (last_pkmap_nr + 1) & LAST_PKMAP_MASK;
+-		if (!last_pkmap_nr) {
+-			flush_all_zero_pkmaps();
+-			count = LAST_PKMAP;
+-		}
+-		if (!pkmap_count[last_pkmap_nr])
+-			break;	/* Found a usable entry */
+-		if (--count)
+-			continue;
++	/*
++	 * Any free after flushing?
++	 */
++	if (pkmap_free == NULL) {
++		DECLARE_WAITQUEUE(wait, current);
++
++		/*
++		 * Sleep for somebody else to unmap their entries.
++		 */
++		current->state = TASK_UNINTERRUPTIBLE;
++		add_wait_queue(&pkmap_map_wait, &wait);
++		spin_unlock(&kmap_lock);
++		schedule();
++		remove_wait_queue(&pkmap_map_wait, &wait);
++		spin_lock(&kmap_lock);
++	}
++}
++
++static inline void *map_new_virtual(struct page *page)
++{
++	pkmap_t		*pkp;
++	int		 index;
++
++	while (pkmap_free == NULL) {
+ 
+ 		/*
+-		 * Sleep for somebody else to unmap their entries
++		 * Keep code to handle out-of-free-pkmaps out of common
++		 * code path.
+ 		 */
+-		{
+-			DECLARE_WAITQUEUE(wait, current);
++		fill_pkmap_free();
+ 
+-			current->state = TASK_UNINTERRUPTIBLE;
+-			add_wait_queue(&pkmap_map_wait, &wait);
+-			spin_unlock(&kmap_lock);
+-			schedule();
+-			remove_wait_queue(&pkmap_map_wait, &wait);
+-			spin_lock(&kmap_lock);
+-
+-			/* Somebody else might have mapped it while we slept */
+-			if (page->virtual)
+-				return (unsigned long) page->virtual;
+-
+-			/* Re-start */
+-			goto start;
+-		}
++		/* Somebody else might have mapped it while we slept */
++		if (page->virtual)
++			return page->virtual;
+ 	}
+-	vaddr = PKMAP_ADDR(last_pkmap_nr);
+-	set_pte(&(pkmap_page_table[last_pkmap_nr]), mk_pte(page, kmap_prot));
+ 
+-	pkmap_count[last_pkmap_nr] = 1;
+-	page->virtual = (void *) vaddr;
++	pkp = pkmap_free;
++	pkmap_free = pkp->pk_next;
++
++	if (pkp->pk_count != 0)
++		BUG();
++	pkp->pk_count = 1;
++
++	index = pkp - pkmap;
++
++	set_pte(&(pkmap_page_table[index]), mk_pte(page, kmap_prot));
+ 
+-	return vaddr;
++	page->virtual = (void *)PKMAP_ADDR(index);
++
++	return page->virtual;
+ }
+ 
++
+ void *kmap_high(struct page *page)
+ {
++	pkmap_t	*pkp;
+ 	unsigned long vaddr;
+ 
+ 	/*
+@@ -125,38 +188,58 @@
+ 	 * We cannot call this from interrupts, as it may block
+ 	 */
+ 	spin_lock(&kmap_lock);
+-	vaddr = (unsigned long) page->virtual;
++	vaddr = (unsigned long)page->virtual;
+ 	if (!vaddr)
+-		vaddr = map_new_virtual(page);
+-	pkmap_count[PKMAP_NR(vaddr)]++;
+-	if (pkmap_count[PKMAP_NR(vaddr)] < 2)
++		vaddr = (unsigned long)map_new_virtual(page);
++
++	pkp = PKMAP_VIRT_TO_PKP(vaddr);
++
++	pkp->pk_count++;
++	if (pkp->pk_count < 2)
+ 		BUG();
+ 	spin_unlock(&kmap_lock);
+-	return (void*) vaddr;
++
++	return (void *)vaddr;
+ }
+ 
+ void kunmap_high(struct page *page)
+ {
++	pkmap_t	*pkp;
++	uint	 need_wakeup;
+ 	unsigned long vaddr;
+-	unsigned long nr;
++
++	need_wakeup = 0;
+ 
+ 	spin_lock(&kmap_lock);
+ 	vaddr = (unsigned long) page->virtual;
+ 	if (!vaddr)
+ 		BUG();
+-	nr = PKMAP_NR(vaddr);
++	pkp = PKMAP_VIRT_TO_PKP(vaddr);
+ 
+ 	/*
+ 	 * A count must never go down to zero
+ 	 * without a TLB flush!
+ 	 */
+-	switch (--pkmap_count[nr]) {
++	switch (--(pkp->pk_count)) {
+ 	case 0:
+ 		BUG();
+ 	case 1:
+-		wake_up(&pkmap_map_wait);
++		/*
++		 * Avoid an unnecessary wake_up() function call.
++		 * The common case is pkmap_count[] == 1, but
++		 * no waiters.
++		 * The tasks queued in the wait-queue are guarded
++		 * by both the lock in the wait-queue-head and by
++		 * the kmap_lock.  As the kmap_lock is held here,
++		 * no need for the wait-queue-head's lock.  Simply
++		 * test if the queue is empty.
++		 */
++		need_wakeup = waitqueue_active(&pkmap_map_wait);
+ 	}
+ 	spin_unlock(&kmap_lock);
++
++	if (need_wakeup)
++		wake_up(&pkmap_map_wait);
+ }
+ 
+ #define POOL_SIZE 32From markhe@veritas.com Thu Aug 16 20:14:26 2001
+Date: Tue, 3 Jul 2001 12:20:47 +0100 (BST)
+From: markhe@veritas.com
+Subject: Re: [Lse-tech] Dbench scalability results on 2.4.0
+Hi Bill,
+  I've been doing some more work on the kmap_lock.
+  The first part isn't very interesting - it modifies highmem.c to use a
+freelist linkage.  Under "normal" usage patterns, I wouldn't expect this
+to give much of an improvement.
+  The second part is more interesting. :)
+  Currently, I don't have access to an 8-way box (only a 4), but I'm
+guessing the kmap lock contention is caused by the flush_tlb_all() which
+is done with the kmap_lock held.
+  Now, flush_tlb_all() sends an IPI to all engines (processors) and
+_waits_ for them all to perform the shootdown.
+  If any of the engines have interrupts blocked, then flush_tlb_all() busy-
+waits until the interrupt (IPI) is delieved and processed.  This can be a
+significant number of CPU cycles - espically as locks which require
+interrupts to be blocked spin with ints disabled (image such a lock which
+has contention - it can be quite sometime until the last contentor breaks
+out of the critical region and enables ints).
+  Analysing the usage of flush_tlb_all() shows that it does not need to
+busy-wait - it can simply send the "shootdown" IPI and continue; it
+doesn't even need to busy-wait for an ack from the other engines.
+ie. flush_tlb_all() can become asynchronous.
+  For example, think about the flush_tlb_all() for highmem.  New mappings
+cannot be created with interrupts disabled (else the orignal
+flush_tlb_all() could deadlock the system), nor from within an interupt
+handler.  Same for "dropping" a mapping, and gaining a reference to an
+existing mapping.
+  Infact, an engine's TLB doesn't need to be flushed until its next call
+to kmap_high() or until a context-switch occurs on the engine.  As the
+highmem TLBs are marked "global", we'd need to add an extra test in
+schedule() which I'd rather stay away from.
+  So, instead, we can wait for the flush on an engine to occur when it
+enables interupts.  This works for the highmem case, and other uses of
+flush_tlb_all().  At least, I believe it does - can anyone find an
+existing case where it doesn't?
+  Ingo, you know the revelent code better than anyone else.  Is the idea
+sound?
+  Does this sound fragile?  Yes, it is, but if it improves scalability and
+is well documented, then it is worth doing.
+  I've attached a patch against 2.4.5.  The original code was pulled from
+a highly modified tree, but I don't think I've made any mistakes...
+Mark

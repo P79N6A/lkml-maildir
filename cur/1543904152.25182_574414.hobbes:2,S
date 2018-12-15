@@ -1,0 +1,89 @@
+Date: Tue, 24 Jul 2007 16:24:24 -0400 (EDT)
+From: Alan Stern <>
+Subject: Re: Towards eliminating the freezer
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2007/7/24/405
+
+On Tue, 24 Jul 2007, Rafael J. Wysocki wrote:
+> Hmm, I still don't understand why we can't lock dpm_list_mutex before the
+> "For each" loop (we already do something like this in device_suspend() and
+> device_resume()) and that would simplify things.
+> 
+> It seems that we can do something like this:
+> 
+> device_suspend:
+> 	Lock dpm_list_mutex (from now on, new devices cannot be added)
+> 	For each device on dpm_active, reverse
+> 		acquire dev->sem (from now on, no new drivers can bind to dev)
+> 		suspend(dev)
+> 		move dev to dpm_off
+You have a minor error there; it's necessary to unlock dpm_list_mutex 
+while acquiring dev-sem and then lock it again.  But more importantly, 
+this code acquires the device semaphores in the wrong order.  They have 
+to be acquired going forward (from the top of the device tree down), 
+not backward.
+Here's my proposal in a more explicit form.  Before doing
+device_suspend() we call lock_all_devices():
+struct list_head dpm_locked;
+static void lock_all_devices()
+{
+	mutex_lock(&dpm_list_mtx);
+	while (!list_empty(&dpm_active)) {
+		struct list_head *entry = dpm_active.next;
+		struct device *dev = to_device(entry);
+		get_device(dev);
+		mutex_unlock(&dpm_list_mtx);
+		down(&dev->sem);
+		mutex_lock(&dpm_list_mtx);
+		if (list_empty(entry))		/* Device was removed */
+			up(&dev->sem);
+		else			/* Move it to the dpm_locked list */
+			list_move_tail(entry, &dpm_locked);
+		put_device(dev);
+	}
+}
+Then device_suspend() can be simplified:
+int device_suspend(pm_message_t state)
+{
+	int error = 0;
+	might_sleep();
+	list_for_each_entry_reverse(dev, &dpm_locked, power.entry) {
+		error = suspend_device(dev, state);
+		if (error) {
+			printk(KERN_ERR "Could not suspend device %s: "
+				"error %d%s\n",
+				kobject_name(&dev->kobj), error,
+				error == -EAGAIN ? " (please convert to suspend_late)" : "");
+			break;
+		}
+		list_move(&dev->power.entry, &dpm_off);
+	}
+	if (error)
+		dpm_resume();
+	return error;
+}
+Appropriate changes are needed in the resume pathway as well, together 
+with an unlock_all_devices() routine:
+static void unlock_all_devices(void)
+{
+	while (!list_empty(&dpm_locked)) {
+		struct list_head *entry = dpm_locked.prev;
+		struct device *dev = to_device(entry);
+		list_move(entry, &dpm_active);
+		up(&dev->sem);
+	}
+	mutex_unlock(&dpm_list_mtx);
+}
+Incidentally, what is dpm_mtx for?  It doesn't seem to do anything 
+useful.  Is it a relic of the former runtime PM support?
+Alan Stern
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+More majordomo info at  
+http://vger.kernel.org/majordomo-info.html
+Please read the FAQ at  
+http://www.tux.org/lkml/

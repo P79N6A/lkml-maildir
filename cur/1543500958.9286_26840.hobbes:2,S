@@ -1,0 +1,565 @@
+Date: Mon, 28 Jun 1999 15:17:35 -0700
+From: Wanderer <>
+Subject: Re: [RFC] File flags handling - proposal for API.
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/6/28/223
+
+Alexander Viro wrote:
+>         With all talks about mixed directory/symlink objects, etc. we
+> *will* need a decent way to work with such attributes. I dearly hope that
+> it will not be done via weird ioctl() as it's currently done for ext2
+> flags (for one thing because the object we are operating with may not be
+> openable - e.g. symlink).
+>         Notice that there is a difference between the attributes affecting
+> the VFS behaviour (append-only, etc.) and ones the VFS (or even kernel)
+> doesn't care of (no-dump, etc.). For the latter we probably want to pass
+> the raw attributes to the fs and let it figure out what it wants. For the
+> former the common representation is needed. So we want a way to deal with
+> raw and generic attributes.
+>         I think that the right way here is to add 6 (ouch) syscalls:
+> {l,f,}chflags() for setting those attributes and {l,f,}new_stat() for
+> reading them. The reason for latter 3 is simple - potential races.
+>         Differences between lfoo, ffoo and foo are the same as in cases of
+> chmod, chown, etc.
+>         int chflags(char *name, int is_raw, int flags) would set the
+> attributes - raw if the second argument is true, generic ones if it is
+> false.
+>         int new_stat(char *name, struct new_stat * buf) would fill the
+> buf with extended variant of struct stat - additional fields being generic
+> and raw attributes. This will be redundant, indeed - that would allow
+> fs-specific programs to deal with raw attributes in redundant way, but at
+> the same time spare normal programs from the need to know the representation
+> of generic attributes on particular filesystems.
+>         Modulo the distinction between raw and generic attributes this was
+> tested on 4.4BSD - it works fine there.
+>         I am ready to write the thing - I have the patch mostly done. It's
+> non-intrusive, in sense that any filesystem that doesn't want to know
+> about those animals will require no changes. If you are OK with the
+> proposed API I'll do it. Comments?
+>
+Attached file is a c toy to demonstate an idea for improved API and
+ties together many discussion threads I think. This is not an
+implementation, just the core of an idea.
+/*
+    Extended Attribute Handling.
+    Re: Various messages about cleaning up Linux API,
+        setting flags, and so on.
+        [with application to meta-files as well ;)]
+*/
+/* Summary:
+    Provide an extended means to query and control system
+    device, directory, file, etc. settings. Without breaking
+    old code. Essentially everything should be controllable
+    via this method.
+    New attribute system interface defined that defines;
+        attribute ID        - initially ioctl codes?
+        attribute name      - readable form of ID.
+        attribute value     - multiple data types supported.
+    while keeping a simple two argument interface.
+    Additional calls provided to allow 'discovery' of the
+    attributes that are available.
+*/
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <dirent.h>
+/*----------------------------------------------------------------------
+    Just cause I'm lazy.
+----------------------------------------------------------------------*/
+typedef unsigned char   uint8;
+typedef unsigned short  uint16;
+typedef unsigned long   uint32;
+typedef          char   int8;
+typedef          short  int16;
+typedef          long   int32;
+/*------ begin /usr/src/linux/include/linux/ext_attr.h ----------*/
+/*----------------------------------------------------------------------
+    NOTE 1: If we adopt this approach, the SHORT_BYTES below needs to
+            be set (larger I assume) to account for the largest ioctl
+            packet that needs to be delivered to a device.
+    NOTE 2: Needs work on handling of long string values.
+----------------------------------------------------------------------*/
+#define X_ATTR_SHORT_BYTES   16
+/*----------------------------------------------------------------------
+----------------------------------------------------------------------*/
+typedef struct ext_attr_name {
+    int32   xa_type;
+#define X_ATTR_NAME_ERROR   -1
+#define X_ATTR_NAME_NULL     0
+#define X_ATTR_NAME_ID       1
+#define X_ATTR_NAME_SHORT    2
+#define X_ATTR_NAME_STRING   3 
+    union   {
+        uint8   xa_name_short[X_ATTR_SHORT_BYTES];
+        uint32  xa_xid;
+        struct {
+            uint32  xa_len;
+            char*   xa_str;
+        } xa_name_long;
+    } xa_name;
+} ext_attr_name_t;
+/*----------------------------------------------------------------------
+----------------------------------------------------------------------*/
+typedef struct ext_attr_value {
+    int32   xa_type;
+#define X_ATTR_VALU_ERROR   -1
+#define X_ATTR_VALU_NULL     0
+#define X_ATTR_VALU_XID      1
+#define X_ATTR_VALU_SHORT    2
+#define X_ATTR_VALU_STRING   3
+#define X_ATTR_VALU_INT8     4
+#define X_ATTR_VALU_INT16    5
+#define X_ATTR_VALU_INT32    6
+#define X_ATTR_VALU_FLOAT    7
+#define X_ATTR_VALU_DOUBLE   8
+#define X_ATTR_VALU_DTIME    9
+#define X_ATTR_VALU_USER    10
+#define X_ATTR_VALU_BYTES   11
+#define X_ATTR_VALU_TYPE    12
+    union       {
+        int8    xa_i8;                          /* INT8            */
+        int16   xa_i16;                         /* INT16           */
+        int32   xa_i32;                         /* XID, INT32, ERR */
+                                                /* TYPE            */
+        float   xa_float;                       /* FLOAT           */
+        double  xa_double;                      /* DOUBLE          */
+        time_t  xa_dtime;                       /* DTIME           */
+        uint8   xa_user[X_ATTR_SHORT_BYTES];    /* SHORT, USER     */
+        struct {                                /* BYTES, STRING   */
+            uint32  xa_len;
+            uint8*  xa_str;
+        } xa_string;
+    } xa_value;
+} ext_attr_value_t;
+/*----------------------------------------------------------------------
+----------------------------------------------------------------------*/
+typedef struct ext_attr {
+    uint32              xa_id;
+    ext_attr_name_t     xa_name;
+    ext_attr_value_t    xa_value;
+} ext_attr_t;
+/*----------------------------------------------------------------------
+    System (2) level functions (some implemented in demo toy).
+ext_attr_count  - Determine the number of attributes that can be
+    read. This gives a count that a program could loop on using
+    'index' calls below.
+ext_attr_list_system - Extracts the ID, name, and type for all
+    system defined attributes for an fd. Index is simply a means
+    to keep getting new information - 0 to n where n is derived
+    from count above. Returns a error when index is out of bounds
+    so using count not really needed. 
+ext_attr_get - Get the ID, name, type, and value of an atribute.
+    Similar to above, but value returned as well.
+ext_attr_get_by_id - Same 'get' above but uses the global system ID
+    for the attribute rather than a relative position. (See below
+    for names and IDs used in demonstration toy.)
+ext_attr_get_by_name - Same as 'get' above but uses the global
+    system name for the attribute rather than a relative position.
+ext_attr_set - Change the value of an attribute. Note: The global
+    system ID, if given, overrides any name given.
+   ******** These are reserved for Meta-File attributes *********
+ext_attr_open, ext_attr_open_by_id, ext_attr_open_by_name - These
+    open the file associated with a meta-file attribute so that
+    standard fd operations may be performed on the atttribute
+    values. Permits large values. It is considered an error to
+    open an fd for short values (types other than string and bytes)
+    so this is not needed for system defined attributes.
+ext_attr_close - close fd for extended meta-file attribute.
+----------------------------------------------------------------------*/
+int     ext_attr_count       (char* path                              );
+int     ext_attr_list_system (char* path, int index , ext_attr_t* info);
+int     ext_attr_get         (char* path, int index , ext_attr_t* info);
+int     ext_attr_get_by_id   (char* path, uint32 id , ext_attr_t* info);
+int     ext_attr_get_by_name (char* path, char* name, ext_attr_t* info);
+int     ext_attr_set         (char* path,             ext_attr_t* info);
+int     ext_attr_open        (char* path, ext_attr_t* info);
+int     ext_attr_open_by_id  (char* path, uint32 id       );
+int     ext_attr_open_by_name(char* path, char* name      );
+int     ext_attr_close       (char* path);
+/* Need an fd set as well for ioctl type */
+int     fext_attr_count       (int fd                              );
+int     fext_attr_list_system (int fd, int index , ext_attr_t* info);
+int     fext_attr_get         (int fd, int index , ext_attr_t* info);
+int     fext_attr_get_by_id   (int fd, uint32 id , ext_attr_t* info);
+int     fext_attr_get_by_name (int fd, char* name, ext_attr_t* info);
+int     fext_attr_set         (int fd,             ext_attr_t* info);
+int     fext_attr_open        (int fd, ext_attr_t* info);
+int     fext_attr_open_by_id  (int fd, uint32 id       );
+int     fext_attr_open_by_name(int fd, char* name      );
+int     fext_attr_close       (int fd);
+/*------ end /usr/src/linux/include/linux/ext_attr.h ----------*/
+/*------ begin /usr/include/ext_attr.h ?? ----------*/
+/*----------------------------------------------------------------------
+    WARNING!! USER LAND (3) FUNCTIONS - NOT IMPLEMENTED!!
+    In these routines, bfr and bfr_sz work as follows;
+        bfr bfr_sz  results
+        --- ------  -------------------------------------------
+         0     0    No information beyond short string returned.
+                    (Use this to get a name to use in open)
+         0     x    If needed, malloc a buffer of up to x bytes
+                    and read data into it.
+         p     x    Read up to x bytes into user buffer at p.
+         p     0    ?
+The allocated buffer or 'p' is returned in the value structure.
+----------------------------------------------------------------------*/
+/*
+int     file_attr_count       (FILE* fp
+                                                                          );
+int     file_attr_list_system (FILE* fp,
+                    int index , ext_attr_t* info                          );
+int     file_attr_get         (FILE* fp,
+                    int index , ext_attr_t* info, char* bfr, uint32 bfr_sz);
+int     file_attr_get_by_id   (FILE* fp,
+                    uint32 id , ext_attr_t* info, char* bfr, uint32 bfr_sz);
+int     file_attr_get_by_name (FILE* fp,
+                    char* name, ext_attr_t* info, char* bfr, uint32 bfr_sz);
+int     file_attr_set         (FILE* fp,
+                                ext_attr_t* info, char* bfr, uint32 bfr_sz);
+FILE*   file_attr_open_by_id  (FILE* fp, uint32 id );
+FILE*   file_attr_open_by_name(FILE* fp, char* name);
+int     file_attr_close       (FILE* fp);
+*/
+/*------ end /usr/include/ext_attr.h ?? ----------*/
+/*----------------------------------------------------------------------
+    Static extended attributes derived from those fields common to all
+devices, directories, and files. Each device driver, file system, etc.
+also needs to have a local table of attributes specific to that device.
+This will include the ioctls, (memory management for mmap?), and
+message control, etc.
+    There should probably be some convention for assigning IDs and for
+assigning names. In particular, this attribute name space will be the
+same as for meta-file attributes which can lead to massive conflicts.
+For demo-toy purposes, the ID is simply the index in the table (plus
+one so we have a good null ID).
+    The structure used here is for toy purposes and is not intended
+as a final implementation. In fact, all of this is demo-level and
+someone brighter about kernel and driver internals than I needs to
+give this some (lottsa) thought!
+    Major problems with this toy's approach include only one value
+for each item. Reality would have to permit multiple occurences of
+some attributes. Also, in many cases we would want an ascii value
+returned - or a variation that gives the ascii - as in st_type below.
+And some values should be available as broken fields - permissions as
+user, group, and other permissions as seperate attributes for
+example.
+----------------------------------------------------------------------*/
+typedef struct ext_attr_static_info {
+    char*       xa_name;
+    int         (*xa_func)(char* path, int ndx, ext_attr_t* attr);
+    int32       xa_offset;
+    uint32      xa_type;
+} ext_attr_static_info_t;
+#include <errno.h>
+#include <time.h>
+#include <linux/stddef.h>
+#include <sys/vfs.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+int get_statfs(char* path, int ndx, ext_attr_t* attr);
+int get_stat  (char* path, int ndx, ext_attr_t* attr);
+int get_fcntl (char* path, int ndx, ext_attr_t* attr);
+#define XA(s,f,t)      {#f,get_##s,offsetof(struct s,f),X_ATTR_VALU_##t}
+#define XAs(s,f,o,t)   {#f,get_##s,o                   ,X_ATTR_VALU_##t}
+ext_attr_static_info_t  xa_static_attrs[] = {
+    XAs(stat,fname,-2,STRING),
+    /* File System stat Information */
+    XA(statfs,f_type,INT32),
+    XA(statfs,f_bsize,INT32),
+    XA(statfs,f_blocks,INT32),
+    XA(statfs,f_bfree,INT32),
+    XA(statfs,f_bavail,INT32),
+    XA(statfs,f_files,INT32),
+    XA(statfs,f_ffree,INT32),
+    XA(statfs,f_fsid,INT32),          /* Broken !!!! */
+    XA(statfs,f_namelen,INT32),
+    /* File Stat Information */
+    XA(stat,st_dev,INT32),
+    XA(stat,st_ino,INT32),
+    XA(stat,st_mode,INT32),
+    XAs(stat,st_type,-1,INT32),
+    XA(stat,st_nlink,INT32),
+    XA(stat,st_uid,INT32),
+    XA(stat,st_gid,INT32),
+    XA(stat,st_rdev,INT32),
+    XA(stat,st_size,INT32),
+    XA(stat,st_blksize,INT32),
+    XA(stat,st_blocks,INT32),
+    XA(stat,st_atime,DTIME),
+    XA(stat,st_mtime,DTIME),
+    XA(stat,st_ctime,DTIME),
+    /* File descriptor information */
+    XAs(fcntl,close_on_exec,0,INT32),
+    XAs(fcntl,fd_flags,0,INT32),
+    XAs(fcntl,lock,0,INT32),
+    XAs(fcntl,signal_pid,0,INT32),
+    /* End Marker */
+    { 0,0,0}
+    };
+#define NUMBER_OF_XAS \
+  (sizeof(xa_static_attrs)/sizeof(ext_attr_static_info_t)) - 1
+/*----------------------------------------------------------------------
+    These routines for toy only - not in real system. Kernel
+    should already have most data.
+----------------------------------------------------------------------*/
+int get_statfs(char* path, int ndx, ext_attr_t* attr) {
+  struct statfs bfr;
+  int32*        ptr;
+    if (statfs(path,&bfr) < 0) {
+        attr->xa_value.xa_type = X_ATTR_VALU_ERROR;
+        attr->xa_value.xa_value.xa_i32 = errno;
+    } else {
+        ptr = (int32*) ((char*)&bfr + xa_static_attrs[ndx].xa_offset);
+        attr->xa_value.xa_value.xa_i32 = *ptr;
+        if (attr->xa_value.xa_value.xa_i32 == -1)
+            attr->xa_value.xa_type = X_ATTR_VALU_NULL;
+        else
+            attr->xa_value.xa_type = X_ATTR_VALU_INT32;
+    }
+    return 0;
+}
+int get_stat  (char* path, int ndx, ext_attr_t* attr) {
+  struct stat   bfr;
+  int32*        ptr;
+    if (stat(path,&bfr) < 0) {
+        attr->xa_value.xa_type = X_ATTR_VALU_ERROR;
+        attr->xa_value.xa_value.xa_i32 = errno;
+    } else {
+        if (xa_static_attrs[ndx].xa_offset == -2) {
+            /* Special for name */
+            if (strlen(path) < X_ATTR_SHORT_BYTES) {
+                attr->xa_value.xa_type = X_ATTR_VALU_SHORT;
+                strcpy(attr->xa_value.xa_value.xa_user,path);
+            } else {
+                attr->xa_value.xa_type = X_ATTR_VALU_STRING;
+                attr->xa_value.xa_value.xa_string.xa_len = strlen(path);
+                attr->xa_value.xa_value.xa_string.xa_str = path;
+            }
+        } else if (xa_static_attrs[ndx].xa_offset == -1) {
+            /* Special for type decode */
+            attr->xa_value.xa_type = X_ATTR_VALU_SHORT;
+            switch (bfr.st_mode & S_IFMT) {
+                case S_IFSOCK:
+                     strcpy(attr->xa_value.xa_value.xa_user,"socket");
+                     break;
+                case S_IFLNK:
+                      strcpy(attr->xa_value.xa_value.xa_user,"symbolic link");
+                      break;
+                case S_IFREG:
+                      strcpy(attr->xa_value.xa_value.xa_user,"regular file");
+                      break;
+                case S_IFBLK:
+                      strcpy(attr->xa_value.xa_value.xa_user,"block device");
+                      break;
+                case S_IFDIR:
+                      strcpy(attr->xa_value.xa_value.xa_user,"directory");
+                      break;
+                case S_IFCHR:
+                      strcpy(attr->xa_value.xa_value.xa_user,"character device");
+                      break;
+                case S_IFIFO:
+                      strcpy(attr->xa_value.xa_value.xa_user,"fifo");
+                      break;
+            }
+        } else {
+            ptr = (int32*) ((char*)&bfr + xa_static_attrs[ndx].xa_offset);
+            attr->xa_value.xa_value.xa_i32 = *ptr;
+            if (attr->xa_value.xa_value.xa_i32 == -1)
+                attr->xa_value.xa_type = X_ATTR_VALU_NULL;
+            else {
+                if (xa_static_attrs[ndx].xa_offset >=
+                    offsetof(struct stat,st_atime)   )
+                    attr->xa_value.xa_type = X_ATTR_VALU_DTIME;
+                else
+                    attr->xa_value.xa_type = X_ATTR_VALU_INT32;
+            }
+        }
+    }
+    return 0;
+}
+int get_fcntl (char* path, int ndx, ext_attr_t* attr) {
+    return 0;
+}
+/*----------------------------------------------------------------------
+    Pretty print utilities for toy.
+----------------------------------------------------------------------*/
+int list_mode = 0;
+void    display_ext_attr_name(ext_attr_name_t* name) {
+    switch(name->xa_type) {
+	case X_ATTR_NAME_ERROR:
+	    printf("%-18s","<error> ");
+	    break;
+	case X_ATTR_NAME_NULL:
+	    printf("%-18s","<null> ");
+	    break;
+	case X_ATTR_NAME_ID:
+	    printf("=%-17d",name->xa_name.xa_xid);
+	    break;
+	case X_ATTR_NAME_SHORT:
+	    printf("%-18s",name->xa_name.xa_name_short);
+	    break;
+	case X_ATTR_NAME_STRING:
+            printf("%6d at %8x",name->xa_name.xa_name_long.xa_len,
+                                  name->xa_name.xa_name_long.xa_str);
+	    break;
+    }
+}
+void    display_ext_attr_value(ext_attr_value_t* valu) {
+  int   i;
+    switch(valu->xa_type) {
+        case X_ATTR_VALU_ERROR:
+            printf("<error> %d",valu->xa_value.xa_i32);
+            break;
+        case X_ATTR_VALU_NULL:
+            printf("<null>");
+            break;
+            printf("<error %d>",valu->xa_value.xa_i32);
+            break;
+        case X_ATTR_VALU_SHORT:
+            printf("%s%s",list_mode==1?"":"Short ",
+                          valu->xa_value.xa_user);
+            break;
+        case X_ATTR_VALU_STRING:
+            printf("%d Chars at %x",valu->xa_value.xa_string.xa_len,
+                                    valu->xa_value.xa_string.xa_str);
+            break;
+        case X_ATTR_VALU_INT8:
+            printf("%s%d (%x)",list_mode==1?"":"Int8 ",
+                               valu->xa_value.xa_i8,
+                               valu->xa_value.xa_i8);
+            break;
+        case X_ATTR_VALU_INT16:
+            printf("%s%d (%x)",list_mode==1?"":"Int16 ",
+                               valu->xa_value.xa_i16,
+                               valu->xa_value.xa_i16);
+            break;
+        case X_ATTR_VALU_XID:   /* Should never happen! */
+        case X_ATTR_VALU_INT32:
+            printf("%s%ld (%lx)",list_mode==1?"":"Int32 ",
+                                 valu->xa_value.xa_i32,
+                                 valu->xa_value.xa_i32);
+            break;
+        case X_ATTR_VALU_FLOAT:
+            printf("%s%g",list_mode==1?"":"Float ",
+                                 valu->xa_value.xa_float);
+            break;
+        case X_ATTR_VALU_DOUBLE:
+            printf("%s%g",list_mode==1?"":"Double ",
+                                  valu->xa_value.xa_double);
+            break;
+        case X_ATTR_VALU_DTIME:
+            printf("%s%s",list_mode==1?"":"Date-Time ",
+                    ctime((time_t*)&(valu->xa_value.xa_dtime)));
+            break;
+        case X_ATTR_VALU_USER:
+            if (list_mode == 0)
+                printf("User ");
+            for (i=0;i < X_ATTR_SHORT_BYTES; ++i)
+                printf("%02x ",valu->xa_value.xa_user[i]&0x0ff);
+            break;
+        case X_ATTR_VALU_BYTES:
+            printf("%d Bytes at %x",valu->xa_value.xa_string.xa_len,
+                                    valu->xa_value.xa_string.xa_str);
+            break;
+        case X_ATTR_VALU_TYPE:
+            switch (valu->xa_value.xa_i32) {
+                case X_ATTR_VALU_ERROR:  printf("ERROR");  break;
+                case X_ATTR_VALU_NULL:   printf("NULL");   break;
+                case X_ATTR_VALU_XID:    printf("XID");    break;
+                case X_ATTR_VALU_SHORT:  printf("SHORT");  break;
+                case X_ATTR_VALU_STRING: printf("STRING"); break;
+                case X_ATTR_VALU_INT8:   printf("INT8");   break;
+                case X_ATTR_VALU_INT16:  printf("INT16");  break;
+                case X_ATTR_VALU_INT32:  printf("INT32");  break;
+                case X_ATTR_VALU_FLOAT:  printf("FLOAT");  break;
+                case X_ATTR_VALU_DOUBLE: printf("DOUBLE"); break;
+                case X_ATTR_VALU_DTIME:  printf("DTIME");  break;
+                case X_ATTR_VALU_USER:   printf("USER");   break;
+                case X_ATTR_VALU_BYTES:  printf("BYTES");  break;
+                case X_ATTR_VALU_TYPE:   printf("TYPE");   break;
+            }
+            break;
+    }
+}
+void    display_ext_attr(ext_attr_t* attr) {
+    if (list_mode == 0) {
+        printf("ID: %2ld Name: ",attr->xa_id);
+        display_ext_attr_name(&attr->xa_name);
+        printf("Value: ");
+        display_ext_attr_value(&attr->xa_value);
+    } else {
+        printf("%2ld ",attr->xa_id);
+        display_ext_attr_name(&attr->xa_name);
+        printf(" ");
+        display_ext_attr_value(&attr->xa_value);
+    }
+    if (attr->xa_value.xa_type != X_ATTR_VALU_DTIME)
+        putchar('\n');
+}
+/*----------------------------------------------------------------------
+    Stub style code for extended system functions.
+----------------------------------------------------------------------*/
+int     ext_attr_list_system (char* path, int index , ext_attr_t* info) {
+    if (index < 0 || index >= NUMBER_OF_XAS)
+        return info->xa_name.xa_type = X_ATTR_NAME_ERROR;
+    info->xa_id = index;
+    info->xa_name.xa_type = X_ATTR_NAME_SHORT;
+    strcpy(info->xa_name.xa_name.xa_name_short,xa_static_attrs[index].xa_name);
+    /* this should fill in the correct type */ 
+    info->xa_value.xa_type = X_ATTR_VALU_TYPE;
+    info->xa_value.xa_value.xa_i32 = xa_static_attrs[index].xa_type;
+    return 0;
+}
+int     ext_attr_get         (char* path, int index , ext_attr_t* info) {
+    if (index < 0 || index >= NUMBER_OF_XAS)
+        return info->xa_name.xa_type = X_ATTR_NAME_ERROR;
+    info->xa_id = index;
+    info->xa_name.xa_type = X_ATTR_NAME_SHORT;
+    strcpy(info->xa_name.xa_name.xa_name_short,xa_static_attrs[index].xa_name);
+    (*xa_static_attrs[index].xa_func)(path,index,info);
+    return 0;
+}
+int     ext_attr_get_by_id   (char* path, uint32 id , ext_attr_t* info) {
+    /* In toy, the index and ID match! */
+    return ext_attr_get(path,id,info);
+}
+int     ext_attr_get_by_name (char* path, char* name, ext_attr_t* info){
+  int ndx;
+    for (ndx=0; xa_static_attrs[ndx].xa_name != 0; ++ndx) {
+        if (strcmp(name,xa_static_attrs[ndx].xa_name) == 0)
+            return ext_attr_get_by_id(path,ndx,info);
+    }
+    return info->xa_name.xa_type = X_ATTR_NAME_ERROR;
+}
+/*----------------------------------------------------------------------
+    The actual toy routine.
+----------------------------------------------------------------------*/
+int main(int argc, char** argv) {
+  int           ndx;
+  char*         fname;
+  ext_attr_t    an_attr;
+    if (argc < 2) {
+        fprintf(stderr,"usage: ext_attr <file>\n");
+        exit(-1);
+    }
+    if (strcmp(argv[1],"-b") == 0) {
+        list_mode = 1;
+        fname = argv[2];
+    } else if (strcmp(argv[1],"-l") == 0) {
+        for (ndx = 0; ext_attr_list_system (argv[2],ndx,&an_attr) >= 0; ++ndx)
+            display_ext_attr(&an_attr);
+        exit(0);
+    } else if (argc > 3 && strcmp(argv[1],"-q") == 0) {
+        ext_attr_get_by_name(argv[3],argv[2],&an_attr);
+        display_ext_attr(&an_attr);
+        exit(0);
+    } else
+        fname = argv[1];
+    for (ndx = 0; ndx < 24; ++ndx) {
+        ext_attr_get_by_name(fname,xa_static_attrs[ndx].xa_name,&an_attr);
+        display_ext_attr(&an_attr);
+    }
+    return 0;
+}

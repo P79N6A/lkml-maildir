@@ -1,0 +1,224 @@
+Date: Fri, 13 Oct 2000 16:10:47 +0200
+From: Andrea Arcangeli <>
+Subject: Re: VM: do_try_to_free_memory failed for XXXX, 2.2.17, 2.2.18pre3
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/10/13/165
+
+On Thu, Oct 12, 2000 at 04:48:55PM -0700, lamont@icopyright.com wrote:
+> 
+> if you aren't comfortable with dropping a lot of the 2.2.18preX stuff onto
+> a production box, there is also the 2.2.18pre2aa2 kernel that andrea made
+2.2.18pre2aa2 should be kind of rock solid (the only problem it has
+as every other rawio capable kernel out there is rawio so if you don't use rawio
+you're just fine for using it in production).
+The latest aa patchkit (2.2.18pre15aa1) also fixes the couple of severe rawio
+bugs that can generate memleaks in SMP memory corruption and a deadlock
+condition that leads to processes unkillable in D state. Obviously nobody
+before me ever used rawio to read from disk to a completly swapped out area.
+The swapped out buffer case is the one that two of those bugs trivially (just
+after one second of runtime the task goes in D state) but if the machine is
+under a little memory pressure bad things could happen anyways (infact the
+reason I looked into it the first time was a bugreport about 2.2.18pre2aa2
+using a real DBMS on a 256Mbyte RAM machine under some memory pressure, the
+kernel was returning -EFAULT and writing error messages).
+The fix also reduces the number of times the kernel walks pagetable
+for each page that we read/write from/to (it reduces from two walks to
+1 walk in the common case where the page is just mapped in memory).
+I was waiting confirm that there are no problems anymore using DBMS (as I can't
+definitely reproduce here anymore with my rawio regression test tool) before
+sending the fix to SCT. But since it's taking some time and I don't want to
+delay the fixes further I'm extracting the fixes here. 2.4.x needs the most
+important part of these fixes too.
+diff -urN rawio-ref/fs/buffer.c rawio/fs/buffer.c
+--- rawio-ref/fs/buffer.c	Fri Oct 13 15:43:59 2000
++++ rawio/fs/buffer.c	Fri Oct 13 15:46:06 2000
+@@ -1276,6 +1276,7 @@
+ 	int i;
+ 	int err;
+ 	struct buffer_head *tmp;
++	unsigned long flags;
+ 
+ 	dprintk ("do_kio start\n");
+ 	
+@@ -1293,9 +1294,10 @@
+ 			iosize = 0;
+ 		}
+ 		
+-		free_async_buffers(tmp);
++		put_unused_buffer_head(tmp);
+ 		iosize += size;
+ 	}
++	wake_up(&buffer_wait);
+ 	
+ 	dprintk ("do_kio end %d %d\n", iosize, err);
+ 	
+@@ -1358,6 +1360,7 @@
+ 	unsigned long	bounce;
+ 	struct page *	map;
+ 	struct buffer_head *tmp, *bh[KIO_MAX_SECTORS];
++	unsigned long	flags;
+ 
+ 	/* 
+ 	 * First, do some alignment and validity checks 
+@@ -1472,9 +1475,9 @@
+  error:
+ 	/* We got an error allocation the bh'es.  Just free the current
+            buffer_heads and exit. */
+-	for (i = bhind; --i >= 0; ) {
+-		free_async_buffers(bh[bhind]);
+-	}
++	for (i = bhind; --i >= 0; )
++		put_unused_buffer_head(bh[i]);
++	wake_up(&buffer_wait);
+ 
+ 	clear_kiobuf_bounce_pages(iobuf);
+ 
+diff -urN rawio-ref/mm/memory.c rawio/mm/memory.c
+--- rawio-ref/mm/memory.c	Fri Oct 13 15:43:59 2000
++++ rawio/mm/memory.c	Fri Oct 13 15:46:06 2000
+@@ -401,7 +401,7 @@
+ /*
+  * Do a quick page-table lookup for a single page. 
+  */
+-static unsigned long get_page(unsigned long address) 
++static unsigned long get_page(unsigned long address, int write)
+ {
+ 	pgd_t *pgd;
+ 	pmd_t *pmd;
+@@ -411,11 +411,11 @@
+ 	if (pmd) {
+ 		pte_t * pte = pte_offset(pmd, address);
+ 		if (pte && pte_present(*pte)) {
+-			return pte_page(*pte);
++			if (!write || pte_write(*pte))
++				return pte_page(*pte);
+ 		}
+ 	}
+ 	
+-	printk(KERN_ERR "Missing page in lock_down_page\n");
+ 	return 0;
+ }
+ 
+@@ -448,12 +448,15 @@
+ 	unsigned long		ptr, end;
+ 	int			err;
+ 	struct mm_struct *	mm;
+-	struct vm_area_struct *	vma = 0;
++	struct vm_area_struct *	vma = 0, * prev_vma;
+ 	unsigned long		page;
+ 	struct page *		map;
+ 	int			doublepage = 0;
+ 	int			repeat = 0;
+ 	int			i;
++	int			write = (rw == READ); /* if we read from disk
++							 it means we write
++							 to memory */
+ 	
+ 	/* Make sure the iobuf is not already mapped somewhere. */
+ 	if (iobuf->nr_pages)
+@@ -483,16 +486,36 @@
+ 	 */
+ 	while (ptr < end) {
+ 		if (!vma || ptr >= vma->vm_end) {
+-			vma = find_vma(current->mm, ptr);
+-			if (!vma) 
++		refind:
++			vma = find_vma_prev(mm, ptr, &prev_vma);
++			if (!vma)
+ 				goto out_unlock;
++			if (vma->vm_start > ptr) {
++				if (!(vma->vm_flags & VM_GROWSDOWN))
++					goto out_unlock;
++				if (expand_stack(vma, ptr, prev_vma))
++					goto out_unlock;
++			}
++			err = -EACCES;
++			if (write) {
++				if (!(vma->vm_flags & VM_WRITE))
++					goto out_unlock;
++			} else {
++				if (!(vma->vm_flags & VM_READ))
++					goto out_unlock;
++			}
++			err = -EFAULT;
+ 		}
+-		if (!handle_mm_fault(current, vma, ptr, (rw==READ))) 
+-			goto out_unlock;
+-		page = get_page(ptr);
+-		if (!page) {
+-			printk (KERN_ERR "Missing page in map_user_kiobuf\n");
+-			goto out_unlock;
++		while (!(page = get_page(ptr, write))) {
++			char * user_ptr = (char *) ptr;
++			char c;
++			up(&mm->mmap_sem);
++			if (get_user(c, user_ptr))
++				goto failed_pagein;
++			if (write && put_user(c, user_ptr))
++				goto failed_pagein;
++			down(&mm->mmap_sem);
++			goto refind;
+ 		}
+ 		map = get_page_map(page);
+ 		if (map) {
+@@ -515,9 +538,15 @@
+ 
+  out_unlock:
+ 	up(&mm->mmap_sem);
++ out:
+ 	unmap_kiobuf(iobuf);
+ 	dprintk ("map_user_kiobuf: end %d\n", err);
+ 	return err;
++
++ failed_pagein:
++	printk(KERN_ERR "map_user_kiobuf: failed pagein\n");
++	goto out;
++
+ 
+  retry:
+ 
+diff -urN rawio-ref/mm/page_alloc.c rawio/mm/page_alloc.c
+--- rawio-ref/mm/page_alloc.c	Tue Sep  5 02:28:50 2000
++++ rawio/mm/page_alloc.c	Fri Oct 13 15:46:06 2000
+@@ -357,6 +357,7 @@
+ 	struct page *new_page;
+ 	unsigned long offset = SWP_OFFSET(entry);
+ 	struct swap_info_struct *swapdev = SWP_TYPE(entry) + swap_info;
++	unsigned long readaround_entry;
+ 	
+ 	offset = (offset >> page_cluster) << page_cluster;
+ 
+@@ -376,8 +377,11 @@
+ 		if (test_bit(offset, swapdev->swap_lockmap))
+ 			break;
+ 
+-		/* Ok, do the async read-ahead now */
+-		new_page = read_swap_cache_async(SWP_ENTRY(SWP_TYPE(entry), offset), 0);
++		readaround_entry = SWP_ENTRY(SWP_TYPE(entry), offset);
++		new_page = find_page(&swapper_inode, ulong2pgoff(readaround_entry));
++		if (!new_page)
++			/* Ok, do the async read-ahead now */
++			new_page = read_swap_cache_async(readaround_entry, 0);
+ 		if (new_page != NULL)
+ 			__free_page(new_page);
+ 		offset++;
+2.2.18pre15 is better than 2.2.18pre2 so there should be no worry in upgrading
+to it. About the incremental 2.2.18pre15aa1 the only experimental thing
+included in 2.2.18pre15aa1 is nfsv3 both client and server and both converted
+to be lfs capable as the aa patchkit is lfs capable as 2.4.x. So you should
+keep using nfsv2 for production right now when running 2.2.18pre15aa1.
+nfsv3 is been reported to return an error on close if used with 4096 large udp
+packets (OTOH Andi seems not able reproduce that). In the next version I'll
+take 4096 as default so that bug if not yet fixed should trigger even more
+easily, but the real reason of the change is that if somebody needs to deal
+with broken TCP stacks he can just override with lower values on the mount
+command line and otherwise people complains for the too low performance.
+Andrea
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+Please read the FAQ at 
+http://www.tux.org/lkml/

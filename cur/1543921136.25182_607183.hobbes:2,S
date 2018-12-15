@@ -1,0 +1,68 @@
+Date: Thu, 18 Oct 2007 20:26:45 -0700 (PDT)
+From: Linus Torvalds <>
+Subject: Re: [PATCH] synchronize_irq needs a barrier
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2007/10/18/483
+
+On Thu, 18 Oct 2007, Linus Torvalds wrote:
+>
+> I *think* it should work with something like
+> 
+> 	for (;;) {
+> 		smp_rmb();
+> 		if (!spin_is_locked(&desc->lock)) {
+> 			smp_rmb();
+> 			if (!(desc->status & IRQ_INPROGRESS)
+> 				break;
+> 		}
+> 		cpu_relax();
+> 	}
+I'm starting to doubt this. 
+One of the issues is that we still need the smp_mb() in front of the loop 
+(because we want to serialize the loop with any writes in the caller).
+The other issue is that I don't think it's enough that we saw the 
+descriptor lock unlocked, and then the IRQ_INPROGRESS bit clear. It might 
+have been unlocked *while* the IRQ was in progress, but the interrupt 
+handler is now in its last throes, and re-takes the spinlock and clears 
+the IRQ_INPROGRESS thing. But we're not actually happy until we've seen 
+the IRQ_INPROGRESS bit clear and the spinlock has been released *again*.
+So those two tests should actually be the other way around: we want to see 
+the IRQ_INPROGRESS bit clear first.
+It's all just too damn subtle and clever. Something like this should not 
+need to be that subtle. 
+Maybe the rigth thing to do is to not rely on *any* ordering what-so-ever, 
+and just make the rule be: "if you look at the IRQ_INPROGRESS bit, you'd 
+better hold the descriptor spinlock", and not have any subtle ordering 
+issues at all.
+But that makes us have a loop with getting/releasing the lock all the 
+time, and then we get back to horrid issues with cacheline bouncing and 
+unfairness of cache accesses across cores (ie look at the issues we had 
+with the runqueue starvation in wait_task_inactive()).
+Those were fixed by starting out with the non-locked and totally unsafe 
+versions, but then having one last "check with lock held, and repeat only 
+if that says things went south". 
+See commit fa490cfd15d7ce0900097cc4e60cfd7a76381138 and ponder. Maybe we 
+should take the same approach here, and do something like
+	repeat:
+		/* Optimistic, no-locking loop */
+		while (desc->status & IRQ_INPROGRESS)
+			cpu_relax();
+		/* Ok, that indicated we're done: double-check carefully */
+		spin_lock_irqsave(&desc->lock, flags);
+		status = desc->status;
+		spin_unlock_irqrestore(&desc->lock, flags);
+		/* Oops, that failed? */
+		if (status & IRQ_INPROGRESS)
+			goto repeat;
+Hmm?
+			Linus
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+More majordomo info at  
+http://vger.kernel.org/majordomo-info.html
+Please read the FAQ at  
+http://www.tux.org/lkml/

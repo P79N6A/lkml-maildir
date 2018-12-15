@@ -1,0 +1,401 @@
+Date: Wed, 1 Aug 2007 05:41:10 +0200 (CEST)
+From: Roman Zippel <>
+Subject: CFS review
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2007/7/31/668
+
+Hi,
+On Sat, 14 Jul 2007, Mike Galbraith wrote:
+> > On Fri, 13 Jul 2007, Mike Galbraith wrote:
+> > 
+> > > > The new scheduler does _a_lot_ of heavy 64 bit calculations without any 
+> > > > attempt to scale that down a little...
+> > > 
+> > > See prio_to_weight[], prio_to_wmult[] and sysctl_sched_stat_granularity.
+> > > Perhaps more can be done, but "without any attempt..." isn't accurate.
+> > 
+> > Calculating these values at runtime would have been completely insane, the 
+> > alternative would be a crummy approximation, so using a lookup table is 
+> > actually a good thing. That's not the problem.
+> 
+> I meant see usage.
+I more meant serious attempts. At this point I'm not that much interested 
+in a few localized optimizations, what I'm interested in is how can this 
+optimized at the design level (e.g. how can arch information be used to 
+simplify things). So I spent quite a bit of time looking through cfs and 
+experimenting with some ideas. I want to put the main focus on the 
+performance aspect, but there are a few other issues as well.
+But first something else (especially for Ingo): I tried to be very careful 
+with any claims made in this mail, but this of course doesn't exclude the 
+possibility of errors, in which case I'd appreciate any corrections. Any 
+explanations done in this mail don't imply that anyone needs any such 
+explanations, they're done to keep things in context, so that interested 
+readers have a chance to follow even if they don't have the complete 
+background information. Any suggestions made don't imply that they have to 
+be implemented like this, there are more an incentive for further 
+discussion and I'm always interested in better solutions.
+A first indication that something may not be quite right is the increase
+in code size:
+2.6.22:
+   text    data     bss     dec     hex filename
+  10150      24    3344   13518    34ce kernel/sched.o
+recent git:
+   text    data     bss     dec     hex filename
+  14724     228    2020   16972    424c kernel/sched.o
+That's i386 without stats/debug. A lot of the new code is in regularly
+executed regions and it's often not exactly trivial code as cfs added
+lots of heavy 64bit calculations. With the increased text comes
+increased runtime memory usage, e.g. task_struct increased so that only
+5 of them instead 6 fit now into 8KB.
+Since sched-design-CFS.txt doesn't really go into any serious detail, so
+the EEVDF paper was more helpful and after playing with the ideas a
+little I noticed that the whole idea of fair scheduling can be explained
+somewhat simpler and I'm a little surprised not finding it mentioned
+anywhere.
+So a different view on this is that the runtime of a task is simply
+normalized and the virtual time (or fair_clock) is the weighted average of
+these normalized runtimes. The advantage of normalization is that it
+makes things comparable, once the normalized time values are equal each
+task got its fair share. It's more obvious in the EEVDF paper, cfs makes
+it a bit more complicated, as it uses the virtual time to calculate the
+eligible runtime, but it doesn't maintain a per process virtual time
+(fair_key is not quite the same).
+Here we get to the first problem, cfs is not overly accurate at
+maintaining a precise balance. First there a lot of rounding errors due
+to constant conversion between normalized and non-normalized values and
+the higher the update frequency the bigger the error. The effect of
+this can be seen by running:
+	while (1)
+		sched_yield();
+and watching the sched_debug output and watch the underrun counter go 
+crazy. cfs thus needs the limiting to keep this misbehaviour under
+control. The problem here is that it's not that difficult to hit one of
+the many limits, which may change the behaviour and makes cfs hard to
+predict how it will behave under different situations.
+The next issue is scheduler granularity, here I don't quite understand
+why the actual running time has no influence at all, which makes it
+difficult to predict how much cpu time a process will get at a time
+(even the comments only refer to the vmstat output). What is basically
+used instead is the normalized time since it was enqueued and
+practically it's a bit more complicated, as fair_key is not entirely a
+normalized time value. If the wait_runtime value is positive, higher
+prioritized tasks are given even more priority than they already get
+from their larger wait_runtime value. The problem here is that this
+triggers underruns and lower priority tasks get even less time.
+Another issue is the sleep bonus given to sleeping tasks. A problem here
+is that this can be exploited, if a job is spread over a few threads,
+they can get more time relativ to other tasks, e.g. in this example
+there are three tasks that run only for about 1ms every 3ms, but they
+get far more time than should have gotten fairly:
+ 4544 roman     20   0  1796  520  432 S 32.1  0.4   0:21.08 lt
+ 4545 roman     20   0  1796  344  256 R 32.1  0.3   0:21.07 lt
+ 4546 roman     20   0  1796  344  256 R 31.7  0.3   0:21.07 lt
+ 4547 roman     20   0  1532  272  216 R  3.3  0.2   0:01.94 l
+The debug output for this is also interesting:
+            task   PID        tree-key         delta       waiting  switches  prio        sum-exec        sum-wait       sum-sleep    wait-overrun   wait-underrun
+------------------------------------------------------------------------------------------------------------------------------------------------------------------
+              lt  4544  42958653977764      -2800118       2797765     11753   120     11449444657       201615584     23750292211            9600               0
+              lt  4545  42958653767067      -3010815       2759284     11747   120     11442604925       202910051     23746575676            9613               0
+               l  4547  42958653330276      -3447606       1332892     32333   120      1035284848       -47628857               0               0           14247
+Practically this means a few interactive tasks can steal quite a lot of
+time from other tasks, which might try to get some work done. This may
+be fine in Desktop environments, but I'm not sure it can be that easily
+generalized. This can make cfs quite unfair, if waiting outside the
+runqueue has more advantages than waiting in the runqueue.
+Finally there is still the issue with the nice levels, where I still
+think the massive increase overcompensates for adequate scheduling
+classes, e.g. to give audio apps a fixed amount of time instead of a
+relative portion.
+Overall while cfs has a number of good ideas, I don't think it was
+quite ready for a stable release. Maybe it's possible to fix this until
+the release, but I certainly would have prefered less time pressure.
+It's not just the small inaccuracies, it's also the significantly
+increased complexity. In this regard I find the claim that cfs "has no
+heuristics whatsoever" interesting, for that to be true I would expect a
+little more accuracy, but that wouldn't be a big problem, if cfs were a
+really fast and compact scheduler and here it's quite hard to argue that
+cfs has been improvement in this particular area. Anyway, before Ingo
+starts accussing me now of "negativism", let's look at some
+possibilities how this could be improved.
+To reduce the inaccuracies it's better to avoid conversion between 
+normalized and real time values, so the first example program pretty much 
+shows just that and demonstrate the very core of a scheduler. It maintains 
+per task normalized times and uses only that to make the scheduling 
+decision (it doesn't even need an explicit wait_runtime value). The nice 
+thing about this how consistently it gives out time shares - unless there 
+is a higher priority task, that task will get the maximum share, which 
+makes the scheduling behaviour quite a bit more predictable.
+The second example program is more complete (e.g. it demonstrates
+adding/removing tasks) but it's based on the same basic idea. First the
+floating point values are converted to fixed point values. To maintain
+accuracy one has to take overflows into account, cfs currently avoids
+overflows by throwing away (possibly important) information, but that
+adds checks all over the place instead of dealing with them within the
+design, so I consider this overflow avoidance a failed strategy - it
+doesn't make anything simpler and creates problems elsewhere. Of course
+the example program has its own limits, but in this case I can define
+them, so that within them the scheduler will work correctly. The most
+important limits are:
+max normalized task time delta = max inverse weight * max cpu share
+max normalized average time delta = max active tasks * max inverse weight * cpu share base
+The first limit is used for comparing individual task and the second one
+is used for maintaining the average.  With these limits it's possible to
+choose the appropriate data types that can hold these maximum values and
+then I don't really have to worry about overflows and I know the
+scheduler is accurate without the need for a lot of extra checks.
+The second example also adds a normalized average, but contrary to
+current cfs it's not central to the design. An average is not needed to
+give every task its fair share, but it can be used to make better
+scheduling decisions to control _when_ a task gets its share. In this
+example I provided two possibilities where it's used to schedule new
+tasks, the first divides time into slices and sets a new task to the
+start of that slice, the second gives the task a full time share
+relative to the current average, but approximating the average (by
+looking just at the min/max time) should work as well.
+The average here is not a weighted average, a weighted average is a
+little more complex to maintain accurately and has issues regarding
+overflows, so I'm using a simple average, which is sufficient especially
+since it's not a primary part of the scheduler anymore.
+BTW above unfairness of sleeping tasks can be easily avoided in this
+model by simply making sure that normalized time never goes backward.
+The accuracy of this model makes it possible to further optimize the
+code (it's really a key element, that's why I'm stressing it so much,
+OTOH it's rather difficult to further optimize current cfs without
+risking to make it worse).
+For example the regular updates aren't really necessary, they can also
+be done when necessary (i.e. when scheduling, where an update is
+necessary anyway for precise accounting), the next schedule time can be
+easily precalculated instead. OTOH the regular updates allow for very
+cheap incremental updates, especially if one already knows that
+scheduler clock has only limited resolution (because it's based on
+jiffies), it becomes possible to use mostly 32bit values.
+I hope the code example helps to further improve scheduler, I'm quite
+aware that it doesn't implement everything, but this just means some of
+the cfs design decisions need more explanation. I'm not really that
+much interested in scheduler, I only want a small and fast scheduler and
+that's some areas where cfs is no real improvement right now. cfs
+practically obliterated my efforts I put into the ntp code to keep the
+regular updates both cheap and highly precise...
+bye, Roman
+#include <stdio.h>
+int weight[10] = {
+	20, 20, 20, 50, 20, 20, 20
+};
+double time[10];
+double ntime[10];
+#define MIN_S		1
+#define MAX_S		10
+#define SLICE(x)	(MAX_S / (double)weight[x])
+#define MINSLICE(x)	(MIN_S / (double)weight[x])
+int main(void)
+{
+	int i, j, l, w;
+	double s, t, min, max;
+	for (i = 0; i < 10; i++)
+		ntime[i] = time[i] = 0;
+	j = 0;
+	l = 0;
+	s = 0;
+	while (1) {
+		j = l ? 0 : 1;
+		for (i = 0; i < 10; i++) {
+			if (!weight[i] || i == l)
+				continue;
+			if (ntime[i] + MINSLICE(i) < ntime[j] + MINSLICE(j))
+				j = i;
+		}
+		if (ntime[l] >= ntime[j] + SLICE(j) ||
+		    (ntime[l] >= ntime[j] &&
+		     ntime[l] >= s + SLICE(l))) {
+			l = j;
+			s = ntime[l];
+		}
+		time[l] += MIN_S;
+		ntime[l] += MIN_S / (double)weight[l];
+		printf("%u", l);
+		for (i = 0, w = 0, t = 0; i < 10; i++) {
+			if (!weight[i])
+				continue;
+			w += weight[i];
+			t += ntime[i] * weight[i];
+			printf("\t%3u/%u:%5g/%-7g", i, weight[i], time[i], ntime[i]);
+		}
+		t /= w;
+		min = max = t;
+		for (i = 0; i < 10; i++) {
+			if (!weight[i])
+				continue;
+			if (ntime[i] < min)
+				min = ntime[i];
+			if (ntime[i] > max)
+				max = ntime[i];
+		}
+		printf("\t| %g (%g)\n", t, max - min);
+	}
+}
+#include <stdio.h>
+#include <stdlib.h>
+struct task {
+	unsigned int weight, weight_inv;
+	int active;
+	unsigned int time, time_avg;
+	int time_norm, avg_fract;
+} task[10]  = {
+	{ .weight = 10 },
+	{ .weight = 40 },
+	{ .weight = 80 },
+};
+#define MIN_S		100
+#define MAX_S		1000
+#define SLICE(x)	(MAX_S * task[x].weight_inv)
+#define MINSLICE(x)	(MIN_S * task[x].weight_inv)
+#define WEIGTH0		40
+#define WEIGTH0_INV	((1 << 16) / WEIGTH0)
+unsigned int time_avg, time_norm_sum;
+int avg_fract, weight_sum_inv;
+static void normalize_avg(int i)
+{
+	if (!weight_sum_inv)
+		return;
+	/* assume the common case of 0/1 first, then fallback */
+	if (task[i].avg_fract < 0 || task[i].avg_fract >= WEIGTH0_INV * MAX_S) {
+		task[i].time_avg++;
+		task[i].avg_fract -= WEIGTH0_INV * MAX_S;
+		if (task[i].avg_fract < 0 || task[i].avg_fract >= WEIGTH0_INV * MAX_S) {
+			task[i].time_avg += task[i].avg_fract / (WEIGTH0_INV * MAX_S);
+			task[i].avg_fract %= WEIGTH0_INV * MAX_S;
+		}
+	}
+	if (avg_fract < 0 || avg_fract >= weight_sum_inv) {
+		time_avg++;
+		avg_fract -= weight_sum_inv;
+		if (avg_fract < 0 || avg_fract >= weight_sum_inv) {
+			time_avg += avg_fract / weight_sum_inv;
+			avg_fract %= weight_sum_inv;
+		}
+	}
+}
+int main(void)
+{
+	int i, j, l, task_cnt;
+	unsigned int s;
+	unsigned int time_sum, time_sum2;
+	task_cnt = time_avg = 0;
+	for (i = 0; i < 10; i++) {
+		if (!task[i].weight)
+			continue;
+		task[i].active = 1;
+		task_cnt++;
+		task[i].weight_inv = (1 << 16) / task[i].weight;
+	}
+	weight_sum_inv = task_cnt * WEIGTH0_INV * MAX_S;
+	printf("w: %u,%u\n", WEIGTH0_INV * MAX_S, weight_sum_inv);
+	time_norm_sum = avg_fract = 0;
+	l = 0;
+	s = 0;
+	while (1) {
+		j = -1;
+		for (i = 0; i < 10; i++) {
+			if (i == l)
+				continue;
+			if (!task[i].active && task[i].weight) {
+				if (!(rand() % 30)) {
+					normalize_avg(i);
+					task[i].active = 1;
+					if (!task_cnt)
+						goto done;
+#if 1
+					if ((int)(task[i].time_avg - time_avg) < 0) {
+						task[i].time_norm -= (int)(task[i].time_avg - time_avg) * WEIGTH0_INV * MAX_S + task[i].avg_fract;
+						task[i].time_avg = time_avg;
+						task[i].avg_fract = 0;
+					}
+#else
+					unsigned int new_time_avg = time_avg;
+					int new_avg_fract = avg_fract / task_cnt - task[i].weight_inv * MAX_S;
+					while (new_avg_fract < 0) {
+						new_time_avg--;
+						new_avg_fract += WEIGTH0_INV * MAX_S;
+					}
+					if ((int)(task[i].time_avg - new_time_avg) < 0 ||
+					    ((int)(task[i].time_avg - new_time_avg) == 0 &&
+					     task[i].avg_fract < new_avg_fract)) {
+						task[i].time_norm += (int)(new_time_avg - task[i].time_avg) * WEIGTH0_INV * MAX_S +
+							new_avg_fract - task[i].avg_fract;
+						task[i].time_avg = new_time_avg;
+						task[i].avg_fract = new_avg_fract;
+					}
+#endif
+				done:
+					task_cnt++;
+					weight_sum_inv += WEIGTH0_INV * MAX_S;
+					avg_fract += (int)(task[i].time_avg - time_avg) * WEIGTH0_INV * MAX_S + task[i].avg_fract;
+					time_norm_sum += task[i].time_norm;
+				}
+			}
+			if (!task[i].active)
+				continue;
+			if (j < 0 ||
+			    (int)(task[i].time_norm + MINSLICE(i) - (task[j].time_norm + MINSLICE(j))) < 0)
+				j = i;
+		}
+		if (!task[l].active) {
+			if (j < 0)
+				continue;
+			goto do_switch;
+		}
+		if (!(rand() % 100)) {
+			task[l].active = 0;
+			task_cnt--;
+			weight_sum_inv -= WEIGTH0_INV * MAX_S;
+			avg_fract -= (int)(task[l].time_avg - time_avg) * WEIGTH0_INV * MAX_S + task[l].avg_fract;
+			time_norm_sum -= task[l].time_norm;
+			if (j < 0)
+				continue;
+			goto do_switch;
+		}
+		if (j >= 0 &&
+		    ((int)(task[l].time_norm - (task[j].time_norm + SLICE(j))) >= 0 ||
+		     ((int)(task[l].time_norm - task[j].time_norm) >= 0 &&
+		      (int)(task[l].time_norm - (s + SLICE(l))) >= 0))) {
+			int prev_time_avg;
+		do_switch:
+			prev_time_avg = time_avg;
+			normalize_avg(l);
+			if (prev_time_avg < time_avg)
+				printf("-\n");
+			l = j;
+			s = task[l].time_norm;
+		}
+		task[l].time += MIN_S;
+		task[l].time_norm += MINSLICE(l);
+		task[l].avg_fract += MINSLICE(l);
+		time_norm_sum += MINSLICE(l);
+		avg_fract += MINSLICE(l);
+		printf("%u", l);
+		time_sum = time_sum2 = 0;
+		for (i = 0; i < 10; i++) {
+			if (!task[i].active) {
+				if (task[i].weight)
+					printf("\t%3u/%u: -\t", i, task[i].weight);
+				continue;
+			}
+			time_sum += task[i].time_norm;
+			time_sum2 += task[i].time_avg * WEIGTH0_INV * MAX_S + task[i].avg_fract;
+			printf("\t%3u/%u:%5u/%-7g/%-7g", i, task[i].weight, task[i].time,
+				(double)task[i].time_norm / (1 << 16),
+				task[i].time_avg + (double)task[i].avg_fract / (WEIGTH0_INV * MAX_S));
+		}
+		if (time_sum != time_norm_sum)
+			abort();
+		if (time_sum2 != time_avg * weight_sum_inv + avg_fract)
+			abort();
+		if (time_sum != time_sum2)
+			abort();
+		printf("\t| %g/%g\n", (double)time_norm_sum / task_cnt / (1 << 16),
+			time_avg + (double)(int)avg_fract / weight_sum_inv);
+	}
+}

@@ -1,0 +1,853 @@
+Date: 16 Feb 2000 22:46:14 -0800
+From: (david parsons)
+Subject: [PATCH] Enhanced memory detection, ported to 2.0.28
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/2/17/36
+
+I don't use 2.2, but I do use 2.0;  this is the patch-in-progress backported
+to the 2.0.x kernels that I do use.
+                 ____
+   david parsons \bi/ Hasn't dumped core yet, so it must be perfect.
+                  \/
+--- linux-2.0.28-orig/arch/i386/boot/setup.S	Sat Mar 30 10:58:57 1996
++++ linux-2.0.28+logo/arch/i386/boot/setup.S	Wed Feb 16 22:41:29 2000
+@@ -26,11 +26,20 @@
+ !
+ ! Video handling moved to video.S by Martin Mares, March 1996
+ ! <mj@k332.feld.cvut.cz>
++!
++! Extended memory detection scheme retwiddled by orc@pell.chi.il.us (david
++! parsons) to avoid loadlin confusion, July 1997
++!
++! Extended memory detection scheme from 2.3.x (David Parsons, Nathan Zook)
++! backported to catch annoying machines that have mangled memory maps,
++! Feb 2000.
++!
+ 
+ ! NOTE! These had better be the same as in bootsect.s!
+ #define __ASSEMBLY__
+ #include <linux/config.h>
+ #include <asm/segment.h>
++#include <asm/e820.h>
+ #include <linux/version.h>
+ #include <linux/compile.h>
+ 
+@@ -55,7 +64,7 @@
+ 
+ entry start
+ start:
+-	jmp	start_of_setup
++	jmp	trampoline
+ ! ------------------------ start of header --------------------------------
+ !
+ ! SETUP-header, must start at CS:2 (old 0x9020:2)
+@@ -103,6 +112,8 @@
+ ramdisk_size:	.long	0	! its size in bytes
+ bootsect_kludge:
+ 		.word   bootsect_helper,SETUPSEG
++trampoline:	br	start_of_setup
++		.space	1024	! room for the e820 bios list
+ heap_end_ptr:	.word	modelist+1024	! space from here (exclusive) down to
+ 				! end of setup code can be used by setup
+ 				! for local heap purposes.
+@@ -232,6 +243,160 @@
+ loader_ok:
+ ! Get memory size (extended mem, kB)
+ 
++	xor	eax,eax			! prezero
++	mov	[0x1e0], eax		! alt_mem_k
++	mov	[E820NR], al		! e820_nr
++	mov	[E820MAP], ax		! and the e820 error flag
++
++! Try three different memory detection schemes.  First, try
++! e820h, which lets us assemble a memory map, then try e801h,
++! which returns a 32-bit memory size, and finally 88h, which
++! returns 0-64m
++
++#ifdef CONFIG_MEM_E820
++
++! method E820H:
++! the memory map from hell.  e820h returns memory classified into
++! a whole bunch of different types, and allows memory holes and
++! everything.  We scan through this memory map and build a list
++! of the first E820MAX memory areas, which we return at [E820MAP].
++!
++! sanity checking:  There are two levels of sanity checking here,
++! depending on how much you trust the bios.  The permissive level
++! merely drops out of the memory detection loop when carry is set
++! (signifying either no such function or finished) or %ebx == 0
++! (end of memory map). The e820 map is abandoned if %ecx < 20 or
++! %ecx > 255 bytes (we want 20 bytes, but e820 has been taken into
++! the ACPI spec, which is apparently veery vague about whether it
++! will adhere to transferring 20 bytes like the spec says) or
++! %eax != 'SMAP' (the call is supposed to copy %edx over to %eax.)
++!
++! The paranoid level of sanity checking also saves ds over the call,
++! in case this is some malicious bios the eats registers that it's
++! not supposed to, and it abandons the e820 map if es:di change over
++! the course of the call (the memory buffer is passed in via es:di,
++! and should not be randomly shuffled around)
++!
++! In both cases, we stash %ecx at the end of the record (rec+20) so
++! the kernelside can use it in further sanity checks.
++
++meme820:
++	xor	ebx, ebx		! continuation counter
++
++	push	ds			! es:di points at the whitelist
++	pop	es
++	mov	di, #E820MAP
++jmpe820:
++	mov	edx, #0x534d4150	! ascii `SMAP'
++	mov	eax, #0x0000e820	! e820, upper word zeroed
++	mov	ecx, #E820LEN		! 20 bytes is what we want.
++
++#ifdef FLAG_E820_PARANOID
++	push	ds
++	push	di			! stash %di into %dx
++	int	0x15			! make the call
++	pop	dx
++	pop	ds
++#else
++	int	0x15			! make the call
++#endif
++	jc	fin820			! fall to e801 if it fails
++
++! do some sanity checking:
++!
++! check to see if the SMAP moved over to %eax, like
++! G-d himself intended.
++
++	cmp	eax, #0x534d4150	! did the bios move for you?
++	je	chksiz820
++
++	mov	ax, #E820_ERR_SMAP
++abort820:
++	mov	[E820MAP], ax
++	xor	ax, ax
++	mov	[E820NR], al
++	jmp	fin820
++
++chksiz820:
++
++! check that %ecx >= 20 && %ecx < 20 + a fudge factor
++
++	mov	ax, #E820_ERR_SIZE
++	cmp	ecx, #E820LEN
++	jl	abort820
++	cmp	ecx, #255
++	jnl	abort820
++
++
++#if FLAG_E820_PARANOID
++
++! Then check that es:di is still the same.
++
++	mov	ax, #E820_ERR_ES
++	cmp	dx, di			! %di should be constant.
++	jne	abort820
++
++! As should %es
++
++	mov	ax, #E820_ERR_DI
++	mov	ax, es			! how about %es?
++	mov	dx, ds			! it should be == %ds
++	cmp	ax, dx
++	jne	abort820		! or it's the apocolypse
++#endif
++
++! If this is usable memory, we save it by simply advancing %di by
++! sizeof(e820rec).
++
++!	mov	al, [E820NR]		! If the table gets too large
++!	cmp	al, #E820MAX		! we must flee
++!	jl	fin820
++
++	mov	ax, #E820_ERR_WRAP
++	mov	E820LEN(di), cx		! stash recsize
++	mov	edx, dword ptr (di)	! convert start/size to start/end
++	mov	ecx, dword ptr 4(di)
++	add	dword ptr 8(di), edx
++	adc	dword ptr 12(di), ecx
++#if FLAG_E820_WRAP
++	jc	abort820
++#endif
++	inc	byte ptr [E820NR]	! up the # of records
++
++	mov	ax, di			! point %es:%di at the next
++	add	ax, #E820LEN+2		! record
++	mov	di, ax
++again820:
++	cmp	ebx, #0			! check to see if
++	jne	jmpe820			! %ebx is set to EOF
++fin820:
++#endif
++
++
++! method E801H:
++! memory size is in 1k chunksizes, to avoid confusing loadlin.
++! we store the 0xe801 memory size in a completely different place,
++! because it will most likely be longer than 16 bits.
++! (use 1e0 because that's what Larry Augustine uses in his
++! alternative new memory detection scheme, and it's sensible
++! to write everything into the same place.)
++
++meme801:
++
++        mov     ax,#0xe801
++	int     0x15
++	jc	mem88
++
++	and     edx, #0xffff    ! clear sign extend
++	shl     edx, 6          ! and go from 64k to 1k chunks
++	mov     [0x1e0],edx     ! store extended memory size
++
++	and     ecx, #0xffff    ! clear sign extend
++	add     [0x1e0],ecx     ! and add lower memory into total size.
++
++! Ye Olde Traditional Methode.  Returns the memory size (up to 16mb or
++! 64mb, depending on the bios) in ax.
++mem88:
+ 	mov	ah,#0x88
+ 	int	0x15
+ 	mov	[2],ax
+--- linux-2.0.28-orig/arch/i386/kernel/setup.c	Fri Sep 20 07:00:34 1996
++++ linux-2.0.28+logo/arch/i386/kernel/setup.c	Wed Feb 16 20:58:52 2000
+@@ -33,6 +33,8 @@
+ #include <asm/system.h>
+ #include <asm/smp.h>
+ 
++#include <asm/e820.h>
++
+ /*
+  * Tell us the machine setup..
+  */
+@@ -77,11 +79,23 @@
+ 
+ extern char empty_zero_page[PAGE_SIZE];
+ 
++struct physical_memory physical_memory;
++
+ /*
+  * This is set up by the setup-routine at boot-time
+  */
+ #define PARAM	empty_zero_page
+ #define EXT_MEM_K (*(unsigned short *) (PARAM+2))
++#define ALT_MEM_K (*(unsigned long *) (PARAM+0x1e0))
++#define E820_MAP_NR (* (char*) (PARAM+E820NR))
++#define E820_MAP    (  (unsigned long *) (PARAM+E820MAP))
++#define E820_ERR    (* (unsigned short*) (PARAM+E820MAP))
++
++#define Region	physical_memory.region
++#define Bios	physical_memory.bios
++
++#define APM_BIOS_INFO (*(struct apm_bios_info *) (PARAM+0x40))
++
+ #ifdef CONFIG_APM
+ #define APM_BIOS_INFO (*(struct apm_bios_info *) (PARAM+64))
+ #endif
+@@ -95,6 +109,8 @@
+ #define KERNEL_START (*(unsigned long *) (PARAM+0x214))
+ #define INITRD_START (*(unsigned long *) (PARAM+0x218))
+ #define INITRD_SIZE (*(unsigned long *) (PARAM+0x21c))
++#define MEMORY_LIST (*(unsigned char*) (PARAM+0x220))
++ 
+ #define COMMAND_LINE ((char *) (PARAM+2048))
+ #define COMMAND_LINE_SIZE 256
+ 
+@@ -105,12 +121,349 @@
+ static char command_line[COMMAND_LINE_SIZE] = { 0, };
+        char saved_command_line[COMMAND_LINE_SIZE];
+ 
++
++unsigned long memparse(char *ptr, char **retptr)
++{
++	unsigned long ret;
++
++	ret = simple_strtoul(ptr, retptr, 0);
++
++	if (**retptr == 'K' || **retptr == 'k') {
++		ret <<= 10;
++		(*retptr)++;
++	}
++	else if (**retptr == 'M' || **retptr == 'm') {
++		ret <<= 20;
++		(*retptr)++;
++	}
++	else if (**retptr == 'G' || **retptr == 'g') {
++		ret <<= 30;
++		(*retptr)++;
++	}
++	return ret;
++} /* memparse */
++
++
++enum region_flags { RF_RECLAIM =0x01,
++                    RF_NOT_RAM =0x02,
++		    RF_OVERFLOW=0x04,
++		    RF_ZERO    =0x08,
++		    RF_MERGED  =0x10,
++		    RF_ADDED   =0x20 } ;
++
++enum region_flags add_memory_region(__u64 start, __u64 end, __u32 type)
++{
++    int i, x;
++    enum region_flags flag = 0;
++
++#if FLAG_E820_RECLAIM
++    if ( (physical_memory.p_flags & CHK_PMEM_RECLAIM) && (type == E820_ACPI) )
++	flag |= RF_RECLAIM;
++    else if (type != E820_RAM)
++	return RF_NOT_RAM;
++#else
++    if (type != E820_RAM)
++	return RF_NOT_RAM;
++#endif
++
++    if (start == end)
++	return flag|RF_ZERO;
++
++#ifdef CONFIG_E820_MERGE
++    /* see if we can merge this region with an existing one */
++
++    for (x=0; x < physical_memory.nr_region; x++)
++	if (end == Region[x].start) {
++	    /* glue memory region onto the start of this one */
++	    Region[x].start = start;
++	    break;
++	}
++	else if (Region[x].end == start) {
++	    /* glue memory region onto the end of this one */
++	    Region[x].end = end;
++	    break;
++	}
++    if (x < physical_memory.nr_region) {
++	/* If we've merged a region, check to see if the new region
++	 * want to merge with anyone else.
++	 */
++	if (x > 0 && Region[x].start == Region[x-1].end) {
++	    Region[x-1].end = Region[x].end;
++	    for (i=x; i < physical_memory.nr_region; i++)
++		Region[x] = Region[x+1];
++	    physical_memory.nr_region--;
++	    x--;
++	}
++	if (x < physical_memory.nr_region-1 && Region[x].end == Region[x+1].start) {
++	    Region[x].end = Region[x+1].end;
++	    for (i=x+1; i < physical_memory.nr_region-1; i++)
++		Region[x] = Region[x+1];
++	    physical_memory.nr_region--;
++	}
++	else
++	    return flag|RF_MERGED;
++    }
++#endif
++
++    if (physical_memory.nr_region == E820MAX)
++	return flag|RF_OVERFLOW;
++
++    /* insert the new region in order */
++    for (x=0; x < physical_memory.nr_region; x++)
++	if (end < Region[x].start) {
++	    /* add it in here */
++	    for (i=physical_memory.nr_region; i>x; --i)
++		Region[i] = Region[i-1];
++	    Region[x].start = start;
++	    Region[x].end   = end;
++	    physical_memory.nr_region++;
++	    return flag|RF_ADDED;
++	}
++    Region[physical_memory.nr_region].start = start;
++    Region[physical_memory.nr_region].end   = end;
++    physical_memory.nr_region++;
++    return flag|RF_ADDED;
++} /* add_memory_region */
++
++
++#define GIGABYTE(x)	((x) * 1024LL * 1024LL * 1024LL)
++#if FLAG_E820_DEBUG
++#  define E820DBG(x)	printk x
++#else
++#  define E820DBG(x)	
++#endif
++
++/*
++ * Do NOT EVER look at the BIOS memory size location.
++ * It does not work on many machines.
++ */
++#define LOWMEMSIZE()	(639 * 1024)
++
++
++#if FLAG_E820_DEBUG
++void
++report(enum region_flags code)
++{
++    if (code & RF_RECLAIM)
++	printk(" reclaimed");
++    if (code & RF_ADDED)
++	printk(" added");
++    if (code & RF_MERGED)
++	printk(" merged");
++    if (code & RF_OVERFLOW)
++	printk(" overflow");
++    if (code & RF_NOT_RAM)
++	printk(" rom");
++    if (code & RF_ZERO)
++	printk(" zero-length");
++}
++#endif
++
++
++/*
++ * region_check() validates the physical_memory map, plus lops out memory
++ * that lives in suspicious places.
++ */
++int
++region_check(void)
++{
++    unsigned int x, i;
++
++    for (x=0; x < physical_memory.nr_region; x++) {
++	if (x < physical_memory.nr_region-1
++		&& Region[x].end >= Region[x+1].start) {
++	    printk("SMAP: region %d (%010Lx - %010Lx) overlaps region %d (%010Lx - %010Lx) -- map dropped\n",
++		    x, Region[x].start,
++		       Region[x].end,
++		    x+1, Region[x+1].start,
++			 Region[x+1].end);
++	    return 1;
++	}
++#if FLAG_E820_GULLIBLE
++	if (physical_memory.p_flag & CHK_PMEM_GULLIBLE)
++	    continue;
++#endif
++	if (Region[x].start >= GIGABYTE(4)) {
++	    E820DBG(("SMAP: region %010Lx - %010Lx dropped\n",
++			Region[x].start, Region[x].end));
++	    for (i=x; i < physical_memory.nr_region; i++)
++		Region[i] = Region[i+1];
++	    x--;
++	    physical_memory.nr_region--;
++	    continue;
++	}
++
++	if (Region[x].end > GIGABYTE(4)) {
++	    E820DBG(("SMAP: region %010Lx - %010Lx truncated to %010Lx - %010Lx\n",
++		    Region[x].start, Region[x].end, Region[x].start,
++		    GIGABYTE(4)));
++	    Region[x].end = GIGABYTE(4);
++	}
++
++	if (Region[x].start >= HIGH_MEMORY || Region[x].end <= LOWMEMSIZE())
++	    continue;
++
++	if (Region[x].start >= LOWMEMSIZE()) {
++	    if (Region[x].end < HIGH_MEMORY) {
++		E820DBG(("%010Lx - %010Lx dropped\n",
++			Region[x].start, Region[x].end));
++		for (i=x; i < physical_memory.nr_region; i++)
++		    Region[i] = Region[i+1];
++		x--;
++		physical_memory.nr_region--;
++	    }
++	    else {
++		E820DBG(("SMAP: %010Lx - %010Lx trimmed to %010lx - %010Lx\n",
++			Region[x].start, Region[x].end,
++			(unsigned long)HIGH_MEMORY, Region[x].end));
++		Region[x].start = HIGH_MEMORY;
++	    }
++	}
++	else if (Region[x].end < HIGH_MEMORY) {
++	    E820DBG(("%010Lx - %010Lx trimmed to %010Lx - %010lx\n",
++		    Region[x].start, Region[x].end,
++		    Region[x].start, (unsigned long)LOWMEMSIZE()));
++	    Region[x].end = LOWMEMSIZE();
++	}
++	else {
++	    E820DBG(("%010Lx - %010Lx split to %010Lx - 640k, 1m - %010Lx\n",
++		    Region[x].start, Region[x].end,
++		    Region[x].start, Region[x].end));
++	    for (i=physical_memory.nr_region; i > x; --i)
++		Region[i+1] = Region[i];
++
++	    Region[x+1].start = HIGH_MEMORY;
++	    Region[x+1].end = Region[x].end;
++	    Region[x].end = LOWMEMSIZE();
++	    x++;
++	    physical_memory.nr_region++;
++	}
++    }
++    return 0;
++} /* region_check */
++
++
++void setup_memory_region(void)
++{
++    int i;
++    enum region_flags ret;
++    unsigned long mem_size;
++
++    physical_memory.nr_region = 0;
++    physical_memory.p_flags = 0;
++
++#if FLAG_E820_DEBUG
++    if (E820_MAP_NR == 0) {	/* spit out possible e820 error codes */
++	char *reason = 0;
++
++	switch (E820_ERR) {
++	case E820_ERR_SMAP:	reason = "SMAP didn't move";		break;
++	case E820_ERR_SIZE:	reason = "returned size is bogus";	break;
++	case E820_ERR_ES:	reason = "es changed";			break;
++	case E820_ERR_DI:	reason = "di changed";			break;
++	case E820_ERR_WRAP:	reason = "start+size > 64 bits";	break;
++	}
++
++	if (reason)
++	    printk("SMAP: map dropped, because %s\n", reason);
++	else if (E820_ERR)
++	    printk("SMAP: map dropped, reason %d\n", E820_ERR);
++    }
++#endif
++
++    /*
++     * If we're lucky and live on a modern system, the setup code
++     * will have given us a memory map that we can use to properly
++     * set up memory.  If we aren't, we'll fake a memory map.
++     *
++     * We check to see that the memory map contains at least 2 elements
++     * before we'll use it, because the detection code in setup.S may
++     * not be perfect and most every PC known to man has two memory
++     * regions: one from 0 to 640k, and one from 1mb up.
++     */
++    if ( (E820_MAP_NR > 1) && (E820_MAP_NR < E820MAX) ) {
++	/* got a memory map; copy it into a safe place.
++	 */
++	physical_memory.p_flags = (FLAG_E820_LENGTH ? CHK_PMEM_LENGTH : 0)
++				| (FLAG_E820_GULLIBLE ? CHK_PMEM_GULLIBLE : 0)
++				| (FLAG_E820_RECLAIM ? CHK_PMEM_RECLAIM : 0) ;
++	physical_memory.nr_bios = E820_MAP_NR;
++	memcpy(&(Bios), E820_MAP,
++		E820_MAP_NR * sizeof Bios[0]);
++	for (i=0; i < E820_MAP_NR; i++) {
++	    ret = add_memory_region(Bios[i].addr,
++				    Bios[i].size,
++				    Bios[i].type);
++#if FLAG_E820_DEBUG
++	    printk("SMAP: %010Lx - %010Lx ",
++		    Bios[i].addr,
++		    Bios[i].size);
++
++	    switch (Bios[i].type) {
++	    case E820_RAM:	printk("(usable)");
++				break;
++	    case E820_RESERVED:
++				printk("(reserved)");
++				break;
++	    case E820_ACPI:
++				printk("(ACPI data)");
++				break;
++	    case E820_NVS:
++				printk("(ACPI NVS)");
++				break;
++	    default:
++				printk("(type %lu)",
++				    (unsigned long)Bios[i].type);
++				break;
++	    }
++#if FLAG_E820_LENGTH
++	    if ( (physical_memory.p_flags & CHK_PMEM_LENGTH) &&
++		 (Bios[i].len != E820LEN) )
++		printk(" [record is %d bytes long]",
++			    Bios[i].len);
++
++#endif
++	    report(ret);
++	    printk("\n");
++#endif
++	    if (ret & RF_OVERFLOW) {
++		printk("SMAP: table overflow -- reverting to old-style memory detection\n");
++		goto oldstyle;
++	    }
++	}
++	/* after putting in the e820 map, massage it into shape
++	 * for use by the kernel.  If region_check returns anything
++	 * except 0, something is very ill in the state of the
++	 * bios map.
++	 */
++	if (region_check() == 0)
++	    return /* the map is fine, so we'll use it */;
++    }
++
++oldstyle:
++    /* otherwise fake a memory map; one section from 0k->640k,
++     * the next section from 1mb->appropriate_mem_k
++     */
++
++    physical_memory.nr_region = 0;
++    physical_memory.p_flags = 0;
++
++    mem_size = (ALT_MEM_K < EXT_MEM_K) ? EXT_MEM_K : ALT_MEM_K;
++
++    add_memory_region(0, LOWMEMSIZE(), E820_RAM);
++    add_memory_region(HIGH_MEMORY,
++		      HIGH_MEMORY + (mem_size << 10), E820_RAM);
++} /* setup_memory_region */
++
++
+ void setup_arch(char **cmdline_p,
+ 	unsigned long * memory_start_p, unsigned long * memory_end_p)
+ {
+ 	unsigned long memory_start, memory_end;
++	unsigned long memory_e801_end = 0;
+ 	char c = ' ', *to = command_line, *from = COMMAND_LINE;
+ 	int len = 0;
++	int i;
+ 	static unsigned char smptrap=0;
+ 
+ 	if(smptrap==1)
+@@ -126,8 +479,22 @@
+ 	apm_bios_info = APM_BIOS_INFO;
+ #endif
+ 	aux_device_present = AUX_DEVICE_INFO;
+-	memory_end = (1<<20) + (EXT_MEM_K<<10);
++
++	setup_memory_region();
++
++	/*
++  	 * Find the highest chunk of memory we have available
++  	 */
++	memory_end = 0;
++ 	for (i = 0; i < physical_memory.nr_region; i++) {
++  		unsigned long start, end;
++		start = PFN_UP(Region[i].start);
++ 		end = PFN_DOWN(Region[i].end);
++  		if ( (start < end) && (Region[i].end > memory_end) )
++			memory_end = Region[i].end;
++  	}
+ 	memory_end &= PAGE_MASK;
++
+ #ifdef CONFIG_BLK_DEV_RAM
+ 	rd_image_start = RAMDISK_FLAGS & RAMDISK_IMAGE_START_MASK;
+ 	rd_prompt = ((RAMDISK_FLAGS & RAMDISK_PROMPT_FLAG) != 0);
+@@ -161,14 +528,12 @@
+ 				from += 9+4;
+ 				x86_capability &= ~8;
+ 			} else {
+-				memory_end = simple_strtoul(from+4, &from, 0);
+-				if ( *from == 'K' || *from == 'k' ) {
+-					memory_end = memory_end << 10;
+-					from++;
+-				} else if ( *from == 'M' || *from == 'm' ) {
+-					memory_end = memory_end << 20;
+-					from++;
+-				}
++				physical_memory.nr_region = 0;
++				memory_end = memparse(from+4, &from);
++				add_memory_region(0, LOWMEMSIZE(), E820_RAM);
++				add_memory_region(HIGH_MEMORY,
++					          memory_end-HIGH_MEMORY,
++					          E820_RAM);
+ 			}
+ 		}
+ 		c = *(from++);
+@@ -180,6 +545,7 @@
+ 	}
+ 	*to = '\0';
+ 	*cmdline_p = command_line;
++
+ 	*memory_start_p = memory_start;
+ 	*memory_end_p = memory_end;
+ 
+--- linux-2.0.28-orig/arch/i386/mm/init.c	Thu Nov 14 05:20:09 1996
++++ linux-2.0.28+logo/arch/i386/mm/init.c	Wed Feb 16 20:21:10 2000
+@@ -25,6 +25,7 @@
+ #include <asm/segment.h>
+ #include <asm/pgtable.h>
+ #include <asm/dma.h>
++#include <asm/e820.h>
+ 
+ #if 0
+ /*
+@@ -206,22 +207,18 @@
+ 
+ void mem_init(unsigned long start_mem, unsigned long end_mem)
+ {
+-	unsigned long start_low_mem = PAGE_SIZE;
++	unsigned long start_low_mem = PAGE_ALIGN(PAGE_SIZE);
+ 	int codepages = 0;
+ 	int reservedpages = 0;
+ 	int datapages = 0;
+ 	unsigned long tmp;
+ 	extern int _etext;
++	int i;
+ 
+ 	end_mem &= PAGE_MASK;
+ 	high_memory = end_mem;
+ 
+-	/* clear the zero-page */
+-	memset(empty_zero_page, 0, PAGE_SIZE);
+-
+ 	/* mark usable pages in the mem_map[] */
+-	start_low_mem = PAGE_ALIGN(start_low_mem);
+-
+ #ifdef __SMP__
+ 	/*
+ 	 * But first pinch a few for the stack/trampoline stuff
+@@ -229,27 +226,34 @@
+ 	start_low_mem += PAGE_SIZE;				/* 32bit startup code */
+ 	start_low_mem = smp_alloc_memory(start_low_mem); 	/* AP processor stacks */
+ #endif
+-	start_mem = PAGE_ALIGN(start_mem);
+ 
+-	/*
+-	 * IBM messed up *AGAIN* in their thinkpad: 0xA0000 -> 0x9F000.
+-	 * They seem to have done something stupid with the floppy
+-	 * controller as well..
+-	 */
+-	while (start_low_mem < 0x9f000) {
+-		clear_bit(PG_reserved, &mem_map[MAP_NR(start_low_mem)].flags);
+-		start_low_mem += PAGE_SIZE;
+-	}
++	start_mem = PFN_UP(start_mem);
++	start_low_mem = PFN_UP(start_low_mem);
+ 
+-	while (start_mem < high_memory) {
+-		clear_bit(PG_reserved, &mem_map[MAP_NR(start_mem)].flags);
+-		start_mem += PAGE_SIZE;
++	for (i = 0; i < physical_memory.nr_region; i++) {
++	    unsigned long start, end;
++
++	    start = PFN_UP(physical_memory.region[i].start);
++	    end   = PFN_DOWN(physical_memory.region[i].end);
++
++	    if (start < start_low_mem)
++		start = start_low_mem;
++	    else if ( start >= PFN_UP(HIGH_MEMORY) && start < start_mem)
++		start = start_mem;
++
++	    for (; start < end; ++start)
++		clear_bit(PG_reserved, &mem_map[start].flags);
+ 	}
++
++	/* clear the zero-page */
++	memset(empty_zero_page, 0, PAGE_SIZE);
++
++
+ 	for (tmp = 0 ; tmp < high_memory ; tmp += PAGE_SIZE) {
+ 		if (tmp >= MAX_DMA_ADDRESS)
+ 			clear_bit(PG_DMA, &mem_map[MAP_NR(tmp)].flags);
+ 		if (PageReserved(mem_map+MAP_NR(tmp))) {
+-			if (tmp >= 0xA0000 && tmp < 0x100000)
++			if ((tmp >= 0xA0000 && tmp < 0x100000))
+ 				reservedpages++;
+ 			else if (tmp < (unsigned long) &_etext)
+ 				codepages++;
+@@ -259,8 +263,7 @@
+ 		}
+ 		mem_map[MAP_NR(tmp)].count = 1;
+ #ifdef CONFIG_BLK_DEV_INITRD
+-		if (!initrd_start || (tmp < initrd_start || tmp >=
+-		    initrd_end))
++		if (!initrd_start || (tmp < initrd_start || tmp >= initrd_end))
+ #endif
+ 			free_page(tmp);
+ 	}
+--- linux-2.0.28-orig/arch/i386/defconfig	Tue Oct 29 17:42:40 1996
++++ linux-2.0.28+logo/arch/i386/defconfig	Tue Feb 15 15:57:56 2000
+@@ -3,6 +3,11 @@
+ #
+ 
+ #
++# Gadgets
++#
++CONFIG_VIDEO_LOGO=y
++
++#
+ # Code maturity level options
+ #
+ # CONFIG_EXPERIMENTAL is not set
+@@ -25,10 +30,15 @@
+ CONFIG_BINFMT_AOUT=y
+ CONFIG_BINFMT_ELF=y
+ CONFIG_KERNEL_ELF=y
+-# CONFIG_M386 is not set
++CONFIG_M386=y
+ # CONFIG_M486 is not set
+-CONFIG_M586=y
++# CONFIG_M586 is not set
+ # CONFIG_M686 is not set
++CONFIG_MEM_E820=y
++CONFIG_E820_PARANOID=y
++CONFIG_E820_MERGE=y
++# CONFIG_E820_RECLAIM is not set
++CONFIG_MEM_E801=y
+ 
+ #
+ # Floppy, IDE, and other block devices
+--- linux-2.0.28-orig/arch/i386/config.in	Sun May 12 21:17:23 1996
++++ linux-2.0.28+logo/arch/i386/config.in	Wed Feb 16 21:05:30 2000
+@@ -5,6 +5,11 @@
+ mainmenu_name "Linux Kernel Configuration"
+ 
+ mainmenu_option next_comment
++comment 'Gadgets'
++bool 'Display boot logo' CONFIG_VIDEO_LOGO
++endmenu
++
++mainmenu_option next_comment
+ comment 'Code maturity level options'
+ bool 'Prompt for development and/or incomplete code/drivers' CONFIG_EXPERIMENTAL
+ endmenu
+@@ -43,6 +48,18 @@
+ 	 486		CONFIG_M486	\
+ 	 Pentium	CONFIG_M586	\
+ 	 PPro		CONFIG_M686" Pentium
++
++mainmenu_option next_comment
++comment 'Memory detection'
++bool 'Use bios call e820 to detect memory' CONFIG_MEM_E820
++if [ "$CONFIG_MEM_E820" = "y" ]; then
++    bool '  Be extra cautious when using e820' CONFIG_E820_PARANOID
++    bool '  Merge adjacent memory regions' CONFIG_E820_MERGE
++    bool '  Reclaim ACPI table memory (DANGEROUS)' CONFIG_E820_RECLAIM
++fi
++bool 'Use bios call E801 to detect memory' CONFIG_MEM_E801
++endmenu
++
+ endmenu
+ 
+ source drivers/block/Config.in
+--- linux-2.0.28-orig/lib/vsprintf.c	Tue Aug  1 00:02:48 1995
++++ linux-2.0.28+logo/lib/vsprintf.c	Wed Feb 16 18:06:52 2000
+@@ -241,7 +241,10 @@
+ 
+ 
+ 		case 'n':
+-			if (qualifier == 'l') {
++			if (qualifier == 'L') {
++				long long * ip = va_arg(args, long long *);
++				*ip = (str - buf);
++			} else if (qualifier == 'l') {
+ 				long * ip = va_arg(args, long *);
+ 				*ip = (str - buf);
+ 			} else {
+@@ -276,7 +279,10 @@
+ 				--fmt;
+ 			continue;
+ 		}
+-		if (qualifier == 'l')
++		if (qualifier == 'L') {
++			long long tmp = va_arg(args, unsigned long long);
++			num = (long) tmp;
++		} else if (qualifier == 'l')
+ 			num = va_arg(args, unsigned long);
+ 		else if (qualifier == 'h')
+ 			if (flags & SIGN)
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

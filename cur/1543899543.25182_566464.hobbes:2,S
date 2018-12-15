@@ -1,0 +1,141 @@
+Date: Mon, 09 Jul 2007 16:46:39 +1000
+From: Benjamin Herrenschmidt <>
+Subject: [RFC/PATCH] Use mmu_gather for /proc stuff instead of flush_tlb_mm()
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2007/7/9/32
+
+Use mmu_gather for fs/proc/task_mmu.c
+This removes the use of flush_tlb_mm() from that proc file, using
+an mmu_gather instead.
+No signed-off yet, not to be merged at this point.
+Index: linux-work/fs/proc/task_mmu.c
+===================================================================
+--- linux-work.orig/fs/proc/task_mmu.c	2007-07-09 16:27:09.000000000 +1000
++++ linux-work/fs/proc/task_mmu.c	2007-07-09 16:27:47.000000000 +1000
+@@ -9,7 +9,7 @@
+ 
+ #include <asm/elf.h>
+ #include <asm/uaccess.h>
+-#include <asm/tlbflush.h>
++#include <asm/tlb.h>
+ #include "internal.h"
+ 
+ char *task_mem(struct mm_struct *mm, char *buffer)
+@@ -124,11 +124,13 @@ struct mem_size_stats
+ 	unsigned long referenced;
+ };
+ 
++typedef void (*pmd_action_t)(struct mmu_gather *tlb, struct vm_area_struct *,
++			     pmd_t *, unsigned long, unsigned long, void *);
+ struct pmd_walker {
++	struct mmu_gather *tlb;
+ 	struct vm_area_struct *vma;
+ 	void *private;
+-	void (*action)(struct vm_area_struct *, pmd_t *, unsigned long,
+-		       unsigned long, void *);
++	pmd_action_t action;
+ };
+ 
+ static int show_map_internal(struct seq_file *m, void *v, struct mem_size_stats *mss)
+@@ -218,7 +220,8 @@ static int show_map(struct seq_file *m, 
+ 	return show_map_internal(m, v, NULL);
+ }
+ 
+-static void smaps_pte_range(struct vm_area_struct *vma, pmd_t *pmd,
++static void smaps_pte_range(struct mmu_gather *tlb,
++			    struct vm_area_struct *vma, pmd_t *pmd,
+ 			    unsigned long addr, unsigned long end,
+ 			    void *private)
+ {
+@@ -258,7 +261,8 @@ static void smaps_pte_range(struct vm_ar
+ 	cond_resched();
+ }
+ 
+-static void clear_refs_pte_range(struct vm_area_struct *vma, pmd_t *pmd,
++static void clear_refs_pte_range(struct mmu_gather *tlb,
++				 struct vm_area_struct *vma, pmd_t *pmd,
+ 				 unsigned long addr, unsigned long end,
+ 				 void *private)
+ {
+@@ -279,6 +283,8 @@ static void clear_refs_pte_range(struct 
+ 		/* Clear accessed and referenced bits. */
+ 		ptep_test_and_clear_young(vma, addr, pte);
+ 		ClearPageReferenced(page);
++		if (tlb)
++			tlb_remove_tlb_entry(tlb, pte, addr);
+ 	}
+ 	pte_unmap_unlock(pte - 1, ptl);
+ 	cond_resched();
+@@ -295,7 +301,8 @@ static inline void walk_pmd_range(struct
+ 		next = pmd_addr_end(addr, end);
+ 		if (pmd_none_or_clear_bad(pmd))
+ 			continue;
+-		walker->action(walker->vma, pmd, addr, next, walker->private);
++		walker->action(walker->tlb, walker->vma, pmd, addr, next,
++			       walker->private);
+ 	}
+ }
+ 
+@@ -323,11 +330,9 @@ static inline void walk_pud_range(struct
+  * Recursively walk the page table for the memory area in a VMA, calling
+  * a callback for every bottom-level (PTE) page table.
+  */
+-static inline void walk_page_range(struct vm_area_struct *vma,
+-				   void (*action)(struct vm_area_struct *,
+-						  pmd_t *, unsigned long,
+-						  unsigned long, void *),
+-				   void *private)
++static inline void walk_page_range(struct mmu_gather *tlb,
++				   struct vm_area_struct *vma,
++				   pmd_action_t	action, void *private)
+ {
+ 	unsigned long addr = vma->vm_start;
+ 	unsigned long end = vma->vm_end;
+@@ -335,6 +340,7 @@ static inline void walk_page_range(struc
+ 		.vma		= vma,
+ 		.private	= private,
+ 		.action		= action,
++		.tlb		= tlb,
+ 	};
+ 	pgd_t *pgd;
+ 	unsigned long next;
+@@ -355,19 +361,25 @@ static int show_smap(struct seq_file *m,
+ 
+ 	memset(&mss, 0, sizeof mss);
+ 	if (vma->vm_mm && !is_vm_hugetlb_page(vma))
+-		walk_page_range(vma, smaps_pte_range, &mss);
++		walk_page_range(NULL, vma, smaps_pte_range, &mss);
+ 	return show_map_internal(m, v, &mss);
+ }
+ 
+ void clear_refs_smap(struct mm_struct *mm)
+ {
+ 	struct vm_area_struct *vma;
++	struct mmu_gather *tlb;
++	unsigned long end_addr = 0;
+ 
+ 	down_read(&mm->mmap_sem);
++	tlb = tlb_gather_mmu(mm, 0);
+ 	for (vma = mm->mmap; vma; vma = vma->vm_next)
+-		if (vma->vm_mm && !is_vm_hugetlb_page(vma))
+-			walk_page_range(vma, clear_refs_pte_range, NULL);
+-	flush_tlb_mm(mm);
++		if (vma->vm_mm && !is_vm_hugetlb_page(vma)) {
++			end_addr = max(vma->vm_end, end_addr);
++			walk_page_range(tlb, vma, clear_refs_pte_range, NULL);
++		}
++	if (tlb)
++		tlb_finish_mmu(tlb, 0, end_addr);
+ 	up_read(&mm->mmap_sem);
+ }
+ 
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+More majordomo info at  
+http://vger.kernel.org/majordomo-info.html
+Please read the FAQ at  
+http://www.tux.org/lkml/

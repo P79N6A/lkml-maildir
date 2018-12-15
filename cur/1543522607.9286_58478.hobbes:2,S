@@ -1,0 +1,232 @@
+Date: Tue, 18 Jan 2000 17:11:27 -0600
+From: Bill Wendling <>
+Subject: Re: [Patch] Polling on more than 16000 file descriptors
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/1/19/67
+
+Also sprach Jamie Lokier:
+} Bill Wendling wrote:
+} > Also sprach Jamie Lokier:
+} > } Does it need to do direct lookups by index?  I am under the impression
+} > } that the code simply iterates over the poll structures, perhaps with
+} > } back pointers, but I haven't actually read it :-)
+} > } 
+} > It just loops through the poll structures in one direction...
+} 
+} Therefore a linked list of pages would be fine...
+} 
+Attached is the start of a linked-list implementation...It needs to be
+modified and it didn't work correctly for me. Feel free to play with
+it...
+-- 
+|| Bill Wendling			wendling@ganymede.isdn.uiuc.edu
+--- linux-2.3.39-pre2.old/fs/select.c	Tue Aug 31 13:30:48 1999
++++ linux-test/fs/select.c	Mon Jan 10 02:07:42 2000
+@@ -328,54 +328,74 @@
+ 	return ret;
+ }
+ 
+-static int do_poll(unsigned int nfds, struct pollfd *fds, poll_table *wait,
+-		   long timeout)
++/* a structure for a linked list of `struct pollfd' objects */
++struct pollfd_list {
++	unsigned int nr;
++	struct pollfd_list *next;
++	struct pollfd *fds;
++};
++
++/* maximum number of `struct pollfd' objects we can fit on a page of memory */
++#define __MAX_POLL_FD_ENTRIES	((PAGE_SIZE - sizeof(struct pollfd_list)) / sizeof(struct pollfd))
++
++static int do_poll(struct pollfd_list *fdl, poll_table *wait, long timeout)
+ {
+ 	int count = 0;
+ 
+ 	for (;;) {
+-		unsigned int j;
+-		struct pollfd * fdpnt;
+-
+ 		set_current_state(TASK_INTERRUPTIBLE);
+-		for (fdpnt = fds, j = 0; j < nfds; j++, fdpnt++) {
+-			int fd;
+-			unsigned int mask;
+-
+-			mask = 0;
+-			fd = fdpnt->fd;
+-			if (fd >= 0) {
+-				struct file * file = fget(fd);
+-				mask = POLLNVAL;
+-				if (file != NULL) {
+-					mask = DEFAULT_POLLMASK;
+-					if (file->f_op && file->f_op->poll)
+-						mask = file->f_op->poll(file, wait);
+-					mask &= fdpnt->events | POLLERR | POLLHUP;
+-					fput(file);
+-				}
+-				if (mask) {
+-					wait = NULL;
+-					count++;
++
++		for (; fdl; fdl = fdl->next) {
++			struct pollfd *fdpnt;
++			unsigned int j;
++
++			for (fdpnt = fdl->fds, j = 0; j < fdl->nr; j++, fdpnt++) {
++				int fd = fdpnt->fd;
++				unsigned int mask = 0;
++
++				if (fd >= 0) {
++					struct file * file = fget(fd);
++					mask = POLLNVAL;
++
++					if (file != NULL) {
++						mask = DEFAULT_POLLMASK;
++
++						if (file->f_op && file->f_op->poll)
++							mask = file->f_op->poll(file, wait);
++
++						mask &= fdpnt->events | POLLERR | POLLHUP;
++						fput(file);
++					}
++
++					if (mask) {
++						wait = NULL;
++						count++;
++					}
+ 				}
++
++				fdpnt->revents = mask;
+ 			}
+-			fdpnt->revents = mask;
+ 		}
+ 
+ 		wait = NULL;
++
+ 		if (count || !timeout || signal_pending(current))
+ 			break;
++
+ 		timeout = schedule_timeout(timeout);
+ 	}
++
+ 	current->state = TASK_RUNNING;
+ 	return count;
+ }
+ 
+ asmlinkage long sys_poll(struct pollfd * ufds, unsigned int nfds, long timeout)
+ {
+-	int i, fdcount, err, size;
+-	struct pollfd * fds, *fds1;
+-	poll_table *wait_table = NULL, *wait = NULL;
++	int fdcount, err, npages, res, offset;
++	struct pollfd_list *fd_list = NULL;
++	struct pollfd_list *tmp;
++	struct pollfd_list **fd_next = &fd_list;
++	poll_table *wait = NULL;
+ 
+ 	lock_kernel();
+ 	/* Do a sanity check on nfds ... */
+@@ -384,7 +404,7 @@
+ 		goto out;
+ 
+ 	if (timeout) {
+-		/* Carefula about overflow in the intermediate values */
++		/* Careful about overflow in the intermediate values */
+ 		if ((unsigned long) timeout < MAX_SCHEDULE_TIMEOUT / HZ)
+ 			timeout = (unsigned long)(timeout*HZ+999)/1000+1;
+ 		else /* Negative or overflow */
+@@ -393,41 +413,72 @@
+ 
+ 	err = -ENOMEM;
+ 	if (timeout) {
+-		wait_table = (poll_table *) __get_free_page(GFP_KERNEL);
+-		if (!wait_table)
++		wait = (poll_table *) __get_free_page(GFP_KERNEL);
++		if (!wait)
+ 			goto out;
+-		wait_table->nr = 0;
+-		wait_table->entry = (struct poll_table_entry *)(wait_table + 1);
+-		wait_table->next = NULL;
+-		wait = wait_table;
++		wait->nr = 0;
++		wait->entry = (struct poll_table_entry *)(wait + 1);
++		wait->next = NULL;
+ 	}
+ 
+-	size = nfds * sizeof(struct pollfd);
+-	fds = (struct pollfd *) kmalloc(size, GFP_KERNEL);
+-	if (!fds)
+-		goto out;
++	/* calculate how many pages we need to hold all of the POLL stuff */
++	npages = ((nfds - 1) / __MAX_POLL_FD_ENTRIES) + 1;
++
++	/* calculate the reside once all "full" pages are filled */
++	res = nfds % __MAX_POLL_FD_ENTRIES;
+ 
+-	err = -EFAULT;
+-	if (copy_from_user(fds, ufds, size))
+-		goto out_fds;
++	/* allocate pages to the linked list of `struct pollfd' objects */
++	for (offset = 0, tmp = fd_list; npages > 0; npages--) {
++		err = -ENOMEM;
++		tmp = (struct pollfd_list *)__get_free_page(GFP_KERNEL);
++		if (!tmp) {
++			(*fd_next)->next = NULL;
++			goto out_fds;
++		}
++
++		tmp->nr = (npages == 1 ? res : __MAX_POLL_FD_ENTRIES);
++		tmp->fds = (struct pollfd *)(tmp + 1);
++		tmp->next = NULL;
++		err = -EFAULT;
++
++		if (copy_from_user(tmp->fds, &ufds[offset], tmp->nr * sizeof(struct pollfd)))
++			goto out_fds;
++
++		offset += tmp->nr;
++
++		*fd_next = tmp;
++		fd_next = &tmp->next;
++	}
+ 
+-	fdcount = do_poll(nfds, fds, wait, timeout);
++	tmp->next = NULL;
++	fdcount = do_poll(fd_list, wait, timeout);
+ 
+ 	/* OK, now copy the revents fields back to user space. */
+-	fds1 = fds;
+-	for(i=0; i < (int)nfds; i++, ufds++, fds1++) {
+-		__put_user(fds1->revents, &ufds->revents);
++	for (offset = 0, tmp = fd_list; tmp; tmp = tmp->next) {
++		struct pollfd *fds1 = tmp->fds;
++		struct pollfd *ufds1 = &ufds[offset];
++		int i;
++
++		for (i = 0; i < (int)tmp->nr; i++, ufds1++, fds1++)
++			__put_user(fds1->revents, &ufds1->revents);
++
++		offset += tmp->nr;
+ 	}
+ 
+ 	err = fdcount;
++
+ 	if (!fdcount && signal_pending(current))
+ 		err = -EINTR;
+ 
+ out_fds:
+-	kfree(fds);
++	for (; fd_list;) {
++		tmp = fd_list->next;
++		free_page((unsigned long)fd_list);
++		fd_list = tmp;
++	}
++	free_wait(wait);
++
+ out:
+-	if (wait)
+-		free_wait(wait_table);
+ 	unlock_kernel();
+ 	return err;
+ }

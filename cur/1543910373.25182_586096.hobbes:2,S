@@ -1,0 +1,157 @@
+Date: Sun, 19 Aug 2007 21:34:35 +0200
+From: Guillaume Chazarain <>
+Subject: Re: [PATCH] Add all thread stats for TASKSTATS_CMD_ATTR_TGID
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2007/8/19/96
+
+TASKSTATS_CMD_ATTR_TGID used to return only the delay accounting stats,
+not the basic and extended accounting. With this patch,
+TASKSTATS_CMD_ATTR_TGID returns also the min, max or sum (depending on
+the semantic of the field) of the accounting info for all threads of a
+thread group. This makes TASKSTATS_CMD_ATTR_TGID usable in a similar
+fashion to TASKSTATS_CMD_ATTR_PID, for commands like iotop -P
+(
+http://guichaz.free.fr/misc/iotop.py
+).
+Changelog since V1 (
+http://lkml.org/lkml/2007/8/2/185
+):
+- Update combined stats of exited threads in fill_tgid_exit() as
+suggested by Balbir Singh.
+- Very light cleanup of fill_tgid_exit() by the way.
+- bacct fields are also combined for all threads.
+- Instead of assuming memory stats are identical for all threads, we
+take the max of all threads (hiwater_rss and hiwater_vm).
+Signed-off-by: Guillaume Chazarain <guichaz@yahoo.fr>
+Cc: Balbir Singh <balbir@in.ibm.com>
+Cc: Jay Lan <jlan@engr.sgi.com>
+Cc: Jonathan Lim <jlim@sgi.com>
+---
+ kernel/taskstats.c |   15 ++++++++++-----
+ kernel/tsacct.c    |   43 ++++++++++++++++++++++---------------------
+ 2 files changed, 32 insertions(+), 26 deletions(-)
+diff -r 73eff559debc kernel/taskstats.c
+--- a/kernel/taskstats.c	Sat Aug 18 17:15:17 2007 -0700
++++ b/kernel/taskstats.c	Sun Aug 19 17:20:15 2007 +0200
+@@ -246,6 +246,8 @@ static int fill_tgid(pid_t tgid, struct 
+ 
+ 		stats->nvcsw += tsk->nvcsw;
+ 		stats->nivcsw += tsk->nivcsw;
++		bacct_add_tsk(stats, tsk);
++		xacct_add_tsk(stats, tsk);
+ 	} while_each_thread(first, tsk);
+ 
+ 	unlock_task_sighand(first, &flags);
+@@ -265,21 +267,24 @@ static void fill_tgid_exit(struct task_s
+ static void fill_tgid_exit(struct task_struct *tsk)
+ {
+ 	unsigned long flags;
++	struct taskstats *tg_stats;
+ 
+ 	spin_lock_irqsave(&tsk->sighand->siglock, flags);
+-	if (!tsk->signal->stats)
++	tg_stats = tsk->signal->stats;
++	if (!tg_stats)
+ 		goto ret;
+ 
+ 	/*
+ 	 * Each accounting subsystem calls its functions here to
+ 	 * accumalate its per-task stats for tsk, into the per-tgid structure
+ 	 *
+-	 *	per-task-foo(tsk->signal->stats, tsk);
+-	 */
+-	delayacct_add_tsk(tsk->signal->stats, tsk);
++	 *	per-task-foo(tg_stats, tsk);
++	 */
++	bacct_add_tsk(tg_stats, tsk);
++	xacct_add_tsk(tg_stats, tsk);
++	delayacct_add_tsk(tg_stats, tsk);
+ ret:
+ 	spin_unlock_irqrestore(&tsk->sighand->siglock, flags);
+-	return;
+ }
+ 
+ static int add_del_listener(pid_t pid, cpumask_t *maskp, int isadd)
+diff -r 73eff559debc kernel/tsacct.c
+--- a/kernel/tsacct.c	Sat Aug 18 17:15:17 2007 -0700
++++ b/kernel/tsacct.c	Sun Aug 19 17:20:43 2007 +0200
+@@ -38,8 +38,9 @@ void bacct_add_tsk(struct taskstats *sta
+ 	/* rebase elapsed time to usec */
+ 	ac_etime = timespec_to_ns(&ts);
+ 	do_div(ac_etime, NSEC_PER_USEC);
+-	stats->ac_etime = ac_etime;
+-	stats->ac_btime = get_seconds() - ts.tv_sec;
++	stats->ac_etime = max_t(u64, stats->ac_etime, ac_etime);
++	stats->ac_btime = min_t(u32, stats->ac_btime,
++				get_seconds() - ts.tv_sec);
+ 	if (thread_group_leader(tsk)) {
+ 		stats->ac_exitcode = tsk->exit_code;
+ 		if (tsk->flags & PF_FORKNOEXEC)
+@@ -60,10 +61,12 @@ void bacct_add_tsk(struct taskstats *sta
+ 	stats->ac_ppid	 = pid_alive(tsk) ?
+ 				rcu_dereference(tsk->real_parent)->tgid : 0;
+ 	rcu_read_unlock();
+-	stats->ac_utime	 = cputime_to_msecs(tsk->utime) * USEC_PER_MSEC;
+-	stats->ac_stime	 = cputime_to_msecs(tsk->stime) * USEC_PER_MSEC;
+-	stats->ac_minflt = tsk->min_flt;
+-	stats->ac_majflt = tsk->maj_flt;
++	stats->ac_utime	 = max_t(u64, stats->ac_utime,
++				 cputime_to_msecs(tsk->utime) * USEC_PER_MSEC);
++	stats->ac_stime	 = max_t(u64, stats->ac_stime,
++				 cputime_to_msecs(tsk->stime) * USEC_PER_MSEC);
++	stats->ac_minflt = max_t(u64, stats->ac_minflt, tsk->min_flt);
++	stats->ac_majflt = max_t(u64, stats->ac_majflt, tsk->maj_flt);
+ 
+ 	strncpy(stats->ac_comm, tsk->comm, sizeof(stats->ac_comm));
+ }
+@@ -81,27 +84,25 @@ void xacct_add_tsk(struct taskstats *sta
+ 	struct mm_struct *mm;
+ 
+ 	/* convert pages-jiffies to Mbyte-usec */
+-	stats->coremem = jiffies_to_usecs(p->acct_rss_mem1) * PAGE_SIZE / MB;
+-	stats->virtmem = jiffies_to_usecs(p->acct_vm_mem1) * PAGE_SIZE / MB;
++	stats->coremem += jiffies_to_usecs(p->acct_rss_mem1) * PAGE_SIZE / MB;
++	stats->virtmem += jiffies_to_usecs(p->acct_vm_mem1) * PAGE_SIZE / MB;
+ 	mm = get_task_mm(p);
+ 	if (mm) {
+ 		/* adjust to KB unit */
+-		stats->hiwater_rss   = mm->hiwater_rss * PAGE_SIZE / KB;
+-		stats->hiwater_vm    = mm->hiwater_vm * PAGE_SIZE / KB;
++		stats->hiwater_rss = max_t(u64, stats->hiwater_rss,
++					   mm->hiwater_rss * PAGE_SIZE / KB);
++		stats->hiwater_vm  = max_t(u64, stats->hiwater_vm,
++					   mm->hiwater_vm * PAGE_SIZE / KB);
+ 		mmput(mm);
+ 	}
+-	stats->read_char	= p->rchar;
+-	stats->write_char	= p->wchar;
+-	stats->read_syscalls	= p->syscr;
+-	stats->write_syscalls	= p->syscw;
++	stats->read_char	+= p->rchar;
++	stats->write_char	+= p->wchar;
++	stats->read_syscalls	+= p->syscr;
++	stats->write_syscalls	+= p->syscw;
+ #ifdef CONFIG_TASK_IO_ACCOUNTING
+-	stats->read_bytes	= p->ioac.read_bytes;
+-	stats->write_bytes	= p->ioac.write_bytes;
+-	stats->cancelled_write_bytes = p->ioac.cancelled_write_bytes;
+-#else
+-	stats->read_bytes	= 0;
+-	stats->write_bytes	= 0;
+-	stats->cancelled_write_bytes = 0;
++	stats->read_bytes	+= p->ioac.read_bytes;
++	stats->write_bytes	+= p->ioac.write_bytes;
++	stats->cancelled_write_bytes += p->ioac.cancelled_write_bytes;
+ #endif
+ }
+ #undef KB
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+More majordomo info at  
+http://vger.kernel.org/majordomo-info.html
+Please read the FAQ at  
+http://www.tux.org/lkml/

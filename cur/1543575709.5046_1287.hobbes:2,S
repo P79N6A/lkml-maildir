@@ -1,0 +1,114 @@
+Date: 13 Dec 2000 14:42:26 +0100
+From: Mark Kettenis <>
+Subject: Re: Pthreads, linux, gdb, oh my!
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/12/13/35
+
+Peter Berger <peterb@telerama.com> writes:
+> > > The zombie problem is a kernel bug.  AFAIK there is no kernel that
+> > > doesn't have this bug.  Unfortunately getting the bugfix in isn't very
+> > > easy.  I'll try poking Linus again when I can find the time.
+> 
+> *sob*
+> 
+> Alan Cox says it is a glibc bug.
+Well, he says it's likely to be a glibc bug, and from the information
+you've given him I don't blame him for coming to that conclusion.
+However, the "zombie problem" is caused by the way ptrace() interacts
+with clone()/exit()/wait(), which I consider to be a kernel bug.  Let
+me explain:
+When LinuxThreads (the glibc pthreads implementation) creates a new
+thread using the clone() system call, it arranges for itself to get a
+special "cancel" signal to be delivered when the newly thread exits
+(instead of SIGCHLD), such that it is possible to distinguish between
+exiting threads and genuine child processes.  When it recieves this
+special "cancel" signal it calls wait() with the __WCLONE flag such
+that exited threads (and only exited threads, not exited child
+processes) are reaped and don't live on as zombies.
+When run under GDB, the debugger attaches to every newly created
+thread (using ptrace()).  This has the effect that the thread's parent
+is now the debugger instead of the special manager thread that is
+supposed to reap that particular thread when it exits.  So the event
+is reported to GDB (with the special "cancel" signal), and GDB does
+the wait() with the __WCLONE flag that's necessary to detach from the
+exited thread.  However the kernel notices that the exited thread was
+being traced and keeps it around as a zombie to give the LinuxThreads
+library the opportunity to wait() for it.  Unfortunately the kernel
+unconditionally sends a SIGCHLD instead of the special "cancel"
+signal, and the event goes unnoticed, as can be seen from the
+following bit of code in linux/kernel/exit.c:sys_wait4():
+                                if (p->p_opptr != p->p_pptr) {
+                                        write_lock_irq(&tasklist_lock);
+                                        REMOVE_LINKS(p);
+                                        p->p_pptr = p->p_opptr;
+                                        SET_LINKS(p);
+                                        write_unlock_irq(&tasklist_lock);
+                                        notify_parent(p, SIGCHLD);
+                                } else
+                                        release(p);
+AFAICT all officially released kernels have this problem.
+Furthermore, there is a problem with some kernels (the 2.4 series and
+the latest kernels in the 2.2 series), where the special exit signal
+is being reset to SIGCHLD by the following code in
+linux/kernel/exit.c:exit_notify():
+        /* Let father know we died 
+         *
+         * Thread signals are configurable, but you aren't going to use
+         * that to send signals to arbitary processes. 
+         * That stops right now.
+         *
+         * If the parent exec id doesn't match the exec id we saved
+         * when we started then we know the parent has changed security
+         * domain.
+         *
+         * If our self_exec id doesn't match our parent_exec_id then
+         * we have changed execution domain as these two values started
+         * the same after a fork.
+         *      
+         */
+        
+        if(current->exit_signal != SIGCHLD &&
+            ( current->parent_exec_id != t->self_exec_id  ||
+              current->self_exec_id != current->parent_exec_id) 
+            && !capable(CAP_KILL))
+                current->exit_signal = SIGCHLD;
+since current->parent_exit_id and t->self_exec_id don't match for
+traced processes (since t->self_exec_id is the exec id of the debugger
+and not of the origional parent).  This means that even if the
+LinuxThreads library receives its special "cancel" signal, it won't
+notice the exited threads (since it uses wait() with the __WCLONE
+flag), and those threads will live on as zombies until the entire
+process exits.
+I'm not sure how to fix this problem.  I would say that the attached
+patch (against Linux 2.2.18) should fix things, but I'm not entirely
+confident that it doesn't open a security hole.  Oh, and I didn't test
+this exact patch, I just tested something similar some time ago.
+Mark
+--- exit.c.orig	Tue Jan  4 19:12:25 2000
++++ exit.c	Wed Dec 13 14:36:24 2000
+@@ -291,7 +291,7 @@
+ 	 * is about to become orphaned.
+ 	 */
+ 	 
+-	t = current->p_pptr;
++	t = current->p_opptr;
+ 	
+ 	if ((t->pgrp != current->pgrp) &&
+ 	    (t->session == current->session) &&
+@@ -497,7 +497,7 @@
+ 					p->p_pptr = p->p_opptr;
+ 					SET_LINKS(p);
+ 					write_unlock_irq(&tasklist_lock);
+-					notify_parent(p, SIGCHLD);
++					notify_parent(p, p->exit_signal);
+ 				} else
+ 					release(p);
+ #ifdef DEBUG_PROC_TREE
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+Please read the FAQ at 
+http://www.tux.org/lkml/

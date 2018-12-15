@@ -1,0 +1,187 @@
+Date: Sun, 17 Sep 2006 20:42:40 +0530
+From: Balbir Singh <>
+Subject: [RFC][PATCH 3/4] Aggregated beancounters syscall support
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2006/9/17/58
+
+Change the system calls to operate with aggregated beancounters instead
+of beancounters.
+Signed-off-by: Balbir Singh <balbir@in.ibm.com>
+---
+ kernel/bc/sys.c |   91 ++++++++++++++++++++++++++++++++++++++------------------
+ 1 files changed, 63 insertions(+), 28 deletions(-)
+diff -puN kernel/bc/sys.c~aggr-bc-syscalls kernel/bc/sys.c
+--- linux-2.6.18-rc5/kernel/bc/sys.c~aggr-bc-syscalls	2006-09-17 20:34:02.000000000 +0530
++++ linux-2.6.18-rc5-balbir/kernel/bc/sys.c	2006-09-17 20:34:02.000000000 +0530
+@@ -10,39 +10,60 @@
+ 
+ #include <bc/beancounter.h>
+ #include <bc/task.h>
++#include <bc/vmpages.h>
+ 
+ asmlinkage long sys_get_bcid(void)
+ {
+ 	struct beancounter *bc;
+ 
+ 	bc = get_exec_bc();
+-	return bc->bc_id;
++	return bc->ab->ab_id;
+ }
+ 
+-asmlinkage long sys_set_bcid(bcid_t id)
++asmlinkage long sys_set_bcid(bcid_t id, pid_t pid)
+ {
+ 	int error;
+-	struct beancounter *bc;
+-	struct task_beancounter *task_bc;
+-
+-	task_bc = &current->task_bc;
++	struct beancounter *bc, *new_bc;
++	struct aggr_beancounter *ab;
++	struct task_struct *tsk;
+ 
+ 	/* You may only set an bc as root */
+ 	error = -EPERM;
+ 	if (!capable(CAP_SETUID))
++		return error;
++
++	read_lock(&tasklist_lock);
++	tsk = find_task_by_pid(pid);
++	if (!tsk) {
++		read_unlock(&tasklist_lock);
++		error = -ESRCH;
+ 		goto out;
++	}
++	read_unlock(&tasklist_lock);
++
++	error = -EINVAL;
++	if (id == tsk->task_bc.exec_bc->ab->ab_id)
++		return error;
+ 
+ 	/* Ok - set up a beancounter entry for this user */
+ 	error = -ENOMEM;
+-	bc = beancounter_findcreate(id, BC_ALLOC);
+-	if (bc == NULL)
++	ab = ab_findcreate(id, BC_ALLOC);
++	if (ab == NULL)
+ 		goto out;
+ 
+-	/* install bc */
+-	put_beancounter(task_bc->exec_bc);
+-	task_bc->exec_bc = bc;
+-	put_beancounter(task_bc->fork_bc);
+-	task_bc->fork_bc = get_beancounter(bc);
++	/*
++	 * Check if limits allow the move - or reclaim if required
++	 * TODO:
++	 */
++
++	get_task_struct(tsk);
++	bc = tsk->task_bc.exec_bc;
++	new_bc = beancounter_relocate(ab, bc->ab, tsk->tgid);
++	put_task_struct(tsk);
++	if (new_bc == NULL) {
++		put_aggr_beancounter(ab);
++		error = -ESRCH;
++	}
+ 	error = 0;
+ out:
+ 	return error;
+@@ -53,7 +74,7 @@ asmlinkage long sys_set_bclimit(bcid_t i
+ {
+ 	int error;
+ 	unsigned long flags;
+-	struct beancounter *bc;
++	struct aggr_beancounter *ab;
+ 	unsigned long new_limits[2];
+ 
+ 	error = -EPERM;
+@@ -74,45 +95,59 @@ asmlinkage long sys_set_bclimit(bcid_t i
+ 		goto out;
+ 
+ 	error = -ENOENT;
+-	bc = beancounter_findcreate(id, BC_LOOKUP);
+-	if (bc == NULL)
++	ab = ab_findcreate(id, BC_LOOKUP);
++	if (ab == NULL)
+ 		goto out;
+ 
+-	spin_lock_irqsave(&bc->bc_lock, flags);
+-	bc->bc_parms[resource].barrier = new_limits[0];
+-	bc->bc_parms[resource].limit = new_limits[1];
+-	spin_unlock_irqrestore(&bc->bc_lock, flags);
++	spin_lock_irqsave(&ab->ab_lock, flags);
++	ab->ab_parms[resource].barrier = new_limits[0];
++	ab->ab_parms[resource].limit = new_limits[1];
++	spin_unlock_irqrestore(&ab->ab_lock, flags);
+ 
+-	put_beancounter(bc);
++	put_aggr_beancounter(ab);
+ 	error = 0;
+ out:
+ 	return error;
+ }
+ 
+-int sys_get_bcstat(bcid_t id, unsigned long resource,
+-		struct bc_resource_parm __user *uparm)
++int sys_get_bcstat(bcid_t bc_id, bcid_t ab_id, unsigned long resource,
++			struct bc_resource_parm __user *bc_uparm,
++			struct ab_resource_parm __user *ab_uparm)
+ {
+ 	int error;
+ 	unsigned long flags;
+ 	struct beancounter *bc;
+-	struct bc_resource_parm parm;
++	struct aggr_beancounter *ab;
++	struct bc_resource_parm bc_parm;
++	struct ab_resource_parm ab_parm;
+ 
+ 	error = -EINVAL;
+ 	if (resource >= BC_RESOURCES)
+ 		goto out;
+ 
+ 	error = -ENOENT;
+-	bc = beancounter_findcreate(id, BC_LOOKUP);
+-	if (bc == NULL)
++	ab = ab_findcreate(ab_id, BC_LOOKUP);
++	if (ab == NULL)
+ 		goto out;
++	spin_lock_irqsave(&ab->ab_lock, flags);
++	bc = beancounter_find_locked(ab, bc_id);
++	if (bc == NULL) {
++		spin_unlock_irqrestore(&ab->ab_lock, flags);
++		goto out;
++	}
+ 
+ 	spin_lock_irqsave(&bc->bc_lock, flags);
+-	parm = bc->bc_parms[resource];
++	bc_parm = bc->bc_parms[resource];
+ 	spin_unlock_irqrestore(&bc->bc_lock, flags);
++	ab_parm = ab->ab_parms[resource];
++	spin_unlock_irqrestore(&ab->ab_lock, flags);
+ 	put_beancounter(bc);
++	put_aggr_beancounter(ab);
+ 
+ 	error = 0;
+-	if (copy_to_user(uparm, &parm, sizeof(parm)))
++	if (copy_to_user(bc_uparm, &bc_parm, sizeof(bc_parm)))
++		error = -EFAULT;
++	if (copy_to_user(ab_uparm, &ab_parm, sizeof(ab_parm)))
+ 		error = -EFAULT;
+ 
+ out:
+_
+-- 
+	Balbir Singh,
+	Linux Technology Center,
+	IBM Software Labs
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+More majordomo info at  
+http://vger.kernel.org/majordomo-info.html
+Please read the FAQ at  
+http://www.tux.org/lkml/

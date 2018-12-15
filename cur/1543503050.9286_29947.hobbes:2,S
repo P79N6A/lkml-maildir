@@ -1,0 +1,199 @@
+Date: Sat, 17 Jul 1999 17:57:10 +0100 (BST)
+From: Mike <>
+Subject: Re: [PATCH] altalloc for 2.3.8
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/7/17/69
+
+On Thu, 1 Jul 1999, Pavel Machek wrote:
+> Hi!
+> 
+> Here's patch to speed up operations like fsck and rm. Impact on normal
+> operation is ~1%, but fsck/rm are speeded up about 2 times... So it is
+> probably worth it.
+> 
+Updated to 2.3.10.  I found I needed the following:
+diff -urN linux-2.3.10-old/fs/intercept.c linux-2.3.10/fs/intercept.c
+--- linux-2.3.10-old/fs/intercept.c     Sat Jul 17 10:49:24 1999
++++ linux-2.3.10/fs/intercept.c Sat Jul 17 12:09:06 1999
+@@ -40,7 +40,7 @@
+                return NULL;
+        }
+-       spin_lock_irqsave(syscall_lock, flags);
++       spin_lock_irqsave(&syscall_lock, flags);
+                if ( syscall_intercept[index] == NULL ) {
+                        tmp = kmalloc( sizeof(syscall_struct_t),
+GFP_KERNEL );
+                        tmp->id = NULL;
+@@ -57,7 +57,7 @@
+                syscall_intercept[index] = tmp;
+                sys_call_table[index] = handler->syscall;
+-       spin_unlock_irqrestore(syscall_lock, flags);
++       spin_unlock_irqrestore(&syscall_lock, flags);
+        *errno = 0;
+        return prev;
+ }
+@@ -71,7 +71,7 @@
+        if ( index >= SYSCALL_COUNT )
+                return -EINVAL;
+-       spin_lock_irqsave(syscall_lock, flags);
++       spin_lock_irqsave(&syscall_lock, flags);
+        begin {
+                dev = syscall_intercept[index];
+                while( dev->next ) {
+@@ -88,7 +88,7 @@
+                if ( prev == NULL )
+                        sys_call_table[index] = dev->func;
+        } end;
+-       spin_unlock_irqrestore(syscall_lock, flags);
++       spin_unlock_irqrestore(&syscall_lock, flags);
+        if ( next == NULL )
+                return -ENODEV;
+        kfree( next );
+diff -urN linux-2.3.9-clean/fs/ext2/inode.c linux-2.3.9-oakley/fs/ext2/inode.c
+--- linux-2.3.9-clean/fs/ext2/inode.c	Thu Jul  8 18:14:58 1999
++++ linux-2.3.9-oakley/fs/ext2/inode.c	Fri Jul 16 18:12:05 1999
+@@ -18,6 +18,8 @@
+  *        David S. Miller (davem@caip.rutgers.edu), 1995
+  *  64-bit file support on 64-bit platforms by Jakub Jelinek
+  * 	(jj@sunsite.ms.mff.cuni.cz)
++ *  altalloc for speeding up rm/fsck by Pavel Machek
++ *	 (pavel@ucw.cz) sponsored by SuSE
+  */
+ 
+ #include <asm/uaccess.h>
+@@ -103,6 +105,26 @@
+ 	wait_on_super (inode->i_sb);
+ 
+ #ifdef EXT2_PREALLOCATE
++	if (inode->u.ext2_i.i_alloc_elsewhere) {
++		if (!inode->u.ext2_i.i_elsewhere_goal) {
++			goal =  (inode->u.ext2_i.i_block_group * 
++				 EXT2_BLOCKS_PER_GROUP(inode->i_sb)) +
++				le32_to_cpu(inode->i_sb->u.ext2_sb.s_es->s_first_data_block);
++			if (goal > 512)
++				goal -= 512;
++		} else	goal = inode->u.ext2_i.i_elsewhere_goal;
++//		printk( "Allocating goal = %d, ", goal );
++		result = ext2_new_block (inode, goal, 0, 0, err);
++		inode->u.ext2_i.i_elsewhere_goal = result;
++//		printk( "got = %d\n", result );
++		if ((result > inode->u.ext2_i.i_next_alloc_goal) &&
++		    (result-32 < inode->u.ext2_i.i_next_alloc_goal)) {
++//			printk( "Making room for indirect blocks\n" );
++			inode->u.ext2_i.i_next_alloc_goal += 32;
++		}
++		return result;
++	}
++
+ 	if (inode->u.ext2_i.i_prealloc_count &&
+ 	    (goal == inode->u.ext2_i.i_prealloc_block ||
+ 	     goal + 1 == inode->u.ext2_i.i_prealloc_block))
+@@ -284,8 +306,11 @@
+ 	}
+ 	*p = cpu_to_le32(tmp);
+ 
+-	inode->u.ext2_i.i_next_alloc_block = new_block;
+-	inode->u.ext2_i.i_next_alloc_goal = tmp;
++	if (!inode->u.ext2_i.i_alloc_elsewhere) {
++		inode->u.ext2_i.i_next_alloc_block = new_block;
++		inode->u.ext2_i.i_next_alloc_goal = tmp;
++	}
++
+ 	inode->i_ctime = CURRENT_TIME;
+ 	inode->i_blocks += blocksize/512;
+ 	if (IS_SYNC(inode) || inode->u.ext2_i.i_osync)
+@@ -392,8 +417,10 @@
+ 	inode->i_ctime = CURRENT_TIME;
+ 	inode->i_blocks += blocksize/512;
+ 	mark_inode_dirty(inode);
+-	inode->u.ext2_i.i_next_alloc_block = new_block;
+-	inode->u.ext2_i.i_next_alloc_goal = tmp;
++	if (!inode->u.ext2_i.i_alloc_elsewhere) {
++		inode->u.ext2_i.i_next_alloc_block = new_block;
++		inode->u.ext2_i.i_next_alloc_goal = tmp;
++	}
+ 	*err = 0;
+ out:
+ 	brelse (bh);
+@@ -477,14 +504,18 @@
+ 		bh = GET_INODE_DATABLOCK(ptr);
+ 		goto out;
+ 	}
++	if (test_opt(inode->i_sb, ALTALLOC))
++		inode->u.ext2_i.i_alloc_elsewhere = 1;
+ 	ptr -= direct_blocks;
+ 	if (ptr < indirect_blocks) {
+ 		bh = GET_INODE_PTR(EXT2_IND_BLOCK);
++		inode->u.ext2_i.i_alloc_elsewhere = 0;
+ 		goto get_indirect;
+ 	}
+ 	ptr -= indirect_blocks;
+ 	if (ptr < double_blocks) {
+ 		bh = GET_INODE_PTR(EXT2_DIND_BLOCK);
++		inode->u.ext2_i.i_alloc_elsewhere = 0;
+ 		goto get_double;
+ 	}
+ 	ptr -= double_blocks;
+@@ -494,6 +525,7 @@
+ 	bh = GET_INDIRECT_PTR((ptr >> ptrs_bits) & (ptrs - 1));
+ get_indirect:
+ 	bh = GET_INDIRECT_DATABLOCK(ptr & (ptrs - 1));
++	inode->u.ext2_i.i_alloc_elsewhere = 0;
+ 
+ #undef GET_INODE_DATABLOCK
+ #undef GET_INODE_PTR
+@@ -664,6 +696,8 @@
+ 	inode->i_blocks = le32_to_cpu(raw_inode->i_blocks);
+ 	inode->i_version = ++event;
+ 	inode->u.ext2_i.i_new_inode = 0;
++	inode->u.ext2_i.i_alloc_elsewhere = 0;
++	inode->u.ext2_i.i_elsewhere_goal = 0;
+ 	inode->u.ext2_i.i_flags = le32_to_cpu(raw_inode->i_flags);
+ 	inode->u.ext2_i.i_faddr = le32_to_cpu(raw_inode->i_faddr);
+ 	inode->u.ext2_i.i_frag_no = raw_inode->i_frag;
+diff -urN linux-2.3.9-clean/fs/ext2/super.c linux-2.3.9-oakley/fs/ext2/super.c
+--- linux-2.3.9-clean/fs/ext2/super.c	Thu Jul  8 18:14:27 1999
++++ linux-2.3.9-oakley/fs/ext2/super.c	Fri Jul 16 18:00:43 1999
+@@ -181,6 +181,8 @@
+ 		}
+ 		else if (!strcmp (this_char, "debug"))
+ 			set_opt (*mount_options, DEBUG);
++		else if (!strcmp (this_char, "altalloc"))
++			set_opt (*mount_options, ALTALLOC);
+ 		else if (!strcmp (this_char, "errors")) {
+ 			if (!value || !*value) {
+ 				printk ("EXT2-fs: the errors option requires "
+diff -urN linux-2.3.9-clean/include/linux/ext2_fs.h linux-2.3.9-oakley/include/linux/ext2_fs.h
+--- linux-2.3.9-clean/include/linux/ext2_fs.h	Thu Jul  8 18:14:59 1999
++++ linux-2.3.9-oakley/include/linux/ext2_fs.h	Fri Jul 16 18:00:43 1999
+@@ -310,6 +310,7 @@
+ #define EXT2_MOUNT_ERRORS_RO		0x0020	/* Remount fs ro on errors */
+ #define EXT2_MOUNT_ERRORS_PANIC		0x0040	/* Panic on errors */
+ #define EXT2_MOUNT_MINIX_DF		0x0080	/* Mimics the Minix statfs */
++#define EXT2_MOUNT_ALTALLOC		0x0100	/* Alloc indirect blocks close to each other */
+ 
+ #define clear_opt(o, opt)		o &= ~EXT2_MOUNT_##opt
+ #define set_opt(o, opt)			o |= EXT2_MOUNT_##opt
+diff -urN linux-2.3.9-clean/include/linux/ext2_fs_i.h linux-2.3.9-oakley/include/linux/ext2_fs_i.h
+--- linux-2.3.9-clean/include/linux/ext2_fs_i.h	Tue May 11 22:37:47 1999
++++ linux-2.3.9-oakley/include/linux/ext2_fs_i.h	Fri Jul 16 18:00:43 1999
+@@ -37,6 +37,8 @@
+ 	__u32	i_prealloc_count;
+ 	__u32	i_high_size;
+ 	int	i_new_inode:1;	/* Is a freshly allocated inode */
++	int	i_alloc_elsewhere:1;
++	__u32	i_elsewhere_goal;
+ };
+ 
+ #endif	/* _LINUX_EXT2_FS_I */
+-- 
+Mike <rickettm@ox.compsoc.net>
+Pardon me, but do you know what it means to be TRULY ONE with your BOOTH!
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

@@ -1,0 +1,433 @@
+Date: Tue, 3 May 2005 13:13:53 +0200
+From: David Welton <>
+Subject: Re: rootdelay
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2005/5/3/31
+
+> Ok, I updated to 2.6.11.8, and indeed it does have problems that
+> weren't there before - although in my case it can't mount the root
+> partition because it's not quite ready yet.  In part, it seems to be
+> caused by the fact that the USB start up sequence introduces a new
+> thread that delays the scsi_host_scan by 5 seconds, which is long
+> enough to cause problems.  I added some code to wait for not only the
+> disk name to be online, but the partition, but even that doesn't seem
+> to be quite enough.
+> Is there anyplace generic that could be hooked that will report when a
+> device is actually online and ready to run?  Perhaps I was just lucky
+> in the past with add_disk :-/
+I "fixed" the problem by not letting storage_probe in storage/usb.c
+finish until the scan_thread is done.  That doesn't seem elegant -
+perhaps there is a better place to put the
+wait_for_completion(&us->scsi_scan_done) call so that the scanning
+thread can go off and do its thing, but will still be waited on where
+it counts?
+I am including a copy of the patch inline, as well as attaching it.  I
+suspect that gmail will mangle the inline version some...
+Thankyou,
+Dave
+diff -uprN -X dontdiff linux-2.6.11.8/drivers/block/genhd.c
+linux-wakeup/drivers/block/genhd.c
+--- linux-2.6.11.8/drivers/block/genhd.c	2005-04-30 03:27:21.000000000 +0200
++++ linux-wakeup/drivers/block/genhd.c	2005-05-02 19:22:13.000000000 +0200
+@@ -14,9 +14,14 @@
+ #include <linux/slab.h>
+ #include <linux/kmod.h>
+ #include <linux/kobj_map.h>
++#include <linux/wait.h>
++#include <linux/sched.h>
+ 
+ #define MAX_PROBE_HASH 255	/* random */
+ 
++DECLARE_WAIT_QUEUE_HEAD(disk_wait_h);
++EXPORT_SYMBOL(disk_wait_h);
++
+ static struct subsystem block_subsys;
+ 
+ static DECLARE_MUTEX(block_subsys_sem);
+@@ -58,6 +63,49 @@ int get_blkdev_list(char *p)
+ }
+ #endif
+ 
++/*
++ * Returns an array of all the block device names and partitions.
++ */
++
++char **get_blkdevs(void)
++{
++	int i = 0;
++	int n = 0;
++	int len = 0;
++	struct list_head *p;
++	char **names = NULL;
++	struct gendisk *sgp;
++	char buf[BDEVNAME_SIZE];
++
++	down_read(&block_subsys.rwsem);
++	
++	list_for_each(p, &block_subsys.kset.list) {
++		len ++;
++	}
++	
++	names = kmalloc(sizeof(char *) * len + 1, GFP_KERNEL);
++
++	list_for_each(p, &block_subsys.kset.list) {
++		sgp = list_entry(p, struct gendisk, kobj.entry);
++		names[i] = kmalloc(strlen(disk_name(sgp, 0, buf)), GFP_KERNEL);
++		strcpy(names[i], disk_name(sgp, 0, buf));
++		
++		for (n = 0; n < sgp->minors - 1; n++) {
++			struct hd_struct *hd = sgp->part[n];
++			if (hd && hd->nr_sects) {
++				names[i] = kmalloc(strlen(disk_name(sgp, n+1, buf)), GFP_KERNEL);
++				strcpy(names[i], disk_name(sgp, n+1, buf));
++				i ++;
++			}
++		}
++	}
++	names[i] = NULL;
++	up_read(&block_subsys.rwsem);
++	return names;
++}
++
++EXPORT_SYMBOL(get_blkdevs);
++
+ int register_blkdev(unsigned int major, const char *name)
+ {
+ 	struct blk_major_name **n, *p;
+@@ -192,6 +240,11 @@ void add_disk(struct gendisk *disk)
+ 			    disk->minors, NULL, exact_match, exact_lock, disk);
+ 	register_disk(disk);
+ 	blk_register_queue(disk);
++
++	/* Wake up queue in init/main.c. */
++	printk("Waking up queue on %s\n",
++	       disk->disk_name);
++	wake_up_interruptible(&disk_wait_h);
+ }
+ 
+ EXPORT_SYMBOL(add_disk);
+diff -uprN -X dontdiff linux-2.6.11.8/drivers/usb/storage/usb.c
+linux-wakeup/drivers/usb/storage/usb.c
+--- linux-2.6.11.8/drivers/usb/storage/usb.c	2005-04-30 03:25:25.000000000 +0200
++++ linux-wakeup/drivers/usb/storage/usb.c	2005-05-03 12:15:29.000000000 +0200
+@@ -1009,6 +1009,7 @@ static int storage_probe(struct usb_inte
+ 
+ 	/* Start up the thread for delayed SCSI-device scanning */
+ 	result = kernel_thread(usb_stor_scan_thread, us, CLONE_VM);
++
+ 	if (result < 0) {
+ 		printk(KERN_WARNING USB_STORAGE 
+ 		       "Unable to start the device-scanning thread\n");
+@@ -1016,6 +1017,8 @@ static int storage_probe(struct usb_inte
+ 		goto BadDevice;
+ 	}
+ 
++	wait_for_completion(&us->scsi_scan_done);
++
+ 	return 0;
+ 
+ 	/* We come here if there are any problems */
+diff -uprN -X dontdiff linux-2.6.11.8/include/linux/genhd.h
+linux-wakeup/include/linux/genhd.h
+--- linux-2.6.11.8/include/linux/genhd.h	2005-04-30 03:24:13.000000000 +0200
++++ linux-wakeup/include/linux/genhd.h	2005-05-02 12:04:50.000000000 +0200
+@@ -16,6 +16,10 @@
+ #include <linux/smp.h>
+ #include <linux/string.h>
+ #include <linux/fs.h>
++#include <linux/wait.h>
++
++/* Wait queue to wait on disks coming online. */
++extern wait_queue_head_t disk_wait_h;
+ 
+ enum {
+ /* These three have identical behaviour; use the second one if DOS FDISK gets
+@@ -232,6 +236,7 @@ extern struct gendisk *get_gendisk(dev_t
+ 
+ extern void set_device_ro(struct block_device *bdev, int flag);
+ extern void set_disk_ro(struct gendisk *disk, int flag);
++extern char **get_blkdevs(void);
+ 
+ /* drivers/char/random.c */
+ extern void add_disk_randomness(struct gendisk *disk);
+diff -uprN -X dontdiff linux-2.6.11.8/init/do_mounts.c
+linux-wakeup/init/do_mounts.c
+--- linux-2.6.11.8/init/do_mounts.c	2005-04-30 03:26:32.000000000 +0200
++++ linux-wakeup/init/do_mounts.c	2005-05-02 19:22:51.000000000 +0200
+@@ -12,6 +12,8 @@
+ #include <linux/nfs_fs_sb.h>
+ #include <linux/nfs_mount.h>
+ 
++#include <linux/genhd.h>
++
+ #include "do_mounts.h"
+ 
+ extern int get_filesystem_list(char * buf);
+@@ -360,8 +362,35 @@ void __init change_floppy(char *fmt, ...
+ }
+ #endif
+ 
++/*
++ * match_root_name - Returns 1 if the root_device_name appears amongst
++ * the list of block devices, 0 otherwise.
++ */
++
++static int __init match_root_name(void) {
++	char **names = NULL;
++	int i = 0;
++	int match = 0;
++	
++	names = get_blkdevs();
++	while (names[i] != NULL) {
++		if (match == 0 && strncmp(names[i],
++					  root_device_name,
++					  strlen(root_device_name)) == 0) {
++			match = 1;
++			printk("Block device %s matches %s root_device_name, continuing\n",
++			       names[i], root_device_name);
++		}
++		kfree(names[i]);
++		i ++;
++	}
++	kfree(names);
++	return match;
++}
++
+ void __init mount_root(void)
+ {
++
+ #ifdef CONFIG_ROOT_NFS
+ 	if (MAJOR(ROOT_DEV) == UNNAMED_MAJOR) {
+ 		if (mount_nfs_root())
+@@ -383,6 +412,14 @@ void __init mount_root(void)
+ 			change_floppy("root floppy");
+ 	}
+ #endif
++
++	/* Here, we wait for the root device to show up, or if it's
++	 * already there, we just go on. */
++	while (!match_root_name()) {
++		printk("Waiting for root device to wake us up\n");
++		interruptible_sleep_on(&disk_wait_h);
++	}
++ 
+ 	create_dev("/dev/root", ROOT_DEV, root_device_name);
+ 	mount_block_root("/dev/root", root_mountflags);
+ }
+diff -uprN -X dontdiff linux-2.6.11.8/init/main.c linux-wakeup/init/main.c
+--- linux-2.6.11.8/init/main.c	2005-04-30 03:24:18.000000000 +0200
++++ linux-wakeup/init/main.c	2005-05-02 12:04:50.000000000 +0200
+@@ -47,6 +47,11 @@
+ #include <linux/mempolicy.h>
+ #include <linux/key.h>
+ 
++#include <linux/genhd.h>
++#include <linux/wait.h>
++#include <linux/sched.h>
++
++
+ #include <asm/io.h>
+ #include <asm/bugs.h>
+ #include <asm/setup.h>diff -uprN -X dontdiff linux-2.6.11.8/drivers/block/genhd.c linux-wakeup/drivers/block/genhd.c
+--- linux-2.6.11.8/drivers/block/genhd.c	2005-04-30 03:27:21.000000000 +0200
++++ linux-wakeup/drivers/block/genhd.c	2005-05-02 19:22:13.000000000 +0200
+@@ -14,9 +14,14 @@
+ #include <linux/slab.h>
+ #include <linux/kmod.h>
+ #include <linux/kobj_map.h>
++#include <linux/wait.h>
++#include <linux/sched.h>
+ 
+ #define MAX_PROBE_HASH 255	/* random */
+ 
++DECLARE_WAIT_QUEUE_HEAD(disk_wait_h);
++EXPORT_SYMBOL(disk_wait_h);
++
+ static struct subsystem block_subsys;
+ 
+ static DECLARE_MUTEX(block_subsys_sem);
+@@ -58,6 +63,49 @@ int get_blkdev_list(char *p)
+ }
+ #endif
+ 
++/*
++ * Returns an array of all the block device names and partitions.
++ */
++
++char **get_blkdevs(void)
++{
++	int i = 0;
++	int n = 0;
++	int len = 0;
++	struct list_head *p;
++	char **names = NULL;
++	struct gendisk *sgp;
++	char buf[BDEVNAME_SIZE];
++
++	down_read(&block_subsys.rwsem);
++	
++	list_for_each(p, &block_subsys.kset.list) {
++		len ++;
++	}
++	
++	names = kmalloc(sizeof(char *) * len + 1, GFP_KERNEL);
++
++	list_for_each(p, &block_subsys.kset.list) {
++		sgp = list_entry(p, struct gendisk, kobj.entry);
++		names[i] = kmalloc(strlen(disk_name(sgp, 0, buf)), GFP_KERNEL);
++		strcpy(names[i], disk_name(sgp, 0, buf));
++		
++		for (n = 0; n < sgp->minors - 1; n++) {
++			struct hd_struct *hd = sgp->part[n];
++			if (hd && hd->nr_sects) {
++				names[i] = kmalloc(strlen(disk_name(sgp, n+1, buf)), GFP_KERNEL);
++				strcpy(names[i], disk_name(sgp, n+1, buf));
++				i ++;
++			}
++		}
++	}
++	names[i] = NULL;
++	up_read(&block_subsys.rwsem);
++	return names;
++}
++
++EXPORT_SYMBOL(get_blkdevs);
++
+ int register_blkdev(unsigned int major, const char *name)
+ {
+ 	struct blk_major_name **n, *p;
+@@ -192,6 +240,11 @@ void add_disk(struct gendisk *disk)
+ 			    disk->minors, NULL, exact_match, exact_lock, disk);
+ 	register_disk(disk);
+ 	blk_register_queue(disk);
++
++	/* Wake up queue in init/main.c. */
++	printk("Waking up queue on %s\n",
++	       disk->disk_name);
++	wake_up_interruptible(&disk_wait_h);
+ }
+ 
+ EXPORT_SYMBOL(add_disk);
+diff -uprN -X dontdiff linux-2.6.11.8/drivers/usb/storage/usb.c linux-wakeup/drivers/usb/storage/usb.c
+--- linux-2.6.11.8/drivers/usb/storage/usb.c	2005-04-30 03:25:25.000000000 +0200
++++ linux-wakeup/drivers/usb/storage/usb.c	2005-05-03 12:15:29.000000000 +0200
+@@ -1009,6 +1009,7 @@ static int storage_probe(struct usb_inte
+ 
+ 	/* Start up the thread for delayed SCSI-device scanning */
+ 	result = kernel_thread(usb_stor_scan_thread, us, CLONE_VM);
++
+ 	if (result < 0) {
+ 		printk(KERN_WARNING USB_STORAGE 
+ 		       "Unable to start the device-scanning thread\n");
+@@ -1016,6 +1017,8 @@ static int storage_probe(struct usb_inte
+ 		goto BadDevice;
+ 	}
+ 
++	wait_for_completion(&us->scsi_scan_done);
++
+ 	return 0;
+ 
+ 	/* We come here if there are any problems */
+diff -uprN -X dontdiff linux-2.6.11.8/include/linux/genhd.h linux-wakeup/include/linux/genhd.h
+--- linux-2.6.11.8/include/linux/genhd.h	2005-04-30 03:24:13.000000000 +0200
++++ linux-wakeup/include/linux/genhd.h	2005-05-02 12:04:50.000000000 +0200
+@@ -16,6 +16,10 @@
+ #include <linux/smp.h>
+ #include <linux/string.h>
+ #include <linux/fs.h>
++#include <linux/wait.h>
++
++/* Wait queue to wait on disks coming online. */
++extern wait_queue_head_t disk_wait_h;
+ 
+ enum {
+ /* These three have identical behaviour; use the second one if DOS FDISK gets
+@@ -232,6 +236,7 @@ extern struct gendisk *get_gendisk(dev_t
+ 
+ extern void set_device_ro(struct block_device *bdev, int flag);
+ extern void set_disk_ro(struct gendisk *disk, int flag);
++extern char **get_blkdevs(void);
+ 
+ /* drivers/char/random.c */
+ extern void add_disk_randomness(struct gendisk *disk);
+diff -uprN -X dontdiff linux-2.6.11.8/init/do_mounts.c linux-wakeup/init/do_mounts.c
+--- linux-2.6.11.8/init/do_mounts.c	2005-04-30 03:26:32.000000000 +0200
++++ linux-wakeup/init/do_mounts.c	2005-05-02 19:22:51.000000000 +0200
+@@ -12,6 +12,8 @@
+ #include <linux/nfs_fs_sb.h>
+ #include <linux/nfs_mount.h>
+ 
++#include <linux/genhd.h>
++
+ #include "do_mounts.h"
+ 
+ extern int get_filesystem_list(char * buf);
+@@ -360,8 +362,35 @@ void __init change_floppy(char *fmt, ...
+ }
+ #endif
+ 
++/*
++ * match_root_name - Returns 1 if the root_device_name appears amongst
++ * the list of block devices, 0 otherwise.
++ */
++
++static int __init match_root_name(void) {
++	char **names = NULL;
++	int i = 0;
++	int match = 0;
++	
++	names = get_blkdevs();
++	while (names[i] != NULL) {
++		if (match == 0 && strncmp(names[i],
++					  root_device_name,
++					  strlen(root_device_name)) == 0) {
++			match = 1;
++			printk("Block device %s matches %s root_device_name, continuing\n",
++			       names[i], root_device_name);
++		}
++		kfree(names[i]);
++		i ++;
++	}
++	kfree(names);
++	return match;
++}
++
+ void __init mount_root(void)
+ {
++
+ #ifdef CONFIG_ROOT_NFS
+ 	if (MAJOR(ROOT_DEV) == UNNAMED_MAJOR) {
+ 		if (mount_nfs_root())
+@@ -383,6 +412,14 @@ void __init mount_root(void)
+ 			change_floppy("root floppy");
+ 	}
+ #endif
++
++	/* Here, we wait for the root device to show up, or if it's
++	 * already there, we just go on. */
++	while (!match_root_name()) {
++		printk("Waiting for root device to wake us up\n");
++		interruptible_sleep_on(&disk_wait_h);
++	}
++ 
+ 	create_dev("/dev/root", ROOT_DEV, root_device_name);
+ 	mount_block_root("/dev/root", root_mountflags);
+ }
+diff -uprN -X dontdiff linux-2.6.11.8/init/main.c linux-wakeup/init/main.c
+--- linux-2.6.11.8/init/main.c	2005-04-30 03:24:18.000000000 +0200
++++ linux-wakeup/init/main.c	2005-05-02 12:04:50.000000000 +0200
+@@ -47,6 +47,11 @@
+ #include <linux/mempolicy.h>
+ #include <linux/key.h>
+ 
++#include <linux/genhd.h>
++#include <linux/wait.h>
++#include <linux/sched.h>
++
++
+ #include <asm/io.h>
+ #include <asm/bugs.h>
+ #include <asm/setup.h>

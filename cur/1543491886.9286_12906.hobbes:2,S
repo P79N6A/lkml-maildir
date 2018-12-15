@@ -1,0 +1,614 @@
+Date: Mon, 5 Apr 1999 00:25:56 +0200 (CEST)
+From: Andrea Arcangeli <>
+Subject: [patch] some buffer.c glitches
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/4/4/63
+
+Today I played a bit with buffer.c and I think to have discovered some
+glitch (the first is my fault sigh).
+1. my nr_hased_buffers++-- were put in the wrong places (blame me). It
+_can't_ harm because it's only provided for debugging purposes, but better
+to put it in the right place ;). The problem is that set_blocksize() could
+recall remove_from_hash_queue() a lot of times on the same just unhased
+buffer (I didn't noticed that). So better to check on the pprev contents
+before decreasing nr_hased_buffers...
+2. insert_into_queues() can't be recalled with a B_FREE buffer becasue
+insert_into_queues() is reacalled only by the buffer allocation code (that
+removed the buffer from the freelist a bit before), or from file_buffer,
+that is recalled only by refile_buffer, and refile_buffer will panic if
+the buffer is the buffer passed is a B_FREE one.
+3. since for point 2, insert_into_queues() never need put_last_free(), we
+can inline this last function and make it able to recall
+remove_from_queues() itself since most of the time if we recall
+put_last_free() we are going to put on the freelist a buffer that was
+inuse previously but that we don't need anymore now.
+4. both put_last_free and put_last_lru don't need to check if the buffer
+passed as parameter is null, this is enforced by the calling function.
+put_last_lru() is called only from here:
+	if (bh) {
+		if (!buffer_dirty(bh)) {
+			if (buffer_uptodate(bh))
+				 put_last_lru(bh);
+			bh->b_flushtime = 0;
+		}
+		return bh;
+	}
+and put_last_free is called only from here:
+void __bforget(struct buffer_head * buf)
+{
+	if (buf->b_count != 1 || buffer_locked(buf)) {
+		__brelse(buf);
+		return;
+	}
+	put_last_free(buf);
+}
+5. if we want to touch a buffer we should do that in find_buffer() or when
+we alloc a buffer removing it from the freelist (if we didn't found it in
+the fuzzy hash).
+6. We don't need to initialize a buffer_head with zero values because a
+buffer head is enforced to be zeroed before being put in the
+unused_buffer_head list.
+Basically this my first patch won't make any functional differences
+(because touch_buffer() is a nono in the stock kernek) but it will cleanup
+a bit the code fixing some minor issue:
+Index: fs/buffer.c
+===================================================================
+RCS file: /var/cvs/linux/fs/buffer.c,v
+retrieving revision 1.1.1.8
+diff -u -r1.1.1.8 buffer.c
+--- buffer.c	1999/03/29 21:38:51	1.1.1.8
++++ linux/fs/buffer.c	1999/04/04 13:55:31
+@@ -434,8 +434,8 @@
+ 		}
+ 		*pprev = next;
+ 		bh->b_pprev = NULL;
++		nr_hashed_buffers--;
+ 	}
+-	nr_hashed_buffers--;
+ }
+ 
+ static inline void remove_from_lru_list(struct buffer_head * bh)
+@@ -488,88 +488,80 @@
+ 
+ static inline void put_last_lru(struct buffer_head * bh)
+ {
+-	if (bh) {
+-		struct buffer_head **bhp = &lru_list[bh->b_list];
++	struct buffer_head **bhp = &lru_list[bh->b_list];
+ 
+-		if (bh == *bhp) {
+-			*bhp = bh->b_next_free;
+-			return;
+-		}
++	if (bh == *bhp) {
++		*bhp = bh->b_next_free;
++		return;
++	}
+ 
+-		if(bh->b_dev == B_FREE)
+-			panic("Wrong block for lru list");
++	if(bh->b_dev == B_FREE)
++		panic("Wrong block for lru list");
+ 
+-		/* Add to back of free list. */
+-		remove_from_lru_list(bh);
+-		if(!*bhp) {
+-			*bhp = bh;
+-			(*bhp)->b_prev_free = bh;
+-		}
+-
+-		bh->b_next_free = *bhp;
+-		bh->b_prev_free = (*bhp)->b_prev_free;
+-		(*bhp)->b_prev_free->b_next_free = bh;
++	/* Add to back of free list. */
++	remove_from_lru_list(bh);
++	if(!*bhp) {
++		*bhp = bh;
+ 		(*bhp)->b_prev_free = bh;
+ 	}
++
++	bh->b_next_free = *bhp;
++	bh->b_prev_free = (*bhp)->b_prev_free;
++	(*bhp)->b_prev_free->b_next_free = bh;
++	(*bhp)->b_prev_free = bh;
+ }
+ 
+ static inline void put_last_free(struct buffer_head * bh)
+ {
+-	if (bh) {
+-		struct buffer_head **bhp = &free_list[BUFSIZE_INDEX(bh->b_size)];
++	struct buffer_head **bhp = &free_list[BUFSIZE_INDEX(bh->b_size)];
+ 
+-		bh->b_dev = B_FREE;  /* So it is obvious we are on the free list. */
+-
+-		/* Add to back of free list. */
+-		if(!*bhp) {
+-			*bhp = bh;
+-			bh->b_prev_free = bh;
+-		}
++	remove_from_queues(bh);
++	bh->b_dev = B_FREE;  /* So it is obvious we are on the free list. */
+ 
+-		bh->b_next_free = *bhp;
+-		bh->b_prev_free = (*bhp)->b_prev_free;
+-		(*bhp)->b_prev_free->b_next_free = bh;
+-		(*bhp)->b_prev_free = bh;
++	/* Add to back of free list. */
++	if(!*bhp) {
++		*bhp = bh;
++		bh->b_prev_free = bh;
+ 	}
++
++	bh->b_next_free = *bhp;
++	bh->b_prev_free = (*bhp)->b_prev_free;
++	(*bhp)->b_prev_free->b_next_free = bh;
++	(*bhp)->b_prev_free = bh;
+ }
+ 
+ static void insert_into_queues(struct buffer_head * bh)
+ {
+-	/* put at end of free list */
+-	if(bh->b_dev == B_FREE) {
+-		put_last_free(bh);
+-	} else {
+-		struct buffer_head **bhp = &lru_list[bh->b_list];
++	struct buffer_head **bhp = &lru_list[bh->b_list];
+ 
+-		if(!*bhp) {
+-			*bhp = bh;
+-			bh->b_prev_free = bh;
+-		}
++	if(!*bhp) {
++		*bhp = bh;
++		bh->b_prev_free = bh;
++	}
+ 
+-		if (bh->b_next_free)
+-			panic("VFS: buffer LRU pointers corrupted");
++	if (bh->b_next_free)
++		panic("VFS: buffer LRU pointers corrupted");
+ 
+-		bh->b_next_free = *bhp;
+-		bh->b_prev_free = (*bhp)->b_prev_free;
+-		(*bhp)->b_prev_free->b_next_free = bh;
+-		(*bhp)->b_prev_free = bh;
++	bh->b_next_free = *bhp;
++	bh->b_prev_free = (*bhp)->b_prev_free;
++	(*bhp)->b_prev_free->b_next_free = bh;
++	(*bhp)->b_prev_free = bh;
+ 
+-		nr_buffers_type[bh->b_list]++;
++	nr_buffers_type[bh->b_list]++;
+ 
+-		/* Put the buffer in new hash-queue if it has a device. */
+-		bh->b_next = NULL;
+-		bh->b_pprev = NULL;
+-		if (bh->b_dev) {
+-			struct buffer_head **bhp = &hash(bh->b_dev, bh->b_blocknr);
+-			struct buffer_head *next = *bhp;
+-
+-			if (next) {
+-				bh->b_next = next;
+-				next->b_pprev = &bh->b_next;
+-			}
+-			*bhp = bh;
+-			bh->b_pprev = bhp;
++	/* Put the buffer in new hash-queue if it has a device. */
++	bh->b_next = NULL;
++	bh->b_pprev = NULL;
++	if (bh->b_dev) {
++		struct buffer_head **bhp = &hash(bh->b_dev, bh->b_blocknr);
++		struct buffer_head *next = *bhp;
++
++		if (next) {
++			bh->b_next = next;
++			next->b_pprev = &bh->b_next;
+ 		}
++		*bhp = bh;
++		bh->b_pprev = bhp;
+ 		nr_hashed_buffers++;
+ 	}
+ }
+@@ -586,6 +578,7 @@
+ 		next = tmp->b_next;
+ 		if (tmp->b_blocknr != block || tmp->b_size != size || tmp->b_dev != dev)
+ 			continue;
++		touch_buffer(tmp);
+ 		next = tmp;
+ 		break;
+ 	}
+@@ -746,6 +739,7 @@
+ 	init_buffer(bh, dev, block, end_buffer_io_sync, NULL);
+ 	bh->b_state=0;
+ 	insert_into_queues(bh);
++	touch_buffer(bh);
+ 	return bh;
+ 
+ 	/*
+@@ -854,7 +848,6 @@
+ 		return;
+ 	}
+ 	buf->b_count = 0;
+-	remove_from_queues(buf);
+ 	put_last_free(buf);
+ }
+ 
+@@ -867,7 +860,6 @@
+ 	struct buffer_head * bh;
+ 
+ 	bh = getblk(dev, block, size);
+-	touch_buffer(bh);
+ 	if (buffer_uptodate(bh))
+ 		return bh;
+ 	ll_rw_block(READ, 1, &bh);
+@@ -904,7 +896,6 @@
+ 	bh = getblk(dev, block, bufsize);
+ 	index = BUFSIZE_INDEX(bh->b_size);
+ 
+-	touch_buffer(bh);
+ 	if (buffer_uptodate(bh))
+ 		return(bh);   
+ 	else ll_rw_block(READ, 1, &bh);
+@@ -1074,13 +1065,9 @@
+ 		bh->b_this_page = head;
+ 		head = bh;
+ 
+-		bh->b_state = 0;
+-		bh->b_next_free = NULL;
+-		bh->b_count = 0;
+ 		bh->b_size = size;
+ 
+ 		bh->b_data = (char *) (page+offset);
+-		bh->b_list = 0;
+ 	}
+ 	return head;
+ /*
+I am also thinking about set_blocksize() and invalidate_buffers(). As
+first I think that both these two functions should move all invalidated
+buffers to the free_list (as bforget now does). I also seen a bad race in
+set_blocksize. We are sleeping knowing that we'll contine walking on
+bhnext:
+			bhnext = bh->b_next_free; 
+			if (bh->b_dev != dev)
+				 continue;
+			if (bh->b_size == size)
+				 continue;
+			bhnext->b_count++;
+			wait_on_buffer(bh);
+			bhnext->b_count--;
+but while we sleep bhnext (and bhext is the next buffer, not the next 
+buffer of the same b_dev) could be moved in another list, so we would end
+browsing the next list instead of invalidating all wrong-sized buffers in
+the current nlist. Maybe I am missing something...
+So to avoid this race I think that we can simply make sure that before go
+to sleep bhnext will be a buffer that belongs to kdev.
+I also don't understand why to walk every lru_list for 2 times (that's
+really an overkill). The point is that if a wrong-sized buffer can be
+moved to the end of the lru_list, if we are unlucky and the I/O is slow
+enough, a double pass won't save us from missing an interesting bh (and
+missing it in the invalidate case means corruption on the read level). To
+make sure to invalidate all buffers that belongs to the kdev, we can't
+rely on walking the list two times, but we must make sure that noplace in
+the kernel can call put_last_lru() or adding wrong-sized buffers, while we
+are invalidating/resizing buffers (no problems instead if the buffers that
+we are going to invalidate will be freed while we are sleeping wakling the
+list).
+Another thing that make me suspectious is that b_flushtime is not
+explicitly set to 0 in the io_completation callback. If for some reason
+it's not set to 0 (if brelse is called before starting I/O for example) we
+may end syncing buffers to disk too early (but maybe I am missing
+something about this flushtime issue).
+I also think that we should put put_last_lru() in find_buffer() and not in
+getblk(). And finally I noticed an time_after() missing.
+So here it is a second incremental patch (against the one above) that
+fixes these secondary (but maybe more serious) issues:
+Index: fs/buffer.c
+===================================================================
+RCS file: /var/cvs/linux/fs/buffer.c,v
+retrieving revision 1.1.2.39
+diff -u -r1.1.2.39 buffer.c
+--- buffer.c	1999/04/04 14:07:04	1.1.2.39
++++ linux/fs/buffer.c	1999/04/04 21:51:07
+@@ -395,6 +395,37 @@
+ 	return err;
+ }
+ 
++static inline void __remove_from_list(struct buffer_head * bh,
++				      struct buffer_head ** list_p)
++{
++	if (bh->b_next_free != bh)
++	{
++		bh->b_prev_free->b_next_free = bh->b_next_free;
++		bh->b_next_free->b_prev_free = bh->b_prev_free;
++
++		if (*list_p == bh)
++			*list_p = bh->b_next_free;
++	} else
++		*list_p = NULL;
++
++	bh->b_next_free = bh->b_prev_free = NULL;
++}
++
++static inline void __insert_into_list(struct buffer_head * bh,
++				      struct buffer_head ** list_p)
++{
++	if (*list_p)
++		bh->b_prev_free = (*list_p)->b_prev_free;
++	else
++	{
++		bh->b_prev_free = bh;
++		*list_p = bh;
++	}
++	bh->b_next_free = *list_p;
++	(*list_p)->b_prev_free->b_next_free = bh;
++	(*list_p)->b_prev_free = bh;
++}
++
+ void invalidate_buffers(kdev_t dev)
+ {
+ 	int i;
+@@ -437,24 +468,37 @@
+ 		nr_hashed_buffers--;
+ 	}
+ }
++
++static inline void insert_into_hash_queue(struct buffer_head * bh)
++{
++	/* Put the buffer in new hash-queue if it has a device. */
++	bh->b_next = NULL;
++	bh->b_pprev = NULL;
++	if (bh->b_dev) {
++		struct buffer_head **bhp = &hash(bh->b_dev, bh->b_blocknr);
++		struct buffer_head *next = *bhp;
++
++		if (next) {
++			bh->b_next = next;
++			next->b_pprev = &bh->b_next;
++		}
++		*bhp = bh;
++		bh->b_pprev = bhp;
++		nr_hashed_buffers++;
++	}
++}
+ 
+-static inline void remove_from_lru_list(struct buffer_head * bh)
++static void remove_from_lru_list(struct buffer_head * bh)
+ {
+ 	if (!(bh->b_prev_free) || !(bh->b_next_free))
+ 		panic("VFS: LRU block list corrupted");
+ 	if (bh->b_dev == B_FREE)
+ 		panic("LRU list corrupted");
+-	bh->b_prev_free->b_next_free = bh->b_next_free;
+-	bh->b_next_free->b_prev_free = bh->b_prev_free;
+ 
+-	if (lru_list[bh->b_list] == bh)
+-		 lru_list[bh->b_list] = bh->b_next_free;
+-	if (lru_list[bh->b_list] == bh)
+-		 lru_list[bh->b_list] = NULL;
+-	bh->b_next_free = bh->b_prev_free = NULL;
++	__remove_from_list(bh, &lru_list[bh->b_list]);
+ }
+ 
+-static inline void remove_from_free_list(struct buffer_head * bh)
++static void remove_from_free_list(struct buffer_head * bh)
+ {
+ 	int isize = BUFSIZE_INDEX(bh->b_size);
+ 	if (!(bh->b_prev_free) || !(bh->b_next_free))
+@@ -463,15 +507,8 @@
+ 		panic("Free list corrupted");
+ 	if(!free_list[isize])
+ 		panic("Free list empty");
+-	if(bh->b_next_free == bh)
+-		 free_list[isize] = NULL;
+-	else {
+-		bh->b_prev_free->b_next_free = bh->b_next_free;
+-		bh->b_next_free->b_prev_free = bh->b_prev_free;
+-		if (free_list[isize] == bh)
+-			 free_list[isize] = bh->b_next_free;
+-	}
+-	bh->b_next_free = bh->b_prev_free = NULL;
++
++	__remove_from_list(bh, &free_list[isize]);
+ }
+ 
+ static void remove_from_queues(struct buffer_head * bh)
+@@ -490,80 +527,36 @@
+ {
+ 	struct buffer_head **bhp = &lru_list[bh->b_list];
+ 
++#if 0 /* nice but it's a special case for a really not fast path -arca */
+ 	if (bh == *bhp) {
+ 		*bhp = bh->b_next_free;
+ 		return;
+ 	}
+-
++#endif
+ 	if(bh->b_dev == B_FREE)
+ 		panic("Wrong block for lru list");
+ 
+ 	/* Add to back of free list. */
+-	remove_from_lru_list(bh);
+-	if(!*bhp) {
+-		*bhp = bh;
+-		(*bhp)->b_prev_free = bh;
+-	}
+-
+-	bh->b_next_free = *bhp;
+-	bh->b_prev_free = (*bhp)->b_prev_free;
+-	(*bhp)->b_prev_free->b_next_free = bh;
+-	(*bhp)->b_prev_free = bh;
++	__remove_from_list(bh, bhp);
++	__insert_into_list(bh, bhp);
+ }
+ 
+-static inline void put_last_free(struct buffer_head * bh)
++static void put_last_free(struct buffer_head * bh)
+ {
+ 	struct buffer_head **bhp = &free_list[BUFSIZE_INDEX(bh->b_size)];
+ 
+ 	remove_from_queues(bh);
+ 	bh->b_dev = B_FREE;  /* So it is obvious we are on the free list. */
+-
+-	/* Add to back of free list. */
+-	if(!*bhp) {
+-		*bhp = bh;
+-		bh->b_prev_free = bh;
+-	}
+-
+-	bh->b_next_free = *bhp;
+-	bh->b_prev_free = (*bhp)->b_prev_free;
+-	(*bhp)->b_prev_free->b_next_free = bh;
+-	(*bhp)->b_prev_free = bh;
++	__insert_into_list(bh, bhp);
+ }
+ 
+ static void insert_into_queues(struct buffer_head * bh)
+ {
+ 	struct buffer_head **bhp = &lru_list[bh->b_list];
+ 
+-	if(!*bhp) {
+-		*bhp = bh;
+-		bh->b_prev_free = bh;
+-	}
+-
+-	if (bh->b_next_free)
+-		panic("VFS: buffer LRU pointers corrupted");
+-
+-	bh->b_next_free = *bhp;
+-	bh->b_prev_free = (*bhp)->b_prev_free;
+-	(*bhp)->b_prev_free->b_next_free = bh;
+-	(*bhp)->b_prev_free = bh;
+-
++	__insert_into_list(bh, bhp);
+ 	nr_buffers_type[bh->b_list]++;
+-
+-	/* Put the buffer in new hash-queue if it has a device. */
+-	bh->b_next = NULL;
+-	bh->b_pprev = NULL;
+-	if (bh->b_dev) {
+-		struct buffer_head **bhp = &hash(bh->b_dev, bh->b_blocknr);
+-		struct buffer_head *next = *bhp;
+-
+-		if (next) {
+-			bh->b_next = next;
+-			next->b_pprev = &bh->b_next;
+-		}
+-		*bhp = bh;
+-		bh->b_pprev = bhp;
+-		nr_hashed_buffers++;
+-	}
++	insert_into_hash_queue(bh);
+ }
+ 
+ struct buffer_head * find_buffer(kdev_t dev, int block, int size)
+@@ -579,6 +572,8 @@
+ 		if (tmp->b_blocknr != block || tmp->b_size != size || tmp->b_dev != dev)
+ 			continue;
+ 		touch_buffer(tmp);
++		if (buffer_uptodate(tmp))
++			put_last_lru(tmp);
+ 		next = tmp;
+ 		break;
+ 	}
+@@ -717,14 +722,8 @@
+ 
+ repeat:
+ 	bh = get_hash_table(dev, block, size);
+-	if (bh) {
+-		if (!buffer_dirty(bh)) {
+-			if (buffer_uptodate(bh))
+-				 put_last_lru(bh);
+-			bh->b_flushtime = 0;
+-		}
++	if (bh)
+ 		return bh;
+-	}
+ 
+ 	isize = BUFSIZE_INDEX(size);
+ get_free:
+@@ -761,7 +760,7 @@
+ 		/* Move buffer to dirty list if jiffies is clear. */
+ 		newtime = jiffies + (flag ? bdf_prm.b_un.age_super : 
+ 				     bdf_prm.b_un.age_buffer);
+-		if(!buf->b_flushtime || buf->b_flushtime > newtime)
++		if(!buf->b_flushtime || time_after(buf->b_flushtime, newtime))
+ 			 buf->b_flushtime = newtime;
+ 	} else {
+ 		buf->b_flushtime = 0;
+@@ -1326,6 +1325,7 @@
+ 			tmp=tmp->b_this_page;
+ 		} while (tmp && tmp != bh);
+ 		set_bit(PG_uptodate, &mem_map[MAP_NR(bh->b_data)].flags);
++		bh->b_flushtime = 0;
+ 		return;
+ 	}
+ 	clear_bit(BH_Uptodate, &bh->b_state);
+The patch does also a further cleanup of the code (adding some helper
+function to avoid having to play with the details of the list
+implementation in higher level functions all over the place). I am using
+these two patches here and everything worked fine so far.
+The other set_blocksize issue (where bhnext could be refiled while we are
+sleeping while walking a lru_list) could be instead fixed with something
+like the patch below (incremental against the two previous one), but I
+should think about that a bit more and so I have not tried it yet here.
+(NOTE: this is only a snapshot that asks for comment; don't apply it!!)
+Index: fs/buffer.c
+===================================================================
+RCS file: /var/cvs/linux/fs/buffer.c,v
+retrieving revision 1.1.2.39
+diff -u -r1.1.2.39 buffer.c
+--- buffer.c	1999/04/04 14:07:04	1.1.2.39
++++ linux/fs/buffer.c	1999/04/04 21:51:07
+@@ -647,11 +642,22 @@
+ 	 */
+ 	for(nlist = 0; nlist < NR_LIST; nlist++) {
+ 		bh = lru_list[nlist];
+-		for (i = nr_buffers_type[nlist]*2 ; --i > 0 ; bh = bhnext) {
+-			if(!bh)
++		if (!bh)
++			continue;
++		bhnext = bh;
++		for (i = nr_buffers_type[nlist] ; i > 0 ; bh = bhnext) {
++			if (!bh)
++				break;
++			while (i--)
++			{
++				bhnext = bhnext->b_next_free;
++				if (bhnext->b_dev != dev)
++					continue;
++				if (bhnext->b_size == size)
++					continue;
+ 				break;
++			}
+ 
+-			bhnext = bh->b_next_free; 
+ 			if (bh->b_dev != dev)
+ 				 continue;
+ 			if (bh->b_size == size)
+@@ -660,12 +666,11 @@
+ 			wait_on_buffer(bh);
+ 			bhnext->b_count--;
+ 			if (bh->b_dev == dev && bh->b_size != size) {
+-				clear_bit(BH_Dirty, &bh->b_state);
+-				clear_bit(BH_Uptodate, &bh->b_state);
+-				clear_bit(BH_Req, &bh->b_state);
+-				bh->b_flushtime = 0;
++				if (bh->b_count)
++					panic("set_blocksize: b_count > 0");
++				bh->b_state = 0;
++				put_last_free(bh);
+ 			}
+-			remove_from_hash_queue(bh);
+ 		}
+ 	}
+ }
+Comments?
+Andrea Arcangeli
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

@@ -1,0 +1,286 @@
+Date: Wed, 17 Aug 2005 12:26:33 -0600
+From: "Bhavesh P. Davda" <>
+Subject: [PATCH 2.6.12.5] NPTL signal delivery deadlock fix
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2005/8/17/121
+
+This bug is quite subtle and only happens in a very interesting
+situation where a real-time threaded process is in the middle of a
+coredump when someone whacks it with a SIGKILL. However, this deadlock
+leaves the system pretty hosed and you have to reboot to recover.
+Not good for real-time priority-preemption applications like our
+telephony application, with 90+ real-time (SCHED_FIFO and SCHED_RR)
+processes, many of them multi-threaded, interacting with each other for
+high volume call processing.
+- Bhavesh
+Also, for your reading pleasure, a complete analysis of how the system
+gets into a deadlock due to this bug. I wanted to post it because I
+spent several hours analysing this.
+-- 
+Bhavesh P. Davda | Distinguished Member of Technical Staff | Avaya |
+1300 West 120th Avenue | B3-B03 | Westminster, CO 80234 | U.S.A. |
+Voice/Fax: 303.538.4438 | bhavesh@avaya.com
+diff -Naur linux-2.6.12.5/kernel/signal.c linux-2.6.12.5-sigfix/kernel/signal.c
+--- linux-2.6.12.5/kernel/signal.c	2005-08-14 18:20:18.000000000 -0600
++++ linux-2.6.12.5-sigfix/kernel/signal.c	2005-08-17 11:36:20.547600092 -0600
+@@ -686,7 +686,7 @@
+ {
+ 	struct task_struct *t;
+ 
+-	if (p->flags & SIGNAL_GROUP_EXIT)
++	if (p->signal->flags & SIGNAL_GROUP_EXIT)
+ 		/*
+ 		 * The process is in the middle of dying already.
+ 		 */When bash sends SIGABRT to rt-pthreaded-app main thread:
+bash: sys_kill(pid, SIGABRT)
+      kill_something_info(SIGABRT, &info, pid)
+      kill_proc_info(SIGABRT, info, pid)
+      p = find_task_by_pid(pid), group_send_sig_info(SIGABRT, info, p)
+      __group_send_sig_info(SIGABRT, info, p)
+      __group_complete_signal(SIGABRT, p)
+Still bash, p==rt-pthreaded-app main thread:
+static void __group_complete_signal(int sig, struct task_struct *p)
+{
+	unsigned int mask;
+	struct task_struct *t;
+	/*
+	 * Don't bother traced and stopped tasks (but
+	 * SIGKILL will punch through that).
+	 */
+	mask = TASK_STOPPED | TASK_TRACED;
+	if (sig == SIGKILL)
+		mask = 0;
+==> mask == TASK_STOPPED|TASK_TRACED
+	/*
+	 * Now find a thread we can wake up to take the signal off the queue.
+	 *
+	 * If the main thread wants the signal, it gets first crack.
+	 * Probably the least surprising to the average bear.
+	 */
+	if (wants_signal(sig, p, mask))
+		t = p;
+==> t = p (rt-pthreaded-app main thread)
+	else if (thread_group_empty(p))
+		/*
+		 * There is just one thread and it does not need to be woken.
+		 * It will dequeue unblocked signals before it runs again.
+		 */
+		return;
+	else {
+		/*
+		 * Otherwise try to find a suitable thread.
+		 */
+		t = p->signal->curr_target;
+		if (t == NULL)
+			/* restart balancing at this thread */
+			t = p->signal->curr_target = p;
+		BUG_ON(t->tgid != p->tgid);
+		while (!wants_signal(sig, t, mask)) {
+			t = next_thread(t);
+			if (t == p->signal->curr_target)
+				/*
+				 * No thread needs to be woken.
+				 * Any eligible threads will see
+				 * the signal in the queue soon.
+				 */
+				return;
+		}
+		p->signal->curr_target = t;
+	}
+	/*
+	 * Found a killable thread.  If the signal will be fatal,
+	 * then start taking the whole group down immediately.
+	 */
+	if (sig_fatal(p, sig) && !(p->signal->flags & SIGNAL_GROUP_EXIT) &&
+	    !sigismember(&t->real_blocked, sig) &&
+	    (sig == SIGKILL || !(t->ptrace & PT_PTRACED))) {
+==> sig_fatal(p, SIGABRT) true
+==> SIGNAL_GROUP_EXIT is not set yet
+==> SIGABRT is not blocked
+==> p is not PT_PTRACED
+		/*
+		 * This signal will be fatal to the whole group.
+		 */
+		if (!sig_kernel_coredump(sig)) {
+==> SIGABRT is sig_kernel_coredump(), skip
+			/*
+			 * Start a group exit and wake everybody up.
+			 * This way we don't have other threads
+			 * running and doing things after a slower
+			 * thread has the fatal signal pending.
+			 */
+			p->signal->flags = SIGNAL_GROUP_EXIT;
+			p->signal->group_exit_code = sig;
+			p->signal->group_stop_count = 0;
+			t = p;
+			do {
+				sigaddset(&t->pending.signal, SIGKILL);
+				signal_wake_up(t, 1);
+				t = next_thread(t);
+			} while (t != p);
+			return;
+		}
+		/*
+		 * There will be a core dump.  We make all threads other
+		 * than the chosen one go into a group stop so that nothing
+		 * happens until it gets scheduled, takes the signal off
+		 * the shared queue, and does the core dump.  This is a
+		 * little more complicated than strictly necessary, but it
+		 * keeps the signal state that winds up in the core dump
+		 * unchanged from the death state, e.g. which thread had
+		 * the core-dump signal unblocked.
+		 */
+		rm_from_queue(SIG_KERNEL_STOP_MASK, &t->pending);
+		rm_from_queue(SIG_KERNEL_STOP_MASK, &p->signal->shared_pending);
+		p->signal->group_stop_count = 0;
+		p->signal->group_exit_task = t;
+		t = p;
+==> Start with thread being killed
+		do {
+			p->signal->group_stop_count++;
+==> For rt-pthreaded-app this will be done twice (for the 2 subthreads)
+			signal_wake_up(t, 0);
+==> This is a no-op so far, because the subthread "t" doesn't have a signal
+			t = next_thread(t);
+		} while (t != p);
+		wake_up_process(p->signal->group_exit_task);
+==> This wakes up the main rt-pthreaded-app thread. At this point in time,
+==> group_stop_count == 2, but SIGNAL_GROUP_EXIT is still not set
+		return;
+==> BASH IS DONE.
+	}
+	/*
+	 * The signal is already in the shared-pending queue.
+	 * Tell the chosen thread to wake up and dequeue it.
+	 */
+	signal_wake_up(t, sig == SIGKILL);
+	return;
+}
+rt-pthreaded-app main thread:
+======================
+Coming out of schedule(), it will look for pending signals
+do_notify_resume()
+do_signal()
+	signr = get_signal_to_deliver(&info, &ka, regs, NULL);
+get_signal_to_deliver()
+	if (unlikely(current->signal->group_stop_count > 0) &&
+		handle_group_stop())
+==> group_stop_count is 2, so call handle_group_stop()
+handle_group_stop()
+	if (current->signal->group_exit_task == current) {
+==> This is true
+		/* Group stop is so we can do a core dump,
+	 	 * We are the initiating thread, so get on with it. */
+		current->signal->group_exit_task = NULL;
+		return 0;
+	}
+==> back to get_signal_to_deliver()
+		signr = dequeue_signal(current, mask, info);
+==> signr == SIGABRT
+	if (!signr) break; /* will return 0 */ (not true, signr==SIGABRT)
+	if ((current->ptrace & PT_PTRACED) && signr != SIGKILL) {
+	(not true, skip)
+	ka = &current->sighand->action[signr-1];
+	if (ka->sa.sa_handler == SIG_IGN) /* Do nothing.  */
+		continue; (not true, handler == SIG_DFL)
+	if (ka->sa.sa_handler != SIG_DFL) {
+	(not true, skip)
+	if (sig_kernel_ignore(signr)) /* Default is nothing. */ continue;
+	(not true, skip)
+	if (current->pid == 1) continue; (not true, skip)
+	if (sig_kernel_stop(signr)) { (not true, skip)
+	/* Anything else is fatal, maybe with a core dump. */
+	current->flags |= PF_SIGNALED;
+	if (sig_kernel_coredump(signr)) {
+==> TRUE
+		do_coredump((long)signr, signr, regs);
+do_coredump(SIGABRT, SIGABRT, regs)
+	current->signal->flags = SIGNAL_GROUP_EXIT;
+==> Finally we set SIGNAL_GROUP_EXIT here
+	current->signal->group_exit_code = exit_code;
+==> group_exit_code == SIGABRT
+	coredump_wait(mm);
+coredump_wait(mm)
+	mm->core_waiters++; /* let other threads block */
+	/* give other threads a chance to run: */
+	yield();
+	zap_threads(mm);
+zap_threads(mm)
+	do_each_thread(g,p)
+		if (mm == p->mm && p != tsk) {
+			force_sig_specific(SIGKILL, p);
+==> This is where the rt-pthreaded-app subthreads are sent a SIGKILL
+force_sig_specific(SIGKILL, p)
+	specific_send_sig_info(SIGKILL, (void *)2, t);
+specific_send_sig_info(SIGKILL, 2, t)
+	ret = send_signal(SIGKILL, 2, t, &t->pending);
+send_signal(SIGKILL, 2, t, &t->pending)
+	/*
+	 * fast-pathed signals for kernel-internal things like SIGSTOP
+	 * or SIGKILL.
+	 */
+	if ((unsigned long)info == 2) goto out_set;
+	(True)
+	sigaddset(&signals->signal, sig);
+	return ret; // returns 0
+Back to specific_send_sig_info(SIGKILL, 2, t)
+	if (!ret && !sigismember(&t->blocked, sig))
+		signal_wake_up(t, sig == SIGKILL);
+	(True)
+signal_wake_up(t, TRUE)
+	set_tsk_thread_flag(t, TIF_SIGPENDING);
+	mask = TASK_INTERRUPTIBLE;
+	if (resume) (True)
+		mask |= TASK_STOPPED | TASK_TRACED;
+	if (!wake_up_state(t, mask))
+		kick_process(t)
+==> This will wake up rt-pthreaded-app subthreads whether they are in
+==> TASK_INTERRUPTIBLE, TASK_STOPPED, or TASK_TRACED states
+==> THIS WON'T WAKE UP TASK_UNINTERRUPTIBLE THREADS
+==> At this point in time:
+==> group_stop_count == 2, SIGNAL_GROUP_EXIT is set in all threads
+			mm->core_waiters++;
+==> This finally becomes 3 (main + 2 subthreads)
+		}
+	while_each_thread(g,p);
+Back to coredump_wait()
+	if (--mm->core_waiters) {
+==> Main thread decrements core_waiters back to 2.
+		up_write(&mm->mmap_sem);
+		wait_for_completion(&startup_done);
+NOW, IF THE MAIN rt-pthreaded-app THREAD IS SENT A SIGKILL WHILE WAITING
+handle_stop_signal()
+	if (p->flags & SIGNAL_GROUP_EXIT) return;
+***** WRONG CHECK! SHOULD BE (p->signal->flags & SIGNAL_GROUP_EXIT) *****
+	else if (sig == SIGKILL) {
+		p->signal->flags = 0;
+	}
+********* WHOOPS! Just cleared SIGNAL_GROUP_EXIT **************
+rt-pthreaded-app subthread:
+====================
+Coming out of schedule(), it will look for pending signals
+do_notify_resume()
+do_signal()
+	signr = get_signal_to_deliver(&info, &ka, regs, NULL);
+get_signal_to_deliver()
+	if (unlikely(current->signal->group_stop_count > 0) &&
+		handle_group_stop())
+==> group_stop_count is 2, so call handle_group_stop()
+handle_group_stop()
+	if (current->signal->group_exit_task == current) {
+	(False)
+	if (current->signal->flags & SIGNAL_GROUP_EXIT) return;
+	(SHOULD HAVE BEEN TRUE, BUT WAS CLEARED BY MAIN THREAD)
+	stop_count = --current->signal->group_stop_count;
+==> group_stop_count is now 1
+	if (stop_count == 0)
+		current->signal->flags = SIGNAL_STOP_STOPPED;
+	current->exit_code = current->signal->group_exit_code;
+==> exit_code == SIGABRT
+	set_current_state(TASK_STOPPED);
+==> Task enters TASK_STOPPED state
+	finish_stop(stop_count);
+DEADLOCK!

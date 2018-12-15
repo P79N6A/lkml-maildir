@@ -1,0 +1,544 @@
+Date: Fri, 9 Apr 1999 21:37:57 +0200 (CEST)
+From: Andrea Arcangeli <>
+Subject: Re: [PFC]: hash instrumentation
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/4/9/125
+
+I extracted my current buffer.c. Most of the changes are commented in my
+previous email. Basically this will fix the flushtime handling, will fix
+the old _bad_ bdflush behavior (well in part is also due me, but I didn't
+realized the whole picture at that time, and my patch with
+wakeup_bdflush(1) in mark_buffer_dirty() at that time was a obviously-safe
+solution and wasn't really so bad since most of the buffers wasn't really
+waiting 30sec before be synced back to disk ;), it will fix a bug in the
+bufferVM setting b_state = 0 before forgetting the buffer in the freelist
+(so it will be freeable again even if we bforgot it while it was dirty).
+In first place I exchanged this last bug with a memleak ;) but the reason
+I trieggered it so easly here is that with flushtime fixed I can really
+forget tons of dirty buffers.
+I would also ask to comment about the run_task_queue(&tq_disk) before
+sleep waiting for bdflush() I/O completation. Why we were running run it
+if then we are going to sleep waiting for a daemon that _will_ generate
+I/O and will recall run_task_queue(&tq_disk) before wakeup us again. Chuck
+told me that such removal decreased a bit performances (maybe it's been a
+random variance in the bench timings?). According to me it should change
+nothing. If it was a black magic or it made a sense I would like to hear a
+comment ;). Thanks!!
+Let me know for any troubles with this code and I'll do my best to fix it!
+Index: fs/buffer.c
+===================================================================
+RCS file: /var/cvs/linux/fs/buffer.c,v
+retrieving revision 1.1.1.8
+retrieving revision 1.1.2.49
+diff -u -r1.1.1.8 -r1.1.2.49
+--- buffer.c	1999/03/29 21:38:51	1.1.1.8
++++ linux/fs/buffer.c	1999/04/06 21:01:35	1.1.2.49
+@@ -97,23 +97,25 @@
+ 		int ndirty;  /* Maximum number of dirty blocks to write out per
+ 				wake-cycle */
+ 		int nrefill; /* Number of clean buffers to try to obtain
+-				each time we call refill */
++				each time we call refill */ /* unused */
+ 		int nref_dirt; /* Dirty buffer threshold for activating bdflush
+-				  when trying to refill buffers. */
++				  when trying to refill buffers. */ /* unused */
+ 		int dummy1;    /* unused */
+ 		int age_buffer;  /* Time for normal buffer to age before 
+ 				    we flush it */
+ 		int age_super;  /* Time for superblock to age before we 
+ 				   flush it */
+-		int dummy2;    /* unused */
++		int nfract_limit; /* Max percentage of dirty buffers to cause
++				     the task to wait for bdflush I/O
++				     completation */
+ 		int dummy3;    /* unused */
+ 	} b_un;
+ 	unsigned int data[N_PARAM];
+-} bdf_prm = {{40, 500, 64, 256, 15, 30*HZ, 5*HZ, 1884, 2}};
++} bdf_prm = {{30, 500, 64, 256, 15, 30*HZ, 5*HZ, 70, 2}};
+ 
+ /* These are the min and max parameter values that we will allow to be assigned */
+-int bdflush_min[N_PARAM] = {  0,  10,    5,   25,  0,   1*HZ,   1*HZ, 1, 1};
+-int bdflush_max[N_PARAM] = {100,5000, 2000, 2000,100, 600*HZ, 600*HZ, 2047, 5};
++int bdflush_min[N_PARAM] = {  0,  10,    5,   25,  0,   1*HZ,   1*HZ, 0, 1};
++int bdflush_max[N_PARAM] = {100,5000, 2000, 2000,100, 600*HZ, 600*HZ, 100, 5};
+ 
+ void wakeup_bdflush(int);
+ 
+@@ -219,7 +221,6 @@
+ 				continue;
+ 			bh->b_count++;
+ 			next->b_count++;
+-			bh->b_flushtime = 0;
+ 			ll_rw_block(WRITE, 1, &bh);
+ 			bh->b_count--;
+ 			next->b_count--;
+@@ -395,6 +396,37 @@
+ 	return err;
+ }
+ 
++static inline void __remove_from_list(struct buffer_head * bh,
++				      struct buffer_head ** list_p)
++{
++	if (bh->b_next_free != bh)
++	{
++		bh->b_prev_free->b_next_free = bh->b_next_free;
++		bh->b_next_free->b_prev_free = bh->b_prev_free;
++
++		if (*list_p == bh)
++			*list_p = bh->b_next_free;
++	} else
++		*list_p = NULL;
++
++	bh->b_next_free = bh->b_prev_free = NULL;
++}
++
++static inline void __insert_into_list(struct buffer_head * bh,
++				      struct buffer_head ** list_p)
++{
++	if (*list_p)
++		bh->b_prev_free = (*list_p)->b_prev_free;
++	else
++	{
++		bh->b_prev_free = bh;
++		*list_p = bh;
++	}
++	bh->b_next_free = *list_p;
++	(*list_p)->b_prev_free->b_next_free = bh;
++	(*list_p)->b_prev_free = bh;
++}
++
+ void invalidate_buffers(kdev_t dev)
+ {
+ 	int i;
+@@ -411,7 +443,6 @@
+ 				continue;
+ 			if (bh->b_count)
+ 				continue;
+-			bh->b_flushtime = 0;
+ 			clear_bit(BH_Protected, &bh->b_state);
+ 			clear_bit(BH_Uptodate, &bh->b_state);
+ 			clear_bit(BH_Dirty, &bh->b_state);
+@@ -434,27 +465,40 @@
+ 		}
+ 		*pprev = next;
+ 		bh->b_pprev = NULL;
++		nr_hashed_buffers--;
++	}
++}
++
++static inline void insert_into_hash_queue(struct buffer_head * bh)
++{
++	/* Put the buffer in new hash-queue if it has a device. */
++	bh->b_next = NULL;
++	bh->b_pprev = NULL;
++	if (bh->b_dev) {
++		struct buffer_head **bhp = &hash(bh->b_dev, bh->b_blocknr);
++		struct buffer_head *next = *bhp;
++
++		if (next) {
++			bh->b_next = next;
++			next->b_pprev = &bh->b_next;
++		}
++		*bhp = bh;
++		bh->b_pprev = bhp;
++		nr_hashed_buffers++;
+ 	}
+-	nr_hashed_buffers--;
+ }
+ 
+-static inline void remove_from_lru_list(struct buffer_head * bh)
++static void remove_from_lru_list(struct buffer_head * bh)
+ {
+ 	if (!(bh->b_prev_free) || !(bh->b_next_free))
+ 		panic("VFS: LRU block list corrupted");
+ 	if (bh->b_dev == B_FREE)
+ 		panic("LRU list corrupted");
+-	bh->b_prev_free->b_next_free = bh->b_next_free;
+-	bh->b_next_free->b_prev_free = bh->b_prev_free;
+ 
+-	if (lru_list[bh->b_list] == bh)
+-		 lru_list[bh->b_list] = bh->b_next_free;
+-	if (lru_list[bh->b_list] == bh)
+-		 lru_list[bh->b_list] = NULL;
+-	bh->b_next_free = bh->b_prev_free = NULL;
++	__remove_from_list(bh, &lru_list[bh->b_list]);
+ }
+ 
+-static inline void remove_from_free_list(struct buffer_head * bh)
++static void remove_from_free_list(struct buffer_head * bh)
+ {
+ 	int isize = BUFSIZE_INDEX(bh->b_size);
+ 	if (!(bh->b_prev_free) || !(bh->b_next_free))
+@@ -463,15 +507,8 @@
+ 		panic("Free list corrupted");
+ 	if(!free_list[isize])
+ 		panic("Free list empty");
+-	if(bh->b_next_free == bh)
+-		 free_list[isize] = NULL;
+-	else {
+-		bh->b_prev_free->b_next_free = bh->b_next_free;
+-		bh->b_next_free->b_prev_free = bh->b_prev_free;
+-		if (free_list[isize] == bh)
+-			 free_list[isize] = bh->b_next_free;
+-	}
+-	bh->b_next_free = bh->b_prev_free = NULL;
++
++	__remove_from_list(bh, &free_list[isize]);
+ }
+ 
+ static void remove_from_queues(struct buffer_head * bh)
+@@ -488,90 +525,40 @@
+ 
+ static inline void put_last_lru(struct buffer_head * bh)
+ {
+-	if (bh) {
+-		struct buffer_head **bhp = &lru_list[bh->b_list];
++	struct buffer_head **bhp = &lru_list[bh->b_list];
+ 
+-		if (bh == *bhp) {
+-			*bhp = bh->b_next_free;
+-			return;
+-		}
+-
+-		if(bh->b_dev == B_FREE)
+-			panic("Wrong block for lru list");
+-
+-		/* Add to back of free list. */
+-		remove_from_lru_list(bh);
+-		if(!*bhp) {
+-			*bhp = bh;
+-			(*bhp)->b_prev_free = bh;
+-		}
+-
+-		bh->b_next_free = *bhp;
+-		bh->b_prev_free = (*bhp)->b_prev_free;
+-		(*bhp)->b_prev_free->b_next_free = bh;
+-		(*bhp)->b_prev_free = bh;
++#if 0 /* nice but it's a special case for a really not fast path -arca */
++	if (bh == *bhp) {
++		*bhp = bh->b_next_free;
++		return;
+ 	}
++#endif
++	if(bh->b_dev == B_FREE)
++		panic("Wrong block for lru list");
++
++	/* Add to back of free list. */
++	__remove_from_list(bh, bhp);
++	__insert_into_list(bh, bhp);
+ }
+ 
+ static inline void put_last_free(struct buffer_head * bh)
+ {
+-	if (bh) {
+-		struct buffer_head **bhp = &free_list[BUFSIZE_INDEX(bh->b_size)];
+-
+-		bh->b_dev = B_FREE;  /* So it is obvious we are on the free list. */
++	struct buffer_head **bhp = &free_list[BUFSIZE_INDEX(bh->b_size)];
+ 
+-		/* Add to back of free list. */
+-		if(!*bhp) {
+-			*bhp = bh;
+-			bh->b_prev_free = bh;
+-		}
+-
+-		bh->b_next_free = *bhp;
+-		bh->b_prev_free = (*bhp)->b_prev_free;
+-		(*bhp)->b_prev_free->b_next_free = bh;
+-		(*bhp)->b_prev_free = bh;
+-	}
++	remove_from_queues(bh);
++	bh->b_count = 0;
++	bh->b_state = 0;
++	bh->b_dev = B_FREE;  /* So it is obvious we are on the free list. */
++	__insert_into_list(bh, bhp);
+ }
+ 
+ static void insert_into_queues(struct buffer_head * bh)
+ {
+-	/* put at end of free list */
+-	if(bh->b_dev == B_FREE) {
+-		put_last_free(bh);
+-	} else {
+-		struct buffer_head **bhp = &lru_list[bh->b_list];
+-
+-		if(!*bhp) {
+-			*bhp = bh;
+-			bh->b_prev_free = bh;
+-		}
+-
+-		if (bh->b_next_free)
+-			panic("VFS: buffer LRU pointers corrupted");
+-
+-		bh->b_next_free = *bhp;
+-		bh->b_prev_free = (*bhp)->b_prev_free;
+-		(*bhp)->b_prev_free->b_next_free = bh;
+-		(*bhp)->b_prev_free = bh;
++	struct buffer_head **bhp = &lru_list[bh->b_list];
+ 
+-		nr_buffers_type[bh->b_list]++;
+-
+-		/* Put the buffer in new hash-queue if it has a device. */
+-		bh->b_next = NULL;
+-		bh->b_pprev = NULL;
+-		if (bh->b_dev) {
+-			struct buffer_head **bhp = &hash(bh->b_dev, bh->b_blocknr);
+-			struct buffer_head *next = *bhp;
+-
+-			if (next) {
+-				bh->b_next = next;
+-				next->b_pprev = &bh->b_next;
+-			}
+-			*bhp = bh;
+-			bh->b_pprev = bhp;
+-		}
+-		nr_hashed_buffers++;
+-	}
++	__insert_into_list(bh, bhp);
++	nr_buffers_type[bh->b_list]++;
++	insert_into_hash_queue(bh);
+ }
+ 
+ struct buffer_head * find_buffer(kdev_t dev, int block, int size)
+@@ -586,6 +573,9 @@
+ 		next = tmp->b_next;
+ 		if (tmp->b_blocknr != block || tmp->b_size != size || tmp->b_dev != dev)
+ 			continue;
++		touch_buffer(tmp);
++		if (!buffer_dirty(tmp) && buffer_uptodate(tmp))
++			put_last_lru(tmp);
+ 		next = tmp;
+ 		break;
+ 	}
+@@ -670,7 +660,6 @@
+ 				clear_bit(BH_Dirty, &bh->b_state);
+ 				clear_bit(BH_Uptodate, &bh->b_state);
+ 				clear_bit(BH_Req, &bh->b_state);
+-				bh->b_flushtime = 0;
+ 			}
+ 			remove_from_hash_queue(bh);
+ 		}
+@@ -694,7 +683,6 @@
+ {
+ 	bh->b_count = 1;
+ 	bh->b_list = BUF_CLEAN;
+-	bh->b_flushtime = 0;
+ 	bh->b_dev = dev;
+ 	bh->b_blocknr = block;
+ 	bh->b_end_io = handler;
+@@ -724,14 +712,8 @@
+ 
+ repeat:
+ 	bh = get_hash_table(dev, block, size);
+-	if (bh) {
+-		if (!buffer_dirty(bh)) {
+-			if (buffer_uptodate(bh))
+-				 put_last_lru(bh);
+-			bh->b_flushtime = 0;
+-		}
++	if (bh)
+ 		return bh;
+-	}
+ 
+ 	isize = BUFSIZE_INDEX(size);
+ get_free:
+@@ -746,6 +728,7 @@
+ 	init_buffer(bh, dev, block, end_buffer_io_sync, NULL);
+ 	bh->b_state=0;
+ 	insert_into_queues(bh);
++	touch_buffer(bh);
+ 	return bh;
+ 
+ 	/*
+@@ -767,10 +750,7 @@
+ 		/* Move buffer to dirty list if jiffies is clear. */
+ 		newtime = jiffies + (flag ? bdf_prm.b_un.age_super : 
+ 				     bdf_prm.b_un.age_buffer);
+-		if(!buf->b_flushtime || buf->b_flushtime > newtime)
+-			 buf->b_flushtime = newtime;
+-	} else {
+-		buf->b_flushtime = 0;
++		buf->b_flushtime = newtime;
+ 	}
+ }
+ 
+@@ -806,12 +786,20 @@
+ 	if(dispose != buf->b_list) {
+ 		file_buffer(buf, dispose);
+ 		if(dispose == BUF_DIRTY) {
+-			int too_many = (nr_buffers * bdf_prm.b_un.nfract/100);
++			int too_many, limit;
+ 
+ 			/* This buffer is dirty, maybe we need to start flushing.
+ 			 * If too high a percentage of the buffers are dirty...
+ 			 */
++			too_many = (nr_buffers * bdf_prm.b_un.nfract/100);
+ 			if (nr_buffers_type[BUF_DIRTY] > too_many)
++				wakeup_bdflush(0);
++
++			/* If we reached the limit of dirty buffer we must
++			 * also wait of I/O completation, sigh. -arca
++			 */
++			limit = (nr_buffers * bdf_prm.b_un.nfract_limit/100);
++			if (nr_buffers_type[BUF_DIRTY] > limit)
+ 				wakeup_bdflush(1);
+ 
+ 			/* If this is a loop device, and
+@@ -830,8 +818,6 @@
+  */
+ void __brelse(struct buffer_head * buf)
+ {
+-	/* If dirty, mark the time this buffer should be written back. */
+-	set_writetime(buf, 0);
+ 	refile_buffer(buf);
+ 
+ 	if (buf->b_count) {
+@@ -853,8 +839,6 @@
+ 		__brelse(buf);
+ 		return;
+ 	}
+-	buf->b_count = 0;
+-	remove_from_queues(buf);
+ 	put_last_free(buf);
+ }
+ 
+@@ -867,7 +851,6 @@
+ 	struct buffer_head * bh;
+ 
+ 	bh = getblk(dev, block, size);
+-	touch_buffer(bh);
+ 	if (buffer_uptodate(bh))
+ 		return bh;
+ 	ll_rw_block(READ, 1, &bh);
+@@ -904,7 +887,6 @@
+ 	bh = getblk(dev, block, bufsize);
+ 	index = BUFSIZE_INDEX(bh->b_size);
+ 
+-	touch_buffer(bh);
+ 	if (buffer_uptodate(bh))
+ 		return(bh);   
+ 	else ll_rw_block(READ, 1, &bh);
+@@ -1074,13 +1056,9 @@
+ 		bh->b_this_page = head;
+ 		head = bh;
+ 
+-		bh->b_state = 0;
+-		bh->b_next_free = NULL;
+-		bh->b_count = 0;
+ 		bh->b_size = size;
+ 
+ 		bh->b_data = (char *) (page+offset);
+-		bh->b_list = 0;
+ 	}
+ 	return head;
+ /*
+@@ -1577,10 +1571,8 @@
+ 	if (current == bdflush_tsk)
+ 		return;
+ 	wake_up(&bdflush_wait);
+-	if (wait) {
+-		run_task_queue(&tq_disk);
++	if (wait)
+ 		sleep_on(&bdflush_done);
+-	}
+ }
+ 
+ 
+@@ -1645,7 +1637,6 @@
+ 				 nwritten++;
+ 				 next->b_count++;
+ 				 bh->b_count++;
+-				 bh->b_flushtime = 0;
+ #ifdef DEBUG
+ 				 if(nlist != BUF_DIRTY) ncount++;
+ #endif
+@@ -1798,7 +1789,6 @@
+ 					  next->b_count++;
+ 					  bh->b_count++;
+ 					  ndirty++;
+-					  bh->b_flushtime = 0;
+ 					  if (major == LOOP_MAJOR) {
+ 						  ll_rw_block(wrta_cmd,1, &bh);
+ 						  wrta_cmd = WRITEA;
+@@ -1831,7 +1821,7 @@
+ 		
+ 		/* If there are still a lot of dirty buffers around, skip the sleep
+ 		   and flush some more */
+-		if(ndirty == 0 || nr_buffers_type[BUF_DIRTY] <= nr_buffers * bdf_prm.b_un.nfract/100) {
++		if(nr_buffers_type[BUF_DIRTY] <= nr_buffers * bdf_prm.b_un.nfract/100) {
+ 			spin_lock_irq(&current->sigmask_lock);
+ 			flush_signals(current);
+ 			spin_unlock_irq(&current->sigmask_lock);
+Index: include/linux/fs.h
+===================================================================
+RCS file: /var/cvs/linux/include/linux/fs.h,v
+retrieving revision 1.1.1.5
+diff -u -r1.1.1.5 fs.h
+--- fs.h	1999/03/24 00:51:45	1.1.1.5
++++ linux/include/linux/fs.h	1999/04/09 16:49:50
+@@ -401,7 +395,6 @@
+ /* Inode state bits.. */
+ #define I_DIRTY		1
+ #define I_LOCK		2
+-#define I_FREEING	4
+ 
+ extern void __mark_inode_dirty(struct inode *);
+ static inline void mark_inode_dirty(struct inode *inode)
+@@ -770,10 +763,10 @@
+ extern inline void mark_buffer_dirty(struct buffer_head * bh, int flag)
+ {
+ 	if (!test_and_set_bit(BH_Dirty, &bh->b_state)) {
+-		set_writetime(bh, flag);
+ 		if (bh->b_list != BUF_DIRTY)
+ 			refile_buffer(bh);
+ 	}
++	set_writetime(bh, flag);
+ }
+ 
+ extern int check_disk_change(kdev_t dev);
+I have also some news about my (2.2.5_arca5-8) VM from people who tried
+it.
+Well the code is slower (kernel compile and similar are slower). The fact
+is that taking a better information about the working set is more
+expensive. But people who tried it under swap is been _very_ happy and
+seen a _big_ responsiveness difference/improvement.
+And I think that people who is using it is using tons of cache and a few
+of pages used for real-work, while instead I would like if somebody with
+some giga of ram would try it with an application that _use_ most of the
+memory and left only 100/200mbyte of cache free (against 1giga of mem used
+for computations). I think that in such conditions my VM should be __far__
+faster. Obviously if 90% of pages in the pagemap are freeable-cache-pages
+and there's no need to swapout, my code _can't_ be faster. But I see as
+the right way to go and people who used it with tons of swapout noticed
+that. I think that if somebody would be in the 1/2giga-used case would
+notice that too ;). Somebody that will run a cvs diff on a CVS repository
+two times will be happy too I think... Well if you try it let me know your
+impressions.
+But to be sure I am reviewing all my code to make sure that the slowdown
+is really due the lru-handling in every find-page/find-buffer.
+I am also a bit worried by shrink_dcache_memory(). It looks like to me
+that it's recalled too late. You should swapout heavily or delete files in
+order to shrink the dcache right now. And the shrink in my tree is more
+finegrined than the complete shrink done by the stock kernel, and since my
+tree is very stable (no peak of low memory) also during swap I think that
+shrink_dcache memory is __never__ recalled with normal operations that
+also involve swap. So I think I'll move shrink_dcache_memory() _before_
+swap_out() to see if it's been part of the bottleneck.
+I won't return shrinking all the dcache if the problem is the one
+described above since I think it wouldn't be a fix, but a misfeature that
+hides a problem ;).
+Comments?
+Andrea Arcangeli
+PS. I am releasing an 2.2.5_arca9 with shrink mmap before swapout and with
+some other completly unrelated overhead (really it's wasn't pure overhead
+but they was spinlocks to make sure to read a costintent xtime, but I
+understand that it's not a major issue...) removed.
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

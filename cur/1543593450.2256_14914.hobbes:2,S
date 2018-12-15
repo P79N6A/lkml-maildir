@@ -1,0 +1,180 @@
+Date: Wed, 6 Jun 2001 10:06:42 +0200 (CEST)
+From: Ingo Molnar <>
+Subject: Re: [patch] softirq-2.4.6-B4
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2001/6/6/46
+
+On Tue, 5 Jun 2001, Linus Torvalds wrote:
+> entry.S:
+>
+> +       xorl %ecx,%ecx; \
+>         testl SYMBOL_NAME(irq_stat)+4(,%eax),%ecx
+oops, bogus indeed.
+the softirq checks in entry.S are now obsolete and i've removed them in
+-C2 completely. (this also explains why this 'dummy' entry.S code had no
+effect on performance and stability.) Any code that can somehow end up
+delaying softirqs is supposed to restart them explicitly.
+this should at least somewhat reduce the cost of having to add a cli to
+the need_resched and sigpending checks.
+we could avoid the cli in the syscall path by putting an additional check
+into the IRQ path: we can check the interrupted EIP and fix up the return
+EIP if we interrupted the 'critical path'. (since the window is small,
+this check would be triggered rarely.) [the idea is not mine, i think it
+came from Chris Evans, and the code is included in the lowlatency
+patches.]
+>    (The "cli" may help the need_resched thing, but I doubt it matters, and
+>    if that's what you're trying to do then you should move it there,
+>    instead of having it at the softirq place).
+yes, it was there partly for need_resched and sigpending purposes as well,
+so a cli before the need_resched and sigpending checks is still needed.
+the attached softirq-2.4.6-C2 patch (relative to -B4) has another change
+as well:
+- to make the local_bh_enable() softirq-check even more lightweight, on
+  x86 i've moved parts of it into asssembly, with the slow path moved into
+  an offline section. The assembly code does not mark any register as
+  clobbered to reduce the register-saving overhead, so it has to save
+  %eax, %ecx and %edx prior calling do_softirq().
+  in -C2 a softirq-restart check is straight fall-through code with two
+  untaken forward-pointing branches, which should put the cost of the
+  common softirq check on the order of 1-2 cycles. (plus the unavoidable
+  icache footprint increase.)
+(the patch has been sanity compiled & booted on both UP and SMP x86.)
+	Ingo
+--- linux/include/asm-i386/softirq.h.orig	Wed Jun  6 08:51:54 2001
++++ linux/include/asm-i386/softirq.h	Wed Jun  6 09:16:26 2001
+@@ -11,10 +11,39 @@
+ 
+ #define local_bh_disable()	cpu_bh_disable(smp_processor_id())
+ #define __local_bh_enable()	__cpu_bh_enable(smp_processor_id())
+-#define local_bh_enable()	do { int __cpu = smp_processor_id(); if (!--local_bh_count(__cpu) && softirq_pending(__cpu)) { do_softirq(); __sti(); } } while (0)
+ #define __cpu_raise_softirq(cpu,nr) set_bit((nr), &softirq_pending(cpu));
+ #define raise_softirq(nr) __cpu_raise_softirq(smp_processor_id(), (nr))
+ 
+ #define in_softirq() (local_bh_count(smp_processor_id()) != 0)
++
++/*
++ * NOTE: this assembly code assumes:
++ *
++ *    (char *)&local_bh_count - 8 == (char *)&softirq_pending
++ *
++ * If you change the offsets in irq_stat then you have to
++ * update this code as well.
++ */
++#define local_bh_enable()						\
++do {									\
++	unsigned int *ptr = &local_bh_count(smp_processor_id());	\
++									\
++	if (!--*ptr)							\
++		__asm__ __volatile__ (					\
++			"cmpl $0, -8(%0);"				\
++			"jnz 2f;"					\
++			"1:;"						\
++									\
++			".section .text.lock,\"ax\";"			\
++			"2: pushl %%eax; pushl %%ecx; pushl %%edx;"	\
++			"call do_softirq;"				\
++			"popl %%edx; popl %%ecx; popl %%eax;"		\
++			"jmp 1b;"					\
++			".previous;"					\
++									\
++		: /* no output */					\
++		: "r" (ptr)						\
++		/* no registers clobbered */ );				\
++} while (0)
+ 
+ #endif	/* __ASM_SOFTIRQ_H */
+--- linux/include/asm-i386/hardirq.h.orig	Wed Jun  6 09:04:59 2001
++++ linux/include/asm-i386/hardirq.h	Wed Jun  6 09:16:26 2001
+@@ -5,7 +5,7 @@
+ #include <linux/threads.h>
+ #include <linux/irq.h>
+ 
+-/* entry.S is sensitive to the offsets of these fields */
++/* assembly code in softirq.h is sensitive to the offsets of these fields */
+ typedef struct {
+ 	unsigned int __softirq_pending;
+ 	unsigned int __local_irq_count;
+--- linux/arch/i386/kernel/entry.S.orig	Wed Jun  6 08:48:09 2001
++++ linux/arch/i386/kernel/entry.S	Wed Jun  6 08:51:39 2001
+@@ -133,18 +133,6 @@
+ 	movl $-8192, reg; \
+ 	andl %esp, reg
+ 
+-#ifdef CONFIG_SMP
+-#define CHECK_SOFTIRQ \
+-	movl processor(%ebx),%eax; \
+-	shll $CONFIG_X86_L1_CACHE_SHIFT,%eax; \
+-	xorl %ecx,%ecx; \
+-	testl SYMBOL_NAME(irq_stat)+4(,%eax),%ecx
+-#else
+-#define CHECK_SOFTIRQ \
+-	xorl %ecx,%ecx; \
+-	testl SYMBOL_NAME(irq_stat)+4,%ecx
+-#endif
+-
+ ENTRY(lcall7)
+ 	pushfl			# We get a different stack layout with call gates,
+ 	pushl %eax		# which has to be cleaned up later..
+@@ -215,9 +203,7 @@
+ 	call *SYMBOL_NAME(sys_call_table)(,%eax,4)
+ 	movl %eax,EAX(%esp)		# save the return value
+ ENTRY(ret_from_sys_call)
+-	cli
+-	CHECK_SOFTIRQ
+-	jne handle_softirq
++	cli				# need_resched and signals atomic test
+ 	cmpl $0,need_resched(%ebx)
+ 	jne reschedule
+ 	cmpl $0,sigpending(%ebx)
+@@ -233,13 +219,6 @@
+ 	jne v86_signal_return
+ 	xorl %edx,%edx
+ 	call SYMBOL_NAME(do_signal)
+-#ifdef CONFIG_SMP
+-	GET_CURRENT(%ebx)
+-#endif
+-	cli
+-	CHECK_SOFTIRQ
+-	je restore_all
+-	call SYMBOL_NAME(do_softirq)
+ 	jmp restore_all
+ 
+ 	ALIGN
+@@ -248,13 +227,6 @@
+ 	movl %eax,%esp
+ 	xorl %edx,%edx
+ 	call SYMBOL_NAME(do_signal)
+-#ifdef CONFIG_SMP
+-	GET_CURRENT(%ebx)
+-#endif
+-	cli
+-	CHECK_SOFTIRQ
+-	je restore_all
+-	call SYMBOL_NAME(do_softirq)
+ 	jmp restore_all
+ 
+ 	ALIGN
+@@ -276,8 +248,6 @@
+ 	ALIGN
+ ret_from_exception:
+ 	cli
+-	CHECK_SOFTIRQ
+-	jne handle_softirq
+ 	cmpl $0,need_resched(%ebx)
+ 	jne reschedule
+ 	cmpl $0,sigpending(%ebx)
+@@ -292,11 +262,6 @@
+ 	jne ret_from_sys_call
+ 	jmp restore_all
+ 
+-	ALIGN
+-handle_softirq:
+-	call SYMBOL_NAME(do_softirq)
+-	jmp ret_from_intr
+-	
+ 	ALIGN
+ reschedule:
+ 	call SYMBOL_NAME(schedule)    # test

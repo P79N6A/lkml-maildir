@@ -1,0 +1,179 @@
+Date: Wed, 28 Mar 2001 11:57:52 +0200 (CEST)
+From: Ingo Molnar <>
+Subject: [patch] pae-2.4.3-C3
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2001/3/28/37
+
+the attached pae-2.4.3-C3 patch fixes the PAE code to work with SLAB
+FORCED_DEBUG (which enables redzoning) too.
+the problem is that redzoning is enabled unconditionally, and SLAB has no
+information about how crutial alignment is in the case of any particular
+SLAB cache. The CPU generates a general protection fault if in PAE mode a
+non-16-byte aligned pgd is loaded into %cr3.
+Redzoning is very useful and most caches use HWCACHE_ALIGN, so i didnt
+want to disable redzoning if SLAB_HWCACHE_ALIGN is set. The patch adds
+SLAB_MUST_HWCACHE_ALIGN, which makes the distinction.
+the patch is against 2.4.3-pre8 (applies cleanly to ac26 as well), and
+compiles & boot cleanly in PAE mode, with or without CONFIG_DEBUG_SLAB.
+The kernel also compiles cleanly in non-PAE mode.
+(the patch also introduces the pae_pgd SLAB cache, which is a tiny
+speedup.)
+	Ingo
+--- linux/init/main.c.orig	Wed Mar 28 14:41:59 2001
++++ linux/init/main.c	Wed Mar 28 14:42:02 2001
+@@ -570,6 +570,9 @@
+ #endif
+ 	mem_init();
+ 	kmem_cache_sizes_init();
++#if CONFIG_X86_PAE
++	init_pae_pgd_cache();
++#endif
+ #ifdef CONFIG_3215_CONSOLE
+         con3215_activate();
+ #endif
+--- linux/mm/slab.c.orig	Wed Mar 28 14:41:59 2001
++++ linux/mm/slab.c	Wed Mar 28 14:42:02 2001
+@@ -102,9 +102,11 @@
+ #if DEBUG
+ # define CREATE_MASK	(SLAB_DEBUG_INITIAL | SLAB_RED_ZONE | \
+ 			 SLAB_POISON | SLAB_HWCACHE_ALIGN | \
+-			 SLAB_NO_REAP | SLAB_CACHE_DMA)
++			 SLAB_NO_REAP | SLAB_CACHE_DMA | \
++			 SLAB_MUST_HWCACHE_ALIGN)
+ #else
+-# define CREATE_MASK	(SLAB_HWCACHE_ALIGN | SLAB_NO_REAP | SLAB_CACHE_DMA)
++# define CREATE_MASK	(SLAB_HWCACHE_ALIGN | SLAB_NO_REAP | \
++			 SLAB_CACHE_DMA | SLAB_MUST_HWCACHE_ALIGN)
+ #endif
+ 
+ /*
+@@ -641,7 +643,7 @@
+ 		flags &= ~SLAB_POISON;
+ 	}
+ #if FORCED_DEBUG
+-	if (size < (PAGE_SIZE>>3))
++	if ((size < (PAGE_SIZE>>3)) && !(flags & SLAB_MUST_HWCACHE_ALIGN))
+ 		/*
+ 		 * do not red zone large object, causes severe
+ 		 * fragmentation.
+--- linux/include/linux/slab.h.orig	Sun Dec 31 20:10:17 2000
++++ linux/include/linux/slab.h	Wed Mar 28 14:44:25 2001
+@@ -36,6 +36,7 @@
+ #define	SLAB_NO_REAP		0x00001000UL	/* never reap from the cache */
+ #define	SLAB_HWCACHE_ALIGN	0x00002000UL	/* align objs on a h/w cache lines */
+ #define SLAB_CACHE_DMA		0x00004000UL	/* use GFP_DMA memory */
++#define	SLAB_MUST_HWCACHE_ALIGN	0x00008000UL	/* force alignment */
+ 
+ /* flags passed to a constructor func */
+ #define	SLAB_CTOR_CONSTRUCTOR	0x001UL		/* if not set, then deconstructor */
+--- linux/include/asm-i386/pgalloc.h.orig	Wed Mar 28 14:41:59 2001
++++ linux/include/asm-i386/pgalloc.h	Wed Mar 28 14:44:25 2001
+@@ -20,13 +20,19 @@
+ 
+ #if CONFIG_X86_PAE
+ 
+-extern void *kmalloc(size_t, int);
+-extern void kfree(const void *);
++struct kmem_cache_s;
++
++extern struct kmem_cache_s *pae_pgd_cachep;
++
++extern void *kmem_cache_alloc(struct kmem_cache_s *, int);
++extern void kmem_cache_free(struct kmem_cache_s *, void *);
++
++extern void init_pae_pgd_cache(void);
+ 
+ extern __inline__ pgd_t *get_pgd_slow(void)
+ {
+ 	int i;
+-	pgd_t *pgd = kmalloc(PTRS_PER_PGD * sizeof(pgd_t), GFP_KERNEL);
++	pgd_t *pgd = kmem_cache_alloc(pae_pgd_cachep, GFP_KERNEL);
+ 
+ 	if (pgd) {
+ 		for (i = 0; i < USER_PTRS_PER_PGD; i++) {
+@@ -42,7 +48,7 @@
+ out_oom:
+ 	for (i--; i >= 0; i--)
+ 		free_page((unsigned long)__va(pgd_val(pgd[i])-1));
+-	kfree(pgd);
++	kmem_cache_free(pae_pgd_cachep, pgd);
+ 	return NULL;
+ }
+ 
+@@ -88,7 +94,7 @@
+ 
+ 	for (i = 0; i < USER_PTRS_PER_PGD; i++)
+ 		free_page((unsigned long)__va(pgd_val(pgd[i])-1));
+-	kfree(pgd);
++	kmem_cache_free(pae_pgd_cachep, pgd);
+ #else
+ 	free_page((unsigned long)pgd);
+ #endif
+--- linux/arch/i386/mm/init.c.orig	Wed Mar 28 14:41:56 2001
++++ linux/arch/i386/mm/init.c	Wed Mar 28 14:42:02 2001
+@@ -15,6 +15,9 @@
+ #include <linux/types.h>
+ #include <linux/ptrace.h>
+ #include <linux/mman.h>
++#include <linux/slab.h>
++#include <linux/sched.h>
++#include <linux/fs.h>
+ #include <linux/mm.h>
+ #include <linux/swap.h>
+ #include <linux/smp.h>
+@@ -131,15 +134,11 @@
+ 	pte_t *pte;
+ 
+ 	pgd = swapper_pg_dir + __pgd_offset(vaddr);
+-	if (pgd_none(*pgd)) {
+-		printk("PAE BUG #00!\n");
+-		return;
+-	}
++	if (pgd_none(*pgd))
++		BUG();
+ 	pmd = pmd_offset(pgd, vaddr);
+-	if (pmd_none(*pmd)) {
+-		printk("PAE BUG #01!\n");
+-		return;
+-	}
++	if (pmd_none(*pmd))
++		BUG();
+ 	pte = pte_offset(pmd, vaddr);
+ 	if (pte_val(*pte))
+ 		pte_ERROR(*pte);
+@@ -183,7 +182,7 @@
+ 			pmd = (pmd_t *) alloc_bootmem_low_pages(PAGE_SIZE);
+ 			set_pgd(pgd, __pgd(__pa(pmd) + 0x1));
+ 			if (pmd != pmd_offset(pgd, 0))
+-				printk("PAE BUG #02!\n");
++				BUG();
+ 		}
+ 		pmd = pmd_offset(pgd, vaddr);
+ #else
+@@ -581,3 +580,23 @@
+ 	val->mem_unit = PAGE_SIZE;
+ 	return;
+ }
++
++#if CONFIG_X86_PAE
++
++#include <linux/slab.h>
++
++struct kmem_cache_s *pae_pgd_cachep;
++
++void __init init_pae_pgd_cache(void)
++{
++	/*
++	 * PAE pgds must be 16-byte aligned:
++	 */
++	pae_pgd_cachep = kmem_cache_create("pae_pgd", 32, 0,
++		SLAB_HWCACHE_ALIGN | SLAB_MUST_HWCACHE_ALIGN, NULL, NULL);
++	if (!pae_pgd_cachep)
++		panic("init_pae(): Cannot alloc pae_pgd SLAB cache");
++}
++
++#endif
++

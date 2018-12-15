@@ -1,0 +1,213 @@
+Date: Mon, 1 Aug 2005 03:02:07 -0700
+From: Lukasz Kosewski <>
+Subject: [PATCH 3/3] Add disk hotswap support to libata RESEND #2
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2005/8/1/70
+
+Patch 03:  Have sata_promise use the perfect, flawless API from the
+previous patch
+As described in the archives, this patch build on patch 02 in the
+series to actually allow the sata_promise controller to hotswap.  Be
+careful, untested!
+This version comes with all of Jeff's suggestions (documented in the
+patch itself).  It depends on patch 01 to apply, and both patch 01 and
+02 to compile and run.
+Luke Kosewski
+01.08.05  Luke Kosewski  <lkosewsk@nit.ca>
+	* A full implementation of hotplug on a libata controller, this being
+	  the Promise Tx4/Tx2 Plus controller line (both SATA150 and SATAII150).
+	  Almost all of the code pertaining to how to talk to the hotplug
+	  registers has been stolen from the pdc-ulsata2 and ultra-1.0.8 Promise
+	  drivers.  This involves detecting when we have an interrupt pending
+	  and on what device, as well as the bit where a hard SATA reset gets
+	  a controller to re-spew a plug interrupt.
+	* Note that the hotplug handling code comes AFTER the normal interrupt
+	  handling code in pdc_interrupt_common; this is because we're much
+	  more likely to receive normal interrupts, so this drops the AVERAGE
+	  interrupt handling time down a lot.
+	* This is a resend of the original patch which in particular:
+	  - Doesn't special-case the turning off of channel interrupts during a
+	    hard reset to the SATAII150 controllers; all controllers now do
+	    this.
+	  - Actually aborts the interrupt handler if, after reading mmio_base +
+	    PDC_INT_SEQMASK, we don't get ANYTHING (aka no device).
+	  - On Jeff's suggestion, the whole hotswap system was changed over to
+	    use a debounce timer; see patch 02 for that goodie.
+Signed-off-by:  Luke Kosewski <lkosewsk@nit.ca>
+--- linux/drivers/scsi/sata_promise.c.old	2005-07-28 20:43:52.000000000 -0700
++++ linux/drivers/scsi/sata_promise.c	2005-08-01 02:23:27.000000000 -0700
+@@ -67,12 +67,16 @@ enum {
+ 	PDC_HAS_PATA		= (1 << 1), /* PDC20375/20575 has PATA */
+ 
+ 	PDC_RESET		= (1 << 11), /* HDMA reset */
++
++	HOTPLUG_PLUG		= 1,
++	HOTPLUG_UNPLUG		= 0,
+ };
+ 
+ 
+ struct pdc_port_priv {
+ 	u8			*pkt;
+ 	dma_addr_t		pkt_dma;
++	int			hotplug_status;
+ };
+ 
+ struct pdc_host_priv {
+@@ -87,6 +91,7 @@ static void pdc_eng_timeout(struct ata_p
+ static int pdc_port_start(struct ata_port *ap);
+ static void pdc_port_stop(struct ata_port *ap);
+ static void pdc_phy_reset(struct ata_port *ap);
++static int pdc_hotplug_action(struct ata_port *ap);
+ static void pdc_pata_phy_reset(struct ata_port *ap);
+ static void pdc_pata_cbl_detect(struct ata_port *ap);
+ static void pdc_qc_prep(struct ata_queued_cmd *qc);
+@@ -133,6 +138,7 @@ static struct ata_port_operations pdc_at
+ 	.port_start		= pdc_port_start,
+ 	.port_stop		= pdc_port_stop,
+ 	.host_stop		= ata_host_stop,
++	.hotplug_action		= pdc_hotplug_action,
+ };
+ 
+ static struct ata_port_info pdc_port_info[] = {
+@@ -299,15 +305,61 @@ static void pdc_reset_port(struct ata_po
+ 	readl(mmio);	/* flush */
+ }
+ 
++/* Mask hotplug interrupts for one channel (ap) */
++static inline void pdc_disable_channel_hotplug_interrupts(struct ata_port *ap)
++{
++	struct pdc_host_priv *hp = ap->host_set->private_data;
++	void *mmio = ap->host_set->mmio_base + hp->hotplug_offset + 2;
++
++	u8 maskflags = readb(mmio);
++	maskflags |= (0x11 << (u8)ap->hard_port_no);
++	writeb(maskflags, mmio);
++}
++
++/* Clear and unmask hotplug interrupts for one channel (ap) */
++static inline void pdc_enable_channel_hotplug_interrupts(struct ata_port *ap)
++{
++	struct pdc_host_priv *hp = ap->host_set->private_data;
++	void *mmio = ap->host_set->mmio_base + hp->hotplug_offset;
++
++	//Clear channel hotplug interrupts
++	u8 maskflags = readb(mmio);
++	maskflags |= (0x11 << (u8)ap->hard_port_no);
++	writeb(maskflags, mmio);
++
++	//Unmask channel hotplug interrupts
++	maskflags = readb(mmio + 2);
++	maskflags &= ~(0x11 << (u8)ap->hard_port_no);
++	writeb(maskflags, mmio + 2);
++}
++
+ static void pdc_phy_reset(struct ata_port *ap)
+ {
+ 	pdc_reset_port(ap);
+-	if (ap->flags & ATA_FLAG_SATA)
+-		sata_phy_reset(ap);
+-	else
++	if (ap->flags & ATA_FLAG_SATA) {
++		/* A hard reset triggers a hotplug interrupt to be played out
++		 * on some controllers.  Hence, disable hotplug interrupts for
++		 * the reset, re-enable them when it's done.
++		 *
++		 * No PATA hotswap support yet
++		 */
++		if (ap->flags & ATA_FLAG_SATA_RESET) {
++			pdc_disable_channel_hotplug_interrupts(ap);
++			sata_phy_reset(ap);
++			pdc_enable_channel_hotplug_interrupts(ap);
++		} else
++			sata_phy_reset(ap);
++	} else
+ 		pdc_pata_phy_reset(ap);
+ }
+ 
++/* Should be called with host_set->lock held */
++static int pdc_hotplug_action(struct ata_port *ap)
++{
++	struct pdc_port_priv *pp = ap->private_data;
++	return pp->hotplug_status;
++}
++
+ static void pdc_pata_cbl_detect(struct ata_port *ap)
+ {
+ 	u8 tmp;
+@@ -467,7 +519,9 @@ static irqreturn_t pdc_interrupt (int ir
+ 	struct ata_port *ap;
+ 	void *mmio_base;
+ 	u32 mask = 0;
+-	unsigned int i, tmp, handled = 0;
++	u8 plugdata, maskflags;
++	struct pdc_host_priv *hp = host_set->private_data;
++	unsigned int i, tmp, handled = 0, hotplug_offset = hp->hotplug_offset;
+ 
+ 	VPRINTK("ENTER\n");
+ 
+@@ -491,7 +545,7 @@ static irqreturn_t pdc_interrupt (int ir
+ 	mask &= 0xffff;		/* only 16 tags possible */
+ 	if (!mask) {
+ 		VPRINTK("QUICK EXIT 3\n");
+-		goto done_irq;
++		goto try_hotplug;
+ 	}
+ 
+ 	writel(mask, mmio_base + PDC_INT_SEQMASK);
+@@ -509,7 +563,40 @@ static irqreturn_t pdc_interrupt (int ir
+ 		}
+ 	}
+ 
+-	VPRINTK("EXIT\n");
++	if (handled) {
++		VPRINTK("EXIT 4\n");
++		goto done_irq;
++	}
++
++try_hotplug:
++	plugdata = readb(mmio_base + hotplug_offset);
++	maskflags = readb(mmio_base + hotplug_offset + 2);
++	plugdata &= ~maskflags;
++	if (plugdata) {
++		struct pdc_port_priv *pp;
++		writeb(plugdata, mmio_base + hotplug_offset);
++		for (i = 0; i < host_set->n_ports; ++i) {
++			ap = host_set->ports[i];
++			pp = ap->private_data;
++			if (!(ap->flags & ATA_FLAG_SATA))
++				continue;  //No PATA support here... yet
++			// Check unplug flag
++			if (plugdata & 0x1) {
++				/* Do stuff related to unplugging a device */
++				pp->hotplug_status = HOTPLUG_UNPLUG;
++				ata_hotplug_op(ap);
++				handled = 1;
++			} else if ((plugdata >> 4) & 0x1) {  //Check plug flag
++				/* Do stuff related to plugging in a device */
++				pp->hotplug_status = HOTPLUG_PLUG;
++				ata_hotplug_op(ap);
++				handled = 1;
++			}
++			plugdata >>= 1;
++		}
++	}
++
++	VPRINTK("EXIT 5\n");
+        
+ done_irq:
+ 	spin_unlock(&host_set->lock);
+@@ -609,9 +696,9 @@ static void pdc_host_init(unsigned int c
+ 	tmp = readl(mmio + hotplug_offset);
+ 	writel(tmp | 0xff, mmio + hotplug_offset);
+ 
+-	/* mask plug/unplug ints */
++	/* unmask plug/unplug ints */
+ 	tmp = readl(mmio + hotplug_offset);
+-	writel(tmp | 0xff0000, mmio + hotplug_offset);
++	writel(tmp & ~0xff0000, mmio + hotplug_offset);
+ 
+ 	/* reduce TBG clock to 133 Mhz. */
+ 	tmp = readl(mmio + PDC_TBG_MODE);

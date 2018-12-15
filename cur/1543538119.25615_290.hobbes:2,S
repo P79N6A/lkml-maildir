@@ -1,0 +1,249 @@
+Date: Mon, 03 Jul 2000 19:17:00 +0200
+From: Roger Larsson <>
+Subject: [PATCH] latency-profiling for 2.4.0-test3-pre2
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/7/3/290
+
+Hi all,
+Since there has been much talk about latencies lately I updated my
+latency profiling patch to the most recent kernel.
+Note: I have simplified usage.
+Output format (changed):
+  Latency <dt>ms PID <pid> % <name>
+  Trace; [<IP>] [<IP>] 
+  dt
+         latency time from rescheduling request (need_resched = 1) until
+actually done.
+  pid
+         process id
+  IPs
+         instruction pointers, decode as any (sampled!) kernel stack
+trace.
+         Note: there might be none since they are sampled with HZ
+  name
+         the running process name. But the problem really is inside the
+kernel. A process
+         running in user space would have been (un-)scheduled
+immediately!!!
+Example (output from dmesg):
+  Latency 708ms PID   267 % modprobe
+  Trace: [<c0205d7e>] [<c0205d7e>] [<c0205d7e>] [<c0205d7e>]
+[<c0205d7e>]
+  [<c0205d7e>] [<c0205d7e>] [<c0205d80>] [<c0205d7e>] [<c0205d7e>] 
+With the modified format you may get symbols by:
+  dmesg | ksymoops
+Trace: c0205d7e <__rdtsc_delay+e/18>
+Trace: c0205d7e <__rdtsc_delay+e/18>
+Trace: c0205d7e <__rdtsc_delay+e/18>
+Trace: c0205d7e <__rdtsc_delay+e/18>
+Trace: c0205d7e <__rdtsc_delay+e/18>
+Trace: c0205d7e <__rdtsc_delay+e/18>
+Trace: c0205d7e <__rdtsc_delay+e/18>
+Trace: c0205d80 <__rdtsc_delay+10/18>
+Trace: c0205d7e <__rdtsc_delay+e/18>
+Trace: c0205d7e <__rdtsc_delay+e/18>
+ 
+But again, note that this is NOT a stack trace. The trace is in sample
+order with HZ (10 ms) run time in between.
+/RogerL
+--
+Home page:
+  
+http://www.norran.net/nra02596/
+--- linux/kernel/Makefile.orig	Mon Jul  3 13:58:16 2000
++++ linux/kernel/Makefile	Mon Jul  3 13:58:43 2000
+@@ -10,7 +10,7 @@
+ O_TARGET := kernel.o
+ O_OBJS    = sched.o dma.o fork.o exec_domain.o panic.o printk.o \
+ 	    module.o exit.o itimer.o info.o time.o softirq.o resource.o \
+-	    sysctl.o acct.o capability.o ptrace.o timer.o
++	    sysctl.o acct.o capability.o ptrace.o timer.o latency-profiling.o
+ 
+ OX_OBJS  += signal.o sys.o
+ 
+@@ -33,5 +33,3 @@ endif
+ CFLAGS_sched.o := $(PROFILING) -fno-omit-frame-pointer
+ 
+ include $(TOPDIR)/Rules.make
+-
+-
+--- linux/kernel/latency-profiling.h.orig	Mon Jul  3 14:18:20 2000
++++ linux/kernel/latency-profiling.h	Mon Jul  3 14:14:00 2000
+@@ -0,0 +1,31 @@
++struct task_struct;
++
++#define LAT_MAX_OVERRUNS 10
++extern int lat_overruns;
++extern unsigned long lat_PC[LAT_MAX_OVERRUNS];
++extern cycles_t lat_start_cycle;
++
++// Prototypes
++void lat_print(struct task_struct * prev);
++static inline void lat_start(void);
++static inline void lat_restart(void);
++
++static inline void lat_start(void) {
++  if (lat_start_cycle == 0)
++    lat_start_cycle = get_cycles(); // could get 0, low prob. 1:2^32 !
++  // unless no TSC then hight prob. 1:1
++}
++
++
++static inline void lat_restart(void) {
++  lat_start_cycle = 0;
++  lat_overruns = 0;
++}
++
++static inline void lat_sample(struct pt_regs * regs) {
++  if (current->need_resched &&
++      lat_overruns < LAT_MAX_OVERRUNS) {
++    lat_PC[lat_overruns++] = instruction_pointer(regs);
++  }
++}
++
+--- linux/kernel/timer.c.orig	Mon Jul  3 13:25:54 2000
++++ linux/kernel/timer.c	Mon Jul  3 13:31:34 2000
+@@ -25,6 +25,8 @@
+ 
+ #include <asm/uaccess.h>
+ 
++#include "latency-profiling.h"
++
+ /*
+  * Timekeeping variables
+  */
+@@ -694,6 +696,7 @@ void do_timer(struct pt_regs *regs)
+ 	mark_bh(TIMER_BH);
+ 	if (tq_timer)
+ 		mark_bh(TQUEUE_BH);
++	lat_sample(regs);
+ }
+ 
+ #if !defined(__alpha__) && !defined(__ia64__)
+--- linux/kernel/latency-profiling.c.orig	Mon Jul  3 14:18:17 2000
++++ linux/kernel/latency-profiling.c	Mon Jul  3 18:45:44 2000
+@@ -0,0 +1,61 @@
++#include <linux/config.h>
++#include <linux/mm.h>
++#include <linux/init.h>
++#include <linux/smp_lock.h>
++#include <linux/interrupt.h>
++#include <linux/kernel_stat.h>
++
++#include <asm/uaccess.h>
++#include <asm/mmu_context.h>
++
++#include "latency-profiling.h"
++
++extern unsigned long cpu_hz; // from linux/arch/i386/time.c
++#define LAT_MS_CYCLES (cpu_hz/ 1000)
++#define LAT_MIN_LATENCY 15 // ms
++
++int lat_overruns;
++unsigned long lat_PC[LAT_MAX_OVERRUNS];
++cycles_t lat_start_cycle;
++
++#define LatMinimum2(a) (a > 2 ? a : 2)
++static inline int lat_time(void)
++{
++  if (lat_start_cycle != 0) {
++    signed long diff = get_cycles() - lat_start_cycle;
++    return diff / LAT_MS_CYCLES;
++  }  else if (lat_overruns >= LatMinimum2(LAT_MS_CYCLES * HZ / 1000)) {
++    // great for non TSC computers
++    // Note: min 2 since otherwice we could be (un)lucky to get a sample
++    // immediately after lat_start()
++    return lat_overruns * 1000 / HZ;
++  } else {
++    return 0;
++  }
++}
++
++void lat_print(struct task_struct * prev) {
++  int overruns = lat_overruns; // sample...
++  int resched_time = lat_time();
++  if (resched_time >= LAT_MIN_LATENCY) {
++    int ix;
++
++    printk("Latency %3dms PID %5d %% %-32s\nTrace:",
++	   resched_time,
++	   prev->pid,
++	   prev->comm); // keeping it last, for auto tools!
++
++    for (ix = 0; ix < overruns; ix++) {
++#if (BITS_PER_LONG == 32)
++      printk(" [<%08lx>]", lat_PC[ix]);
++#else
++      printk(" [<%016lx>]", lat_PC[ix]);
++#endif
++    }
++
++    printk("\n");
++  }
++}
++
++
++
+--- linux/kernel/sched.c.orig	Fri Jun 30 23:55:04 2000
++++ linux/kernel/sched.c	Mon Jul  3 13:58:49 2000
+@@ -42,6 +42,8 @@ unsigned securebits = SECUREBITS_DEFAULT
+ 
+ extern void mem_use(void);
+ 
++#include "latency-profiling.h"
++
+ /*
+  *	Init task must be ok at boot for the ix86 as we will check its signals
+  *	via the SMP irq return path.
+@@ -249,6 +251,7 @@ static inline void reschedule_idle(struc
+ 		
+ send_now:
+ 	target_cpu = tsk->processor;
++	lat_start(); //RL does not really handle SMP...
+ 	tsk->need_resched = 1;
+ 	spin_unlock_irqrestore(&runqueue_lock, flags);
+ 	/*
+@@ -263,8 +266,10 @@ send_now:
+ 	struct task_struct *tsk;
+ 
+ 	tsk = cpu_curr(this_cpu);
+-	if (preemption_goodness(tsk, p, this_cpu) > 0)
++	if (preemption_goodness(tsk, p, this_cpu) > 0) {
++	        lat_start();
+ 		tsk->need_resched = 1;
++	}
+ 	spin_unlock_irqrestore(&runqueue_lock, flags);
+ #endif
+ }
+@@ -483,7 +488,12 @@ move_rr_back:
+ 			del_from_runqueue(prev);
+ 		case TASK_RUNNING:
+ 	}
++
++	if (prev->need_resched) {
++	  lat_print(prev);
++	}
+ 	prev->need_resched = 0;
++	lat_restart();
+ 
+ 	/*
+ 	 * this is the scheduler proper:
+@@ -890,6 +900,7 @@ static int setscheduler(pid_t pid, int p
+ 	if (task_on_runqueue(p))
+ 		move_first_runqueue(p);
+ 
++	lat_start();
+ 	current->need_resched = 1;
+ 
+ out_unlock:
+@@ -967,6 +978,7 @@ asmlinkage long sys_sched_yield(void)
+ 	spin_lock_irq(&runqueue_lock);
+ 	if (current->policy == SCHED_OTHER)
+ 		current->policy |= SCHED_YIELD;
++	lat_start();
+ 	current->need_resched = 1;
+ 	move_last_runqueue(current);
+ 	spin_unlock_irq(&runqueue_lock);

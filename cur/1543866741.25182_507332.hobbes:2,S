@@ -1,0 +1,99 @@
+Date: Sat, 10 Feb 2007 12:59:54 -0800 (PST)
+From: Davide Libenzi <>
+Subject: Re: [PATCH 0 of 4] Generic AIO by scheduling stacks
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2007/2/10/176
+
+On Sat, 10 Feb 2007, Linus Torvalds wrote:
+> On Sat, 10 Feb 2007, Davide Libenzi wrote:
+> > 
+> > For the queue approach, I meant the async_submit() to simply add the 
+> > request (cookie, syscall number and params) inside queue, and not trying 
+> > to execute the syscall. Once you're inside schedule, "stuff" has already 
+> > partially happened, and you cannot have the same request re-initiated by a 
+> > different thread.
+> 
+> But that makes it impossible to do things synchronously, which I think is 
+> a *major* mistake.
+Yes! That's what I said when I described the method. No synco fast-paths. 
+At that point you could implement the full-queued method in userspace.
+> The whole (and really _only_) point of my patch was really the whole 
+> "synchronous call" part. I'm personally of the opinion that if you cannot 
+> handle the cached case as fast as just doing the system call directly, 
+> then the whole thing is almost pointless.
+> 
+> Things that take a long time we already have good methods for. "epoll" and 
+> "kevent" are always going to be the best way to handle the "we have ten 
+> thousand events outstanding". There simply isn't any question about it. 
+> You can *never* handle ten thousand long-running events efficiently with 
+> threads - even if you ignore all the CPU overhead, you're going to have a 
+> much bigger memory (and thus *cache*) footprint.
+Think about the old-fashioned web server, using epoll to handle thousands 
+of connections. You'll be hosting an epoll_wait() over an async 
+thread/fibril. Now a burst of 500 connections becomes suddendly "hot", and 
+you start looping through those 500 hot connections trying to handle them. 
+You'll need to stat/open/read (let's assume a trivial, non-cached HTTP 
+server) from the file pointed by the URL's doc, and those better be 
+handled in async fashion otherwise you'll starve the others and pay huge 
+time in performance. You can multiplex using a state machine or coroutines 
+for example. Using coroutines your epoll dispatching loop end up doing 
+something like:
+	struct conn {
+		coroutine_t co;
+		int res;
+		int skfd;
+		...
+	};
+	void events_dispatch(struct epoll_event *events, int n) {
+		for (i = 0; i < n; i++) {
+			struct conn *c = (struct conn *) events[i].data;
+			co_call(c->co);
+		}
+	}
+Note that co_call() will make the coroutine to re-emerge from the last 
+co_resume() they issued.
+Your code doesn't not need to be coroutine/async aware, once you wrap the 
+possibly-blocking calls with like:
+	int my_stat(struct conn *c, const char *path, struct stat *buf) {
+		/* "c" is the cookie */
+		if ((c->res = async_submit(c, __NR_stat, path, buf)) == EASYNC)
+			/* co_resume() will bounce back to the scheduler loop */
+			co_resume();
+		return c->res;
+	}
+Now, the *main* loop will be the async_wait() driven one:
+	struct async_result {
+		void *cookie;
+		long result;
+	};
+	n = async_wait(ares, nares);
+	for (i = 0; i < n; i++) {
+		if (ares[i].cookie == epoll_special_cookie)
+			events_dispatch(...);
+		else {
+			struct conn *c = (struct conn *) ares[i].cookie;
+			c->res = ares[i].result;
+			co_call(c->co);
+		}
+	}
+Many of the async submission will complete in a synco way, but many of 
+them will require reschedule and service-thread attention. Of these 500 
+burst, you can expect 100 or more to require async service. Right away, 
+not sometime later. According to Oracle, 1000 or more requests, 90% of 
+which can be expected to block, can be fired at a time.
+It is true that we need to have a fast synco path, but it is also true 
+that we must not suck in the non-synco path, because the submitting thread 
+has something else to do then simply issue one async request (it like 
+have *many* of them to push).
+There we go, I broke my "No more than 20 lines" rule again :)
+- Davide
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+More majordomo info at  
+http://vger.kernel.org/majordomo-info.html
+Please read the FAQ at  
+http://www.tux.org/lkml/

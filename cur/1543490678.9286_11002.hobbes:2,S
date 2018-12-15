@@ -1,0 +1,135 @@
+Date: Tue, 23 Mar 1999 04:22:39 +0100 (CET)
+From: Andrea Arcangeli <>
+Subject: Re: 3 Ooopses in 2.2.3
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/3/22/170
+
+On Mon, 22 Mar 1999, Andrea Arcangeli wrote:
+>In the meantime as just said I'll try to do some things I thought to
+>improve the kernel stack safety.
+It's quite obvious that the bh handler must run only in not nested irqs.
+This mean that the bh handler will have all at least more space on the
+kstack.
+Currently do_bottom_half() tried to do that but without success:
+static inline int hardirq_trylock(int cpu)
+{
+      return !atomic_read(&global_irq_count) && !test_bit(0,&global_irq_lock);
+	      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+}
+hardirq_trylock was avoiding the bh handler to run if there was an irq in
+progress, but the problem is that there could be a nested irq that started
+after the __sti() in the bh handling, and such nested irq could run
+do_bottom_half() itself without noticing that it's a nested irq.
+And btw using atomic_read(&global_irq_count) was also too much aggressive,
+we could have used more simply local_irq_count[cpu] because a bh handler
+can always run in parallel with another unrelated irq in the other CPU (if
+the other irq would be started a bit after that would happen anyway).
+So I changed a bit how do_IRQ works to make sure that it will run bh
+handlers only from a not-nested irq. This way do_bottom_half won't have to
+care about irq nesting because it will be recalled _only_ in a safe
+context. I also removed the __sti() because for example schedule() doesn't
+need it, so it's more efficient and simpler to __sti()/__cli() in the
+caller.
+It will be interesting to know if this my patch will avoid the reported
+crashes:
+Index: arch/i386/kernel/irq.c
+===================================================================
+RCS file: /var/cvs/linux/arch/i386/kernel/irq.c,v
+retrieving revision 1.1.2.7
+diff -u -r1.1.2.7 irq.c
+--- irq.c	1999/02/20 15:57:11	1.1.2.7
++++ linux/arch/i386/kernel/irq.c	1999/03/23 03:00:02
+@@ -804,8 +804,10 @@
+ 	 */
+ 	int irq = regs.orig_eax & 0xff; /* subtle, see irq.h */
+ 	int cpu = smp_processor_id();
++	static int nested_level[NR_CPUS] = { [0 ... NR_CPUS-1] = -1, };
+ 
+ 	kstat.irqs[cpu][irq]++;
++	nested_level[cpu]++;
+ 	irq_desc[irq].handler->handle(irq, &regs);
+ 
+ 	/*
+@@ -815,9 +817,15 @@
+ 	 * half handling or not..
+ 	 */
+ 	if (1) {
+-		if (get_active_bhs())
++		/* Run the bh handling only if we aren't a nested irq. -arca */
++		if (!nested_level[cpu] && get_active_bhs())
++		{
++			__sti();
+ 			do_bottom_half();
++			__cli();
++		}
+ 	}
++	nested_level[cpu]--;
+ }
+ 
+ int setup_x86_irq(unsigned int irq, struct irqaction * new)
+Index: include/asm-i386/hardirq.h
+===================================================================
+RCS file: /var/cvs/linux/include/asm-i386/hardirq.h,v
+retrieving revision 1.1.2.1
+diff -u -r1.1.2.1 hardirq.h
+--- hardirq.h	1999/01/18 01:33:32	1.1.2.1
++++ linux/include/asm-i386/hardirq.h	1999/03/23 02:38:48
+@@ -53,7 +53,7 @@
+ 
+ static inline int hardirq_trylock(int cpu)
+ {
+-	return !atomic_read(&global_irq_count) && !test_bit(0,&global_irq_lock);
++	return !test_bit(0,&global_irq_lock);
+ }
+ 
+ #define hardirq_endlock(cpu)	do { } while (0)
+Index: kernel/sched.c
+===================================================================
+RCS file: /var/cvs/linux/kernel/sched.c,v
+retrieving revision 1.1.2.20
+diff -u -r1.1.2.20 sched.c
+--- sched.c	1999/03/15 12:06:23	1.1.2.20
++++ linux/kernel/sched.c	1999/03/23 03:00:09
+@@ -666,7 +666,7 @@
+ 	release_kernel_lock(prev, this_cpu);
+ 
+ 	/* Do "administrative" work here while we don't hold any locks */
+-	if (bh_active & bh_mask)
++	if (get_active_bhs())
+ 		do_bottom_half();
+ 
+ 	spin_lock(&scheduler_lock);
+Index: kernel/softirq.c
+===================================================================
+RCS file: /var/cvs/linux/kernel/softirq.c,v
+retrieving revision 1.1.2.2
+diff -u -r1.1.2.2 softirq.c
+--- softirq.c	1999/02/02 16:41:42	1.1.2.2
++++ linux/kernel/softirq.c	1999/03/23 02:59:54
+@@ -53,7 +53,6 @@
+ 
+ 	if (softirq_trylock(cpu)) {
+ 		if (hardirq_trylock(cpu)) {
+-			__sti();
+ 			run_bottom_halves();
+ 			hardirq_endlock(cpu);
+ 		}
+The hardirq_trylock is still needed to avoid the bh handler to run if
+there is a cli() in progress somewhere.
+This bug was quite subtle and I am not sure if it's really the cause of
+the crashes, but I suggest everybody who is having crashed/reboots to give
+a try it out this my patch against 2.2.3, maybe it will be enough ;).
+If it won't be enough I suggest to use the patch-ikd or the
+vmalloc-stack-allocation approch to discover if the MM corruptions cames
+really from a stack overflow (details on how to do that are in my previous
+email of this same thread).
+Andrea Arcangeli
+Goodnight...
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

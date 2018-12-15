@@ -1,0 +1,696 @@
+Date: Wed, 2 May 2001 23:59:55 +0200 (CEST)
+From: Urban Widmark <>
+Subject: [PATCH][RFT] smbfs bugfixes for 2.4.4
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2001/5/2/198
+
+Hello all
+This patch have been building up for a while, without reaching some
+undefined level of readiness. I would like some feedback from other smbfs
+users before submitting this for 2.4.4-something. Particularly from people
+mounting win9x shares.
+* win9x will sometimes not give back the right filesize, this can cause
+  problems when cp'ing a file over an existing one. When truncating the
+  file to 0 bytes the server keeps reporting the old size and much
+  confusion arises.
+  (reported by Xuan Baldauf, could you verify that this fixes it? If it
+   does it's a much better fix than the workaround you got before.)
+* The timeout for a reconnect was only 5 seconds, which may not be enough.
+  To make it worse, if there is a timeout the mount will be dead.
+  umount time.
+* Allow smbmount to supply a new connection even if the retry attempt has
+  timed-out. "dead" mounts can then be resurrected ... this allows you to
+  replace a smbmount that have crashed, or it would if smbmount supported
+  that.
+* Locking bug in smb_newconn, it modifies the "server" struct without
+  having the server lock.
+* Fix theoretical memory leak and the missing smb malloc debug functions.
+* fsync now causes a SMBflush to tell the server that we want the data to
+  hit the disc. (as suggested by Jochen Dolze)
+* Don't zero out the superblock flags to allow readonly mounts to be
+  readonly. If someone knows why sb->s_flags = 0; is a good idea I'd
+  like to know. (fix&testing by René Scharfe)
+Patch vs 2.4.4, if someone prefers 2.4.4-acX it should work (even if the
+patch fails on changes to Configure.help).
+/Urban
+diff -urN -X exclude linux-2.4.4-orig/Documentation/Configure.help linux-2.4.4-smbfs/Documentation/Configure.help
+--- linux-2.4.4-orig/Documentation/Configure.help	Wed May  2 20:01:07 2001
++++ linux-2.4.4-smbfs/Documentation/Configure.help	Wed May  2 20:44:43 2001
+@@ -12081,10 +12081,7 @@
+   The nls settings can be changed at mount time, if your smbmount
+   supports that, using the codepage and iocharset parameters.
+ 
+-  Currently no smbmount distributed with samba supports this, it is
+-  assumed future versions will. In the meantime you can get an
+-  unofficial patch for samba 2.0.7 from:
+-  
+http://www.hojdpunkten.ac.se/054/samba/index.html
++  smbmount from samba 2.2.0 or later supports this.
+ 
+ nls support setting
+ CONFIG_SMB_NLS_REMOTE
+@@ -12096,10 +12093,7 @@
+   The nls settings can be changed at mount time, if your smbmount
+   supports that, using the codepage and iocharset parameters.
+ 
+-  Currently no smbmount distributed with samba supports this, it is
+-  assumed future versions will. In the meantime you can get an
+-  unofficial patch for samba 2.0.7 from:
+-  
+http://www.hojdpunkten.ac.se/054/samba/index.html
++  smbmount from samba 2.2.0 or later supports this.
+ 
+ Coda file system support (advanced network fs)
+ CONFIG_CODA_FS
+diff -urN -X exclude linux-2.4.4-orig/MAINTAINERS linux-2.4.4-smbfs/MAINTAINERS
+--- linux-2.4.4-orig/MAINTAINERS	Wed May  2 20:01:07 2001
++++ linux-2.4.4-smbfs/MAINTAINERS	Wed May  2 20:42:24 2001
+@@ -1171,7 +1171,7 @@
+ 
+ SMB FILESYSTEM
+ P:	Urban Widmark
+-M:	urban@svenskatest.se
++M:	urban@teststation.com
+ W:	
+http://samba.org/
+ L:	samba@samba.org
+ S:	Maintained
+diff -urN -X exclude linux-2.4.4-orig/fs/smbfs/ChangeLog linux-2.4.4-smbfs/fs/smbfs/ChangeLog
+--- linux-2.4.4-orig/fs/smbfs/ChangeLog	Sat Mar 31 19:11:53 2001
++++ linux-2.4.4-smbfs/fs/smbfs/ChangeLog	Wed May  2 23:48:56 2001
+@@ -1,5 +1,18 @@
+ ChangeLog for smbfs.
+ 
++2001-04-25 René Scharfe <l.s.r@web.de>
++
++	* inode.c: Don't clear s_flags and allow ro mounts
++
++2001-04-21 Urban Widmark <urban@teststation.com>
++
++	* dir.c, proc.c: replace tests on conn_pid with tests on state to
++	  fix smbmount reconnect on smb_retry timeout and up the timeout to 30s.
++	* proc.c: smb_newconn must have the server locked while updating it.
++	* inode.c, proc.c: need flush after truncate on some servers (win9x)
++	* file.c: add call to send SMBflush on fsync
++	  (as suggested by Jochen Dolze <dolze@epcnet.de>)
++
+ 2001-03-06 Urban Widmark <urban@teststation.com>
+ 
+ 	* cache.c: d_add on hashed dentries corrupts d_hash list and
+diff -urN -X exclude linux-2.4.4-orig/fs/smbfs/dir.c linux-2.4.4-smbfs/fs/smbfs/dir.c
+--- linux-2.4.4-orig/fs/smbfs/dir.c	Thu Feb 22 20:52:03 2001
++++ linux-2.4.4-smbfs/fs/smbfs/dir.c	Wed May  2 20:42:24 2001
+@@ -210,10 +210,6 @@
+ 	return result;
+ }
+ 
+-/*
+- * Note: in order to allow the smbmount process to open the
+- * mount point, we don't revalidate if conn_pid is NULL.
+- */
+ static int
+ smb_dir_open(struct inode *dir, struct file *file)
+ {
+@@ -230,14 +226,18 @@
+ 	 */
+ 	lock_kernel();
+ 	server = server_from_dentry(dentry);
+-	if (server->opt.protocol < SMB_PROTOCOL_LANMAN2)
+-	{
++	if (server->opt.protocol < SMB_PROTOCOL_LANMAN2) {
+ 		unsigned long age = jiffies - dir->u.smbfs_i.oldmtime;
+ 		if (age > 2*HZ)
+ 			smb_invalid_dir_cache(dir);
+ 	}
+ 
+-	if (server->conn_pid)
++	/*
++	 * Note: in order to allow the smbmount process to open the
++	 * mount point, we only revalidate if the connection is valid or
++	 * if the process is trying to access something other than the root.
++	 */
++	if (server->state == CONN_VALID || !IS_ROOT(dentry))
+ 		error = smb_revalidate_inode(dentry);
+ 	unlock_kernel();
+ 	return error;
+diff -urN -X exclude linux-2.4.4-orig/fs/smbfs/file.c linux-2.4.4-smbfs/fs/smbfs/file.c
+--- linux-2.4.4-orig/fs/smbfs/file.c	Thu Feb 22 20:52:03 2001
++++ linux-2.4.4-smbfs/fs/smbfs/file.c	Wed May  2 21:55:58 2001
+@@ -28,8 +28,23 @@
+ static int
+ smb_fsync(struct file *file, struct dentry * dentry, int datasync)
+ {
++	int result;
++	struct smb_sb_info *server = server_from_dentry(dentry);
++
+ 	VERBOSE("sync file %s/%s\n", DENTRY_PATH(dentry));
+-	return 0;
++
++	/*
++	 * The VFS will writepage() all dirty pages for us, but we
++	 * should send a SMBflush to the server, letting it know that
++	 * we want things synchronized with actual storage.
++	 *
++	 * Note: this function requires all pages to have been written already
++	 *       (should be ok with writepage_sync)
++	 */
++	smb_lock_server(server);
++	result = smb_proc_flush(server, dentry->d_inode->u.smbfs_i.fileid);
++	smb_unlock_server(server);
++	return result;
+ }
+ 
+ /*
+@@ -205,6 +220,20 @@
+ 
+ 	VERBOSE("file %s/%s, count=%lu@%lu\n", DENTRY_PATH(dentry),
+ 		(unsigned long) count, (unsigned long) *ppos);
++
++	/*
++	 * The localwrite flag is needed vs some servers that do not
++	 * immediately return the correct filesize. But it also prevents us
++	 * from ever seeing changes made on the serverside. Clearing the flag
++	 * on read helps one case and breaks the other.
++	 * (broken are: win98se, possibly not win95-original?)
++	 *
++	 * Jochen Dolze <dolze@epcnet.de> has the details. I hope oplocks
++	 * are the solution. -- puw
++	 */
++#if 0
++	dentry->d_inode->u.smbfs_i.flags &= ~SMB_F_LOCALWRITE;
++#endif
+ 
+ 	status = smb_revalidate_inode(dentry);
+ 	if (status)
+diff -urN -X exclude linux-2.4.4-orig/fs/smbfs/inode.c linux-2.4.4-smbfs/fs/smbfs/inode.c
+--- linux-2.4.4-orig/fs/smbfs/inode.c	Wed May  2 20:01:37 2001
++++ linux-2.4.4-smbfs/fs/smbfs/inode.c	Wed May  2 22:30:52 2001
+@@ -121,8 +121,10 @@
+ 	inode->i_blksize= fattr->f_blksize;
+ 	inode->i_blocks = fattr->f_blocks;
+ 	/*
+-	 * Don't change the size and mtime/atime fields
+-	 * if we're writing to the file.
++	 * Don't change the size and mtime/atime fields if we're
++	 * writing to the file. We need this as we may have local
++	 * unwritten changes that we don't want replaced just because
++	 * someone revalidated.
+ 	 */
+ 	if (!(inode->u.smbfs_i.flags & SMB_F_LOCALWRITE)) {
+ 		inode->i_size  = fattr->f_size;
+@@ -234,9 +236,10 @@
+ 	last_sz   = inode->i_size;
+ 	error = smb_refresh_inode(dentry);
+ 	if (error || inode->i_mtime != last_time || inode->i_size != last_sz) {
+-		VERBOSE("%s/%s changed, old=%ld, new=%ld\n",
++		VERBOSE("%s/%s changed, old=%ld, new=%ld, oz=%ld, nz=%ld\n",
+ 			DENTRY_PATH(dentry),
+-			(long) last_time, (long) inode->i_mtime);
++			(long) last_time, (long) inode->i_mtime,
++			(long) last_sz, (long) inode->i_size);
+ 
+ 		if (!S_ISDIR(inode->i_mode))
+ 			invalidate_inode_pages(inode);
+@@ -355,8 +358,8 @@
+ 	if (server->conn_pid)
+ 	       kill_proc(server->conn_pid, SIGTERM, 1);
+ 
+-	kfree(server->mnt);
+-	kfree(sb->u.smbfs_sb.temp_buf);
++	smb_kfree(server->mnt);
++	smb_kfree(sb->u.smbfs_sb.temp_buf);
+ 	if (server->packet)
+ 		smb_vfree(server->packet);
+ 
+@@ -390,7 +393,6 @@
+ 	sb->s_blocksize = 1024;	/* Eh...  Is this correct? */
+ 	sb->s_blocksize_bits = 10;
+ 	sb->s_magic = SMB_SUPER_MAGIC;
+-	sb->s_flags = 0;
+ 	sb->s_op = &smb_sops;
+ 
+ 	sb->u.smbfs_sb.mnt = NULL;
+@@ -400,13 +402,13 @@
+ 	sb->u.smbfs_sb.conn_pid = 0;
+ 	sb->u.smbfs_sb.state = CONN_INVALID; /* no connection yet */
+ 	sb->u.smbfs_sb.generation = 0;
+-	sb->u.smbfs_sb.packet_size = smb_round_length(SMB_INITIAL_PACKET_SIZE);	
++	sb->u.smbfs_sb.packet_size = smb_round_length(SMB_INITIAL_PACKET_SIZE);
+ 	sb->u.smbfs_sb.packet = smb_vmalloc(sb->u.smbfs_sb.packet_size);
+ 	if (!sb->u.smbfs_sb.packet)
+ 		goto out_no_mem;
+ 
+ 	/* Allocate the global temp buffer */
+-	sb->u.smbfs_sb.temp_buf = kmalloc(2*SMB_MAXPATHLEN + 20, GFP_KERNEL);
++	sb->u.smbfs_sb.temp_buf = smb_kmalloc(2*SMB_MAXPATHLEN+20, GFP_KERNEL);
+ 	if (!sb->u.smbfs_sb.temp_buf)
+ 		goto out_no_temp;
+ 
+@@ -417,7 +419,7 @@
+ 
+ 	/* Allocate the mount data structure */
+ 	/* FIXME: merge this with the other malloc and get a whole page? */
+-	mnt = kmalloc(sizeof(struct smb_mount_data_kernel), GFP_KERNEL);
++	mnt = smb_kmalloc(sizeof(struct smb_mount_data_kernel), GFP_KERNEL);
+ 	if (!mnt)
+ 		goto out_no_mount;
+ 	sb->u.smbfs_sb.mnt = mnt;
+@@ -482,9 +484,9 @@
+ out_no_root:
+ 	iput(root_inode);
+ out_bad_option:
+-	kfree(sb->u.smbfs_sb.mnt);
++	smb_kfree(sb->u.smbfs_sb.mnt);
+ out_no_mount:
+-	kfree(sb->u.smbfs_sb.temp_buf);
++	smb_kfree(sb->u.smbfs_sb.temp_buf);
+ out_no_temp:
+ 	smb_vfree(sb->u.smbfs_sb.packet);
+ out_no_mem:
+diff -urN -X exclude linux-2.4.4-orig/fs/smbfs/ioctl.c linux-2.4.4-smbfs/fs/smbfs/ioctl.c
+--- linux-2.4.4-orig/fs/smbfs/ioctl.c	Wed May  2 20:01:37 2001
++++ linux-2.4.4-smbfs/fs/smbfs/ioctl.c	Wed May  2 20:42:24 2001
+@@ -23,7 +23,7 @@
+ smb_ioctl(struct inode *inode, struct file *filp,
+ 	  unsigned int cmd, unsigned long arg)
+ {
+-	struct smb_sb_info *server = SMB_SERVER(inode);
++	struct smb_sb_info *server = server_from_inode(inode);
+ 	struct smb_conn_opt opt;
+ 	int result = -EINVAL;
+ 
+@@ -37,7 +37,7 @@
+ 		break;
+ 
+ 	case SMB_IOC_NEWCONN:
+-		/* require an argument == the mount data, else it is EINVAL */
++		/* require an argument == smb_conn_opt, else it is EINVAL */
+ 		if (!arg)
+ 			break;
+ 
+@@ -45,7 +45,8 @@
+ 		if (!copy_from_user(&opt, (void *)arg, sizeof(opt)))
+ 			result = smb_newconn(server, &opt);
+ 		break;
+-	default:;
++	default:
++		break;
+ 	}
+ 
+ 	return result;
+diff -urN -X exclude linux-2.4.4-orig/fs/smbfs/proc.c linux-2.4.4-smbfs/fs/smbfs/proc.c
+--- linux-2.4.4-orig/fs/smbfs/proc.c	Wed May  2 20:01:37 2001
++++ linux-2.4.4-smbfs/fs/smbfs/proc.c	Wed May  2 23:32:41 2001
+@@ -54,18 +54,6 @@
+ 		    struct smb_fattr *fattr);
+ 
+ 
+-static inline void
+-smb_lock_server(struct smb_sb_info *server)
+-{
+-	down(&(server->sem));
+-}
+-
+-static inline void
+-smb_unlock_server(struct smb_sb_info *server)
+-{
+-	up(&(server->sem));
+-}
+-
+ 
+ static void
+ str_upper(char *name, int len)
+@@ -661,29 +649,31 @@
+ 	pid_t pid = server->conn_pid;
+ 	int error, result = 0;
+ 
+-	if (server->state != CONN_INVALID)
++	if (server->state == CONN_VALID || server->state == CONN_RETRYING)
+ 		goto out;
+ 
+ 	smb_close_socket(server);
+ 
+ 	if (pid == 0) {
++		/* FIXME: this is fatal */
+ 		printk(KERN_ERR "smb_retry: no connection process\n");
+ 		server->state = CONN_RETRIED;
+ 		goto out;
+ 	}
+ 
+ 	/*
+-	 * Clear the pid to enable the ioctl.
++	 * Change state so that only one retry per server will be started.
+ 	 */
+-	server->conn_pid = 0;
++	server->state = CONN_RETRYING;
+ 
+ 	/*
+ 	 * Note: use the "priv" flag, as a user process may need to reconnect.
+ 	 */
+ 	error = kill_proc(pid, SIGUSR1, 1);
+ 	if (error) {
++		/* FIXME: this is fatal */
+ 		printk(KERN_ERR "smb_retry: signal failed, error=%d\n", error);
+-		goto out_restore;
++		goto out;
+ 	}
+ 	VERBOSE("signalled pid %d, waiting for new connection\n", pid);
+ 
+@@ -691,7 +681,9 @@
+ 	 * Wait for the new connection.
+ 	 */
+ #ifdef SMB_RETRY_INTR
+-	interruptible_sleep_on_timeout(&server->wait,  5*HZ);
++	smb_unlock_server(server);
++	interruptible_sleep_on_timeout(&server->wait,  30*HZ);
++	smb_lock_server(server);
+ 	if (signal_pending(current))
+ 		printk(KERN_INFO "smb_retry: caught signal\n");
+ #else
+@@ -702,8 +694,13 @@
+ 	 *
+ 	 * smbmount should be able to reconnect later, but it can't because
+ 	 * it will get an -EIO on attempts to open the mountpoint!
++	 *
++	 * FIXME: go back to the interruptable version now that smbmount
++	 * can avoid -EIO on the mountpoint when reconnecting?
+ 	 */
+-	sleep_on_timeout(&server->wait, 5*HZ);
++	smb_unlock_server(server);
++	sleep_on_timeout(&server->wait, 30*HZ);
++	smb_lock_server(server);
+ #endif
+ 
+ 	/*
+@@ -715,15 +712,11 @@
+ 		PARANOIA("successful, new pid=%d, generation=%d\n",
+ 			 server->conn_pid, server->generation);
+ 		result = 1;
++	} else if (server->state == CONN_RETRYING) {
++		/* allow further attempts later */
++		server->state = CONN_RETRIED;
+ 	}
+ 
+-	/*
+-	 * Restore the original pid if we didn't get a new one.
+-	 */
+-out_restore:
+-	if (!server->conn_pid)
+-		server->conn_pid = pid;
+-
+ out:
+ 	return result;
+ }
+@@ -742,19 +735,16 @@
+ 	s->err = 0;
+ 
+ 	/* Make sure we have a connection */
+-	if (s->state != CONN_VALID)
+-	{
++	if (s->state != CONN_VALID) {
+ 		if (!smb_retry(s))
+ 			goto out;
+ 	}
+ 
+-	if (smb_request(s) < 0)
+-	{
++	if (smb_request(s) < 0) {
+ 		DEBUG1("smb_request failed\n");
+ 		goto out;
+ 	}
+-	if (smb_valid_packet(s->packet) != 0)
+-	{
++	if (smb_valid_packet(s->packet) != 0) {
+ 		PARANOIA("invalid packet!\n");
+ 		goto out;
+ 	}
+@@ -764,8 +754,7 @@
+ 	 * is squashing some error codes, but I don't think this is
+ 	 * correct: after a server error the packet won't be valid.
+ 	 */
+-	if (s->rcls != 0)
+-	{
++	if (s->rcls != 0) {
+ 		result = -smb_errno(s);
+ 		if (!result)
+ 			printk(KERN_DEBUG "smb_request_ok: rcls=%d, err=%d mapped to 0\n",
+@@ -785,10 +774,6 @@
+ /*
+  * This implements the NEWCONN ioctl. It installs the server pid,
+  * sets server->state to CONN_VALID, and wakes up the waiting process.
+- *
+- * Note that this must be called with the server locked, except for
+- * the first call made after mounting the volume. The server pid
+- * will be set to zero to indicate that smbfs is awaiting a connection.
+  */
+ int
+ smb_newconn(struct smb_sb_info *server, struct smb_conn_opt *opt)
+@@ -798,11 +783,13 @@
+ 
+ 	VERBOSE("fd=%d, pid=%d\n", opt->fd, current->pid);
+ 
++	smb_lock_server(server);
++
+ 	/*
+-	 * Make sure we don't already have a pid ...
++	 * Make sure we don't already have a valid connection ...
+ 	 */
+ 	error = -EINVAL;
+-	if (server->conn_pid)
++	if (server->state == CONN_VALID)
+ 		goto out;
+ 
+ 	error = -EACCES;
+@@ -851,6 +838,8 @@
+ 		int len = smb_round_length(server->opt.max_xmit);
+ 		char *buf = smb_vmalloc(len);
+ 		if (buf) {
++			if (server->packet)
++				smb_vfree(server->packet);
+ 			server->packet = buf;
+ 			server->packet_size = len;
+ 		} else {
+@@ -863,6 +852,8 @@
+ 	}
+ 
+ out:
++	smb_unlock_server(server);
++
+ #ifdef SMB_RETRY_INTR
+ 	wake_up_interruptible(&server->wait);
+ #else
+@@ -1016,7 +1007,7 @@
+ 	}
+ 
+ 	if (!smb_is_open(inode)) {
+-		struct smb_sb_info *server = SMB_SERVER(inode);
++		struct smb_sb_info *server = server_from_inode(inode);
+ 		smb_lock_server(server);
+ 		result = 0;
+ 		if (!smb_is_open(inode))
+@@ -1084,6 +1075,8 @@
+ 		 * two seconds ... round the times to avoid needless
+ 		 * cache invalidations!
+ 		 */
++		/* FIXME: could this be the cause of the problems with tar
++		   randomly reporting files as changed? */
+ 		if (ino->i_mtime & 1)
+ 			ino->i_mtime--;
+ 		if (ino->i_atime & 1)
+@@ -1119,9 +1112,8 @@
+ {
+ 	int result = 0;
+ 
+-	if (smb_is_open(ino))
+-	{
+-		struct smb_sb_info *server = SMB_SERVER(ino);
++	if (smb_is_open(ino)) {
++		struct smb_sb_info *server = server_from_inode(ino);
+ 		smb_lock_server(server);
+ 		result = smb_proc_close_inode(server, ino);
+ 		smb_unlock_server(server);
+@@ -1423,6 +1415,17 @@
+ 	return result;
+ }
+ 
++/*
++ * Called with the server locked
++ */
++int
++smb_proc_flush(struct smb_sb_info *server, __u16 fileid)
++{
++	smb_setup_header(server, SMBflush, 1, 0);
++	WSET(server->packet, smb_vwv0, fileid);
++	return smb_request_ok(server, SMBflush, 0, 0);
++}
++
+ int
+ smb_proc_trunc(struct smb_sb_info *server, __u16 fid, __u32 length)
+ {
+@@ -1431,7 +1434,7 @@
+ 
+ 	smb_lock_server(server);
+ 
+-      retry:
++retry:
+ 	p = smb_setup_header(server, SMBwrite, 5, 3);
+ 	WSET(server->packet, smb_vwv0, fid);
+ 	WSET(server->packet, smb_vwv1, 0);
+@@ -1445,7 +1448,16 @@
+ 			goto retry;
+ 		goto out;
+ 	}
++
++	/*
++	 * win9x doesn't appear to update the size immediately.
++	 * It will return the old file size after the truncate,
++	 * confusing smbfs.
++	 * NT and Samba return the new value immediately.
++	 */
+ 	result = 0;
++	if (server->mnt->flags & SMB_MOUNT_WIN95)
++		result = smb_proc_flush(server, fid);
+ out:
+ 	smb_unlock_server(server);
+ 	return result;
+diff -urN -X exclude linux-2.4.4-orig/fs/smbfs/sock.c linux-2.4.4-smbfs/fs/smbfs/sock.c
+--- linux-2.4.4-orig/fs/smbfs/sock.c	Thu Feb 22 20:52:03 2001
++++ linux-2.4.4-smbfs/fs/smbfs/sock.c	Wed May  2 20:42:24 2001
+@@ -150,14 +150,14 @@
+ 	DEBUG1("found=%d, count=%d, result=%d\n", found, count, result);
+ 	if (found)
+ 		found_data(job->sk);
+-	kfree(ptr);
++	smb_kfree(ptr);
+ }
+ 
+ static void
+ smb_data_ready(struct sock *sk, int len)
+ {
+ 	struct data_callback* job;
+-	job = kmalloc(sizeof(struct data_callback),GFP_ATOMIC);
++	job = smb_kmalloc(sizeof(struct data_callback),GFP_ATOMIC);
+ 	if(job == 0) {
+ 		printk("smb_data_ready: lost SESSION KEEPALIVE due to OOM.\n");
+ 		found_data(sk);
+diff -urN -X exclude linux-2.4.4-orig/include/linux/smb.h linux-2.4.4-smbfs/include/linux/smb.h
+--- linux-2.4.4-orig/include/linux/smb.h	Thu Feb 22 21:34:21 2001
++++ linux-2.4.4-smbfs/include/linux/smb.h	Wed May  2 22:00:19 2001
+@@ -94,21 +94,14 @@
+ };
+ 
+ enum smb_conn_state {
+-        CONN_VALID,             /* everything's fine */
+-        CONN_INVALID,           /* Something went wrong, but did not
+-                                   try to reconnect yet. */
+-        CONN_RETRIED            /* Tried a reconnection, but was refused */
++	CONN_VALID,		/* everything's fine */
++	CONN_INVALID,		/* Something went wrong, but did not
++				   try to reconnect yet. */
++	CONN_RETRIED,		/* Tried a reconnection, but was refused */
++	CONN_RETRYING		/* Currently trying to reconnect */
+ };
+ 
+-/*
+- * The readdir cache size controls how many directory entries are cached.
+- */
+-#define SMB_READDIR_CACHE_SIZE        64
+-
+ #define SMB_SUPER_MAGIC               0x517B
+-
+-#define SMB_SERVER(inode)    (&(inode->i_sb->u.smbfs_sb))
+-#define SMB_INOP(inode)      (&(inode->u.smbfs_i))
+ 
+ #define SMB_HEADER_LEN   37     /* includes everything up to, but not
+                                  * including smb_bcc */
+diff -urN -X exclude linux-2.4.4-orig/include/linux/smb_fs.h linux-2.4.4-smbfs/include/linux/smb_fs.h
+--- linux-2.4.4-orig/include/linux/smb_fs.h	Thu Feb 22 21:44:20 2001
++++ linux-2.4.4-smbfs/include/linux/smb_fs.h	Wed May  2 22:09:58 2001
+@@ -48,8 +48,11 @@
+ 
+ #ifdef DEBUG_SMB_MALLOC
+ 
++#include <linux/slab.h>
++
+ extern int smb_malloced;
+ extern int smb_current_vmalloced;
++extern int smb_current_kmalloced;
+ 
+ static inline void *
+ smb_vmalloc(unsigned int size)
+@@ -66,12 +69,27 @@
+         vfree(obj);
+ }
+ 
++static inline void *
++smb_kmalloc(size_t size, int flags)
++{
++	smb_malloced += 1;
++	smb_current_kmalloced += 1;
++	return kmalloc(size, flags);
++}
++
++static inline void
++smb_kfree(void *obj)
++{
++	smb_current_kmalloced -= 1;
++	kfree(obj);
++}
++
+ #else /* DEBUG_SMB_MALLOC */
+ 
+-#define smb_kmalloc(s,p) kmalloc(s,p)
+-#define smb_kfree_s(o,s) kfree(o)
+-#define smb_vmalloc(s)   vmalloc(s)
+-#define smb_vfree(o)     vfree(o)
++#define smb_kmalloc(s,p)	kmalloc(s,p)
++#define smb_kfree(o)		kfree(o)
++#define smb_vmalloc(s)		vmalloc(s)
++#define smb_vfree(o)		vfree(o)
+ 
+ #endif /* DEBUG_SMB_MALLOC */
+ 
+@@ -139,7 +157,7 @@
+ static inline int
+ smb_is_open(struct inode *i)
+ {
+-	return (i->u.smbfs_i.open == SMB_SERVER(i)->generation);
++	return (i->u.smbfs_i.open == server_from_inode(i)->generation);
+ }
+ 
+ 
+@@ -194,6 +212,7 @@
+ int smb_proc_dskattr(struct super_block *, struct statfs *);
+ int smb_proc_disconnect(struct smb_sb_info *);
+ int smb_proc_trunc(struct smb_sb_info *, __u16, __u32);
++int smb_proc_flush(struct smb_sb_info *, __u16);
+ void smb_init_root_dirent(struct smb_sb_info *, struct smb_fattr *);
+ 
+ /* linux/fs/smbfs/sock.c */
+diff -urN -X exclude linux-2.4.4-orig/include/linux/smb_fs_sb.h linux-2.4.4-smbfs/include/linux/smb_fs_sb.h
+--- linux-2.4.4-orig/include/linux/smb_fs_sb.h	Thu Feb 22 21:34:21 2001
++++ linux-2.4.4-smbfs/include/linux/smb_fs_sb.h	Wed May  2 22:00:19 2001
+@@ -58,6 +58,19 @@
+ 		       struct nls_table *, struct nls_table *);
+ };
+ 
++
++static inline void
++smb_lock_server(struct smb_sb_info *server)
++{
++	down(&(server->sem));
++}
++
++static inline void
++smb_unlock_server(struct smb_sb_info *server)
++{
++	up(&(server->sem));
++}
++
+ #endif /* __KERNEL__ */
+ 
+ #endif
+Binary files linux-2.4.4-orig/patch-2.4.4-ac3.gz and linux-2.4.4-smbfs/patch-2.4.4-ac3.gz differ

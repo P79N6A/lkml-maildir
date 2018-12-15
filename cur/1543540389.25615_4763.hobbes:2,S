@@ -1,0 +1,166 @@
+Date: Mon, 31 Jul 2000 22:19:01 +0200
+From: Remi Turk <>
+Subject: flink(2) patch, O_ANONYMOUS flag and struct inode_operations ideas
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/7/31/121
+
+Hi,
+Attached is a patch against 2.4.0-test5 which implements
+flink(fd, newname)
+It allows you to link a file with inode->nlink == 0 back into the
+filesystem, so it won't be garbage-collected when your process exits.
+% echo 'Hello, world!' > old
+% ll -i
+total 0
+  32619 -rw-r--r--   1 remi     users          14 Jul 31 15:44 old
+% exec 5<old
+% rm old
+% ll -i
+total 0
+% ~/src/flink/flink 5 new
+% ll -i 
+total 0
+  32619 -rw-r--r--   1 remi     users          14 Jul 31 15:44 new
+% cat new
+Hello, world!
+%
+My second idea is related and even crazier:
+Temporary files are often create(2)ed and then unlink(2)ed.
+create(2) creates an inode and a hard-link. You then use unlink(2)
+to remove the hard-link.
+So I've been thinking about an O_ANONYMOUS or O_NONAME flag for open(2)
+to specify you don't want any name for it.
+(So create(2) with O_ANONYMOUS + flink(2) would be the same (except
+non-atomic) as create(2))
+However, the ->create method of struct inode_operations already creates
+the first name for the file. Which brings me to my next idea:
+What if ->create only creates the inode, not the first hard-link?
+If the O_ANONYMOUS flag is not given, the VFS could then call the ->link
+method for the creation of the first hardlink.
+(I'm afraid this would cause trouble for filesystems without support
+for nlink > 1 like FAT.)
+P.S. flink(2) is my first patch, so please don't laugh too hard ;-).
+--
+Linux localhost.localdomain 2.4.0-test5 #1 Mon Jul 31 13:21:59 CEST 2000#include <linux/unistd.h>
+#include <stdlib.h>
+#include <stdio.h>
+_syscall2(long, flink, unsigned int, fd, const char *, newname)
+int main(int argc, char **argv)
+{
+	if (argc != 3) {
+		fprintf(stderr, "Usage: flink fd newname\n");
+		return 1;
+	}
+	if (flink(atoi(argv[1]), argv[2]) < 0) {
+		perror("flink");
+		return 1;
+	}
+	return 0;
+}
+diff -urN linux-2.4.0-test5-std/arch/i386/kernel/entry.S linux-2.4.0-test5-flink/arch/i386/kernel/entry.S
+--- linux-2.4.0-test5-std/arch/i386/kernel/entry.S	Sun Jul 30 12:48:23 2000
++++ linux-2.4.0-test5-flink/arch/i386/kernel/entry.S	Mon Jul 31 13:22:35 2000
+@@ -641,6 +641,7 @@
+ 	.long SYMBOL_NAME(sys_pivot_root)
+ 	.long SYMBOL_NAME(sys_mincore)
+ 	.long SYMBOL_NAME(sys_madvise)
++	.long SYMBOL_NAME(sys_flink)
+ 
+ 
+ 	/*
+@@ -649,6 +650,6 @@
+ 	 * entries. Don't panic if you notice that this hasn't
+ 	 * been shrunk every time we add a new system call.
+ 	 */
+-	.rept NR_syscalls-219
++	.rept NR_syscalls-220
+ 		.long SYMBOL_NAME(sys_ni_syscall)
+ 	.endr
+diff -urN linux-2.4.0-test5-std/fs/namei.c linux-2.4.0-test5-flink/fs/namei.c
+--- linux-2.4.0-test5-std/fs/namei.c	Sun Jul 30 12:48:40 2000
++++ linux-2.4.0-test5-flink/fs/namei.c	Mon Jul 31 21:54:09 2000
+@@ -21,6 +21,7 @@
+ #include <linux/quotaops.h>
+ #include <linux/pagemap.h>
+ #include <linux/dcache.h>
++#include <linux/file.h>
+ 
+ #include <asm/uaccess.h>
+ #include <asm/unaligned.h>
+@@ -1598,6 +1599,62 @@
+ 	}
+ 	putname(from);
+ 
++	return error;
++}
++
++asmlinkage long sys_flink(unsigned int fd, const char *newname)
++{
++	int error;
++	struct file *file;
++	struct dentry *dentry;
++	const char *to;
++
++	error = -EBADF;
++	file = fget(fd);
++	if (!file)
++		goto exit;
++
++	to = getname(newname);
++	error = PTR_ERR(to);
++	if (!IS_ERR(to)) {
++
++		struct dentry *new_dentry;
++		struct nameidata nd;
++		
++		error = 0;
++
++		dentry = file->f_dentry;
++
++		/* Where (and why) should I put this (un)lock_kernel() */
++		lock_kernel();
++		
++		if (path_init(to, LOOKUP_PARENT, &nd))
++			error = path_walk(to, &nd);
++		if (error)
++			goto out;
++
++		error = -EXDEV;
++		if (file->f_vfsmnt != nd.mnt)
++			goto out;
++
++		new_dentry = lookup_create(&nd, 0);
++		error = PTR_ERR(new_dentry);
++		if (!IS_ERR(new_dentry)) {
++			error = vfs_link(dentry, nd.dentry->d_inode, new_dentry);
++			/* Where is the corresponding dget? */
++			dput(new_dentry);
++		}
++
++		/* lookup_create() down()s it */
++		up(&nd.dentry->d_inode->i_sem);
++		
++		path_release(&nd);
++	}
++out:	
++	unlock_kernel();
++	putname(to);
++	fput(file);
++exit:
+ 	return error;
+ }
+ 
+diff -urN linux-2.4.0-test5-std/include/asm-i386/unistd.h linux-2.4.0-test5-flink/include/asm-i386/unistd.h
+--- linux-2.4.0-test5-std/include/asm-i386/unistd.h	Sun Apr 30 19:13:12 2000
++++ linux-2.4.0-test5-flink/include/asm-i386/unistd.h	Mon Jul 31 13:22:35 2000
+@@ -225,6 +225,7 @@
+ #define __NR_mincore		218
+ #define __NR_madvise		219
+ #define __NR_madvise1		219	/* delete when C lib stub is removed */
++#define __NR_flink		220
+ 
+ /* user-visible error numbers are in the range -1 - -124: see <asm-i386/errno.h> */
+ 

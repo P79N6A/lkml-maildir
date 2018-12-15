@@ -1,0 +1,178 @@
+Date: Tue, 1 Aug 2000 21:34:01 +0200 (CEST)
+From: Andrea Arcangeli <>
+Subject: Re: [patch?] Re: Do ramdisk exec's map direct to buffer cache?
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/8/1/123
+
+On Tue, 1 Aug 2000, Linus Torvalds wrote:
+>I changed "wait" to be either 0, 1 or 2 - where 1 means "start writeout"
+>and 2 means "wait for completion" (and 0 obviously means "only free if you
+>can do so immediately).
+Looks fine. Probably I preferred the gfp_mask because in my current tree
+wait is gone since I replaced the random guess in shrink_mmap with a
+per-buffer finegrined information. This way we know when it worths to wait
+synchronously on the buffer to become clean. The below is just a snapshot
+to show the basic of the logic, it won't compile. I can extract it as
+well (it's actually packeted with other probably worthwhile stuff).
+diff -urN 2.4.0-test5/fs/buffer.c 2.4.0-test5-classzone-6/fs/buffer.c
+--- 2.4.0-test5/fs/buffer.c	Fri Jul 28 07:24:13 2000
++++ 2.4.0-test5-classzone-6/fs/buffer.c	Tue Aug  1 05:44:26 2000
+@@ -2105,19 +2110,49 @@
+  * This all is required so that we can free up memory
+  * later.
+  */
+-static void sync_page_buffers(struct buffer_head *bh, int wait)
++static int sync_page_buffers(struct buffer_head *bh)
+ {
+ 	struct buffer_head * tmp = bh;
++	int ret, i;
++#if BITS_PER_LONG < MAX_BUF_PER_PAGE
++#error wait_IO is too short, convert to it to array for your architecture in this define
++#else
++	unsigned long wait_IO = 0;
++#endif
+ 
++	ret = i = 0;
+ 	do {
+ 		struct buffer_head *p = tmp;
+ 		tmp = tmp->b_this_page;
+-		if (buffer_locked(p)) {
+-			if (wait)
+-				__wait_on_buffer(p);
+-		} else if (buffer_dirty(p))
+-			ll_rw_block(WRITE, 1, &p);
++		if (buffer_dirty(p) || buffer_locked(p)) {
++			if (test_and_set_bit(BH_Wait_IO, &p->b_state)) {
++				ret = 1;
++				if (buffer_dirty(p))
++					ll_rw_block(WRITE, 1, &p);
++				if (buffer_locked(p))
+				^^ here I'm not sure if it should be
+				   an "else if"
++					wait_IO |= 1UL << i;
++			}
++#if 0 /* There's no WRITEA in 2.4.x */
++			else {
++				if (buffer_dirty(p))
++					ll_rw_block(WRITEA, 1, &p);
++			}
++#endif
++		}
++		i++;
+ 	} while (tmp != bh);
++
++	while (wait_IO) {
++		struct buffer_head *p = tmp;
++		tmp = tmp->b_this_page;
++		if (wait_IO & 1)
++			wait_on_buffer(p);
++		if (tmp == bh)
++			break;
++		wait_IO >>= 1;
++	}
++
++	return ret;
+ }
+ 
+ /*
+@@ -2137,11 +2172,13 @@
+  *       obtain a reference to a buffer head within a page.  So we must
+  *	 lock out all of these paths to cleanly toss the page.
+  */
+-int try_to_free_buffers(struct page * page, int wait)
++int try_to_free_buffers(struct page * page, int gfp_mask)
+ {
+ 	struct buffer_head * tmp, * bh = page->buffers;
+ 	int index = BUFSIZE_INDEX(bh->b_size);
++	int pass = 0;
+ 
++ again:
+ 	spin_lock(&lru_list_lock);
+ 	write_lock(&hash_table_lock);
+ 	spin_lock(&free_list[index].lock);
+@@ -2187,7 +2224,11 @@
+ 	spin_unlock(&free_list[index].lock);
+ 	write_unlock(&hash_table_lock);
+ 	spin_unlock(&lru_list_lock);	
+-	sync_page_buffers(bh, wait);
++	if ((gfp_mask & __GFP_IO) && !pass && sync_page_buffers(bh)) {
++		pass = 1;
++		goto again;
++	}
++	wakeup_bdflush(0);
+ 	return 0;
+ }
+ 
+diff -urN 2.4.0-test5/include/linux/fs.h 2.4.0-test5-classzone-6/include/linux/fs.h
+--- 2.4.0-test5/include/linux/fs.h	Tue Aug  1 18:07:36 2000
++++ 2.4.0-test5-classzone-6/include/linux/fs.h	Mon Jul 31 05:54:53 2000
+@@ -202,6 +202,7 @@
+ #define BH_Mapped	4	/* 1 if the buffer has a disk mapping */
+ #define BH_New		5	/* 1 if the buffer is new and not yet written out */
+ #define BH_Protected	6	/* 1 if the buffer is protected */
++#define BH_Wait_IO	7	/* 1 if the buffer is under I/O for too long */
+ 
+ /*
+  * Try to keep the most commonly used fields in single cache lines (16
+diff -urN 2.4.0-test5/include/linux/locks.h 2.4.0-test5-classzone-6/include/linux/locks.h
+--- 2.4.0-test5/include/linux/locks.h	Tue Aug  1 18:07:36 2000
++++ 2.4.0-test5-classzone-6/include/linux/locks.h	Mon Jul 31 05:11:26 2000
+@@ -29,6 +29,7 @@
+ extern inline void unlock_buffer(struct buffer_head *bh)
+ {
+ 	clear_bit(BH_Lock, &bh->b_state);
++	clear_bit(BH_Wait_IO, &bh->b_state);
+ 	wake_up(&bh->b_wait);
+ }
+ 
+I extracted now some fix from my tree.
+This one avoids swap_out to SMP race with msync:
+	
+ftp://ftp
+.*.kernel.org/pub/linux/kernel/people/andrea/patches/v2.4/2.4.0-test5/msync-smp-race-1
+This one avoids copying non necessary fields while doing highmem bounces
+(the page have to be anonymous when we call that function). It's not a
+fix but just a cleanup.
+	
+ftp://ftp
+.*.kernel.org/pub/linux/kernel/people/andrea/patches/v2.4/2.4.0-test5/highmem-cleanup-1
+This one makes the put_dirty_page more robust (it's not a fix at this
+moment).
+	
+ftp://ftp
+.*.kernel.org/pub/linux/kernel/people/andrea/patches/v2.4/2.4.0-test5/put_dirty_page-1
+This one sched_yield properly within tasklet_kill().
+	
+ftp://ftp
+.*.kernel.org/pub/linux/kernel/people/andrea/patches/v2.4/2.4.0-test5/softirq-schedule-1
+This one close one more SMP race between swapin and swapoff. There are
+still races there of course. To fix them we can use the page_table_lock
+and rely on the ordering, or we should add some additional lock in some
+fast path. If we want to drop the mm semaphore from the page fault in the
+long term (to scale while paging in from disk with threads) the first
+approch shouldn't be much more difficult to the rest of the complexity of 
+the page fault path.
+	
+ftp://ftp
+.*.kernel.org/pub/linux/kernel/people/andrea/patches/v2.4/2.4.0-test5/swapfile-race-1
+This one accounts for the buffers overlapped on the swap cache during the
+swap cache wp fault:
+	
+ftp://ftp
+.*.kernel.org/pub/linux/kernel/people/andrea/patches/v2.4/2.4.0-test5/swap-cache-wp-fault-1
+This one does the tlb flush in the right ordering for all archs but s390.
+s390 is safe doing it the other way around because it does atomically sets
+the tlb as invalid and flushes the tlb (and it also needs the tlb in place
+to flush the tlb). Thanks to Manfred for pointing this out. As Manfred
+noticed some month ago we have also bad race conditions in the munmap
+where a thread could exploit a race between __free_page() and
+flush_tlb_range (also in 2.2.x) to try to corrupt random memory, but that
+one is still there.
+	
+ftp://ftp
+.*.kernel.org/pub/linux/kernel/people/andrea/patches/v2.4/2.4.0-test5/tlb-flush-smp-race-1
+Andrea
+[unhandled content-type:image/png]

@@ -1,0 +1,166 @@
+Date: Thu, 8 Jul 1999 22:52:26 +0200 (MEST)
+From: Bernd Paysan <>
+Subject: [Patch] Re: usleep granularity
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/7/8/106
+
+On Wed, 7 Jul 1999, Mattias Engdegård wrote:
+> In linux-kernel you wrote:
+> 
+> >I don't accept that. gettimeofday() knows pretty good where inside the
+> >tick period the system is. Rounding up to the next tick (instead of
+> >rounding up the delta to the tick accuracy, and then rounding up to
+> >the next tick - double rounding to me) is possible, and would allow to
+> >have a 0-10 ms sleep period, too. It's not just a single line like
+> >deleting a + 1 in case timeout is not zero, but I believe it's doable.
+> >I'll prepare a patch to prove it.
+> 
+> I've been thinking about this as well, and think it should not be hard
+> at all. The gettimeoffset functionality isn't exported from the
+> machine-dependent files, so this has to be fixed for all architectures.
+> A small problem is that some of them are quite optimized (look at the sparc
+> code), and people are going to complain if we add a single cycle to the
+> gettimeofday path. Please tell me if you have a patch prepared.
+I've prepared a first patch (x86 only for now), which does what I have in
+mind. It exports gettimeoffset() from arch/xx/kernel/time.c (only for x86
+at the moment), never undersleeps on nanosleep (sleeps to the nearest tick
+after timeout), and never oversleeps on select (sleeps to nearest tick
+before timeout). I did some short tests to prove this, and it seems to
+work. The basics are done in timespec_to_jiffies
+There's a known flaw in my implementation: since timespec_to_jiffies just
+provides a delta, the jiffies could have been incremented after I rounded
+up, which gives an unnecessary tick to wait in that case. Rewriting that
+so that timespec_to_jiffies adds jiffies itself (with taking overflows
+into account) is more time-consuming; it's on my ToDo list.
+A patch for other architectures where it is easy to port without testing
+will follow, but for the more complicated parts (SPARC), I'll very likely
+leave the challange of providing gettimeoffset() to the maintainers of
+that platform ;-).
+Bernd Paysan
+"If you want it done right, you have to do it yourself"
+http://www.jwdt.com/~paysan/
+--- linux-2.3.9/arch/i386/kernel/time.c.orig	Thu Jul  8 21:46:02 1999
++++ linux-2.3.9/arch/i386/kernel/time.c	Thu Jul  8 21:46:59 1999
+@@ -232,6 +232,15 @@
+ #endif
+ 
+ /*
++ * This is the exported gettimeoffset() function -- Bernd Paysan
++ */
++
++unsigned long gettimeoffset(void)
++{
++	return do_gettimeoffset();
++}
++
++/*
+  * This version of gettimeofday has microsecond resolution
+  * and better than microsecond precision on fast x86 machines with TSC.
+  */
+--- linux-2.3.9/fs/select.c.orig	Thu Jul  8 21:12:43 1999
++++ linux-2.3.9/fs/select.c	Thu Jul  8 22:16:33 1999
+@@ -14,6 +14,7 @@
+ #include <linux/smp_lock.h>
+ #include <linux/poll.h>
+ #include <linux/file.h>
++#include <linux/time.h>
+ 
+ #include <asm/uaccess.h>
+ 
+@@ -231,6 +232,17 @@
+  *
+  * Update: ERESTARTSYS breaks at least the xview clock binary, so
+  * I'm trying ERESTARTNOHAND which restart only when you want to.
++ *
++ * Update: the previous code had a sleep time between 10 and 20 ms
++ * at least - it wasn't possible to sleep between 0 and 10 ms. The
++ * new code doesn't consider worst-case szenarios, and instead
++ * uses gettimeoffset() to compensate for the time to the current
++ * jiffie's schedule time.
++ *
++ * I also want to use the same code for nanosleep() as for select().
++ *
++ *                              -- Bernd Paysan <bernd.paysan@gmx.de>
++ *
+  */
+ #define MAX_SELECT_SECONDS \
+ 	((unsigned long) (MAX_SCHEDULE_TIMEOUT / HZ)-1)
+@@ -257,8 +269,12 @@
+ 			goto out_nofds;
+ 
+ 		if ((unsigned long) sec < MAX_SELECT_SECONDS) {
+-			timeout = ROUND_UP(usec, 1000000/HZ);
+-			timeout += sec * (unsigned long) HZ;
++			struct timespec tspec;
++
++			tspec.tv_sec  = sec;
++			tspec.tv_nsec = usec * 1000;
++
++			timeout = timespec_to_jiffies(&tspec);
+ 		}
+ 	}
+ 
+--- linux-2.3.9/include/linux/time.h.orig	Thu Jul  8 21:34:34 1999
++++ linux-2.3.9/include/linux/time.h	Thu Jul  8 22:04:29 1999
+@@ -23,20 +23,56 @@
+  * to wait "jiffies+1" in order to guarantee that we wait
+  * at _least_ "jiffies" - so "jiffies+1" had better still
+  * be positive.
++ *
++ * Update: timespec_to_jiffies used to round up worst case,
++ * instead of just adding the current offset to the ns delay.
++ * CAVEAT: this really should include jiffies in the calculation,
++ * since jiffies could overflow between the call off gettimeoffset()
++ * and the addition of jiffies in the underlying code.
++ *
++ * The timer code in arch/<machine>/kernel/time.c must export gettimeoffset(),
++ * which should return 999999999L (worst case) if unknown.
++ *                               -- Bernd Paysan <bernd.paysan@gmx.de>
+  */
+ #define MAX_JIFFY_OFFSET ((~0UL >> 1)-1)
+ 
++#ifdef __KERNEL__
++extern unsigned long gettimeoffset(void);
++#endif
++
+ static __inline__ unsigned long
+ timespec_to_jiffies(struct timespec *value)
+ {
+ 	unsigned long sec = value->tv_sec;
+ 	long nsec = value->tv_nsec;
++	long offset;
++#ifdef T2J_WITH_JIFFIES
++	long jiffies1;
++#endif
+ 
+ 	if (sec >= (MAX_JIFFY_OFFSET / HZ))
++#ifdef T2J_WITH_JIFFIES
++		return jiffies + MAX_JIFFY_OFFSET;
++#else
+ 		return MAX_JIFFY_OFFSET;
+-	nsec += 1000000000L / HZ - 1;
++#endif
++
++#ifdef T2J_WITH_JIFFIES
++	do {
++		jiffies1 = jiffies;
++#endif
++		offset = gettimeoffset();
++#ifdef T2J_WITH_JIFFIES
++	} while (jiffies1 != jiffies);
++#endif
++
++	nsec += offset;
+ 	nsec /= 1000000000L / HZ;
+-	return HZ * sec + nsec;
++	return HZ * sec + nsec
++#ifdef T2J_WITH_JIFFIES
++		+ jiffies
++#endif
++	;
+ }
+ 
+ static __inline__ void

@@ -1,0 +1,570 @@
+Date: Tue, 14 Sep 2004 16:03:10 +0100
+From: Alan Cox <>
+Subject: I2O Updates + Questions
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2004/9/14/238
+
+Markus, the new I2O stuff mostly looks nice. I found a few bits that
+seem wrong and some of my old cleanup bits still needed
+The attached patch files 
+- Fix misformed error messages in i2o_block
+- Add recieve_to_virt and send_to_virt to clean up remaining
+  virt_to_* usage. (I've tweaked them to reflect the i2o_dma
+  objects) so hopefully I got it right
+- Post an 8 byte startup message area. Some Promises scribble on the
+  wrong dword. Also catch this
+- Fix several cases where messages got written to I/O space without
+  i2o_raw_writel
+- Fix a case where we skipped dpt controllers on quiesce and didnt
+  skip them on enable
+- Add some bits to try and get promise behaving again
+- Cleaned up the probe loop
+- Removed the remainder of i2o_retry and used the trick I was using
+  in my test code from back whenever- on congestion report BUS_BUSY
+  and leave it to the scsi layer
+Looking at the code the event stuff seems totally broken in the new code
+both in core and the commented out i2o_block code (which now leaks
+memory). Also i2o_scsi error path does a readl on msg->body[3] which is
+wrong as msg->body[3] is in kernel space and its contents are an I2O
+side message value so should get fed to i2o_send_to_virt().
+Other question is message size - right now it uses the 2.4 message size
+which is twice what all the vendors recommend as working best (and
+doesn't work at all on AMI)
+Alan
+diff -u -p --new-file --recursive --exclude-from /usr/src/exclude linux.vanilla-2.6.9rc2/drivers/message/i2o/i2o_block.c linux-2.6.9rc2/drivers/message/i2o/i2o_block.c
+--- linux.vanilla-2.6.9rc2/drivers/message/i2o/i2o_block.c	2004-09-14 14:22:53.446818368 +0100
++++ linux-2.6.9rc2/drivers/message/i2o/i2o_block.c	2004-09-14 16:14:32.863352248 +0100
+@@ -420,7 +420,6 @@ static int i2o_block_reply(struct i2o_co
+ 		struct i2o_message *pmsg;
+ 		u32 pm;
+ 
+-		printk(KERN_WARNING "FAIL");
+ 		/*
+ 		 * FAILed message from controller
+ 		 * We increment the error count and abort it
+@@ -538,7 +537,7 @@ static int i2o_block_reply(struct i2o_co
+ 		 *      Don't stick a supertrak100 into cache aggressive modes
+ 		 */
+ 
+-		printk(KERN_ERR "\n/dev/%s error: %s", dev->gd->disk_name,
++		printk(KERN_ERR "/dev/%s error: %s", dev->gd->disk_name,
+ 		       bsa_errors[readl(&msg->body[0]) & 0xffff]);
+ 		if (readl(&msg->body[0]) & 0x00ff0000)
+ 			printk(" - DDM attempted %d retries",
+@@ -563,7 +562,7 @@ static int i2o_block_reply(struct i2o_co
+ 		i2o_block_sglist_free(ireq);
+ 		i2o_block_request_free(ireq);
+ 	} else
+-		printk(KERN_ERR "still remaining chunks\n");
++		printk(KERN_ERR "i2o_block: still remaining chunks\n");
+ 
+ 	return 1;
+ };
+diff -u -p --new-file --recursive --exclude-from /usr/src/exclude linux.vanilla-2.6.9rc2/drivers/message/i2o/i2o_core.c linux-2.6.9rc2/drivers/message/i2o/i2o_core.c
+--- linux.vanilla-2.6.9rc2/drivers/message/i2o/i2o_core.c	2004-09-14 14:22:53.451817608 +0100
++++ linux-2.6.9rc2/drivers/message/i2o/i2o_core.c	2004-09-14 16:36:14.440482448 +0100
+@@ -342,6 +342,47 @@ void *i2o_context_list_get(u32 context, 
+ }
+ #endif
+ 
++/**
++ *	i2o_receive_to_virt	-	Turn an I2O message to a virtual address
++ *	@c: controller
++ *	@msg: message engine value
++ *
++ *	Turn a receive message from an I2O controller bus address into
++ *	a Linux virtual address. The shared page frame is a linear block
++ *	so we simply have to shift the offset. This function does not 
++ *	work for sender side messages as they are ioremap objects
++ *	provided by the I2O controller.
++ */
++ 
++void *i2o_receive_to_virt(struct i2o_controller *c, u32 msg)
++{
++	if(msg < c->out_queue.phys || msg >= c->out_queue.phys + c->out_queue.len)
++		BUG();
++	msg -= c->out_queue.phys;
++	return c->out_queue.virt + msg;
++}
++
++EXPORT_SYMBOL_GPL(i2o_receive_to_virt);
++
++/**
++ *	i2o_send_to_virt	-	Turn an I2O message to a virtual address
++ *	@c: controller
++ *	@msg: message engine value
++ *
++ *	Turn a send message from an I2O controller bus address into
++ *	a Linux virtual address. The shared page frame is a linear block
++ *	so we simply have to shift the offset. This function does not 
++ *	work for receive side messages as they are kmalloc objects
++ *	in a different pool.
++ */
++ 
++void *i2o_send_to_virt(struct i2o_controller *c, u32 msg)
++{
++	return c->in_queue.virt + msg;
++}
++
++EXPORT_SYMBOL_GPL(i2o_send_to_virt);
++
+ /*
+  * I2O Core reply handler
+  */
+@@ -354,7 +395,7 @@ static void i2o_core_reply(struct i2o_ha
+ 
+ 	if (msg[0] & MSG_FAIL) // Fail bit is set
+ 	{
+-		u32 *preserved_msg = (u32*)(c->msg_virt + msg[7]);
++		u32 *preserved_msg = (u32*)i2o_send_to_virt(c, msg[7]);
+ 
+ 		i2o_report_status(KERN_INFO, "i2o_core", msg);
+ 		i2o_dump_message(preserved_msg);
+@@ -1328,7 +1369,7 @@ void i2o_run_queue(struct i2o_controller
+ 		mb();
+ 
+ 		/* That 960 bug again... */	
+-		if((mv=I2O_REPLY_READ32(c))==0xFFFFFFFF)
++		if((mv=I2O_REPLY_READ32(c))==0xFFFFFFFFUL)
+ 			mv=I2O_REPLY_READ32(c);
+ 	}		
+ }
+@@ -1782,38 +1823,37 @@ static int i2o_reset_controller(struct i
+ 	u32 m;
+ 	u8 *status;
+ 	dma_addr_t status_phys;
+-	u32 *msg;
++	void *msg;
+ 	long time;
+ 
+ 	/* Quiesce all IOPs first */
+ 
+ 	for (iop = i2o_controller_chain; iop; iop = iop->next)
+ 	{
+-		if(!iop->dpt)
++		if(!iop->dpt && !iop->promise)
+ 			i2o_quiesce_controller(iop);
+ 	}
+ 
+ 	m=i2o_wait_message(c, "AdapterReset");
+-	if(m==0xFFFFFFFF)	
++	if(m==0xFFFFFFFFUL)	
+ 		return -ETIMEDOUT;
+-	msg=(u32 *)(c->msg_virt+m);
++	msg= c->msg_virt + m;
+ 	
+-	status = pci_alloc_consistent(c->pdev, 4, &status_phys);
++	status = pci_alloc_consistent(c->pdev, 8, &status_phys);
+ 	if(status == NULL) {
+ 		printk(KERN_ERR "IOP reset failed - no free memory.\n");
+ 		return -ENOMEM;
+ 	}
+-	memset(status, 0, 4);
++	memset(status, 0, 8);
+ 	
+-	msg[0]=EIGHT_WORD_MSG_SIZE|SGL_OFFSET_0;
+-	msg[1]=I2O_CMD_ADAPTER_RESET<<24|HOST_TID<<12|ADAPTER_TID;
+-	msg[2]=core_context;
+-	msg[3]=0;
+-	msg[4]=0;
+-	msg[5]=0;
+-	msg[6]=status_phys;
+-	msg[7]=0;	/* 64bit host FIXME */
+-
++	i2o_raw_writel(EIGHT_WORD_MSG_SIZE|SGL_OFFSET_0, msg);
++	i2o_raw_writel(I2O_CMD_ADAPTER_RESET<<24|HOST_TID<<12|ADAPTER_TID, msg+4);
++	i2o_raw_writel(core_context, msg+8);
++	i2o_raw_writel(0, msg + 12);
++	i2o_raw_writel(0, msg + 16);
++	i2o_raw_writel(0, msg + 20);
++	i2o_raw_writel(status_phys, msg + 24);
++	i2o_raw_writel(0, msg + 28);	/* We use 32bit DMA mask.. */
+ 	i2o_post_message(c,m);
+ 
+ 	/* Wait for a reply */
+@@ -1822,13 +1862,19 @@ static int i2o_reset_controller(struct i
+ 	{
+ 		if((jiffies-time)>=20*HZ)
+ 		{
+-			printk(KERN_ERR "IOP reset timeout.\n");
++			printk(KERN_ERR "i2o: IOP reset timeout.\n");
+ 			/* The controller still may respond and overwrite
+ 			 * status_phys, LEAK it to prevent memory corruption.
+ 			 */
+ 			return -ETIMEDOUT;
+ 		}
+-		schedule();
++		if( status[1] != 0)
++		{
++			printk(KERN_WARNING "i2o: IOP wrote wrong status word.\n");
++			*status = 0;
++			break;
++		}
++		msleep(1);
+ 		barrier();
+ 	}
+ 
+@@ -1848,7 +1894,7 @@ static int i2o_reset_controller(struct i
+ 
+ 		time = jiffies; 
+ 		m = I2O_POST_READ32(c); 
+-		while(m == 0XFFFFFFFF) 
++		while(m == 0XFFFFFFFFUL) 
+ 		{ 
+ 			if((jiffies-time) >= 30*HZ)
+ 			{
+@@ -1882,10 +1928,10 @@ static int i2o_reset_controller(struct i
+ 	/* Enable other IOPs */
+ 
+ 	for (iop = i2o_controller_chain; iop; iop = iop->next)
+-		if (iop != c)
++		if (iop != c && !iop->dpt && !iop->promise)
+ 			i2o_enable_controller(iop);
+ 
+-	pci_free_consistent(c->pdev, 4, status, status_phys);
++	pci_free_consistent(c->pdev, 8, status, status_phys);
+ 	return 0;
+ }
+ 
+@@ -1904,7 +1950,7 @@ int i2o_status_get(struct i2o_controller
+ {
+ 	long time;
+ 	u32 m;
+-	u32 *msg;
++	void *msg;
+ 	u8 *status_block;
+ 
+ 	if (c->status_block == NULL) 
+@@ -1925,17 +1971,17 @@ int i2o_status_get(struct i2o_controller
+ 	m=i2o_wait_message(c, "StatusGet");
+ 	if(m==0xFFFFFFFF)
+ 		return -ETIMEDOUT;	
+-	msg=(u32 *)(c->msg_virt+m);
++	msg= c->msg_virt + m;
+ 
+-	msg[0]=NINE_WORD_MSG_SIZE|SGL_OFFSET_0;
+-	msg[1]=I2O_CMD_STATUS_GET<<24|HOST_TID<<12|ADAPTER_TID;
+-	msg[2]=core_context;
+-	msg[3]=0;
+-	msg[4]=0;
+-	msg[5]=0;
+-	msg[6]=c->status_block_phys;
+-	msg[7]=0;   /* 64bit host FIXME */
+-	msg[8]=sizeof(i2o_status_block); /* always 88 bytes */
++	i2o_raw_writel(NINE_WORD_MSG_SIZE|SGL_OFFSET_0, msg);
++	i2o_raw_writel(I2O_CMD_STATUS_GET<<24|HOST_TID<<12|ADAPTER_TID, msg + 4);
++	i2o_raw_writel(core_context, msg + 8);
++	i2o_raw_writel(0, msg + 12);
++	i2o_raw_writel(0, msg + 16);
++	i2o_raw_writel(0, msg + 20);
++	i2o_raw_writel(c->status_block_phys, msg + 24);
++	i2o_raw_writel(0, msg + 28);
++	i2o_raw_writel(sizeof(i2o_status_block), msg + 32); /* always 88 bytes */
+ 
+ 	i2o_post_message(c,m);
+ 
+@@ -2268,6 +2314,63 @@ static void i2o_sys_shutdown(void)
+ }
+ 
+ /**
++ *	i2o_send_nop		-	send a core NOP message
++ *	@c: controller
++ *	
++ *	Send a no-operation message with a reply set to cause no
++ *	action either. Needed for bringing up promise controllers
++ */
++ 
++static void i2o_send_nop(struct i2o_controller *c)
++{
++	u32 m = i2o_wait_message(c, "SendNop");
++	void *msg;
++	if(m == 0xFFFFFFFFUL)
++		return;
++	msg = m + c->msg_virt;
++	
++	i2o_raw_writel(THREE_WORD_MSG_SIZE|SGL_OFFSET_0, msg);
++	i2o_raw_writel(I2O_CMD_UTIL_NOP| HOST_TID << 12 | 0  , msg+4);
++	i2o_raw_writel(0, msg+8);
++	
++	i2o_post_message(c, m);
++}
++
++/**
++ *	i2o_activate_promise	-	activate Promise not quite I2O
++ *	@c: controller
++ *
++ *	Bring up and activate the Promise SX I2O controllers which don't
++ *	quite follow I2O and don't like an I2O boot at all.
++ */
++ 
++static int i2o_activate_promise(struct i2o_controller *iop)
++{
++	int ret = 0;
++	/* Beat up the hardware first of all */
++	struct pci_dev *i960 = pci_find_slot(iop->pdev->bus->number, PCI_DEVFN(PCI_SLOT(iop->pdev->devfn), 0));
++	if(i960)
++		pci_write_config_word(i960, 0x42, 0);
++		
++	/* Follow this sequence precisely or the controller
++	   ceases to perform useful functions until reboot */
++	i2o_send_nop(iop);
++	if(i2o_reset_controller(iop) < 0 ||
++	  (i2o_status_get(iop) < 0) ||
++	  (i2o_init_outbound_q(iop) < 0) ||
++	  (i2o_post_outbound_messages(iop) < 0))
++	  	ret = -1;
++	  	
++	i2o_send_nop(iop);
++
++	if(i2o_status_get(iop) < 0)
++		ret = -1 ;
++	if(i960)
++		pci_write_config_word(i960, 0x42, 0x3FF);
++	return ret;
++}
++
++/**
+  *	i2o_activate_controller	-	bring controller up to HOLD
+  *	@iop: controller
+  *
+@@ -2339,14 +2442,14 @@ int i2o_init_outbound_q(struct i2o_contr
+ 	u8 *status;
+ 	dma_addr_t status_phys;
+ 	u32 m;
+-	u32 *msg;
++	void *msg;
+ 	u32 time;
+ 
+ 	dprintk(KERN_INFO "%s: Initializing Outbound Queue...\n", c->name);
+ 	m=i2o_wait_message(c, "OutboundInit");
+ 	if(m==0xFFFFFFFF)
+ 		return -ETIMEDOUT;
+-	msg=(u32 *)(c->msg_virt+m);
++	msg= c->msg_virt + m;
+ 
+ 	status = pci_alloc_consistent(c->pdev, 4, &status_phys);
+ 	if (status==NULL) {
+@@ -2356,15 +2459,15 @@ int i2o_init_outbound_q(struct i2o_contr
+ 	}
+ 	memset(status, 0, 4);
+ 
+-	msg[0]= EIGHT_WORD_MSG_SIZE| TRL_OFFSET_6;
+-	msg[1]= I2O_CMD_OUTBOUND_INIT<<24 | HOST_TID<<12 | ADAPTER_TID;
+-	msg[2]= core_context;
+-	msg[3]= 0x0106;				/* Transaction context */
+-	msg[4]= 4096;				/* Host page frame size */
+-	/* Frame size is in words. 256 bytes a frame for now */
+-	msg[5]= MSG_FRAME_SIZE<<16|0x80;	/* Outbound msg frame size in words and Initcode */
+-	msg[6]= 0xD0000004;			/* Simple SG LE, EOB */
+-	msg[7]= status_phys;
++	i2o_raw_writel(EIGHT_WORD_MSG_SIZE| TRL_OFFSET_6, msg);
++	i2o_raw_writel(I2O_CMD_OUTBOUND_INIT<<24 | HOST_TID<<12 | ADAPTER_TID, msg + 4);;
++	i2o_raw_writel(core_context, msg + 8);
++	i2o_raw_writel(0x0106, msg + 12);	/* Transaction context */
++	i2o_raw_writel(4096, msg + 16);		/* Host page frame size */
++	/* Frame size is in words. 128 bytes a frame for now. SCSI assumes this */
++	i2o_raw_writel(MSG_FRAME_SIZE << 16|0x80, msg + 20);	/* Outbound msg frame size in words and Initcode */
++	i2o_raw_writel(0xD0000004, msg + 24);	/* Simple SG LE, EOB */
++	i2o_raw_writel(status_phys, msg + 28);
+ 
+ 	i2o_post_message(c,m);
+ 	
+@@ -2435,6 +2538,8 @@ int i2o_post_outbound_messages(struct i2
+ 	for(i=0; i< NMBR_MSG_FRAMES; i++) {
+ 		I2O_REPLY_WRITE32(c,m);
+ 		mb();
++		if(c->promise)
++			udelay(1);	/* May be overkill */
+ 		m += (MSG_FRAME_SIZE << 2);
+ 	}
+ 
+@@ -3677,7 +3782,7 @@ int __init i2o_pci_install(struct pci_de
+ 	if(dev->subsystem_vendor == PCI_VENDOR_ID_PROMISE)
+ 	{
+ 		c->promise = 1;
+-		printk(KERN_INFO "I2O: Promise workarounds activated.\n");
++		printk(KERN_INFO "I2O: Promise vaguely I2O mode activated.\n");
+ 	}
+ 
+ 	/*
+@@ -3686,9 +3791,9 @@ int __init i2o_pci_install(struct pci_de
+ 	 */
+ 	 
+ 	if(dev->vendor == PCI_VENDOR_ID_DPT) {
+-		c->dpt=1;
++		c->dpt = 1;
+ 		if(dev->device == 0xA511)
+-			c->raptor=1;
++			c->raptor = 1;
+ 	}
+ 
+ 	for(i=0; i<6; i++)
+@@ -3846,16 +3951,33 @@ int __init i2o_pci_scan(void)
+ 
+ 	while ((dev = pci_find_device(PCI_ANY_ID, PCI_ANY_ID, dev)) != NULL)
+ 	{
+-		if((dev->class>>8)!=PCI_CLASS_INTELLIGENT_I2O &&
+-		   (dev->vendor!=PCI_VENDOR_ID_DPT || dev->device!=0xA511))
+-			continue;
+-
+-		if((dev->class>>8)==PCI_CLASS_INTELLIGENT_I2O &&
+-		   (dev->class&0xFF)>1)
++		if (dev->subsystem_vendor == PCI_VENDOR_ID_PROMISE &&
++		    dev->subsystem_device == 0x0000 &&
++		    dev->vendor == PCI_VENDOR_ID_INTEL)
+ 		{
+-			printk(KERN_INFO "i2o: I2O Controller found but does not support I2O 1.5 (skipping).\n");
+-			continue;
++			/* This is best described as quirky */
++			printk(KERN_INFO "i2o: Promise SuperTrak SX6000 series controller on bus %d at %d.\n",
++				dev->bus->number, dev->devfn);
++		}
++		else if(dev->vendor == PCI_VENDOR_ID_DPT &&
++			dev->device == 0xA511)
++		{
++			printk(KERN_INFO "i2o: DPT controller on bus %d at %d.\n",
++				dev->bus->number, dev->devfn);
++		}
++		else if (dev->class >> 8 == PCI_CLASS_INTELLIGENT_I2O)
++		{
++			if((dev->class & 0xFF) > 1)
++			{
++				printk(KERN_INFO "i2o: I2O Controller found but does not support I2O 1.5 (skipping).\n");
++				continue;
++			}
++			printk(KERN_INFO "i2o: I2O controller on bus %d at %d.\n",
++				dev->bus->number, dev->devfn);
+ 		}
++		else	/* Not I2O */
++			continue;
++			
+ 		if (pci_enable_device(dev))
+ 			continue;
+ 		printk(KERN_INFO "i2o: I2O controller on bus %d at %d.\n",
+diff -u -p --new-file --recursive --exclude-from /usr/src/exclude linux.vanilla-2.6.9rc2/drivers/message/i2o/i2o_scsi.c linux-2.6.9rc2/drivers/message/i2o/i2o_scsi.c
+--- linux.vanilla-2.6.9rc2/drivers/message/i2o/i2o_scsi.c	2004-09-14 14:22:53.459816392 +0100
++++ linux-2.6.9rc2/drivers/message/i2o/i2o_scsi.c	2004-09-14 17:02:02.320168968 +0100
+@@ -274,53 +274,6 @@ static const char *i2o_scsi_info(struct 
+ 	return hostdata->iop->name;
+ }
+ 
+-#if 0
+-/**
+- *	i2o_retry_run		-	retry on timeout
+- *	@f: unused
+- *
+- *	Retry congested frames. This actually needs pushing down into
+- *	i2o core. We should only bother the OSM with this when we can't
+- *	queue and retry the frame. Or perhaps we should call the OSM
+- *	and its default handler should be this in the core, and this
+- *	call a 2nd "I give up" handler in the OSM ?
+- */
+-
+-static void i2o_retry_run(unsigned long f)
+-{
+-	int i;
+-	unsigned long flags;
+-
+-	spin_lock_irqsave(&retry_lock, flags);
+-	for (i = 0; i < retry_ct; i++)
+-		i2o_post_message(retry_ctrl[i], virt_to_bus(retry[i]));
+-	retry_ct = 0;
+-	spin_unlock_irqrestore(&retry_lock, flags);
+-}
+-
+-/**
+- *	flush_pending		-	empty the retry queue
+- *
+- *	Turn each of the pending commands into a NOP and post it back
+- *	to the controller to clear it.
+- */
+-
+-static void flush_pending(void)
+-{
+-	int i;
+-	unsigned long flags;
+-
+-	spin_lock_irqsave(&retry_lock, flags);
+-	for (i = 0; i < retry_ct; i++) {
+-		retry[i][0] &= ~0xFFFFFF;
+-		retry[i][0] |= I2O_CMD_UTIL_NOP << 24;
+-		i2o_post_message(retry_ctrl[i], virt_to_bus(retry[i]));
+-	}
+-	retry_ct = 0;
+-	spin_unlock_irqrestore(&retry_lock, flags);
+-}
+-#endif
+-
+ /**
+  *	i2o_scsi_reply - SCSI OSM message reply handler
+  *	@c: controller issuing the reply
+@@ -348,16 +301,17 @@ static int i2o_scsi_reply(struct i2o_con
+ 	if (msg->u.head[0] & (1 << 13)) {
+ 		struct i2o_message *pmsg;	/* preserved message */
+ 		u32 pm;
++		int err = DID_ERROR;
+ 
+-		pm = readl(&msg->body[3]);
++		pm = le32_to_cpu(msg->body[3]);
+ 
+-		pmsg = c->in_queue.virt + pm;
++		pmsg = i2o_send_to_virt(pm);
+ 
+-		printk("IOP fail.\n");
+-		printk("From %d To %d Cmd %d.\n",
++		printk(KERN_ERR "IOP fail.\n");
++		printk(KERN_ERR "From %d To %d Cmd %d.\n",
+ 		       (msg->u.head[1] >> 12) & 0xFFF,
+ 		       msg->u.head[1] & 0xFFF, msg->u.head[1] >> 24);
+-		printk("Failure Code %d.\n", msg->body[0] >> 24);
++		printk(KERN_ERR "Failure Code %d.\n", msg->body[0] >> 24);
+ 		if (msg->body[0] & (1 << 16))
+ 			printk("Format error.\n");
+ 		if (msg->body[0] & (1 << 17))
+@@ -365,16 +319,18 @@ static int i2o_scsi_reply(struct i2o_con
+ 		if (msg->body[0] & (1 << 18))
+ 			printk("Path State.\n");
+ 		if (msg->body[0] & (1 << 18))
++		{
+ 			printk("Congestion.\n");
++			err = DID_BUS_BUSY;
++		}
+ 
+-		printk("Failing message is %p.\n", pmsg);
++		printk(KERN_DEBUG "Failing message is %p.\n", pmsg);
+ 
+ 		cmd = i2o_cntxt_list_get(c, readl(&pmsg->u.s.tcntxt));
+ 		if (!cmd)
+ 			return 1;
+ 
+-		printk("Aborted %ld\n", cmd->serial_number);
+-		cmd->result = DID_ERROR << 16;
++		cmd->result = err << 16;
+ 		cmd->scsi_done(cmd);
+ 
+ 		/* Now flush the message by making it a NOP */diff -u -p --new-file --recursive --exclude-from /usr/src/exclude linux.vanilla-2.6.9rc2/include/linux/i2o.h linux-2.6.9rc2/include/linux/i2o.h
+--- linux.vanilla-2.6.9rc2/include/linux/i2o.h	2004-09-14 14:22:57.318229824 +0100
++++ linux-2.6.9rc2/include/linux/i2o.h	2004-09-14 16:36:11.372948784 +0100
+@@ -47,7 +47,7 @@ struct i2o_message {
+ 			u32 function:8;
+ 			u32 icntxt;	/* initiator context */
+ 			u32 tcntxt;	/* transaction context */
+-		} s;
++		} __attribute((packed)) s;
+ 		u32 head[4];
+ 	} u;
+ 	/* List follows */
+@@ -597,6 +597,10 @@ extern int i2o_parm_field_get(struct i2o
+ extern int i2o_parm_field_set(struct i2o_device *, int, int, void *, int);
+ extern int i2o_parm_table_get(struct i2o_device *, int, int, int, void *, int,
+ 			      void *, int);
++ 
++extern void *i2o_send_to_virt(struct i2o_controller *, u32);
++extern void *i2o_receive_to_virt(struct i2o_controller *, u32);
++
+ /* FIXME: remove
+ extern int i2o_query_table(int, struct i2o_controller *, int, int, int,
+ 			   void *, int, void *, int);

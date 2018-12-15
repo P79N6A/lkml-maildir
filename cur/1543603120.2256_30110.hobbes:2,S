@@ -1,0 +1,715 @@
+Date: Mon, 1 Oct 2001 16:21:01 +0200 (MET DST)
+From: Bjorn Wesen <>
+Subject: [PATCH] mkcramfs gets an option to use meta-information
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2001/10/1/113
+
+[there is no maintainer listed for cramfs but the copyright says
+Transmeta, so therefore I send it to you, Alan and the list]
+The enclosed patch makes it possible to, by metafiles, control what
+permissions and ownership the created files will get in the resulting file
+system image. Previously the only way to achieve this was to create the
+filesystem as root (so the original files already had the right
+permissions and ownership). It is also possible to specify subdirectories
+and files to be excluded or included, and to specify files to be generated
+as device-files.
+This functionality is very useful for building root-images for embedded
+Linux etc, and nobody wants to develop as root so it's necessary as well.. 
+The same metafile-format can be used in conjunction with JFFS1 and 2, but
+those patches are handled separately. In the meantime, this patch also
+encloses Documentation/filesystems/metafiles.txt as documentation and RFC.
+The metafile itself for an embedded system can be generated automatically
+by build-scripts which wrap the "install" command, for example.
+If no metafile is specified, the behaviour is exactly as before.
+Another option needed for cross-development using mkcramfs is also added,
+to override the default page-size used for the image (for example, in our
+systems we need a target page-size of 8192, but mkcramfs.c normally is
+hardcoded to 4096). Default is as before 4096.
+/Bjorn
+--- tmp/linux/scripts/cramfs/mkcramfs.c	Tue Jul 24 14:42:58 2001
++++ linux/scripts/cramfs/mkcramfs.c	Fri Sep  7 16:23:50 2001
+@@ -29,6 +29,8 @@
+ #include <errno.h>
+ #include <string.h>
+ #include <assert.h>
++#include <ctype.h>
++#include <limits.h>
+ #include <getopt.h>
+ #include <linux/cramfs_fs.h>
+ #include <zlib.h>
+@@ -36,6 +38,7 @@
+ #define PAD_SIZE 512		/* only 0 and 512 supported by kernel */
+ 
+ static const char *progname = "mkcramfs";
++static const char *meta_file_name = NULL; /* NULL means ignore meta file */
+ 
+ /* N.B. If you change the disk format of cramfs, please update fs/cramfs/README. */
+ 
+@@ -44,24 +47,27 @@
+ {
+ 	FILE *stream = status ? stderr : stdout;
+ 
+-	fprintf(stream, "usage: %s [-h] [-e edition] [-i file] [-n name] dirname outfile\n"
+-		" -h         print this help\n"
+-		" -E         make all warnings errors (non-zero exit status)\n"
+-		" -e edition set edition number (part of fsid)\n"
+-		" -i file    insert a file image into the filesystem (requires >= 2.4.0)\n"
+-		" -n name    set name of cramfs filesystem\n"
+-		" -p         pad by %d bytes for boot code\n"
+-		" -s         sort directory entries (old option, ignored)\n"
+-		" -z         make explicit holes (requires >= 2.3.39)\n"
+-		" dirname    root of the filesystem to be compressed\n"
+-		" outfile    output file\n", progname, PAD_SIZE);
++	fprintf(stream, "usage: %s [-h] [-b blocksize] [-e edition] [-i file] [-m filename]\n"
++			"       [-n name] dirname outfile\n"
++		" -h           print this help\n"
++		" -E           make all warnings errors (non-zero exit status)\n"
++		" -b blocksize the page-size (default is 4096)\n"
++		" -e edition   set edition number (part of fsid)\n"
++		" -i file      insert a file image into the filesystem (requires >= 2.4.0)\n"
++		" -m filename  look for meta files with this name in each subdir\n"
++		" -n name      set name of cramfs filesystem\n"
++		" -p           pad by %d bytes for boot code\n"
++		" -s           sort directory entries (old option, ignored)\n"
++		" -z           make explicit holes (requires >= 2.3.39)\n"
++		" dirname      root of the filesystem to be compressed\n"
++		" outfile      output file\n", progname, PAD_SIZE);
+ 
+ 	exit(status);
+ }
+ 
+-#define PAGE_CACHE_SIZE (4096)
++#define DEFAULT_PAGE_CACHE_SIZE (4096)
+ /* The kernel assumes PAGE_CACHE_SIZE as block size. */
+-static unsigned int blksize = PAGE_CACHE_SIZE;
++static unsigned int blksize = DEFAULT_PAGE_CACHE_SIZE;
+ static long total_blocks = 0, total_nodes = 1; /* pre-count the root node */
+ static int image_length = 0;
+ 
+@@ -81,6 +87,7 @@
+ static char *opt_name = NULL;
+ 
+ static int warn_dev, warn_gid, warn_namelen, warn_skip, warn_size, warn_uid;
++static int name_offset;	/* For removing directory name in output */
+ 
+ #ifndef MIN
+ # define MIN(_a,_b) ((_a) < (_b) ? (_a) : (_b))
+@@ -134,6 +141,348 @@
+         }
+ }
+ 
++/*****************************************************************/
++
++/* Meta types */
++
++#define META_IGNORE          1
++#define META_IGNORE_CONTENTS 2
++#define META_DEVICE          3
++#define META_INCLUDE         4
++#define META_UID             5
++#define META_GID             6
++
++#define ID_NONE UINT_MAX	/* for ignoring default_uid and default_gid */
++
++struct metadata {
++	struct metadata *next;	/* next node in linked list */
++	int type;		/* meta type */
++	char *name;		/* entry name */
++	unsigned int id;	/* for type META_UID and META_GID */
++	char dev_type;		/* for type META_DEVICE */
++	unsigned char major;	/* for type META_DEVICE */
++	unsigned char minor;	/* for type META_DEVICE */
++};
++
++#define BUFFERLENGTH 256
++
++/* Meta data functions */
++
++struct metadata *create_meta_ignore(char *line, struct metadata *meta, int ignoretype)
++{
++	struct metadata *new_meta;
++	char *end = &line[strlen(line)];
++
++	while (isspace(*line)) {
++		line++;
++	}
++
++	for (end--; end > line && isspace(*end); end--) {
++		*end = '\0';
++	}
++
++	if (end > line && *line == '"' && *end == '"') {
++		line++;
++		*end = '\0';
++	}
++
++	/* Can't ignore the . and .. directories */
++	if (strlen(line) && strcmp(line, ".") && strcmp(line, "..")) {
++		if ((new_meta = malloc(sizeof(struct metadata)))) {
++			new_meta->next = meta;
++			new_meta->type = ignoretype;
++			new_meta->name = strdup(line);
++			return new_meta;
++		} else {
++			fprintf(stderr,"out of memory\n");
++			exit(1);
++		}
++	}
++
++	return meta;
++}
++
++struct metadata *create_meta_include(char *line, struct metadata *meta)
++{
++	struct metadata *new_meta;
++	char *end = &line[strlen(line)];
++
++	while (isspace(*line)) {
++		line++;
++	}
++
++	for (end--; end > line && isspace(*end); end--) {
++		*end = '\0';
++	}
++
++	if (end > line && *line == '"' && *end == '"') {
++		line++;
++		*end = '\0';
++	}
++
++	if ((new_meta = malloc(sizeof(struct metadata)))) {
++		new_meta->next = meta;
++		new_meta->type = META_INCLUDE;
++		new_meta->name = strdup(line);
++		return new_meta;
++	} else {
++		fprintf(stderr,"out of memory\n");
++		exit(1);
++	}
++
++	return meta;
++}
++
++struct metadata *create_meta_device(char *line, struct metadata *meta)
++{
++	struct metadata *new_meta;
++	char name[MAX_INPUT_NAMELEN + 1];
++	char dev_type;
++	unsigned int major = 0;
++	unsigned int minor = 0;
++	int found;
++
++	found = sscanf(line, "%s %c %u %u", name, &dev_type, &major, &minor);
++	
++	if ((found == 2 || found == 4) &&
++	    (dev_type == 'b' || dev_type == 'c' || dev_type == 'p') &&
++	    major < 256 && minor < 256) {
++		if ((new_meta = malloc(sizeof(struct metadata)))) {
++			new_meta->next = meta;
++			new_meta->type = META_DEVICE;
++			new_meta->name = strdup(name);
++			new_meta->dev_type = dev_type;
++			if (dev_type == 'b' || dev_type == 'c') {
++				new_meta->major = (unsigned char)major;
++				new_meta->minor = (unsigned char)minor;
++			}
++			return new_meta;
++		} else {
++			fprintf(stderr,"out of memory\n");
++			exit(1);
++		}
++	} else
++		fprintf(stderr, "Illegal device file specification: %s", line);
++
++	return meta;
++}
++
++struct metadata *create_meta_uid(char *line, struct metadata *meta)
++{
++	struct metadata *new_meta;
++	char name[MAX_INPUT_NAMELEN + 1];
++	unsigned int uid;
++	int found;
++
++	found = sscanf(line, "%s %u", name, &uid);
++	
++	if (found == 2) {
++		if ((new_meta = malloc(sizeof(struct metadata)))) {
++			new_meta->next = meta;
++			new_meta->type = META_UID;
++			new_meta->name = strdup(name);
++			new_meta->id = uid;
++
++			return new_meta;
++		} else {
++			fprintf(stderr,"out of memory\n");
++			exit(1);
++		}
++	} else
++		fprintf(stderr, "Illegal uid specification: %s", line);
++
++	return meta;
++}
++
++struct metadata *create_meta_gid(char *line, struct metadata *meta)
++{
++	struct metadata *new_meta;
++	char name[MAX_INPUT_NAMELEN + 1];
++	unsigned int gid;
++	int found;
++
++	found = sscanf(line, "%s %u", name, &gid);
++	
++	if (found == 2) {
++		if ((new_meta = malloc(sizeof(struct metadata)))) {
++			new_meta->next = meta;
++			new_meta->type = META_GID;
++			new_meta->name = strdup(name);
++			new_meta->id = gid;
++
++			return new_meta;
++		} else {
++			fprintf(stderr,"out of memory\n");
++			exit(1);
++		}
++	} else
++		fprintf(stderr, "Illegal gid specification: %s", line);
++
++	return meta;
++}
++
++struct metadata *read_meta_data(const char *dir_name, unsigned int *default_uid_ptr, unsigned int *default_gid_ptr)
++{
++	FILE *meta_file;
++	char *file_name;
++	struct metadata *meta = 0;
++	char line[BUFFERLENGTH];
++
++	if (!meta_file_name)
++		return NULL;
++
++	if (!(file_name = malloc(strlen(dir_name) + strlen(meta_file_name) + 2))) {
++		fprintf(stderr,"out of memory\n");
++		return 0;
++	}
++
++	strcpy(file_name, dir_name);
++	strcat(file_name, "/");
++	strcat(file_name, meta_file_name);
++
++	if (!(meta_file = fopen(file_name, "r"))) {
++		return 0;
++	}
++
++	while (!feof(meta_file)) {
++		if (fgets(line, BUFFERLENGTH - 1, meta_file)) {
++			if (!strncasecmp("Ignore:", line, 7)) {
++				meta = create_meta_ignore(line + 7, meta, META_IGNORE);
++			} else if (!strncasecmp("IgnoreContents:", line, 15)) {
++				meta = create_meta_ignore(line + 15, meta,
++							  META_IGNORE_CONTENTS);
++			} else if (!strncasecmp("Include:", line, 8)) {
++				meta = create_meta_include(line + 8, meta);
++			} else if (!strncasecmp("Device:", line, 7)) {
++				meta = create_meta_device(line + 7, meta);
++			} else if (!strncasecmp("UserId:", line, 7)) {
++				meta = create_meta_uid(line + 7, meta);
++			} else if (!strncasecmp("GroupId:", line, 8)) {
++				meta = create_meta_gid(line + 8, meta);
++			} else if (!strncasecmp("DefaultUserId:", line, 14)) {
++				int count = sscanf(line + 14, "%u", default_uid_ptr);
++				if (count < 1)
++					fprintf(stderr, "Illegal default uid specification: %s", line);
++			} else if (!strncasecmp("DefaultGroupId:", line, 15)) {
++				int count = sscanf(line + 15, "%u", default_gid_ptr);
++				if (count < 1)
++					fprintf(stderr, "Illegal default gid specification: %s", line);
++			} else {
++				fprintf(stderr, "Illegal meta specification: %s", line);
++			}
++		}
++	}
++	
++	fclose(meta_file);
++	free(file_name);
++
++	return meta;
++}
++
++void free_meta_data(struct metadata *meta)
++{
++	struct metadata *next;
++
++	for (; meta; meta = next) {
++		next = meta->next;
++		free(meta->name);
++		free(meta);
++	}
++}
++
++int meta_ignore(struct metadata *meta, char *name)
++{
++	for (; meta; meta = meta->next) {
++		if (meta->type == META_IGNORE && !strcmp(name, meta->name)) {
++			return 1;
++		}
++	}
++
++	return 0;
++}
++
++int meta_ignore_contents(struct metadata *meta, char *name)
++{
++	for (; meta; meta = meta->next) {
++		if (meta->type == META_IGNORE_CONTENTS && !strcmp(name, meta->name)) {
++			return 1;
++		}
++	}
++
++	return 0;
++}
++
++int meta_include(struct metadata *meta, char *name)
++{
++	int found = 0;
++
++	/* Always include . and .. */
++	if (!strcmp(name, ".") || !strcmp(name, ".."))
++		return 1;  
++
++	for (; meta; meta = meta->next) {
++		if (meta->type == META_INCLUDE) {
++			found = 1;
++			if (!strcmp(name, meta->name)) {
++				return 1;
++			}
++		}
++	}
++
++	return !found;
++}
++
++int meta_handle_device(struct metadata *meta, struct entry *entry)
++{
++	for (; meta; meta = meta->next) {
++		if (meta->type == META_DEVICE &&
++		    !strcmp(entry->name, meta->name)) {
++			if (meta->dev_type == 'b') {
++				entry->mode = (entry->mode & ~S_IFMT) | S_IFBLK;
++				entry->size = makedev(meta->major, meta->minor);
++			} else if (meta->dev_type == 'c') {
++				entry->mode = (entry->mode & ~S_IFMT) | S_IFCHR;
++				entry->size = makedev(meta->major, meta->minor);
++			} else {
++				entry->mode = (entry->mode & ~S_IFMT) | S_IFIFO;
++			}
++			return 1;
++		}
++	}
++
++	return 0;
++}
++
++int meta_handle_uid(struct metadata *meta, struct entry *entry)
++{
++	for (; meta; meta = meta->next) {
++		if (meta->type == META_UID) {
++			if (!strcmp(entry->name, meta->name)) {
++				entry->uid = meta->id;
++				return 1;
++			}
++		}
++	}
++
++	return 0;
++}
++
++int meta_handle_gid(struct metadata *meta, struct entry *entry)
++{
++	for (; meta; meta = meta->next) {
++		if (meta->type == META_GID) {
++			if (!strcmp(entry->name, meta->name)) {
++				entry->gid = meta->id;
++				return 1;
++			}
++		}
++	}
++
++	return 0;
++}
++
++/*****************************************************************/
++
+ /*
+  * We define our own sorting function instead of using alphasort which
+  * uses strcoll and changes ordering based on locale information.
+@@ -144,12 +493,15 @@
+ 		       (*(const struct dirent **) b)->d_name);
+ }
+ 
+-static unsigned int parse_directory(struct entry *root_entry, const char *name, struct entry **prev, loff_t *fslen_ub)
++static unsigned int parse_directory(struct entry *root_entry, const char *name, struct entry **prev, loff_t *fslen_ub, int ignore_contents, unsigned int default_uid, unsigned int default_gid)
+ {
+ 	struct dirent **dirlist;
+ 	int totalsize = 0, dircount, dirindex;
+ 	char *path, *endpath;
+ 	size_t len = strlen(name);
++	struct metadata *meta;
++
++	meta = read_meta_data(name, &default_uid, &default_gid);
+ 
+ 	/* Set up the path. */
+ 	/* TODO: Reuse the parent's buffer to save memcpy'ing and duplication. */
+@@ -190,6 +542,25 @@
+ 					continue;
+ 			}
+ 		}
++
++		/* Ignore files according to meta data */
++		if (ignore_contents) {
++			printf("Meta: ignoring content %s/%s\n", name + name_offset, dirent->d_name);
++			continue;
++		}
++		if (meta_file_name && !strcmp(dirent->d_name, meta_file_name)) {
++			printf("Meta: ignoring meta file %s/%s\n", name + name_offset, dirent->d_name);
++			continue; /* don't include the meta data file */
++		}
++		if (!meta_include(meta, dirent->d_name)) {
++			printf("Meta: not including %s/%s\n", name + name_offset, dirent->d_name);
++			continue; /* include files according to the meta data */
++		}
++		if (meta_ignore(meta, dirent->d_name)) {
++			printf("Meta: ignoring %s/%s\n", name + name_offset, dirent->d_name);
++			continue; /* ignore files according to the meta data */
++		}
++
+ 		namelen = strlen(dirent->d_name);
+ 		if (namelen > MAX_INPUT_NAMELEN) {
+ 			fprintf(stderr,
+@@ -239,7 +610,7 @@
+ 		size = sizeof(struct cramfs_inode) + ((namelen + 3) & ~3);
+ 		*fslen_ub += size;
+ 		if (S_ISDIR(st.st_mode)) {
+-			entry->size = parse_directory(root_entry, path, &entry->child, fslen_ub);
++			entry->size = parse_directory(root_entry, path, &entry->child, fslen_ub, meta_ignore_contents(meta, dirent->d_name), default_uid, default_gid);
+ 		} else if (S_ISREG(st.st_mode)) {
+ 			/* TODO: We ought to open files in do_compress, one
+ 			   at a time, instead of amassing all these memory
+@@ -250,6 +621,11 @@
+ 
+ 			   While we're at it, do analagously for symlinks
+ 			   (which would just save a little memory). */
++			if (meta_handle_device(meta, entry)) {
++				if (entry->size & -(1 << CRAMFS_SIZE_WIDTH))
++					warn_dev = 1;
++				printf("Meta: device (%c %d %d) %s/%s\n", (S_ISBLK(entry->mode))? 'b' : 'c', major(entry->size), minor(entry->size), name + name_offset, dirent->d_name);
++			} else {
+ 			int fd = open(path, O_RDONLY);
+ 			if (fd < 0) {
+ 				perror(path);
+@@ -269,6 +645,7 @@
+ 				}
+ 			}
+ 			close(fd);
++			}
+ 		} else if (S_ISLNK(st.st_mode)) {
+ 			entry->uncompressed = malloc(entry->size);
+ 			if (!entry->uncompressed) {
+@@ -297,11 +674,26 @@
+ 				*fslen_ub += (4+26)*blocks + entry->size + 3;
+                 }
+ 
++		if (meta_handle_uid(meta, entry)) {
++			printf("Meta: uid (%u) %s/%s\n", entry->uid, name + name_offset, dirent->d_name);
++		} else if (default_uid != ID_NONE) {
++			entry->uid = default_uid;
++			printf("Meta: default uid (%u) %s/%s\n", entry->uid, name + name_offset, dirent->d_name);
++		}
++
++		if (meta_handle_gid(meta, entry)) {
++			printf("Meta: gid (%u) %s/%s\n", entry->gid, name + name_offset, dirent->d_name);
++		} else if (default_gid != ID_NONE) {
++			entry->gid = default_gid;
++			printf("Meta: default gid (%u) %s/%s\n", entry->gid, name + name_offset, dirent->d_name);
++		}
++
+ 		/* Link it into the list */
+ 		*prev = entry;
+ 		prev = &entry->next;
+ 		totalsize += size;
+ 	}
++	free_meta_data(meta);
+ 	free(path);
+ 	free(dirlist);		/* allocated by scandir() with malloc() */
+ 	return totalsize;
+@@ -576,17 +968,22 @@
+  */
+ #define MAXFSLEN ((((1 << CRAMFS_OFFSET_WIDTH) - 1) << 2) /* offset */ \
+ 		  + (1 << CRAMFS_SIZE_WIDTH) - 1 /* filesize */ \
+-		  + (1 << CRAMFS_SIZE_WIDTH) * 4 / PAGE_CACHE_SIZE /* block pointers */ )
++		  + (1 << CRAMFS_SIZE_WIDTH) * 4 / blksize /* block pointers */ )
+ 
+ 
+ /*
+  * Usage:
+  *
+- *      mkcramfs directory-name outfile
++ *      mkcramfs [options] directory output-file
+  *
+  * where "directory-name" is simply the root of the directory
+  * tree that we want to generate a compressed filesystem out
+  * of.
++ *
++ * Options can currently be -b XXX where XXX is the blocksize to use and
++ * -m filename, where filename is the name of meta files to be used.
++ * This allows the building of filesystems on one host to be used on another
++ * with a different blocksize (just beware that endianess needs to be the same).
+  */
+ int main(int argc, char **argv)
+ {
+@@ -607,7 +1004,7 @@
+ 		progname = argv[0];
+ 
+ 	/* command line options */
+-	while ((c = getopt(argc, argv, "hEe:i:n:psz")) != EOF) {
++	while ((c = getopt(argc, argv, "hEe:i:b:m:n:psz")) != EOF) {
+ 		switch (c) {
+ 		case 'h':
+ 			usage(0);
+@@ -626,6 +1023,17 @@
+ 			image_length = st.st_size; /* may be padded later */
+ 			fslen_ub += (image_length + 3); /* 3 is for padding */
+ 			break;
++		case 'b':
++			blksize = atoi(optarg);
++			if (blksize <= 0) {
++				fprintf(stderr, "%s: wrong block size\n",
++					progname);
++				usage(0);
++			}
++			break;
++		case 'm':
++			meta_file_name = optarg;
++			break;
+ 		case 'n':
+ 			opt_name = optarg;
+ 			break;
+@@ -647,6 +1055,10 @@
+ 	dirname = argv[optind];
+ 	outfile = argv[optind + 1];
+ 
++	printf("Using a blocksize of %d bytes.\n", blksize);
++	if (meta_file_name)
++		printf("Using meta file(s) named \"%s\".\n", meta_file_name);
++
+ 	if (stat(dirname, &st) < 0) {
+ 		perror(dirname);
+ 		exit(16);
+@@ -662,7 +1074,8 @@
+ 	root_entry->uid = st.st_uid;
+ 	root_entry->gid = st.st_gid;
+ 
+-	root_entry->size = parse_directory(root_entry, dirname, &root_entry->child, &fslen_ub);
++	name_offset = strlen(dirname);
++	root_entry->size = parse_directory(root_entry, dirname, &root_entry->child, &fslen_ub, 0, ID_NONE, ID_NONE);
+ 
+ 	/* always allocate a multiple of blksize bytes because that's
+            what we're going to write later on */
+--- tmp/linux/Documentation/filesystems/metafiles.txt	Thu Jan  1 01:00:00 1970
++++ linux/Documentation/filesystems/metafiles.txt	Mon Sep 17 13:38:43 2001
+@@ -0,0 +1,92 @@
++Metafiles
++=========
++
++Metafiles are used to let a filesystem builder, such as mkcramfs and
++mkfs.jffs2, ignore files and change attributes of files while building
++the filesystem.
++
++This document briefly describes how Axis Communications are using metafiles
++with mkcramfs amd mkfs.jffs2 and is also a proposal of a metafile standard
++for filesystem builders.
++
++
++
++Metafile Format
++===============
++
++An instruction is a line in a metafile telling the filesystem builder if
++anything special should be done with a file or directory before writing it to
++the filesystem. The following instructions should be recognized by the
++filesystem builder:
++
++
++Ignore
++------
++Syntax: "Ignore: FILE"
++
++Ignores a file or directory. I.e. FILE is not included in the filesystem.
++The metafiles themselves are always ignored and do not have to be mentioned
++in any metafiles.
++
++
++IgnoreContents
++--------------
++Syntax: "IgnoreContents: DIRECTORY"
++
++Ignores the contents of a directory. I.e. DIRECTORY is included in the
++filesystem but all files and directories in DIRECTORY are ignored.
++
++
++Include
++-------
++Syntax: "Include: FILE"
++
++Includes a file or directory. If an Include instruction is found in a
++metafile, all files or directories (in the same directory as the metafile)
++that are not included will be ignored (NOTE!).
++
++
++Device
++------
++Syntax: "Device: FILE TYPE MAJOR MINOR"
++
++Convert a regular file to a device special file. If FILE exists it will be
++written to the filesystem as a character or block special file with
++MAJOR and MINOR numbers. TYPE is 'b' for block and 'c' for character device.
++
++Example: To create the character special file /dev/ttyS0 using metafiles,
++add the following line to the metafile in the /dev directory:
++
++Device: ttyS0 c 4 64
++
++
++UserId
++------
++Syntax: "UserId: FILE UID"
++
++Change file owner. The owner of FILE will be UID.
++
++
++DefaultUserId
++-------------
++Syntax: "DefaultUserId: UID"
++
++Change file owner recursively. All files and directories in this directory
++will be owned by UID unless overridden with the UserId instruction.
++
++
++GroupId
++-------
++Syntax: "GroupId: FILE GID"
++
++Change group ownership on a file or directory. The group membership of FILE
++will be GID.
++
++
++DefaultGroupId
++--------------
++Syntax: "DefaultGroupId: UID"
++
++Change gruop ownership recursively. The group membership of all files and
++directories in this directory will be GID unless overridden with the GroupId
++instruction.

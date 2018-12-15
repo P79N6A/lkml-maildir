@@ -1,0 +1,248 @@
+Date: Mon, 5 Apr 1999 16:16:05 +0200 (CEST)
+From: Andrea Arcangeli <>
+Subject: Re: [patch] some buffer.c glitches
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/4/5/62
+
+On Mon, 5 Apr 1999, Andrea Arcangeli wrote:
+>On Mon, 5 Apr 1999, Andrea Arcangeli wrote:
+>
+>>Another thing that make me suspectious is that b_flushtime is not
+>>explicitly set to 0 in the io_completation callback. If for some reason
+>>it's not set to 0 (if brelse is called before starting I/O for example) we
+>>may end syncing buffers to disk too early (but maybe I am missing
+>>something about this flushtime issue).
+>
+From my current troubles I have the confirm that flushtime = 0 is needed
+>in the io_completation callback.
+>
+>My problem now is that with a real 50 delay before update will flush
+>buffers back to disk, under heavy I/O, on my system dirty buffers have all
+>the time grows too much and so mark_buffer_dirty is forced to call bdflush
+>by hand, and this cause all processes to block waiting for bdflush I/O
+>completation!!
+>
+>So with this flushtime-bug fixed by my previous patch, in order to get
+>performance back, I need to rebalance the system with sane sysctl values
+>that previously wasn't needed due the flushtime-bug.
+>
+>Index: buffer.c
+>===================================================================
+>RCS file: /var/cvs/linux/fs/buffer.c,v
+>retrieving revision 1.1.2.40
+>diff -u -r1.1.2.40 buffer.c
+>--- buffer.c	1999/04/04 22:10:41	1.1.2.40
+>+++ linux/fs/buffer.c	1999/04/05 00:15:48
+>@@ -109,7 +109,7 @@
+> 		int dummy3;    /* unused */
+> 	} b_un;
+> 	unsigned int data[N_PARAM];
+>-} bdf_prm = {{40, 500, 64, 256, 15, 30*HZ, 5*HZ, 1884, 2}};
+>+} bdf_prm = {{50, 500, 64, 256, 15, 5*HZ, 5*HZ, 1884, 2}};
+Well 30 sec was a good timeout value. The real problem was that we must
+have a two level buffer-dirty-percentage. The first one will wakeup
+bdflush. The second `limit' one will wait for I/O compleatation. And
+bdflush is _not_ sync(2)!!, and so we can stop bdflush as far as the dirty
+buffers are lower than the lower percentage limit (we don't need to sync
+back to disk every dirty buffer as happens now every time bdflush get
+wakenup).
+Also set_writetime was wrong according to me. If a buffer is marked dirty,
+it's inuse and so we must always give it a good timeout. The point is that
+the buffer flushtime has to going on only when the dirty buffers are a
+few. It's only intended to avoid _old_ not used buffers to stay around.
+BTW, flushtime = 0 special case was also a jiffy-wrap design bug (minor
+issue I know ;).
+I also found another new major problem. in bforget we care that the buffer is
+not inuse and that it's not under I/O. And we obviously want to forget also
+dirty-not-under-IO buffers, but we are not setting b_state to 0, so we may
+put on the freelist a dirty buffer.
+So finally my third patch (the one quoted abuve) in the previous email was
+bogus. This new patch instead will fix these issues properly giving a great
+improvement here. Now writes are cached properly and cvs rdiff performances
+are impressive.
+Also process stalling while writing large files seems to be gone
+completly away (sleeping with ndirty == 0 in bdflush was really not
+needed and was harming really too much).
+Here is the new "third" patch against the two previous ones (the two ones in
+the first email of this thread):
+Index: buffer.c
+===================================================================
+RCS file: /var/cvs/linux/fs/buffer.c,v
+retrieving revision 1.1.2.40
+retrieving revision 1.1.2.47
+diff -u -r1.1.2.40 -r1.1.2.47
+--- buffer.c	1999/04/04 22:10:41	1.1.2.40
++++ linux/fs/buffer.c	1999/04/05 15:01:50	1.1.2.47
+@@ -97,23 +97,25 @@
+ 		int ndirty;  /* Maximum number of dirty blocks to write out per
+ 				wake-cycle */
+ 		int nrefill; /* Number of clean buffers to try to obtain
+-				each time we call refill */
++				each time we call refill */ /* unused */
+ 		int nref_dirt; /* Dirty buffer threshold for activating bdflush
+-				  when trying to refill buffers. */
++				  when trying to refill buffers. */ /* unused */
+ 		int dummy1;    /* unused */
+ 		int age_buffer;  /* Time for normal buffer to age before 
+ 				    we flush it */
+ 		int age_super;  /* Time for superblock to age before we 
+ 				   flush it */
+-		int dummy2;    /* unused */
++		int nfract_limit; /* Max percentage of dirty buffers to cause
++				     the task to wait for bdflush I/O
++				     completation */
+ 		int dummy3;    /* unused */
+ 	} b_un;
+ 	unsigned int data[N_PARAM];
+-} bdf_prm = {{40, 500, 64, 256, 15, 30*HZ, 5*HZ, 1884, 2}};
++} bdf_prm = {{30, 500, 64, 256, 15, 30*HZ, 5*HZ, 70, 2}};
+ 
+ /* These are the min and max parameter values that we will allow to be assigned */
+-int bdflush_min[N_PARAM] = {  0,  10,    5,   25,  0,   1*HZ,   1*HZ, 1, 1};
+-int bdflush_max[N_PARAM] = {100,5000, 2000, 2000,100, 600*HZ, 600*HZ, 2047, 5};
++int bdflush_min[N_PARAM] = {  0,  10,    5,   25,  0,   1*HZ,   1*HZ, 0, 1};
++int bdflush_max[N_PARAM] = {100,5000, 2000, 2000,100, 600*HZ, 600*HZ, 100, 5};
+ 
+ void wakeup_bdflush(int);
+ 
+@@ -219,7 +221,6 @@
+ 				continue;
+ 			bh->b_count++;
+ 			next->b_count++;
+-			bh->b_flushtime = 0;
+ 			ll_rw_block(WRITE, 1, &bh);
+ 			bh->b_count--;
+ 			next->b_count--;
+@@ -442,7 +443,6 @@
+ 				continue;
+ 			if (bh->b_count)
+ 				continue;
+-			bh->b_flushtime = 0;
+ 			clear_bit(BH_Protected, &bh->b_state);
+ 			clear_bit(BH_Uptodate, &bh->b_state);
+ 			clear_bit(BH_Dirty, &bh->b_state);
+@@ -572,7 +572,7 @@
+ 		if (tmp->b_blocknr != block || tmp->b_size != size || tmp->b_dev != dev)
+ 			continue;
+ 		touch_buffer(tmp);
+-		if (buffer_uptodate(tmp))
++		if (!buffer_dirty(tmp) && buffer_uptodate(tmp))
+ 			put_last_lru(tmp);
+ 		next = tmp;
+ 		break;
+@@ -658,7 +658,6 @@
+ 				clear_bit(BH_Dirty, &bh->b_state);
+ 				clear_bit(BH_Uptodate, &bh->b_state);
+ 				clear_bit(BH_Req, &bh->b_state);
+-				bh->b_flushtime = 0;
+ 			}
+ 			remove_from_hash_queue(bh);
+ 		}
+@@ -682,7 +681,6 @@
+ {
+ 	bh->b_count = 1;
+ 	bh->b_list = BUF_CLEAN;
+-	bh->b_flushtime = 0;
+ 	bh->b_dev = dev;
+ 	bh->b_blocknr = block;
+ 	bh->b_end_io = handler;
+@@ -750,10 +748,7 @@
+ 		/* Move buffer to dirty list if jiffies is clear. */
+ 		newtime = jiffies + (flag ? bdf_prm.b_un.age_super : 
+ 				     bdf_prm.b_un.age_buffer);
+-		if(!buf->b_flushtime || time_after(buf->b_flushtime, newtime))
+-			 buf->b_flushtime = newtime;
+-	} else {
+-		buf->b_flushtime = 0;
++		buf->b_flushtime = newtime;
+ 	}
+ }
+ 
+@@ -789,12 +784,20 @@
+ 	if(dispose != buf->b_list) {
+ 		file_buffer(buf, dispose);
+ 		if(dispose == BUF_DIRTY) {
+-			int too_many = (nr_buffers * bdf_prm.b_un.nfract/100);
++			int too_many, limit;
+ 
+ 			/* This buffer is dirty, maybe we need to start flushing.
+ 			 * If too high a percentage of the buffers are dirty...
+ 			 */
++			too_many = (nr_buffers * bdf_prm.b_un.nfract/100);
+ 			if (nr_buffers_type[BUF_DIRTY] > too_many)
++				wakeup_bdflush(0);
++
++			/* If we reached the limit of dirty buffer we must
++			 * also wait of I/O completation, sigh. -arca
++			 */
++			limit = (nr_buffers * bdf_prm.b_un.nfract_limit/100);
++			if (nr_buffers_type[BUF_DIRTY] > limit)
+ 				wakeup_bdflush(1);
+ 
+ 			/* If this is a loop device, and
+@@ -837,6 +840,7 @@
+ 		return;
+ 	}
+ 	buf->b_count = 0;
++	buf->b_state = 0;
+ 	put_last_free(buf);
+ }
+ 
+@@ -1315,7 +1319,6 @@
+ 			tmp=tmp->b_this_page;
+ 		} while (tmp && tmp != bh);
+ 		set_bit(PG_uptodate, &mem_map[MAP_NR(bh->b_data)].flags);
+-		bh->b_flushtime = 0;
+ 		return;
+ 	}
+ 	clear_bit(BH_Uptodate, &bh->b_state);
+@@ -1570,10 +1573,8 @@
+ 	if (current == bdflush_tsk)
+ 		return;
+ 	wake_up(&bdflush_wait);
+-	if (wait) {
+-		run_task_queue(&tq_disk);
++	if (wait)
+ 		sleep_on(&bdflush_done);
+-	}
+ }
+ 
+ 
+@@ -1638,7 +1639,6 @@
+ 				 nwritten++;
+ 				 next->b_count++;
+ 				 bh->b_count++;
+-				 bh->b_flushtime = 0;
+ #ifdef DEBUG
+ 				 if(nlist != BUF_DIRTY) ncount++;
+ #endif
+@@ -1791,7 +1791,6 @@
+ 					  next->b_count++;
+ 					  bh->b_count++;
+ 					  ndirty++;
+-					  bh->b_flushtime = 0;
+ 					  if (major == LOOP_MAJOR) {
+ 						  ll_rw_block(wrta_cmd,1, &bh);
+ 						  wrta_cmd = WRITEA;
+@@ -1824,7 +1823,7 @@
+ 		
+ 		/* If there are still a lot of dirty buffers around, skip the sleep
+ 		   and flush some more */
+-		if(ndirty == 0 || nr_buffers_type[BUF_DIRTY] <= nr_buffers * bdf_prm.b_un.nfract/100) {
++		if(nr_buffers_type[BUF_DIRTY] <= nr_buffers * bdf_prm.b_un.nfract/100) {
+ 			spin_lock_irq(&current->sigmask_lock);
+ 			flush_signals(current);
+ 			spin_unlock_irq(&current->sigmask_lock);
+comments?
+Andrea Arcangeli
+PS. I am releasing now 2.2.5_arca6.gz with this new stuff in (and the
+    b_state = 0 was harming here, in first place I confused it with a
+    pagemap-lru memleak ;).
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

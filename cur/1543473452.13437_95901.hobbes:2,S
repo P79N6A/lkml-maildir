@@ -1,0 +1,240 @@
+Date: 30 Dec 1998 02:10:47 +0000
+From: David Wragg <>
+Subject: [PATCH] bootp arp corruption fix (was Re: 2.2.0 Bug summary)
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1998/12/30/33
+
+Alan Cox <alan@terrorserver.swansea.linux.org.uk> writes:
+> Unfixed and definitely needing fixes
+> ...
+> o	bootp autobooting stuff corrupts other hosts arp stuff it seems
+> ...
+My patch to reintroduce 2.0-alike 0.0.0.0 ip address behaviour happens
+to fix this. The main point is to allow bootpc/bootp setup scripts
+that work with 2.0 to work with 2.1, and as a side effect it
+simplifies the ip autoconfiguration via bootp code, fixing this bug.
+Please consider it for 2.2, on both counts.
+Dave Wragg
+diff -rua linux-2.1.131/net/ipv4/devinet.c linux-2.1.131.bootp/net/ipv4/devinet.c
+--- linux-2.1.131/net/ipv4/devinet.c	Mon Sep  7 14:27:58 1998
++++ linux-2.1.131.bootp/net/ipv4/devinet.c	Wed Dec 16 16:13:11 1998
+@@ -208,9 +208,16 @@
+ {
+ 	struct in_ifaddr *ifa1, **ifap, **last_primary;
+ 
+-	if (ifa->ifa_local == 0) {
+-		inet_free_ifa(ifa);
+-		return 0;
++	/* Allow 0.0.0.0, but it must be the only address to avoid
++           multiple matches. */
++	if (in_dev->ifa_list) {
++		if (ifa->ifa_local == 0) {
++			inet_free_ifa(ifa);
++			return 0;
++		}
++
++		if (in_dev->ifa_list->ifa_local == 0)
++			inet_del_ifa(in_dev, &in_dev->ifa_list, 1);
+ 	}
+ 
+ 	ifa->ifa_flags &= ~IFA_F_SECONDARY;
+@@ -1001,18 +1008,12 @@
+ 
+ __initfunc(int inet_add_bootp_addr(struct device *dev))
+ {
+-	struct in_device *in_dev = dev->ip_ptr;
+ 	struct in_ifaddr *ifa;
+ 
+-	if (!in_dev && !(in_dev = inetdev_init(dev)))
+-		return -ENOBUFS;
+ 	if (!(ifa = inet_alloc_ifa()))
+ 		return -ENOBUFS;
+-	ifa->ifa_dev = in_dev;
+-	in_dev->ifa_list = ifa;
+-	rtmsg_ifa(RTM_NEWADDR, ifa);
+-	notifier_call_chain(&inetaddr_chain, NETDEV_UP, ifa);
+-	return 0;
++
++	return inet_set_ifa(dev, ifa);
+ }
+ 
+ __initfunc(void inet_del_bootp_addr(struct device *dev))
+diff -rua linux-2.1.131/net/ipv4/fib_frontend.c linux-2.1.131.bootp/net/ipv4/fib_frontend.c
+--- linux-2.1.131/net/ipv4/fib_frontend.c	Mon Sep  7 14:27:58 1998
++++ linux-2.1.131.bootp/net/ipv4/fib_frontend.c	Wed Dec 23 14:18:46 1998
+@@ -443,13 +443,13 @@
+ 	if (ifa->ifa_broadcast && ifa->ifa_broadcast != 0xFFFFFFFF)
+ 		fib_magic(RTM_NEWROUTE, RTN_BROADCAST, ifa->ifa_broadcast, 32, prim);
+ 
+-	if (!ZERONET(prefix) && !(ifa->ifa_flags&IFA_F_SECONDARY) &&
++	if (!(ifa->ifa_flags&IFA_F_SECONDARY) &&
+ 	    (prefix != addr || ifa->ifa_prefixlen < 32)) {
+ 		fib_magic(RTM_NEWROUTE, dev->flags&IFF_LOOPBACK ? RTN_LOCAL :
+ 			  RTN_UNICAST, prefix, ifa->ifa_prefixlen, prim);
+ 
+ 		/* Add network specific broadcasts, when it takes a sense */
+-		if (ifa->ifa_prefixlen < 31) {
++		if (!ZERONET(prefix) && ifa->ifa_prefixlen < 31) {
+ 			fib_magic(RTM_NEWROUTE, RTN_BROADCAST, prefix, 32, prim);
+ 			fib_magic(RTM_NEWROUTE, RTN_BROADCAST, prefix|~mask, 32, prim);
+ 		}
+diff -rua linux-2.1.131/net/ipv4/ipconfig.c linux-2.1.131.bootp/net/ipv4/ipconfig.c
+--- linux-2.1.131/net/ipv4/ipconfig.c	Sun Nov  8 18:40:51 1998
++++ linux-2.1.131.bootp/net/ipv4/ipconfig.c	Wed Dec 16 14:13:19 1998
+@@ -411,96 +411,6 @@
+ static struct bootp_pkt *ic_recv_bootp __initdata = NULL; /* Packet being received */
+ 
+ /*
+- *  Dirty tricks for BOOTP packet routing.  We replace the standard lookup function
+- *  for the local fib by our version which does fake lookups and returns our private
+- *  fib entries. Ugly, but it seems to be the simplest way to do the job.
+- */
+-
+-static void *ic_old_local_lookup __initdata = NULL;	/* Old local routing table lookup function */
+-static struct fib_info *ic_bootp_tx_fib __initdata = NULL; /* Our fake fib entries */
+-static struct fib_info *ic_bootp_rx_fib __initdata = NULL;
+-
+-__initfunc(static int ic_bootp_route_lookup(struct fib_table *tb, const struct rt_key *key,
+-	struct fib_result *res))
+-{
+-	static u32 ic_brl_zero = 0;
+-
+-	DBG(("BOOTP: Route lookup: %d:%08x -> %d:%08x: ", key->iif, key->src, key->oif, key->dst));
+-	res->scope = RT_SCOPE_UNIVERSE;
+-	res->prefix = &ic_brl_zero;
+-	res->prefixlen = 0;
+-	res->nh_sel = 0;
+-	if (key->src == 0 && key->dst == 0xffffffff && key->iif == loopback_dev.ifindex) { /* Packet output */
+-		DBG(("Output\n"));
+-		res->type = RTN_UNICAST;
+-		res->fi = ic_bootp_tx_fib;
+-	} else if (key->iif && key->iif != loopback_dev.ifindex && key->oif == 0) {	/* Packet input */
+-		DBG(("Input\n"));
+-		res->type = RTN_LOCAL;
+-		res->fi = ic_bootp_rx_fib;
+-	} else if (!key->iif && !key->oif && !key->src) {	/* Address check by inet_addr_type() */
+-		DBG(("Check\n"));
+-		res->type = RTN_UNICAST;
+-		res->fi = ic_bootp_tx_fib;
+-	} else {
+-		DBG(("Drop\n"));
+-		return -EINVAL;
+-	}
+-	return 0;
+-}
+-
+-__initfunc(static int ic_set_bootp_route(struct ic_device *d))
+-{
+-	struct fib_info *f = ic_bootp_tx_fib;
+-	struct fib_nh *n = &f->fib_nh[0];
+-
+-	n->nh_dev = d->dev;
+-	n->nh_oif = n->nh_dev->ifindex;
+-	rt_cache_flush(0);
+-	return 0;
+-}
+-
+-__initfunc(static int ic_bootp_route_init(void))
+-{
+-	int size = sizeof(struct fib_info) + sizeof(struct fib_nh);
+-	struct fib_info *rf, *tf;
+-	struct fib_nh *nh;
+-
+-	if (!(rf = ic_bootp_rx_fib = kmalloc(size, GFP_KERNEL)) ||
+-	    !(tf = ic_bootp_tx_fib = kmalloc(size, GFP_KERNEL)))
+-		return -1;
+-
+-	memset(rf, 0, size);
+-	rf->fib_nhs = 1;
+-	nh = &rf->fib_nh[0];
+-	nh->nh_scope = RT_SCOPE_UNIVERSE;
+-
+-	memset(tf, 0, size);
+-	rf->fib_nhs = 1;
+-	nh = &rf->fib_nh[0];
+-	nh->nh_dev = ic_first_dev->dev;
+-	nh->nh_scope = RT_SCOPE_UNIVERSE;
+-	nh->nh_oif = nh->nh_dev->ifindex;
+-
+-	/* Dirty trick: replace standard routing table lookup by our function */
+-	ic_old_local_lookup = local_table->tb_lookup;
+-	local_table->tb_lookup = ic_bootp_route_lookup;
+-
+-	return 0;
+-}
+-
+-__initfunc(static void ic_bootp_route_cleanup(void))
+-{
+-	if (ic_old_local_lookup)
+-		local_table->tb_lookup = ic_old_local_lookup;
+-	if (ic_bootp_rx_fib)
+-		kfree_s(ic_bootp_rx_fib, sizeof(struct fib_info) + sizeof(struct fib_nh));
+-	if (ic_bootp_tx_fib)
+-		kfree_s(ic_bootp_tx_fib, sizeof(struct fib_info) + sizeof(struct fib_nh));
+-}
+-
+-
+-/*
+  *  Allocation and freeing of BOOTP packet buffers.
+  */
+ __initfunc(static int ic_bootp_alloc(void))
+@@ -677,10 +587,9 @@
+ 	/* Add fake zero addresses to all interfaces */
+ 	if (ic_bootp_addrs_add() < 0)
+ 		return -1;
+-
+-	/* Initialize BOOTP routing */
+-	if (ic_bootp_route_init() < 0)
+-		return -1;
++	
++	/* Setting the addresses automatically creates appropriate
++	   routes. */	
+ 
+ 	/* Initialize common portion of BOOTP request */
+ 	memset(ic_xmit_bootp, 0, sizeof(struct bootp_pkt));
+@@ -699,7 +608,6 @@
+ 	ic_bootp_xmit_sock->sk->broadcast = 1;
+ 	ic_bootp_xmit_sock->sk->reuse = 1;
+ 	ic_bootp_recv_sock->sk->reuse = 1;
+-	ic_set_bootp_route(ic_first_dev);
+ 	if (ic_udp_bind(ic_bootp_recv_sock, INADDR_ANY, 68) ||
+ 	    ic_udp_bind(ic_bootp_xmit_sock, INADDR_ANY, 68) ||
+ 	    ic_udp_connect(ic_bootp_xmit_sock, INADDR_BROADCAST, 67))
+@@ -718,7 +626,6 @@
+ 	ic_udp_close(ic_bootp_recv_sock);
+ 	ic_bootp_addrs_del();
+ 	ic_bootp_free();
+-	ic_bootp_route_cleanup();
+ }
+ 
+ 
+@@ -735,7 +642,6 @@
+ 	memset(b->hw_addr, 0, sizeof(b->hw_addr));
+ 	memcpy(b->hw_addr, dev->dev_addr, dev->addr_len);
+ 	b->secs = htons(jiffies / HZ);
+-	ic_set_bootp_route(d);
+ 	return ic_udp_send(ic_bootp_xmit_sock, b, sizeof(struct bootp_pkt));
+ }
+ 
+diff -rua linux-2.1.131/net/ipv4/route.c linux-2.1.131.bootp/net/ipv4/route.c
+--- linux-2.1.131/net/ipv4/route.c	Sun Nov  8 18:40:06 1998
++++ linux-2.1.131.bootp/net/ipv4/route.c	Wed Dec 16 14:12:40 1998
+@@ -950,6 +950,10 @@
+ 	if (BADCLASS(daddr) || ZERONET(daddr) || LOOPBACK(daddr))
+ 		goto martian_destination;
+ 
++	/* Accept anything arriving at 0.0.0.0 */
++	if (in_dev->ifa_list && in_dev->ifa_list->ifa_local == 0)
++		goto local_input;
++
+ 	/*
+ 	 *	Now we are ready to route packet.
+ 	 */
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

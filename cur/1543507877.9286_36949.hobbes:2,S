@@ -1,0 +1,133 @@
+Date: Thu, 2 Sep 1999 10:44:19 +0200 (CEST)
+From: Andrea Arcangeli <>
+Subject: Re: [patch] buffer locks more finegrined
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/9/2/20
+
+On Wed, 1 Sep 1999, David S. Miller wrote:
+>Read the commentary above the first function you changed.  The callers
+>all set themselves up such that they have created an environment where
+>the count has gone to zero and they've closed up some of the entry
+>paths to referencing that buffer head.
+You mean here:
+			if (atomic_read(&bh->b_count) == 0) {
+			XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+				__remove_from_queues(bh);
+				put_last_free(bh);
+			}
+basically you want to avoid somebody to find the buffer while we are
+running in the XXXXX line.
+But I still can't see why I am breaking the subtle issue with my patch.
+IMHO the subtle problem is present also in your version of
+__remove_from_queues. See below.
+To avoid somebody to get the buffer while you are in the XXX line you
+should acquire the hash-lock _before_ checking that the b_count is zero.
+Acquiring the lock for a longer time in __remove_from_queues won't help at
+all to avoid such a race.
+Anyway in set_blocksize that doesn't seems to be a problem to me because
+by design the b_count should be zero for all buffers belonging to such
+blockdevice and nobody should try to get them from the hash.
+I agree that making it more robust is better though.
+>The routines in question have to guarentee that neither hash lookups
+>not kflushd/bdflush find it and bump it's reference count.  I am very
+kflushd only rely on the lru-list-lock so you can release the hash lock as
+far as you have finished playing with the hash and
+kswapd/whatever-flushing-daemon won't race with you.
+>positive that I had good reason to hold both locks at once there, the
+>deal is that you cannot create a situation where BH visibility "half
+>changes", you must remove it from both of the two lists it is one, all
+>in one atomic sequence.
+Now that you talk about visibility, I think I see the reason you grabbed
+both locks in insert_into_queues(). But there's no need of taking both the
+lock if you take care of first inserting the buffer in the lru list and
+_then_ you make it visible on the hashtable.
+The new subtle issue is that if you first insert the buffer in the hash,
+then you can expect somebody to refile the buffer before you have a chance
+to insert the buffer in the lru list. So you may end inserting two times
+the same buffer on its lru list and that's definitely bad.
+To avoid this we only need to first insert the buffer in the lru list and
+_then_ hash it.
+This new patch I did now, IMHO should be safer than the stock code
+(because I check the b_count with the hash-lock held) and will scale
+better than the original code (and it also it's nicer to read because the 
+reader will see the only necessary locking):
+--- 2.3.16/fs/buffer.c	Wed Sep  1 09:30:03 1999
++++ buffer.c	Thu Sep  2 10:26:09 1999
+@@ -511,29 +511,24 @@
+ 	bh->b_next_free = bh->b_prev_free = NULL;
+ }
+ 
+-/* The following two functions must operate atomically
+- * because they control the visibility of a buffer head
++/* The following operation control the visibility of a buffer head
+  * to the rest of the kernel.
++ * A buffer must be always linked into the lru list before being visible
++ * in the hashtable. This because once the buffer is visible in the hashtable
++ * somebody may refile it and add it to the lru list before us. So if we
++ * would link the buffer into the lru list, after making it visible in the
++ * hash, we could risk to insert the buffer two times in the lru list.
+  */
+-static __inline__ void __remove_from_queues(struct buffer_head *bh)
+-{
+-	write_lock(&hash_table_lock);
+-	if (bh->b_pprev)
+-		__hash_unlink(bh);
+-	__remove_from_lru_list(bh, bh->b_list);
+-	write_unlock(&hash_table_lock);
+-}
+-
+ static void insert_into_queues(struct buffer_head *bh)
+ {
+ 	struct buffer_head **head = &hash(bh->b_dev, bh->b_blocknr);
+ 
+ 	spin_lock(&lru_list_lock);
++	__insert_into_lru_list(bh, bh->b_list);
++	spin_unlock(&lru_list_lock);
+ 	write_lock(&hash_table_lock);
+ 	__hash_link(bh, head);
+-	__insert_into_lru_list(bh, bh->b_list);
+ 	write_unlock(&hash_table_lock);
+-	spin_unlock(&lru_list_lock);
+ }
+ 
+ /* This function must only run if there are no other
+@@ -604,7 +599,7 @@
+ void set_blocksize(kdev_t dev, int size)
+ {
+ 	extern int *blksize_size[];
+-	int i, nlist;
++	int i, nlist, freeing;
+ 	struct buffer_head * bh, *bhnext;
+ 
+ 	if (!blksize_size[MAJOR(dev)])
+@@ -651,8 +646,19 @@
+ 				clear_bit(BH_Uptodate, &bh->b_state);
+ 				clear_bit(BH_Req, &bh->b_state);
+ 			}
+-			if (atomic_read(&bh->b_count) == 0) {
+-				__remove_from_queues(bh);
++
++			freeing = 0;
++			write_lock(&hash_table_lock);
++			if (atomic_read(&bh->b_count) == 0)
++			{
++				freeing = 1;
++				if (bh->b_pprev)
++					__hash_unlink(bh);
++			}		
++			write_unlock(&hash_table_lock);
++			if (freeing)
++			{
++				__remove_from_lru_list(bh, bh->b_list);
+ 				put_last_free(bh);
+ 			}
+ 		}
+Andrea
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

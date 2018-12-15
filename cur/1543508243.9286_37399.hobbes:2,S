@@ -1,0 +1,1702 @@
+Date: Sun, 5 Sep 1999 00:41:10 -0400 (EDT)
+From: Rolf Braun <>
+Subject: [PATCH] new 2-dir masq patch, and passive FTP mode, with TCP options fixes for FTP
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/9/4/112
+
+The following patch is a new version of the 2-dir masq patch I submitted
+to the kernel list about two months ago. It works very differently this
+time:
+packets coming in on 2-dir connections are marked with an skb flag, which
+is interpreted in the forward chain to force masquerading of that packet,
+with a second entry created for the other masq direction, also with the
+2-dir flag set. Everything is defined out so that it can be a kernel
+compile option.
+The other patch is to ip_masq_app (the app support) and allows modules to
+key into the system by source port rather than dest port, so it works for
+servers behind a firewall being accessed from outside. This is also
+controlled by a #define. The FTP module has code to support masqing of
+passive FTP.
+While I was at it, I fixed a serious problem in the FTP module wherein it
+assumes the TCP data begins after the TCP header with no options in
+between. The following is a Bad Thing:
+data = (char *)&th[1];
+this is the Right Thing:
+data = (char *)th;
+data += th->doff*4;
+...assuming that proper bounds checking is also being performed which it
+is here. This fix is not #defined; it is included regardless of the
+options set. The problem affected the passive FTP specifically, but it is
+a bug no matter which way it is sliced.
+There's one bug in this patch - the tcp/udp checksum code in masq is
+conditioned out if the 2-dir option is enabled, because it wasn't working
+the second time through. This is a bug somewhere, but I need someone to
+explain to me exactly what it's doing and what all the checksum-related
+fields in the skb are... thanks.
+Oh yes: this _has_ been tested under pretty heavy load. :-)
+Any chance of seeing this in 2.2.1[34]?
+(btw: my employer waives all rights to this code. it's yours.)
+/*
+ *
+ *	mbfw - FW Mark Forwarding Table Editing
+ *
+ * 	$Id: mfw.c,v 0.1 1998/07/29 17:50:31 jjo Exp jjo $
+ *
+ *	Author: Juan Jose Ciarlante <jjciarla@raiz.uncu.edu.ar>
+ *	        Strongly based on Steve Clark's portfw.
+ *
+ *	This program is free software; you can redistribute it and/or modify
+ *	it under the terms of the GNU General Public License as published by
+ *	the Free Software Foundation; either version 2 of the License, or
+ *	(at your option) any later version.
+ *
+ *	This program is distributed in the hope that it will be useful,
+ *	but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *	MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *	GNU General Public License for more details.
+ *
+ *	You should have received a copy of the GNU General Public License
+ *	along with this program; if not, write to the Free Software
+ *	Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+ *
+ * Fixes:
+ *      Rolf Braun:             added mbfw, based on mfw
+ *	Juan J. Ciarlante:	allow nul rport => use packet's port
+ */
+#include <stdio.h>
+#include <errno.h>
+#include <limits.h>
+#include <string.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <getopt.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <net/if.h>
+#include <sys/param.h>
+#include <linux/ip_masq.h>
+#include "ipmasqadm.h"
+#include "ipmasqctl.h"
+#define IP_MARKFW_DEF_PREF 10
+int do_setsockopt(int cmd, struct ip_masq_ctl *m, int mlen);
+void exit_error(int status, char *msg);
+void exit_display_help(void);
+int list_forwarding(int);
+static const char *modname;
+int masqmod_main(int argc, const char *argv[])
+{
+	int c;
+	int command = IP_MASQ_CMD_NONE;
+	struct ip_masq_ctl mctl;
+#define mbfw mctl.u.mbfw_user
+	struct sockaddr_in redir_sin, lm_sin;
+	int tmp;
+	int nonames = 0;
+	memset (&redir_sin, 0, sizeof (redir_sin));
+	memset (&lm_sin, 0, sizeof (lm_sin));
+	mbfw.fwmark = 0;
+	mbfw.raddr = 0;
+	mbfw.rport = 0;
+	mbfw.flags = 0;
+	mbfw.lmaddr = 0;
+	mbfw.pref  = IP_MARKFW_DEF_PREF;
+	modname = argv[0];
+	while ((c = getopt(argc, (char**) argv, "AEDFSLnm:r:p:l:h")) != -1)
+		switch (c) {
+		case 'A':
+			if (command != IP_MASQ_CMD_NONE)
+				exit_error(2, "multiple commands specified");
+			command = IP_MASQ_CMD_ADD;
+			break;
+		case 'E':
+			if (command != IP_MASQ_CMD_NONE)
+				exit_error(2, "multiple commands specified");
+			command = IP_MASQ_CMD_SET;
+			break;
+		case 'D':
+			if (command != IP_MASQ_CMD_NONE)
+				exit_error(2, "multiple commands specified");
+			command = IP_MASQ_CMD_DEL;
+			break;
+		case 'F':
+			if (command != IP_MASQ_CMD_NONE)
+				exit_error(2, "multiple commands specified");
+			command = IP_MASQ_CMD_FLUSH;
+			break;
+		case 'S':
+			if (command != IP_MASQ_CMD_NONE)
+				exit_error(2, "multiple commands specified");
+			command = IP_MASQ_CMD_SET;
+			mbfw.flags |= IP_MASQ_MFW_SCHED;
+			break;
+                case 'L':
+                        if (command != IP_MASQ_CMD_NONE)
+				exit_error(2, "multiple commands specified");
+			command = IP_MASQ_CMD_LIST;
+			break;
+		case 'n':
+			nonames++;
+			break;
+		case 'm':
+			mbfw.fwmark = atoi(optarg);
+			break;
+		case 'r':
+			if (redir_sin.sin_addr.s_addr||redir_sin.sin_port)
+				exit_error(2, "multiple destinations specified");
+			tmp = optind-1;
+			tmp = parse_addressport(argv+tmp, argc-tmp, &redir_sin, nonames);
+			if (tmp < 1)
+				exit_error(2, "illegal destination specified");
+			optind += tmp -1;
+			break;
+		case 'l':
+			if (lm_sin.sin_addr.s_addr)
+				exit_error(2, "multiple local masq addresses specified");
+			tmp = optind-1;
+			tmp = parse_addressport(argv+tmp, argc-tmp, &lm_sin, nonames);
+			if (tmp < 1)
+				exit_error(2, "illegal local masq address");
+			optind += tmp-1;
+			break;
+                case 'p':
+                        mbfw.pref = atoi(optarg);
+			/*
+			 *	pref == 0 marks the entry as un-schedulable
+			 */
+                        if (mbfw.pref < 0)
+                                exit_error(2, "illegal preference value specified");
+                        break;
+		case 'h':
+		case '?':
+		default:
+			exit_display_help();
+		}
+        if (optind < argc) {
+		printf("optind=%d (%s) argc=%d\n", optind, argv[optind-1], argc);
+                exit_error(2, "unknown arguments found on commandline");
+	}
+	mbfw.rport = redir_sin.sin_port;
+	mbfw.raddr = redir_sin.sin_addr.s_addr;
+	mbfw.lmaddr = lm_sin.sin_addr.s_addr;
+	if (command == IP_MASQ_CMD_NONE)
+		exit_display_help();
+	else if (command == IP_MASQ_CMD_ADD && (mbfw.fwmark == 0 ))
+#if 0
+		 || mbfw.rport == 0 || mbfw.raddr == 0 || mbfw.lmaddr == 0))
+#endif
+		exit_error(2, "insufficient options specified");
+	else if (command == IP_MASQ_CMD_DEL &&
+		(mbfw.fwmark == 0))
+		exit_error(2, "insufficient options specified");
+#if 0
+	else if (command == IP_MASQ_CMD_DEL &&
+		 (mbfw.rport != 0 || mbfw.raddr != 0))
+		exit_error(2, "incompatible options specified");
+#endif        
+	else if ((command == IP_MASQ_CMD_FLUSH || command == IP_MASQ_CMD_LIST) &&
+		 (mbfw.fwmark != 0 || mbfw.rport != 0 || mbfw.raddr != 0))
+		exit_error(2, "incompatible options specified");
+        if (command == IP_MASQ_CMD_LIST) {
+		/*	Just "peek" for kernel module  */
+		do_setsockopt(IP_MASQ_CMD_NONE, &mctl, sizeof(mctl));
+		return list_forwarding(nonames);
+	}
+                
+	return(do_setsockopt(command, &mctl, sizeof(mctl)));
+}
+int do_setsockopt(int cmd, struct ip_masq_ctl *m, int mlen)
+{
+	int sockfd;
+	int ret;
+	if ((sockfd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW)) < 0) {
+		perror("mbfw: socket creation failed");
+		exit(1);
+	}
+	
+	/* This is a masq-mod target op */
+	m->m_target = IP_MASQ_TARGET_MOD;
+	
+	/* This is the target module name */
+	strncpy(m->m_tname, modname, sizeof(m->m_tname));
+	/* This is the command */
+	m->m_cmd = cmd;
+	/* Here we go ... */
+	ret = setsockopt(sockfd, IPPROTO_IP, IP_FW_MASQ_CTL , (void *) m, mlen);
+	if (ret)
+		perror("mbfw: setsockopt failed");
+	return ret;
+}
+void exit_error(int status, char *msg)
+{
+	fprintf(stderr, "%s: %s\n", modname, msg);
+	exit(status);
+}
+int list_forwarding(int nm)
+{
+   char buffer[256];
+   int lnum = 0;
+   char ra_name[80], ra2_name[80];
+   char rs_name[16];
+   unsigned int fwmark;
+   unsigned int hraddr=0, hrport=0, laddr=0;
+   int pref_cnt, pref;
+   FILE *handle = NULL;
+   const char *proc_names[] = {
+	   "/proc/net/ip_masq/mbfw",
+	   NULL
+   };
+   const char **proc_name = proc_names;
+   for (;*proc_name;proc_name++) {
+	handle = fopen(*proc_name, "r");
+	if (handle) 
+		break;
+	fprintf(stderr, "Could not open \"%s\"\n", *proc_name);
+   }
+   if (!handle) {
+	   fprintf(stderr, "Check if you have enabled fwmark-forwarding\n");
+	   return 1;
+   }
+   /*
+    *	Line format:
+    *	FWMark > RAddr    RPort PrCnt  Pref               
+    *	1020   > C0A8020B    56    10    10               
+    *
+    */
+   while (!feof(handle))
+       if (fgets(buffer, sizeof(buffer), handle)) {
+	   if (lnum) {
+		pref_cnt = pref = -1;
+		sscanf(buffer, "%x > %x %d %x %d %d", 
+			&fwmark, 
+			&hraddr, &hrport, &laddr,
+			&pref_cnt, &pref);
+		printf("%-8d %-20s %8s %-20s %5d %5d\n", 
+			fwmark, 
+			addr_to_name(ntohl(hraddr), ra_name, sizeof(ra_name), nm),
+			serv_to_name(ntohs(hrport), rs_name, sizeof(rs_name), nm),
+			addr_to_name(ntohl(laddr), ra2_name, sizeof(ra2_name), nm),
+			pref_cnt, 
+			pref);
+	   } else {
+		printf("%-8s %-20s %8s %-20s %5s %5s\n", 
+		   	"fwmark",
+			"rediraddr",
+			"rport", "laddr",
+			"pcnt", "pref");
+	   }
+	   lnum++;
+       }
+   fclose(handle);
+   return 0;
+}
+void exit_display_help(void)
+{
+	printf(
+"Usage: %s -A -m FWMARK -r RADDR RPORT -l LHOST [-p PREF] add entry\n"
+"       %s -D -m FWMARK [-r RADDR RPORT]         delete entry\n"
+"       %s -E -m FWMARK [-r RADDR RPORT]         edit entry\n"
+"       %s -S -m FWMARK                          force scheduling\n"
+"       %s -F                                    clear table\n"
+"       %s -L                                    list table\n"
+"       %s <args> -n                             no names\n\n"
+"FWMARK is the fwmark being redirected.\n"
+"RADDR is the remote address.\n"
+"RPORT is the port being redirected to.\n"
+"PREF  is the preference level (load balancing, default=%d)\n"
+"LHOST is the local host from which the redirected connection will appear to be coming (use the correct gateway please!)",
+               modname, modname, modname, modname, modname, modname, modname,
+               IP_MARKFW_DEF_PREF);
+	exit(0);
+}
+/* bidirectional-masquerading mark forwarding (mbfw)
+   RAB 2.2.5 140699 */
+/* This module is intended for local connections (from a single interface to itself)
+   only! It has the unwanted but unavoidable side effect of obscuring the real IP in server
+   logs. Therefore, it is recommended that the firewall rules be set up to log all incoming
+   connections into this module (make sure to use -y -l instead of just -l to avoid
+   oversized log files :-) and that firewall rules be split so that outside connections
+   use the other mfw module */
+/*
+ *		IP_MASQ_MARKFW masquerading module
+ *
+ *	Does (reverse-masq) forwarding based on skb->fwmark value
+ *
+ *	$Id: ip_masq_mfw.c,v 1.3 1999/01/26 05:33:47 davem Exp $
+ *
+ * Author:	Juan Jose Ciarlante   <jjciarla@raiz.uncu.edu.ar>
+ *		  based on Steven Clarke's portfw
+ *
+ * Fixes:	
+ *      Rolf Braun:             created mbfw modules from mfw module
+ *				blatant plug: this hack was supported
+ * 				by Helix Computer Systems
+ *				<
+http://www.helixsystems.com
+>
+ *	JuanJo Ciarlante:	added u-space sched support
+ *	JuanJo Ciarlante:	if rport==0, use packet dest port *grin*
+ *	JuanJo Ciarlante:	fixed tcp syn&&!ack creation
+ *
+ *
+ */
+#include <linux/config.h>
+#include <linux/module.h>
+#include <linux/types.h>
+#include <linux/kernel.h>
+#include <linux/errno.h>
+#include <linux/list.h>
+#include <net/ip.h>
+#include <linux/ip_fw.h>
+#include <linux/ip_masq.h>
+#include <net/ip_masq.h>
+#include <net/ip_masq_mod.h>
+#include <linux/proc_fs.h>
+#include <linux/init.h>
+#include <asm/softirq.h>
+#include <asm/spinlock.h>
+#include <asm/atomic.h>
+static struct ip_masq_mod *mmod_self = NULL;
+#ifdef CONFIG_IP_MASQ_DEBUG
+static int debug=0;
+MODULE_PARM(debug, "i");
+#endif
+/*
+ *  Lists structure:
+ *	There is a "main" linked list with entries hashed
+ *	by fwmark value (struct ip_masq_mfw, the "m-entries").
+ *
+ *	Each of this m-entry holds a double linked list
+ *	of "forward-to" hosts (struct ip_masq_mfw_host, the "m.host"),
+ *	the round-robin scheduling takes place by rotating m.host entries
+ *	"inside" its m-entry.
+ */
+/*
+ *	Each forwarded host (addr:port) is stored here
+ */
+struct ip_masq_mbfw_host {
+	struct 	list_head list;
+	__u32 	addr;
+	__u16	port;
+	__u16	pad0;
+	__u32	lmaddr; /* local masquerading address */
+	__u32 	fwmark;
+	int 	pref;
+	atomic_t	pref_cnt;
+};
+#define IP_MASQ_MBFW_HSIZE	16
+/*
+ *	This entries are indexed by fwmark, 
+ *	they hold a list of forwarded addr:port
+ */	
+struct ip_masq_mbfw {
+	struct ip_masq_mbfw *next;	/* linked list */
+	__u32 fwmark;			/* key: firewall mark */
+	struct list_head hosts;		/* list of forward-to hosts */
+	atomic_t nhosts;		/* number of "" */
+#ifdef __SMP__
+	rwlock_t lock;
+#endif
+};
+static struct semaphore mbfw_sema = MUTEX;
+#ifdef __SMP__
+static rwlock_t mbfw_lock = RW_LOCK_UNLOCKED;
+#endif
+static struct ip_masq_mbfw *ip_masq_mbfw_table[IP_MASQ_MBFW_HSIZE];
+static __inline__ int mbfw_hash_val(int fwmark)
+{
+	return fwmark & 0x0f;
+}
+/*
+ *	Get m-entry by "fwmark"
+ *	Caller must lock tables.
+ */
+static struct ip_masq_mbfw *__mbfw_get(int fwmark)
+{
+	struct ip_masq_mbfw* mbfw;
+	int hash = mbfw_hash_val(fwmark);
+	for (mbfw=ip_masq_mbfw_table[hash];mbfw;mbfw=mbfw->next) {
+		if (mbfw->fwmark==fwmark) {
+			goto out;
+		}
+	}
+out:
+	return mbfw;
+}
+/*
+ *	Links m-entry.
+ *	Caller should have checked if already present for same fwmark
+ *
+ *	Caller must lock tables.
+ */
+static int __mbfw_add(struct ip_masq_mbfw *mbfw)
+{
+	int fwmark = mbfw->fwmark;
+	int hash = mbfw_hash_val(fwmark);
+	mbfw->next = ip_masq_mbfw_table[hash];
+	ip_masq_mbfw_table[hash] = mbfw;
+	ip_masq_mod_inc_nent(mmod_self);
+	return 0;
+}
+/*
+ *	Creates a m-entry (doesn't link it)
+ */
+static struct ip_masq_mbfw * mbfw_new(int fwmark)
+{
+	struct ip_masq_mbfw *mbfw;
+	mbfw = kmalloc(sizeof(*mbfw), GFP_KERNEL);
+	if (mbfw == NULL) 
+		goto out;
+	MOD_INC_USE_COUNT;
+	memset(mbfw, 0, sizeof(*mbfw));
+	mbfw->fwmark = fwmark;
+#ifdef __SMP__
+	mbfw->lock = (rwlock_t) RW_LOCK_UNLOCKED;
+#endif
+	INIT_LIST_HEAD(&mbfw->hosts);
+out:
+	return mbfw;
+}
+static void mbfw_host_to_user(struct ip_masq_mbfw_host *h, struct ip_mbfw_user *mu)
+{
+	mu->lmaddr = h->lmaddr;
+	mu->raddr = h->addr;
+	mu->rport = h->port;
+	mu->fwmark = h->fwmark;
+	mu->pref = h->pref;
+}
+/*
+ *	Creates a m.host (doesn't link it in a m-entry)
+ */
+static struct ip_masq_mbfw_host * mbfw_host_new(struct ip_mbfw_user *mu)
+{
+	struct ip_masq_mbfw_host * mbfw_host;
+	mbfw_host = kmalloc(sizeof (*mbfw_host), GFP_KERNEL);
+	if (!mbfw_host)
+		return NULL;
+	MOD_INC_USE_COUNT;
+	memset(mbfw_host, 0, sizeof(*mbfw_host));
+	mbfw_host->addr = mu->raddr;
+	mbfw_host->port = mu->rport;
+	mbfw_host->fwmark = mu->fwmark;
+	mbfw_host->pref = mu->pref;
+	mbfw_host->lmaddr = mu->lmaddr;
+	atomic_set(&mbfw_host->pref_cnt, mu->pref);
+	return mbfw_host;
+}
+/*
+ *	Create AND link m.host to m-entry.
+ *	It locks m.lock.
+ */
+static int mbfw_addhost(struct ip_masq_mbfw *mbfw, struct ip_mbfw_user *mu, int attail)
+{
+	struct ip_masq_mbfw_host *mbfw_host;
+	mbfw_host = mbfw_host_new(mu);
+	if (!mbfw_host) 
+		return -ENOMEM;
+	write_lock_bh(&mbfw->lock);
+	list_add(&mbfw_host->list, attail? mbfw->hosts.prev : &mbfw->hosts);
+	atomic_inc(&mbfw->nhosts);
+	write_unlock_bh(&mbfw->lock);
+	return 0;
+}
+/*
+ *	Unlink AND destroy m.host(s) from m-entry.
+ *	Wildcard (nul host or addr) ok.
+ *	It uses m.lock.
+ */
+static int mbfw_delhost(struct ip_masq_mbfw *mbfw, struct ip_mbfw_user *mu)
+{
+	struct list_head *l,*e;
+	struct ip_masq_mbfw_host *h;
+	int n_del = 0;
+	l = &mbfw->hosts;
+	write_lock_bh(&mbfw->lock);
+	for (e=l->next; e!=l; e=e->next)
+	{
+		h = list_entry(e, struct ip_masq_mbfw_host, list);
+		if ((!mu->raddr || h->addr == mu->raddr) && 
+			(!mu->rport || h->port == mu->rport)) {
+			/* HIT */
+			atomic_dec(&mbfw->nhosts);
+			list_del(&h->list);
+			kfree_s(h, sizeof(*h));
+			MOD_DEC_USE_COUNT;
+			n_del++;
+		}
+				
+	}
+	write_unlock_bh(&mbfw->lock);
+	return n_del? 0 : -ESRCH;
+}
+/*
+ *	Changes m.host parameters
+ *	Wildcards ok
+ *
+ *	Caller must lock tables.
+ */
+static int __mbfw_edithost(struct ip_masq_mbfw *mbfw, struct ip_mbfw_user *mu)
+{
+	struct list_head *l,*e;
+	struct ip_masq_mbfw_host *h;
+	int n_edit = 0;
+	l = &mbfw->hosts;
+	for (e=l->next; e!=l; e=e->next)
+	{
+		h = list_entry(e, struct ip_masq_mbfw_host, list);
+		if ((!mu->raddr || h->addr == mu->raddr) && 
+			(!mu->rport || h->port == mu->rport)) {
+			/* HIT */
+			h->pref = mu->pref;
+			atomic_set(&h->pref_cnt, mu->pref);
+			n_edit++;
+		}
+				
+	}
+	return n_edit? 0 : -ESRCH;
+}
+/*
+ *	Destroys m-entry.
+ *	Caller must have checked that it doesn't hold any m.host(s)
+ */
+static void mbfw_destroy(struct ip_masq_mbfw *mbfw)
+{
+	kfree_s(mbfw, sizeof(*mbfw));
+	MOD_DEC_USE_COUNT;
+}
+/* 
+ *	Unlink m-entry.
+ *
+ *	Caller must lock tables.
+ */
+static int __mbfw_del(struct ip_masq_mbfw *mbfw)
+{
+	struct ip_masq_mbfw **mbfw_p;
+	int ret = -EINVAL;
+	for(mbfw_p=&ip_masq_mbfw_table[mbfw_hash_val(mbfw->fwmark)]; 
+			*mbfw_p; 
+			mbfw_p = &((*mbfw_p)->next)) 
+	{
+		if (mbfw==(*mbfw_p)) {
+			*mbfw_p = mbfw->next;
+			ip_masq_mod_dec_nent(mmod_self);
+			ret = 0;
+			goto out;
+		}
+	}
+out:
+	return ret;
+}
+/*
+ *	Crude m.host scheduler
+ *	This interface could be exported to allow playing with 
+ *	other sched policies.
+ *
+ *	Caller must lock m-entry.
+ */
+static struct ip_masq_mbfw_host * __mbfw_sched(struct ip_masq_mbfw *mbfw, int force)
+{
+	struct ip_masq_mbfw_host *h = NULL;
+	if (atomic_read(&mbfw->nhosts) == 0)
+		goto out;
+	/*
+	 *	Here resides actual sched policy: 
+	 *	When pref_cnt touches 0, entry gets shifted to tail and
+	 *	its pref_cnt reloaded from h->pref (actual value
+	 *	passed from u-space).
+	 *
+	 *	Exception is pref==0: avoid scheduling.
+	 */
+	h = list_entry(mbfw->hosts.next, struct ip_masq_mbfw_host, list);
+	if (atomic_read(&mbfw->nhosts) <= 1)
+		goto out;
+	if ((h->pref && atomic_dec_and_test(&h->pref_cnt)) || force) {
+		atomic_set(&h->pref_cnt, h->pref);
+		list_del(&h->list);
+		list_add(&h->list, mbfw->hosts.prev);
+	}
+out:
+	return h;
+}
+/*
+ *	Main lookup routine.
+ *	HITs fwmark and schedules m.host entries if required
+ */
+static struct ip_masq_mbfw_host * mbfw_lookup(int fwmark)
+{
+	struct ip_masq_mbfw *mbfw;
+	struct ip_masq_mbfw_host *h = NULL;
+	read_lock(&mbfw_lock);
+	mbfw = __mbfw_get(fwmark);
+	if (mbfw) {
+		write_lock(&mbfw->lock);
+		h = __mbfw_sched(mbfw, 0);
+		write_unlock(&mbfw->lock);
+	}
+	read_unlock(&mbfw_lock);
+	return h;
+}
+#ifdef CONFIG_PROC_FS
+static int mbfw_procinfo(char *buffer, char **start, off_t offset,
+			      int length, int dummy)
+{
+	struct ip_masq_mbfw *mbfw;
+	struct ip_masq_mbfw_host *h;
+	struct list_head *l,*e;
+	off_t pos=0, begin;
+	char temp[129];
+        int idx = 0;
+	int len=0;
+	MOD_INC_USE_COUNT;
+	IP_MASQ_DEBUG(1-debug, "Entered mbfw_info\n");
+	if (offset < 64)
+	{
+                sprintf(temp, "FwMark > RAddr    RPort PrCnt  Pref");
+		len = sprintf(buffer, "%-63s\n", temp);
+	}
+	pos = 64;
+        for(idx = 0; idx < IP_MASQ_MBFW_HSIZE; idx++)
+	{
+		read_lock(&mbfw_lock);
+		for(mbfw = ip_masq_mbfw_table[idx]; mbfw ; mbfw = mbfw->next)
+		{
+			read_lock_bh(&mbfw->lock);
+			l=&mbfw->hosts;
+			for(e=l->next;l!=e;e=e->next) {
+				h = list_entry(e, struct ip_masq_mbfw_host, list);
+				pos += 64;
+				if (pos <= offset) {
+					len = 0;
+					continue;
+				}
+				sprintf(temp,"0x%x > %08lX %5u %08lX %5d %5d",
+						h->fwmark,
+						ntohl(h->addr), ntohs(h->port),
+						ntohl(h->lmaddr), atomic_read(&h->pref_cnt), h->pref);
+				len += sprintf(buffer+len, "%-63s\n", temp);
+				if(len >= length) {
+					read_unlock_bh(&mbfw->lock);
+					read_unlock(&mbfw_lock);
+					goto done;
+				}
+			}
+			read_unlock_bh(&mbfw->lock);
+		}
+		read_unlock(&mbfw_lock);
+	}
+done:
+	if (len) {
+		begin = len - (pos - offset);
+		*start = buffer + begin;
+		len -= begin;
+	}
+	if(len>length)
+		len = length;
+	MOD_DEC_USE_COUNT;
+	return len;
+}
+static struct proc_dir_entry mbfw_proc_entry = {
+/* 		0, 0, NULL", */
+		0, 4, "mbfw",
+		S_IFREG | S_IRUGO, 1, 0, 0,
+		0, &proc_net_inode_operations,
+		mbfw_procinfo
+};
+#define proc_ent &mbfw_proc_entry
+#else /* !CONFIG_PROC_FS */
+#define proc_ent NULL
+#endif
+static void mbfw_flush(void)
+{
+	struct ip_masq_mbfw *mbfw, *local_table[IP_MASQ_MBFW_HSIZE];
+	struct ip_masq_mbfw_host *h;
+	struct ip_masq_mbfw *mbfw_next;
+	int idx;
+	struct list_head *l,*e;
+	write_lock_bh(&mbfw_lock);
+	memcpy(local_table, ip_masq_mbfw_table, sizeof ip_masq_mbfw_table);
+	memset(ip_masq_mbfw_table, 0, sizeof ip_masq_mbfw_table);
+	write_unlock_bh(&mbfw_lock);
+	/*
+	 *	For every hash table row ...
+	 */
+	for(idx=0;idx<IP_MASQ_MBFW_HSIZE;idx++) {
+		/*
+		 *	For every m-entry in row ...
+		 */
+		for(mbfw=local_table[idx];mbfw;mbfw=mbfw_next) {
+			/*
+			 *	For every m.host in m-entry ...
+			 */
+			l=&mbfw->hosts;
+			while((e=l->next) != l) {
+				h = list_entry(e, struct ip_masq_mbfw_host, list);
+				atomic_dec(&mbfw->nhosts);
+				list_del(&h->list);
+				kfree_s(h, sizeof(*h));
+				MOD_DEC_USE_COUNT;
+			}
+			if (atomic_read(&mbfw->nhosts)) {
+				IP_MASQ_ERR("mbfw_flush(): after flushing row nhosts=%d\n",
+						atomic_read(&mbfw->nhosts));
+			}
+			mbfw_next = mbfw->next;
+			kfree_s(mbfw, sizeof(*mbfw));	
+			MOD_DEC_USE_COUNT;
+			ip_masq_mod_dec_nent(mmod_self);
+		}
+	}
+}
+/*
+ *	User space control entry point
+ */
+static int mbfw_ctl(int optname, struct ip_masq_ctl *mctl, int optlen)
+{
+        struct ip_mbfw_user *mu =  &mctl->u.mbfw_user;
+	struct ip_masq_mbfw *mbfw;
+	int ret = EINVAL;
+	int arglen = optlen - IP_MASQ_CTL_BSIZE;
+	int cmd;
+	IP_MASQ_DEBUG(1-debug, "ip_masq_user_ctl(len=%d/%d|%d/%d)\n",
+		arglen,
+		sizeof (*mu),
+		optlen,
+		sizeof (*mctl));
+	/*
+	 *	checks ...
+	 */
+	if (arglen != sizeof(*mu) && optlen != sizeof(*mctl)) 
+		return -EINVAL;
+ 
+	/* 
+	 *	Don't trust the lusers - plenty of error checking! 
+	 */
+	cmd = mctl->m_cmd;
+	IP_MASQ_DEBUG(1-debug, "ip_masq_mbfw_ctl(cmd=%d, fwmark=%d)\n",
+			cmd, mu->fwmark);
+	switch(cmd) {
+		case IP_MASQ_CMD_NONE:
+			return 0;
+		case IP_MASQ_CMD_FLUSH:
+			break;
+		case IP_MASQ_CMD_ADD:
+		case IP_MASQ_CMD_INSERT:
+		case IP_MASQ_CMD_SET:
+			if (mu->fwmark == 0) {
+				IP_MASQ_DEBUG(1-debug, "invalid fwmark==0\n");
+				return -EINVAL;
+			}
+			if (mu->pref < 0) {
+				IP_MASQ_DEBUG(1-debug, "invalid pref==%d\n",
+					mu->pref);
+				return -EINVAL;
+			}
+			break;
+	}
+	ret = -EINVAL;
+	switch(cmd) {
+	case IP_MASQ_CMD_ADD:
+	case IP_MASQ_CMD_INSERT:
+		if (!mu->raddr || !mu->lmaddr) {
+			IP_MASQ_DEBUG(0-debug, "ip_masq_mbfw_ctl(ADD): invalid redirect 0x%x:%d\n",
+					mu->raddr, mu->rport);
+			goto out;
+		}
+		/*
+		 *	Cannot just use mbfw_lock because below
+		 *	are allocations that can sleep; so
+		 *	to assure "new entry" atomic creation
+		 *	I use a semaphore.
+		 *
+		 */
+		down(&mbfw_sema);
+		read_lock(&mbfw_lock);
+		mbfw = __mbfw_get(mu->fwmark);
+		read_unlock(&mbfw_lock);
+		
+		/*
+		 *	If first host, create m-entry
+		 */
+		if (mbfw == NULL) {
+			mbfw = mbfw_new(mu->fwmark);
+			if (mbfw == NULL) 
+				ret = -ENOMEM;
+		} 
+		if (mbfw) {
+			/*
+			 *	Put m.host in m-entry.
+			 */
+			ret = mbfw_addhost(mbfw, mu, cmd == IP_MASQ_CMD_ADD);
+			/*
+			 *	If first host, link m-entry to hash table.
+			 *	Already protected by global lock.
+			 */
+			if (ret == 0 && atomic_read(&mbfw->nhosts) == 1)  {
+				write_lock_bh(&mbfw_lock);
+				__mbfw_add(mbfw);
+				write_unlock_bh(&mbfw_lock);
+			} 
+			if (atomic_read(&mbfw->nhosts) == 0) {
+				mbfw_destroy(mbfw);
+			}
+		}
+		up(&mbfw_sema);
+		break;
+	case IP_MASQ_CMD_DEL:
+		down(&mbfw_sema);
+		read_lock(&mbfw_lock);
+		mbfw = __mbfw_get(mu->fwmark);
+		read_unlock(&mbfw_lock);
+		if (mbfw) {
+			ret = mbfw_delhost(mbfw, mu);
+			/*
+			 *	Last lease will free
+			 *	XXX check logic XXX
+			 */
+			if (atomic_read(&mbfw->nhosts) == 0) {
+				write_lock_bh(&mbfw_lock);
+				__mbfw_del(mbfw);
+				write_unlock_bh(&mbfw_lock);
+				mbfw_destroy(mbfw);
+			}
+		} else 
+			ret = -ESRCH;
+		up(&mbfw_sema);
+		break;
+	case IP_MASQ_CMD_FLUSH:
+		down(&mbfw_sema);
+		mbfw_flush();
+		up(&mbfw_sema);
+		ret = 0;
+		break;
+	case IP_MASQ_CMD_SET:
+		/*
+		 *	No need to semaphorize here, main list is not 
+		 *	modified.
+		 */
+		read_lock(&mbfw_lock);
+		
+		mbfw = __mbfw_get(mu->fwmark);
+		if (mbfw) {
+			write_lock_bh(&mbfw->lock);
+			
+			if (mu->flags & IP_MASQ_MFW_SCHED) {
+				struct ip_masq_mbfw_host *h;
+				if ((h=__mbfw_sched(mbfw, 1))) {
+					mbfw_host_to_user(h, mu);
+					ret = 0;
+				} 
+			} else {
+				ret = __mbfw_edithost(mbfw, mu);
+			}
+				
+			write_unlock_bh(&mbfw->lock);
+		}
+		read_unlock(&mbfw_lock);
+		break;
+	}
+out:
+	
+	return ret;
+}
+/*
+ *	Module stubs called from ip_masq core module
+ */
+ 
+/*
+ *	Input rule stub, called very early for each incoming packet, 
+ *	to see if this module has "interest" in packet.
+ */
+static int mbfw_in_rule(const struct sk_buff *skb, const struct iphdr *iph)
+{
+	int val;
+	read_lock(&mbfw_lock);
+	val = ( __mbfw_get(skb->fwmark) != 0);
+	read_unlock(&mbfw_lock);
+	return val;
+}
+/*
+ *	Input-create stub, called to allow "custom" masq creation
+ */
+static struct ip_masq * mbfw_in_create(const struct sk_buff *skb, const struct iphdr *iph, __u32 maddr)
+{
+	union ip_masq_tphdr tph;
+	struct ip_masq *ms = NULL;
+	struct ip_masq_mbfw_host *h = NULL;
+	tph.raw = (char*) iph + iph->ihl * 4;
+	switch (iph->protocol) {
+		case IPPROTO_TCP:
+			/* 	
+			 *	Only open TCP tunnel if SYN+!ACK packet
+			 */
+			if (!tph.th->syn && tph.th->ack)
+				return NULL;
+		case IPPROTO_UDP:
+			break;
+		default:
+			return NULL;
+	}
+	/* 
+	 *	If no entry exists in the masquerading table
+ 	 * 	and the port is involved
+	 *  	in port forwarding, create a new masq entry 
+	 */
+	if ((h=mbfw_lookup(skb->fwmark))) {
+		ms = ip_masq_new2(iph->protocol,
+				iph->daddr, tph.portp[1],	
+				/* if no redir-port, use packet dest port */
+				h->addr, h->port? h->port : tph.portp[1],
+				iph->saddr, tph.portp[0],
+				IP_MASQ_F_BIDIR, h->lmaddr);
+		if (ms != NULL)
+			ip_masq_listen(ms);
+	}
+	return ms;
+}
+#define mbfw_in_update	NULL
+#define mbfw_out_rule	NULL
+#define mbfw_out_create	NULL
+#define mbfw_out_update	NULL
+static struct ip_masq_mod mbfw_mod = {
+	NULL,			/* next */
+	NULL,			/* next_reg */
+	"mbfw",		/* name */
+	ATOMIC_INIT(0),		/* nent */
+	ATOMIC_INIT(0),		/* refcnt */
+	proc_ent,
+	mbfw_ctl,
+	NULL,			/* masq_mod_init */
+	NULL,			/* masq_mod_done */
+	mbfw_in_rule,
+	mbfw_in_update,
+	mbfw_in_create,
+	mbfw_out_rule,
+	mbfw_out_update,
+	mbfw_out_create,
+};
+__initfunc(int ip_mbfw_init(void))
+{
+	return register_ip_masq_mod ((mmod_self=&mbfw_mod));
+}
+int ip_mbfw_done(void)
+{
+	return unregister_ip_masq_mod(&mbfw_mod);
+}
+#ifdef MODULE
+EXPORT_NO_SYMBOLS;
+int init_module(void)
+{
+	if (ip_mbfw_init() != 0)
+		return -EIO;
+	return 0;
+}
+void cleanup_module(void)
+{
+	if (ip_mbfw_done() != 0)
+		printk(KERN_INFO "can't remove module");
+}
+#endif /* MODULE */
+diff -aur linux-2.2.10/include/net/ip.h linux-2.2.10new/include/net/ip.h
+--- linux-2.2.10/include/net/ip.h	Tue May 11 13:36:44 1999
++++ linux-2.2.10new/include/net/ip.h	Fri Sep  3 23:54:03 1999
+@@ -47,6 +47,7 @@
+ #define IPSKB_MASQUERADED	1
+ #define IPSKB_TRANSLATED	2
+ #define IPSKB_FORWARDED		4
++#define IPSKB_MASQ_BIDIR	8
+ };
+ 
+ struct ipcm_cookie
+diff -aur linux-2.2.10/include/net/ip_masq.h linux-2.2.10new/include/net/ip_masq.h
+--- linux-2.2.10/include/net/ip_masq.h	Sun Jul 25 14:58:09 1999
++++ linux-2.2.10new/include/net/ip_masq.h	Fri Sep  3 23:54:03 1999
+@@ -58,6 +58,7 @@
+ 
+ #define IP_MASQ_F_MPORT		      0x1000 	/* own mport specified */
+ #define IP_MASQ_F_USER		      0x2000	/* from uspace */
++#define IP_MASQ_F_BIDIR		      0x4000	/* 2-dir masq */
+ #define IP_MASQ_F_SIMPLE_HASH	      0x8000	/* prevent s+d and m+d hashing */
+ 
+ /*
+@@ -127,7 +128,7 @@
+ /*
+  *	functions called from ip layer
+  */
+-extern int ip_fw_masquerade(struct sk_buff **, __u32 maddr);
++extern int ip_fw_masquerade(struct sk_buff **, __u32 maddr, int bidir);
+ extern int ip_fw_masq_icmp(struct sk_buff **, __u32 maddr);
+ extern int ip_fw_unmasq_icmp(struct sk_buff *);
+ extern int ip_fw_demasquerade(struct sk_buff **);
+@@ -176,6 +177,8 @@
+                 (struct ip_masq_app *, struct ip_masq *, struct sk_buff **, __u32);
+ };
+ 
++#define IP_MASQ_APP_F_REVERSE 0x01000000 /* RAB - match sport, not dport */
++
+ /*
+  *	ip_masq_app initializer
+  */
+@@ -185,12 +188,13 @@
+  * 	ip_masq_app object registration functions (port: host byte order)
+  */
+ extern int register_ip_masq_app(struct ip_masq_app *mapp, unsigned short proto, __u16 port);
++extern int register_ip_masq_app_flags(struct ip_masq_app *mapp, unsigned short proto, __u16 port, __u32 flags);
+ extern int unregister_ip_masq_app(struct ip_masq_app *mapp);
+ 
+ /*
+  *	get ip_masq_app obj by proto,port(net_byte_order)
+  */
+-extern struct ip_masq_app * ip_masq_app_get(unsigned short proto, __u16 port);
++extern struct ip_masq_app * ip_masq_app_get(unsigned short proto, __u16 port, __u16 sport);
+ 
+ /*
+  *	ip_masq TO ip_masq_app (un)binding functions.
+diff -aur linux-2.2.10/net/ipv4/Config.in linux-2.2.10new/net/ipv4/Config.in
+--- linux-2.2.10/net/ipv4/Config.in	Sun Mar 21 10:22:00 1999
++++ linux-2.2.10new/net/ipv4/Config.in	Sat Sep  4 13:30:20 1999
+@@ -47,10 +47,15 @@
+       comment 'Protocol-specific masquerading support will be built as modules.'
+       if [ "$CONFIG_EXPERIMENTAL" = "y" ]; then
+         bool 'IP: masquerading special modules support' CONFIG_IP_MASQUERADE_MOD 
++        bool 'IP: bidirectional masquerading support (EXPERIMENTAL)' CONFIG_IP_MASQ_BIDIR
++	bool 'IP: server port keyed protocol-specific support (for servers, like FTP)' CONFIG_IP_MASQ_APP_SPORT
+         if [ "$CONFIG_IP_MASQUERADE_MOD" = "y" ]; then
+           tristate 'IP: ipautofw masq support (EXPERIMENTAL)' CONFIG_IP_MASQUERADE_IPAUTOFW
+           tristate 'IP: ipportfw masq support (EXPERIMENTAL)' CONFIG_IP_MASQUERADE_IPPORTFW
+           tristate 'IP: ip fwmark masq-forwarding support (EXPERIMENTAL)' CONFIG_IP_MASQUERADE_MFW
++	  if [ "$CONFIG_IP_MASQ_BIDIR" = "y" ]; then
++		  tristate 'IP: ip fwmark bidirectional masq-forwarding support (VERY EXPERIMENTAL)' CONFIG_IP_MASQUERADE_MBFW
++	  fi
+ 	fi
+       fi
+     fi
+diff -aur linux-2.2.10/net/ipv4/Makefile linux-2.2.10new/net/ipv4/Makefile
+--- linux-2.2.10/net/ipv4/Makefile	Mon Jan  4 18:31:35 1999
++++ linux-2.2.10new/net/ipv4/Makefile	Fri Sep  3 23:54:03 1999
+@@ -89,6 +89,14 @@
+     endif
+   endif
+ 
++  ifeq ($(CONFIG_IP_MASQUERADE_MBFW),y)
++  IPV4_OBJS += ip_masq_mbfw.o
++  else
++    ifeq ($(CONFIG_IP_MASQUERADE_MBFW),m)
++    M_OBJS += ip_masq_mbfw.o
++    endif
++  endif
++
+ endif
+ 
+ M_OBJS += ip_masq_user.o
+diff -aur linux-2.2.10/net/ipv4/ip_forward.c linux-2.2.10new/net/ipv4/ip_forward.c
+--- linux-2.2.10/net/ipv4/ip_forward.c	Sun Mar 21 10:22:00 1999
++++ linux-2.2.10new/net/ipv4/ip_forward.c	Sat Sep  4 23:54:39 1999
+@@ -19,6 +19,7 @@
+  *		Jos Vos		:	Call forward firewall after routing
+  *					(always use output device).
+  *		Mike McLagan	:	Routing by source
++ *		Rolf Braun	:	2-dir masq support
+  */
+ 
+ #include <linux/config.h>
+@@ -213,6 +214,17 @@
+ 	}
+ 
+ skip_call_fw_firewall:
++#ifdef CONFIG_IP_MASQ_BIDIR
++
++/* bidirectional masq - if it's set, we pretend it wasn't demasq'ed
++   so we masq it in the other direction, but with a catch: the other
++   connection is also marked bidirectional! */
++	if (IPCB(skb)->flags&IPSKB_MASQ_BIDIR) {
++		IPCB(skb)->flags &= ~IPSKB_MASQUERADED;
++		fw_res = FW_MASQUERADE;
++	}
++
++#endif /* CONFIG_IP_MASQ_BIDIR */
+ 	/*
+ 	 * If this fragment needs masquerading, make it so...
+ 	 * (Don't masquerade de-masqueraded fragments)
+@@ -228,7 +240,11 @@
+ #endif
+ 			maddr = inet_select_addr(dev2, rt->rt_gateway, RT_SCOPE_UNIVERSE);
+ 
+-			if (ip_fw_masquerade(&skb, maddr) < 0) {
++#ifndef CONFIG_IP_MASQ_BIDIR
++			if (ip_fw_masquerade(&skb, maddr, 0) < 0) {
++#else /* CONFIG_IP_MASQ_BIDIR */
++			if (ip_fw_masquerade(&skb, maddr, (IPCB(skb)->flags & IPSKB_MASQ_BIDIR)?1:0) < 0) {
++#endif /* CONFIG_IP_MASQ_BIDIR */
+ 				kfree_skb(skb);
+ 				return -1;
+ 			} else {
+diff -aur linux-2.2.10/net/ipv4/ip_input.c linux-2.2.10new/net/ipv4/ip_input.c
+--- linux-2.2.10/net/ipv4/ip_input.c	Thu Apr 22 21:45:19 1999
++++ linux-2.2.10new/net/ipv4/ip_input.c	Sat Sep  4 13:14:38 1999
+@@ -97,6 +97,7 @@
+  *		Alan Cox	:	Multicast routing hooks
+  *		Jos Vos		:	Do accounting *before* call_in_firewall
+  *	Willy Konynenberg	:	Transparent proxying support
++ *	Rolf Braun		:	2-dir masq support
+  *
+  *  
+  *
+@@ -274,6 +275,9 @@
+ 		if (ret) {
+ 			iph=skb->nh.iph;
+ 			IPCB(skb)->flags |= IPSKB_MASQUERADED;
++#ifdef CONFIG_IP_MASQ_BIDIR
++			if (ret == 2) IPCB(skb)->flags |= IPSKB_MASQ_BIDIR;
++#endif /* CONFIG_IP_MASQ_BIDIR */
+ 			dst_release(skb->dst);
+ 			skb->dst = NULL;
+ 			if (ip_route_input(skb, iph->daddr, iph->saddr, iph->tos, skb->dev)) {
+diff -aur linux-2.2.10/net/ipv4/ip_masq.c linux-2.2.10new/net/ipv4/ip_masq.c
+--- linux-2.2.10/net/ipv4/ip_masq.c	Sun Jul 25 14:58:09 1999
++++ linux-2.2.10new/net/ipv4/ip_masq.c	Sat Sep  4 13:12:21 1999
+@@ -47,6 +47,7 @@
+  *	Kai Bankett		:	do not toss other IP protos in proto_doff()
+  *	Dan Kegel		:	pointed correct NAT behavior for UDP streams
+  *	Julian Anastasov	:	use daddr and dport as hash keys
++ *	Rolf Braun		:	support for 2-dir masquerading
+  *	
+  */
+ 
+@@ -1105,7 +1106,7 @@
+ 	return ret;
+ }
+ 
+-int ip_fw_masquerade(struct sk_buff **skb_p, __u32 maddr)
++int ip_fw_masquerade(struct sk_buff **skb_p, __u32 maddr, int bidir)
+ {
+ 	struct sk_buff  *skb = *skb_p;
+ 	struct iphdr	*iph = skb->nh.iph;
+@@ -1170,9 +1171,20 @@
+ 				skb->csum = csum_partial(h.raw , doff, csum);
+ 			}
+ 			case CHECKSUM_HW:
++#ifndef CONFIG_IP_MASQ_BIDIR
+ 				if (csum_tcpudp_magic(iph->saddr, iph->daddr, 
++#else /* CONFIG_IP_MASQ_BIDIR */
++				if (0) {
++/* I don't know what's wrong with this code, but it's clearly screwed up */
++/*				if (csum_tcpudp_magic(iph->saddr, iph->daddr, 
++#endif /* CONFIG_IP_MASQ_BIDIR */
+ 						size, iph->protocol, skb->csum))
++#ifndef CONFIG_IP_MASQ_BIDIR
+ 				{
++#else /* CONFIG_IP_MASQ_BIDIR */
++				{ */
++					IP_MASQ_DEBUG(0, "Result %d failed from stored checksum %d, computed checksum %d", csum, skb->csum, csum_tcpudp_magic(iph->saddr, iph->daddr, size, iph->protocol, 0));
++#endif /* CONFIG_IP_MASQ_BIDIR */
+ 					IP_MASQ_DEBUG(0, "Outgoing failed %s checksum from %d.%d.%d.%d (size=%d)!\n",
+ 					       masq_proto_name(iph->protocol),
+ 					       NIPQUAD(iph->saddr),
+@@ -1260,7 +1272,11 @@
+ 					maddr, 0,
+ 					iph->saddr, h.portp[0],
+ 					iph->daddr, h.portp[1],
++#ifndef CONFIG_IP_MASQ_BIDIR
+ 					0);
++#else /* CONFIG_IP_MASQ_BIDIR */
++					bidir ? IP_MASQ_F_BIDIR : 0);
++#endif /* CONFIG_IP_MASQ_BIDIR */
+                 if (ms == NULL)
+ 			return -1;
+  	}
+@@ -1944,6 +1960,9 @@
+ 	int doff = 0;
+ 	int csum = 0;
+ 	int csum_ok = 0;
++#ifdef CONFIG_IP_MASQ_BIDIR
++	int bidir = 0;
++#endif /* CONFIG_IP_MASQ_BIDIR */
+ 	__u32 maddr;
+ 
+ 	/*
+@@ -2017,9 +2036,19 @@
+ 				skb->csum = csum_partial(h.raw , doff, csum);
+ 
+ 			case CHECKSUM_HW:
++#ifndef CONFIG_IP_MASQ_BIDIR
+ 				if (csum_tcpudp_magic(iph->saddr, iph->daddr, 
++#else /* CONFIG_IP_MASQ_BIDIR */
++				if (0) {
++/* I don't know what's wrong with this code, but it's clearly screwed up */
++/*				if (csum_tcpudp_magic(iph->saddr, iph->daddr, 
++#endif /* CONFIG_IP_MASQ_BIDIR */
+ 						size, iph->protocol, skb->csum))
++#ifndef CONFIG_IP_MASQ_BIDIR
+ 				{
++#else /* CONFIG_IP_MASQ_BIDIR */
++				{ */
++#endif /* CONFIG_IP_MASQ_BIDIR */
+ 					IP_MASQ_DEBUG(0, "Incoming failed %s checksum from %d.%d.%d.%d (size=%d)!\n",
+ 					       masq_proto_name(iph->protocol),
+ 					       NIPQUAD(iph->saddr),
+@@ -2180,9 +2209,16 @@
+                 IP_MASQ_DEBUG(2, "I-routed to %08lX:%04X\n",ntohl(iph->daddr),ntohs(h.portp[1]));
+ 
+ 		masq_set_state (ms, 0, iph, h.portp);
++#ifdef CONFIG_IP_MASQ_BIDIR
++		if (ms->flags & IP_MASQ_F_BIDIR) bidir = 1;
++#endif /* CONFIG_IP_MASQ_BIDIR */
+ 		ip_masq_put(ms);
+ 
++#ifndef CONFIG_IP_MASQ_BIDIR
+                 return 1;
++#else /* CONFIG_IP_MASQ_BIDIR */
++                return (bidir ? 2 : 1);
++#endif /* CONFIG_IP_MASQ_BIDIR */
+  	}
+ 
+  	/* sorry, all this trouble for a no-hit :) */
+@@ -2202,6 +2238,10 @@
+ 				NIPQUAD(ms->daddr),ntohs(ms->dport),
+ 				NIPQUAD(ctl_ms->daddr),ntohs(ctl_ms->dport));
+ 	ms->control = ctl_ms;
++#ifdef CONFIG_IP_MASQ_BIDIR
++/* whee hee - automate 2-dir support for modules! */
++	ms->flags |= ctl_ms->flags & IP_MASQ_F_BIDIR;
++#endif /* CONFIG_IP_MASQ_BIDIR */
+ 	atomic_inc(&ctl_ms->n_control);
+ }
+ 
+@@ -2540,6 +2580,9 @@
+ #endif
+ #ifdef CONFIG_IP_MASQUERADE_MFW
+ 	ip_mfw_init();
++#endif
++#ifdef CONFIG_IP_MASQUERADE_MBFW
++	ip_mbfw_init();
+ #endif
+         ip_masq_app_init();
+ 
+diff -aur linux-2.2.10/net/ipv4/ip_masq_app.c linux-2.2.10new/net/ipv4/ip_masq_app.c
+--- linux-2.2.10/net/ipv4/ip_masq_app.c	Sun Oct  4 13:21:45 1998
++++ linux-2.2.10new/net/ipv4/ip_masq_app.c	Sat Sep  4 13:18:41 1999
+@@ -41,13 +41,22 @@
+ 
+ #define IP_MASQ_APP_TAB_SIZE  16 /* must be power of 2 */
+ 
++/* Hash doesn't need three params, because two per hash chain isn't really
++   a big deal at all... */
+ #define IP_MASQ_APP_HASH(proto, port) ((port^proto) & (IP_MASQ_APP_TAB_SIZE-1))
++#ifndef CONFIG_IP_MASQ_APP_SPORT
+ #define IP_MASQ_APP_TYPE(proto, port) ( proto<<16 | port )
++#else /* CONFIG_IP_MASQ_APP_SPORT */
++#define IP_MASQ_APP_TYPE(proto, port, flags) ( proto<<16 | port | flags)
++#endif /* CONFIG_IP_MASQ_APP_SPORT */
+ #define IP_MASQ_APP_PORT(type)        ( type & 0xffff )
+ #define IP_MASQ_APP_PROTO(type)       ( (type>>16) & 0x00ff )
+-
++#ifdef CONFIG_IP_MASQ_APP_SPORT
++#define IP_MASQ_APP_FLAGS(type)       ( (type>>24) & 0x00ff )
++#endif /* CONFIG_IP_MASQ_APP_SPORT */
+ 
+ EXPORT_SYMBOL(register_ip_masq_app);
++EXPORT_SYMBOL(register_ip_masq_app_flags);
+ EXPORT_SYMBOL(unregister_ip_masq_app);
+ EXPORT_SYMBOL(ip_masq_skb_replace);
+ 
+@@ -57,12 +66,17 @@
+ 
+ struct ip_masq_app *ip_masq_app_base[IP_MASQ_APP_TAB_SIZE];
+ 
++/* Why two functions and not an extra parm? We don't want to break existing modules! */
++int register_ip_masq_app(struct ip_masq_app *mapp, unsigned short proto, __u16 port) {
++	return register_ip_masq_app_flags(mapp, proto, port, 0);
++}
++
+ /*
+  * 	ip_masq_app registration routine
+  *	port: host byte order.
+  */
+ 
+-int register_ip_masq_app(struct ip_masq_app *mapp, unsigned short proto, __u16 port)
++int register_ip_masq_app_flags(struct ip_masq_app *mapp, unsigned short proto, __u16 port, __u32 mflags)
+ {
+         unsigned long flags;
+         unsigned hash;
+@@ -70,7 +84,11 @@
+                 IP_MASQ_ERR("register_ip_masq_app(): NULL arg\n");
+                 return -EINVAL;
+         }
++#ifndef CONFIG_IP_MASQ_APP_SPORT
+         mapp->type = IP_MASQ_APP_TYPE(proto, port);
++#else /* CONFIG_IP_MASQ_APP_SPORT */
++        mapp->type = IP_MASQ_APP_TYPE(proto, port, mflags);
++#endif /* CONFIG_IP_MASQ_APP_SPORT */
+         mapp->n_attach = 0;
+         hash = IP_MASQ_APP_HASH(proto, port);
+ 
+@@ -125,15 +143,27 @@
+  *	get ip_masq_app object by its proto and port (net byte order).
+  */
+ 
+-struct ip_masq_app * ip_masq_app_get(unsigned short proto, __u16 port)
++struct ip_masq_app * ip_masq_app_get(unsigned short proto, __u16 port, __u16 sport)
+ {
+         struct ip_masq_app *mapp;
+         unsigned hash;
+         unsigned type;
+ 
++#ifndef CONFIG_IP_MASQ_APP_SPORT
+         port = ntohs(port);
+         type = IP_MASQ_APP_TYPE(proto,port);
+         hash = IP_MASQ_APP_HASH(proto,port);
++#else /* CONFIG_IP_MASQ_APP_SPORT */
++        port = ntohs(port);
++        type = IP_MASQ_APP_TYPE(proto,port,0);
++        hash = IP_MASQ_APP_HASH(proto,port);
++        for(mapp = ip_masq_app_base[hash]; mapp ; mapp = mapp->next) {
++                if (type == mapp->type) return mapp;
++        }
++        sport = ntohs(sport);
++        type = IP_MASQ_APP_TYPE(proto,sport,IP_MASQ_APP_F_REVERSE);
++        hash = IP_MASQ_APP_HASH(proto,sport);
++#endif /* CONFIG_IP_MASQ_APP_SPORT */
+         for(mapp = ip_masq_app_base[hash]; mapp ; mapp = mapp->next) {
+                 if (type == mapp->type) return mapp;
+         }
+@@ -180,7 +210,7 @@
+ 	if (ms->protocol != IPPROTO_TCP && ms->protocol != IPPROTO_UDP)
+ 		return NULL;
+ 
+-        mapp = ip_masq_app_get(ms->protocol, ms->dport);
++        mapp = ip_masq_app_get(ms->protocol, ms->dport, ms->sport);
+ 
+ #if 0000
+ /* #ifdef CONFIG_IP_MASQUERADE_IPAUTOFW */
+diff -aur linux-2.2.10/net/ipv4/ip_masq_ftp.c linux-2.2.10new/net/ipv4/ip_masq_ftp.c
+--- linux-2.2.10/net/ipv4/ip_masq_ftp.c	Mon Oct  5 15:28:09 1998
++++ linux-2.2.10new/net/ipv4/ip_masq_ftp.c	Sat Sep  4 13:23:49 1999
+@@ -16,6 +16,7 @@
+  * 	Juan Jose Ciarlante	:	Litl bits for 2.1
+  *	Juan Jose Ciarlante	:	use ip_masq_listen() 
+  *	Juan Jose Ciarlante	: 	use private app_data for own flag(s)
++ *	Rolf Braun		:	passive FTP support, TCP options fixes
+  *
+  *
+  *
+@@ -59,6 +60,9 @@
+  */
+ static int ports[MAX_MASQ_APP_PORTS] = {21}; /* I rely on the trailing items being set to zero */
+ struct ip_masq_app *masq_incarnations[MAX_MASQ_APP_PORTS];
++#ifdef CONFIG_IP_MASQ_APP_SPORT
++struct ip_masq_app *masq_incarnations_reverse[MAX_MASQ_APP_PORTS];
++#endif /* CONFIG_IP_MASQ_APP_SPORT */
+ 
+ /*
+  *	Debug level
+@@ -73,12 +77,38 @@
+ /*	Dummy variable */
+ static int masq_ftp_pasv;
+ 
++#ifdef CONFIG_IP_MASQ_APP_SPORT
++
++struct ftp_priv_data {
++	int state;
++	int pos;
++};
++
++#endif /* CONFIG_IP_MASQ_APP_SPORT */
+ static int
+ masq_ftp_init_1 (struct ip_masq_app *mapp, struct ip_masq *ms)
+ {
++	MOD_INC_USE_COUNT;
++	return 0;
++}
++
++#ifdef CONFIG_IP_MASQ_APP_SPORT
++static int
++masq_ftp_init_1_reverse (struct ip_masq_app *mapp, struct ip_masq *ms)
++{
+         MOD_INC_USE_COUNT;
++	if ((ms->app_data = kmalloc(sizeof(struct ftp_priv_data),
++				    GFP_ATOMIC)) == NULL) 
++		printk(KERN_INFO "FTP: No memory for application data\n");
++	else 
++	{
++		struct ftp_priv_data *priv = 
++			(struct ftp_priv_data *)ms->app_data;
++		priv->state = 0;
++	}
+         return 0;
+ }
++#endif /* CONFIG_IP_MASQ_APP_SPORT */
+ 
+ static int
+ masq_ftp_done_1 (struct ip_masq_app *mapp, struct ip_masq *ms)
+@@ -87,6 +117,17 @@
+         return 0;
+ }
+ 
++#ifdef CONFIG_IP_MASQ_APP_SPORT
++static int
++masq_ftp_done_1_reverse (struct ip_masq_app *mapp, struct ip_masq *ms)
++{
++        MOD_DEC_USE_COUNT;
++	if (ms->app_data)
++		kfree_s(ms->app_data, sizeof(struct ftp_priv_data));
++        return 0;
++}
++
++#endif /* CONFIG_IP_MASQ_APP_SPORT */
+ int
+ masq_ftp_out (struct ip_masq_app *mapp, struct ip_masq *ms, struct sk_buff **skb_p, __u32 maddr)
+ {
+@@ -105,7 +146,9 @@
+         skb = *skb_p;
+ 	iph = skb->nh.iph;
+         th = (struct tcphdr *)&(((char *)iph)[iph->ihl*4]);
+-        data = (char *)&th[1];
++/*        data = (char *)&th[1]; */
++	data = (char *)th;
++	data += th->doff*4; /* RAB: TCP options fix */
+ 
+         data_limit = skb->h.raw + skb->len - 18;
+         if (skb->len >= 6 && (memcmp(data, "PASV\r\n", 6) == 0 || memcmp(data, "pasv\r\n", 6) == 0))
+@@ -244,7 +287,9 @@
+ 	skb = *skb_p;
+ 	iph = skb->nh.iph;
+ 	th = (struct tcphdr *)&(((char *)iph)[iph->ihl*4]);
+-	data = (char *)&th[1];
++/*	data = (char *)&th[1]; */
++	data = (char *)th;
++	data += th->doff*4; // RAB - tcp options fix
+ 	data_limit = skb->h.raw + skb->len;
+ 
+ 	while (data < data_limit && *data != ' ')
+@@ -310,6 +355,171 @@
+ 	return 0;	/* no diff required for incoming packets, thank goodness */
+ }
+ 
++#ifdef CONFIG_IP_MASQ_APP_SPORT
++/* RAB - for servers, we do the reverse */
++
++int
++masq_ftp_out_reverse (struct ip_masq_app *mapp, struct ip_masq *ms, struct sk_buff **skb_p, __u32 maddr)
++{
++	struct sk_buff *skb;
++	struct iphdr *iph;
++	struct tcphdr *th;
++	char *data, *data_limit, *p;
++	unsigned char p1,p2,p3,p4,p5,p6;
++	__u32 from;
++	__u16 port;
++	struct ip_masq *n_ms;
++	char buf[24];
++	unsigned buf_len;
++	int diff;
++	struct ftp_priv_data *priv = (struct ftp_priv_data *)ms->app_data;
++
++	if (!ms->app_data || !((struct ftp_priv_data *)ms->app_data)->state)
++		return 0;	/* quick exit if no outstanding PASV */
++
++	skb = *skb_p;
++	iph = skb->nh.iph;
++	th = (struct tcphdr *)&(((char *)iph)[iph->ihl*4]);
++	data = (char *)th;
++	data += th->doff*4;
++	data_limit = skb->h.raw + skb->len;
++	priv = (struct ftp_priv_data *)ms->app_data;
++
++// hopefully this mini state machine will be a bit more robust
++	while (data < data_limit && priv->state != 4) {
++		switch (priv->state) {
++			case 1:
++			if (*data == ' ') priv->state = 2;
++			else data++;
++			break;
++			case 2:
++			if (*data != ' ') {
++				priv->state = 3;
++				priv->pos = 0;
++			}
++			else data++;
++			break;
++			case 3:
++			if (priv->pos < 22) {
++				priv->pos++;
++				data++;
++			}
++			else priv->state = 4;
++			break;
++			default:
++			data++;
++			break;
++		}
++	}
++	if (data >= data_limit) return 0;
++	priv->state = 0;
++	if (data >= data_limit || *data != '(')
++		return 0;
++	p = data+1;
++	p1 = simple_strtoul(data+1, &data, 10);
++	if (data >= data_limit || *data != ',')
++		return 0;
++	p2 = simple_strtoul(data+1, &data, 10);
++	if (data >= data_limit || *data != ',')
++		return 0;
++	p3 = simple_strtoul(data+1, &data, 10);
++	if (data >= data_limit || *data != ',')
++		return 0;
++	p4 = simple_strtoul(data+1, &data, 10);
++	if (data >= data_limit || *data != ',')
++		return 0;
++	p5 = simple_strtoul(data+1, &data, 10);
++	if (data >= data_limit || *data != ',')
++		return 0;
++	p6 = simple_strtoul(data+1, &data, 10);
++	if (data >= data_limit || *data != ')')
++		return 0;
++
++	from = (p1<<24) | (p2<<16) | (p3<<8) | p4;
++	port = (p5<<8) | p6;
++
++	/*
++	 * Now update or create an masquerade entry for it
++	 */
++	IP_MASQ_DEBUG(1-debug, "server-side PASV response %lX:%X %X:%X detected\n", ntohl(ms->saddr), 0, from, port);
++
++/* yeah, we always use out_get because it has the _real_ addresses */
++	n_ms = ip_masq_out_get(iph->protocol,
++				 htonl(from), htons(port),
++				 ms->daddr, 0);
++	if (!n_ms) {
++		n_ms = ip_masq_new(IPPROTO_TCP,
++					maddr, 0,
++					htonl(from), htons(port),
++					ms->daddr, 0,
++					IP_MASQ_F_NO_DPORT);
++
++		if (n_ms==NULL)
++			return 0;
++		ip_masq_control_add(n_ms, ms);
++	}
++	/*
++	 * Replace the old PORT with the new one
++	 */
++	from = ntohl(n_ms->maddr);
++	port = ntohs(n_ms->mport);
++	sprintf(buf,"%d,%d,%d,%d,%d,%d",
++		from>>24&255,from>>16&255,from>>8&255,from&255,
++		port>>8&255,port&255);
++	buf_len = strlen(buf);
++
++	IP_MASQ_DEBUG(1-debug, "new PASV %X:%X\n",from,port);
++
++	/*
++	 * Calculate required delta-offset to keep TCP happy
++	 */
++	
++	diff = buf_len - (data-p);
++	
++	/*
++	 *	No shift.
++	 */
++	
++	if (diff==0) {
++		/*
++		 * simple case, just replace the old PORT cmd
++		 */
++		memcpy(p,buf,buf_len);
++	} else {
++
++		*skb_p = ip_masq_skb_replace(skb, GFP_ATOMIC, p, data-p, buf, buf_len);
++	}
++	/*
++	 * 	Move tunnel to listen state
++	 */
++	ip_masq_listen(n_ms);
++	ip_masq_put(n_ms);
++
++	return diff;
++}
++
++int
++masq_ftp_in_reverse (struct ip_masq_app *mapp, struct ip_masq *ms, struct sk_buff **skb_p, __u32 maddr)
++{
++        struct sk_buff *skb;
++	struct iphdr *iph;
++	struct tcphdr *th;
++	char *data, *data_limit;
++
++        skb = *skb_p;
++	iph = skb->nh.iph;
++        th = (struct tcphdr *)&(((char *)iph)[iph->ihl*4]);
++        data = (char *)th;
++	data += (th->doff*4);
++
++        data_limit = skb->h.raw + skb->len;
++        if (skb->len >= 6 && (memcmp(data, "PASV\r\n", 6) == 0 || memcmp(data, "pasv\r\n", 6) == 0)) {
++		((struct ftp_priv_data *)ms->app_data)->state = 1;
++	}
++	return 0;
++}
++
++#endif /* CONFIG_IP_MASQ_APP_SPORT */
+ struct ip_masq_app ip_masq_ftp = {
+         NULL,			/* next */
+ 	"ftp",			/* name */
+@@ -321,6 +531,19 @@
+         masq_ftp_in,            /* pkt_in */
+ };
+ 
++#ifdef CONFIG_IP_MASQ_APP_SPORT
++struct ip_masq_app ip_masq_ftp_reverse = {
++        NULL,			/* next */
++	"ftp",			/* name */
++        0,                      /* type */
++        0,                      /* n_attach */
++        masq_ftp_init_1_reverse,        /* ip_masq_init_1 */
++        masq_ftp_done_1_reverse,        /* ip_masq_done_1 */
++        masq_ftp_out_reverse,           /* pkt_out */
++        masq_ftp_in_reverse,            /* pkt_in */
++};
++
++#endif /* CONFIG_IP_MASQ_APP_SPORT */
+ /*
+  * 	ip_masq_ftp initialization
+  */
+@@ -340,6 +563,17 @@
+ 						      ports[i]))) {
+ 				return j;
+ 			}
++#ifdef CONFIG_IP_MASQ_APP_SPORT
++			if ((masq_incarnations_reverse[i] = kmalloc(sizeof(struct ip_masq_app),
++							    GFP_KERNEL)) == NULL)
++				return -ENOMEM;
++			memcpy(masq_incarnations_reverse[i], &ip_masq_ftp_reverse, sizeof(struct ip_masq_app));
++			if ((j = register_ip_masq_app_flags(masq_incarnations_reverse[i], 
++						      IPPROTO_TCP, 
++						      ports[i], IP_MASQ_APP_F_REVERSE))) {
++				return j;
++			}
++#endif /* CONFIG_IP_MASQ_APP_SPORT */
+ 			IP_MASQ_DEBUG(1-debug, "Ftp: loaded support on port[%d] = %d\n",
+ 			       i, ports[i]);
+ 		} else {
+@@ -370,6 +604,18 @@
+ 				       i, ports[i]);
+ 			}
+ 		}
++#ifdef CONFIG_IP_MASQ_APP_SPORT
++		if (masq_incarnations_reverse[i]) {
++			if ((j = unregister_ip_masq_app(masq_incarnations_reverse[i]))) {
++				k = j;
++			} else {
++				kfree(masq_incarnations_reverse[i]);
++				masq_incarnations_reverse[i] = NULL;
++				IP_MASQ_DEBUG(1-debug, "Ftp: unloaded support on port[%d] = %d\n",
++				       i, ports[i]);
++			}
++		}
++#endif /* CONFIG_IP_MASQ_APP_SPORT */
+ 	}
+ 	return k;
+ }

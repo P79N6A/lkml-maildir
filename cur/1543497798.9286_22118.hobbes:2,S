@@ -1,0 +1,315 @@
+Date: Sat, 5 Jun 1999 02:39:47 +0300 (EEST)
+From: Julian Anastasov <>
+Subject: Use daddr and dport as hash keys for faster masq redirector!
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/6/4/181
+
+	Anyone with CPU (network) problems when using Linux 2.2
+as masq redirector (load balancer / virtual server) when many
+incoming connections are created?
+        Current hashing in ip_masq_m_tab[IP_MASQ_TAB_SIZE] and
+ip_masq_s_tab[IP_MASQ_TAB_SIZE] is inadequate for virtual server,
+i.e. when many connections are created outside the firewall (if
+using MFW or PORTFW module) and linux host is used as redirector
+or load balancer. Using only maddr and mport to hash
+ip_masq_m_tab and only saddr and sport to hash ip_masq_s_tab
+means table with all entries linked with same hash value, i.e.
+all remote connections to our virtual or internal server(s) are
+linked using same hash value (calculated from addr and port of
+virtual or internal server). This can be tested with ipmasqadm:
+add some internal hosts (web servers for example) using mfw or
+portfw module. cat /proc/net/ip_masquerade displays all entries
+with same "Masq" value (port 80) in ip_masq_m_tab, i.e. all
+entries linked and with same index in table.
+	Current hashing works for connections created from
+internal hosts when new mport is allocated (in range 61000-65095)
+and when connections come from many different ports but not when
+all connections are created outside the firewall to specific
+ports (virtual servers) and then demasqueraded and redirected to real
+servers to specific ports. What this means. IP_MASQ_TAB_SIZE
+can be any value if we don't use other keys to hash. Currently
+there is no difference between 256 (default), 16384 (recommended
+by someone) and 2 for instance if all connections to our server
+occupy one row from table. Searching in list with all masq
+entries must be (and it is really) very slow when performed for
+each incoming packet (ip_masq_m_tab or ip_masq_s_tab table) when
+many connections are present, mostly in TIME_WAIT state (99% if
+connections are served for 1 second, terminated and time-waited 120
+seconds (default period).
+	I thing it is possible and preferable all masq entries with
+IP_MASQ_F_MPORT flag set to be hashed in ip_masq_hash/ip_masq_unhash
+using daddr and dport as keys:
+ip_masq_hash_key(ms->protocol, ms->maddr^ms->daddr, ms->mport^ms->dport)
+instead of old way which still must be used if IP_MASQ_F_MPORT is not
+set, i.e. for connections initiated from internal (masqueraded) hosts:
+ip_masq_hash_key(ms->protocol, ms->maddr, ms->mport)
+Same for ip_masq_s_tab: ms->saddr^ms->daddr and ms->sport^ms->dport
+	Yes, daddr and dport can be changed after first hashing
+for some connections created using masq modules but only once per
+each connection, so we can rehash entry when client and server
+are connected (not common case for incoming connections).
+I think this will improve handling of incoming packets and
+with IP_MASQ_TAB_SIZE=131072 (1092*120=131072) we can have 1092
+connections per second when TIME_WAIT=120 seconds and we can hit
+all entries at first time in ideal case. This is possible because
+we don't have any limits (is this bad or good?) for the number of
+incoming connections to our virtual server(s). 4096*10 is limit
+only for the number of connections created from internal
+hosts (with allocated mport in reserved range).
+	Below is my patch which I tested with 2.2.9 kernel
+using mfw module to redirect connections to internal servers.
+	Some goals and assumptions in this patch:
+-	Give priority for connections to our servers when searching
+	in hash tables and then for connections created inside
+	firewall.
+-	We use daddr and dport as keys only for server ports, i.e.
+	when IP_MASQ_F_MPORT is set in ip_masq_new.
+-	We assume IP_MASQ_F_DLOOSE(UDP) is not set when IP_MASQ_F_MPORT
+	is set. We can handle TCP and UDP but not ICMP entries, i.e.
+	we always use old way to hash if not possible to use
+	daddr and dport as keys. Our goal is to improve access for
+	incoming connections. There is no need to use daddr and
+	dport as keys for outgoing connections - they already use
+	different mports from reserved range and different rows from
+	masq tables.
+-	We can handle entries with IP_MASQ_F_NO_DADDR and/or
+	IP_MASQ_F_NO_DPORT flags set - they are rehashed when
+	connection is established and each flag is cleared.
+-	We assume IP_MASQ_F_NO_SPORT is not set when IP_MASQ_F_MPORT
+	is set (we assume these entries are for outgoing connections).
+-	Large value for IP_MASQ_TAB_SIZE is still recommended for
+	this code to work if many connections are expected.
+	Any ideas or comments? I thing this code can be
+integrated in 2.2. May be after some tunning?
+--- v2.2.9/linux/net/ipv4/ip_masq.c	Sun May 16 13:35:56 1999
++++ linux/net/ipv4/ip_masq.c	Sat Jun  5 01:30:59 1999
+@@ -46,6 +46,7 @@
+  *	Juan Jose Ciarlante	: 	make masq_proto_doff() robust against fake sized/corrupted packets
+  *	Kai Bankett		:	do not toss other IP protos in proto_doff()
+  *	Dan Kegel		:	pointed correct NAT behavior for UDP streams
++ *	Julian Anastasov	:	use daddr and dport as hash keys
+  *	
+  */
+ 
+@@ -407,6 +408,14 @@
+  */
+ #define CONFIG_IP_MASQ_LOOSE_DEFAULT 1
+ 
++/*
++ *	Use daddr and dport as keys when IP_MASQ_F_MPORT is set.
++ *	This will reduce CPU usage when redirecting many connections to
++ *	internal servers.
++ *
++ *	By default use daddr and dport as keys to optimize for redirector
++ */
++#define CONFIG_IP_MASQ_OPT_REDIRECTOR 1
+ 
+ /*
+  * 	Set masq expiration (deletion) and adds timer,
+@@ -450,6 +459,17 @@
+ 			__builtin_return_address(0));
+                 return 0;
+         }
++#ifdef	CONFIG_IP_MASQ_OPT_REDIRECTOR
++	/*
++	 *	Hash by proto,m{addr,port},d{addr,port}
++	 */
++	if ((ms->flags & (IP_MASQ_F_NO_DADDR | IP_MASQ_F_NO_DPORT |
++		IP_MASQ_F_NO_SADDR | IP_MASQ_F_NO_SPORT |
++		IP_MASQ_F_DLOOSE | IP_MASQ_F_MPORT)) == IP_MASQ_F_MPORT)
++		hash = ip_masq_hash_key(ms->protocol,
++			ms->maddr^ms->daddr, ms->mport^ms->dport);
++	else
++#endif
+         /*
+          *	Hash by proto,m{addr,port}
+          */
+@@ -458,6 +478,17 @@
+ 	atomic_inc(&ms->refcnt);
+         ip_masq_m_tab[hash] = ms;
+ 
++#ifdef	CONFIG_IP_MASQ_OPT_REDIRECTOR
++	/*
++	 *	Hash by proto,s{addr,port},d{addr,port}
++	 */
++	if ((ms->flags & (IP_MASQ_F_NO_DADDR | IP_MASQ_F_NO_DPORT |
++		IP_MASQ_F_NO_SADDR | IP_MASQ_F_NO_SPORT |
++		IP_MASQ_F_DLOOSE | IP_MASQ_F_MPORT)) == IP_MASQ_F_MPORT)
++		hash = ip_masq_hash_key(ms->protocol,
++			ms->saddr^ms->daddr, ms->sport^ms->dport);
++	else
++#endif
+         /*
+          *	Hash by proto,s{addr,port}
+          */
+@@ -486,6 +517,17 @@
+ 			__builtin_return_address(0));
+                 return 0;
+         }
++#ifdef	CONFIG_IP_MASQ_OPT_REDIRECTOR
++	/*
++	 *	UNhash by m{addr,port},d{addr,port}
++	 */
++	if ((ms->flags & (IP_MASQ_F_NO_DADDR | IP_MASQ_F_NO_DPORT |
++		IP_MASQ_F_NO_SADDR | IP_MASQ_F_NO_SPORT |
++		IP_MASQ_F_DLOOSE | IP_MASQ_F_MPORT)) == IP_MASQ_F_MPORT)
++		hash = ip_masq_hash_key(ms->protocol,
++			ms->maddr^ms->daddr, ms->mport^ms->dport);
++	else
++#endif
+         /*
+          *	UNhash by m{addr,port}
+          */
+@@ -497,6 +539,17 @@
+                         break;
+                 }
+ 
++#ifdef	CONFIG_IP_MASQ_OPT_REDIRECTOR
++	/*
++	 *	UNhash by s{addr,port},d{addr,port}
++	 */
++	if ((ms->flags & (IP_MASQ_F_NO_DADDR | IP_MASQ_F_NO_DPORT |
++		IP_MASQ_F_NO_SADDR | IP_MASQ_F_NO_SPORT |
++		IP_MASQ_F_DLOOSE | IP_MASQ_F_MPORT)) == IP_MASQ_F_MPORT)
++		hash = ip_masq_hash_key(ms->protocol,
++			ms->saddr^ms->daddr, ms->sport^ms->dport);
++	else
++#endif
+         /*
+          *	UNhash by s{addr,port}
+          */
+@@ -536,6 +589,31 @@
+         unsigned hash;
+         struct ip_masq *ms = NULL;
+ 
++#ifdef	CONFIG_IP_MASQ_OPT_REDIRECTOR
++	/*
++	 *	First priority for connections to internal servers
++	 */
++	hash = ip_masq_hash_key(protocol, d_addr^s_addr, d_port^s_port);
++
++        for(ms = ip_masq_m_tab[hash]; ms ; ms = ms->m_link) {
++		if (((ms->flags & (IP_MASQ_F_NO_DADDR | IP_MASQ_F_NO_DPORT |
++		    IP_MASQ_F_NO_SADDR | IP_MASQ_F_NO_SPORT |
++		    IP_MASQ_F_DLOOSE | IP_MASQ_F_MPORT)) == IP_MASQ_F_MPORT) &&
++		    s_port==ms->dport && s_addr==ms->daddr &&
++		    d_port==ms->mport && protocol==ms->protocol &&
++		    d_addr==ms->maddr
++		    ) {
++			IP_MASQ_DEBUG(2, "look/in %d %08X:%04hX->%08X:%04hX OK\n",
++			       protocol,
++			       s_addr,
++			       s_port,
++			       d_addr,
++			       d_port);
++			atomic_inc(&ms->refcnt);
++                        goto out;
++		}
++        }
++#endif
+         hash = ip_masq_hash_key(protocol, d_addr, d_port);
+ 
+         for(ms = ip_masq_m_tab[hash]; ms ; ms = ms->m_link) {
+@@ -586,6 +664,33 @@
+         unsigned hash;
+         struct ip_masq *ms = NULL;
+ 
++#ifdef	CONFIG_IP_MASQ_OPT_REDIRECTOR
++	/*
++	 *	First priority for connections to internal servers
++	 */
++	hash = ip_masq_hash_key(protocol, s_addr^d_addr, s_port^d_port);
++
++        for(ms = ip_masq_s_tab[hash]; ms ; ms = ms->s_link) {
++		if (((ms->flags & (IP_MASQ_F_NO_DADDR | IP_MASQ_F_NO_DPORT |
++		    IP_MASQ_F_NO_SADDR | IP_MASQ_F_NO_SPORT |
++		    IP_MASQ_F_DLOOSE | IP_MASQ_F_MPORT)) == IP_MASQ_F_MPORT) &&
++		    d_addr==ms->daddr && d_port==ms->dport &&
++		    s_addr==ms->saddr && s_port==ms->sport &&
++		    protocol==ms->protocol
++                   ) {
++			IP_MASQ_DEBUG(2, "lk/out0 %d %08X:%04hX->%08X:%04hX OK\n",
++			       protocol,
++			       s_addr,
++			       s_port,
++			       d_addr,
++			       d_port);
++
++			atomic_inc(&ms->refcnt);
++			goto out;
++		}
++
++        }
++#endif
+ 	/*	
+ 	 *	Check for "full" addressed entries
+ 	 */
+@@ -1157,11 +1262,16 @@
+ 		 */
+ 
+ 		if ( ms->flags & IP_MASQ_F_NO_SPORT && ms->protocol == IPPROTO_TCP ) {
++#ifndef	CONFIG_IP_MASQ_OPT_REDIRECTOR
+ 			ms->flags &= ~IP_MASQ_F_NO_SPORT;
++#endif
+ 
+ 			write_lock(&__ip_masq_lock);
+ 			
+ 			ip_masq_unhash(ms);
++#ifdef	CONFIG_IP_MASQ_OPT_REDIRECTOR
++			ms->flags &= ~IP_MASQ_F_NO_SPORT;
++#endif
+ 			ms->sport = h.portp[0];
+ 			ip_masq_hash(ms);	/* hash on new sport */
+ 
+@@ -2011,16 +2121,48 @@
+ 			ms->daddr = iph->saddr;
+ 		} else {
+                 if ( ms->flags & IP_MASQ_F_NO_DPORT ) { /*  && ms->protocol == IPPROTO_TCP ) { */
++#ifdef	CONFIG_IP_MASQ_OPT_REDIRECTOR
++			if (ms->flags & IP_MASQ_F_MPORT) {
++				write_lock(&__ip_masq_lock);
++
++				ip_masq_unhash(ms);
++				ms->flags &= ~IP_MASQ_F_NO_DPORT;
++				ms->dport = h.portp[0];
++				ip_masq_hash(ms);	/* hash on new dport */
++
++				write_unlock(&__ip_masq_lock);
++			} else {
++				ms->flags &= ~IP_MASQ_F_NO_DPORT;
++				ms->dport = h.portp[0];
++			}
++#else
+                         ms->flags &= ~IP_MASQ_F_NO_DPORT;
+                         ms->dport = h.portp[0];
++#endif
+ 
+                         IP_MASQ_DEBUG(1, "ip_fw_demasquerade(): filled dport=%d\n",
+                                ntohs(ms->dport));
+ 
+                 }
+                 if (ms->flags & IP_MASQ_F_NO_DADDR ) { /*  && ms->protocol == IPPROTO_TCP)  { */
++#ifdef	CONFIG_IP_MASQ_OPT_REDIRECTOR
++			if (ms->flags & IP_MASQ_F_MPORT) {
++				write_lock(&__ip_masq_lock);
++
++				ip_masq_unhash(ms);
++				ms->flags &= ~IP_MASQ_F_NO_DADDR;
++				ms->daddr = iph->saddr;
++				ip_masq_hash(ms);	/* hash on new daddr */
++
++				write_unlock(&__ip_masq_lock);
++			} else {
++				ms->flags &= ~IP_MASQ_F_NO_DADDR;
++				ms->daddr = iph->saddr;
++			}
++#else
+                         ms->flags &= ~IP_MASQ_F_NO_DADDR;
+                         ms->daddr = iph->saddr;
++#endif
+ 
+                         IP_MASQ_DEBUG(1, "ip_fw_demasquerade(): filled daddr=%lX\n",
+                                ntohl(ms->daddr));

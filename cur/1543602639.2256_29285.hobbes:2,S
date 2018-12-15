@@ -1,0 +1,306 @@
+Date: Thu, 27 Sep 2001 10:13:42 +0200 (CEST)
+From: Ingo Molnar <>
+Subject: [patch] exec-argsize-2.4.10-A3
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2001/9/27/20
+
+On Wed, 26 Sep 2001, Kiril Vidimce wrote:
+> Is there any way to reconfigure the kernel at runtime to change the
+> limit for arguments passed during an exec? [...]
+include/linux/binfmts.h's MAX_ARG_PAGES define limits exec() arguments to
+128k on systems with 4k pages, 256k on systems with 8k pages. Since this
+define is used in the linux_binprm structure to define a static array,
+there is no natural way (ioctl()) to change it runtime.
+i've written a patch (attached) for 2.4.10 that implements runtime execve
+argument size via /proc/sys/vm/exec-argsize. The patch also cleans up
+do_execve() to be more compact. The latest versions of the patch are also
+available at:
+	
+http://redhat.com/~mingo/execve-patches/
+You can change the exec-argsize sysctl to any reasonable value - the
+kernel will allocate at least 4 KB argument size, which is more than
+enough to change the value back to a more reasonable value :) The
+theoretical upper limit on x86 systems is 128 MB, due to kmalloc()
+limitations. (but there might be other, mapping or sizing limitations in
+libc or bash.)
+systems with many users might want to set exec-argsize to a lower value
+than the default.
+i've tested the patch against vanilla 2.4.10 and it works just fine on
+x86. A good testcase is:
+	ls -d `find /usr/src/linux/`
+this runs just fine on my system if max-argsize is set to 1 MB.
+I've seen no memory leaks in error cases either. Due to the extra
+kmalloc(), execve is slower by 1-2 microseconds, but i think this is well
+worth the flexibility - especially considering that execve() often takes
+several milliseconds to finish.
+note 1: This version of exec() gets sensitive to VM fragmentation above an
+argument size is bigger than ~4MB - this is the size when the pages-array
+gets larger than 4 KB, and kmalloc() uses higher-order page allocations.
+note 2: it's safe to change the exec-argsize parameter in while exec()s
+are in progress - old exec()s will use the older value, newer exec()s use
+the newer value. The exec() code picks the parameter only once and does
+not rely on it to be constant.
+note 3: i've renamed struct binprm's ->page field to ->pages, to safely
+break code that is not updated to use ->nr_pages yet. This breaks some
+architectures in a safe way.)
+Comments?
+	Ingo
+--- linux/fs/exec.c.orig	Thu Sep 27 08:52:32 2001
++++ linux/fs/exec.c	Thu Sep 27 09:33:41 2001
+@@ -48,6 +48,12 @@
+ 
+ int core_uses_pid;
+ 
++/*
++ * Max exec() argument size in bytes. Kernel aligns
++ * it to PAGE_SIZE boundary.
++ */
++int exec_argsize = PAGE_SIZE * 32;
++
+ static struct linux_binfmt *formats;
+ static rwlock_t binfmt_lock = RW_LOCK_UNLOCKED;
+ 
+@@ -204,11 +210,11 @@
+ 
+ 			offset = pos % PAGE_SIZE;
+ 			i = pos/PAGE_SIZE;
+-			page = bprm->page[i];
++			page = bprm->pages[i];
+ 			new = 0;
+ 			if (!page) {
+ 				page = alloc_page(GFP_HIGHUSER);
+-				bprm->page[i] = page;
++				bprm->pages[i] = page;
+ 				if (!page)
+ 					return -ENOMEM;
+ 				new = 1;
+@@ -296,7 +302,7 @@
+ 	struct vm_area_struct *mpnt;
+ 	int i;
+ 
+-	stack_base = STACK_TOP - MAX_ARG_PAGES*PAGE_SIZE;
++	stack_base = STACK_TOP - bprm->nr_pages*PAGE_SIZE;
+ 
+ 	bprm->p += stack_base;
+ 	if (bprm->loader)
+@@ -322,10 +328,10 @@
+ 		current->mm->total_vm = (mpnt->vm_end - mpnt->vm_start) >> PAGE_SHIFT;
+ 	} 
+ 
+-	for (i = 0 ; i < MAX_ARG_PAGES ; i++) {
+-		struct page *page = bprm->page[i];
++	for (i = 0 ; i < bprm->nr_pages ; i++) {
++		struct page *page = bprm->pages[i];
+ 		if (page) {
+-			bprm->page[i] = NULL;
++			bprm->pages[i] = NULL;
+ 			put_dirty_page(current,page,stack_base);
+ 		}
+ 		stack_base += PAGE_SIZE;
+@@ -747,7 +753,7 @@
+ 			offset = 0;
+ 			kunmap(page);
+ inside:
+-			page = bprm->page[bprm->p/PAGE_SIZE];
++			page = bprm->pages[bprm->p/PAGE_SIZE];
+ 			kaddr = kmap(page);
+ 		}
+ 		kunmap(page);
+@@ -778,7 +784,7 @@
+ 		fput(bprm->file);
+ 		bprm->file = NULL;
+ 
+-	        loader = PAGE_SIZE*MAX_ARG_PAGES-sizeof(void *);
++	        loader = PAGE_SIZE*bprm->nr_pages-sizeof(void *);
+ 
+ 		file = open_exec(dynloader[0]);
+ 		retval = PTR_ERR(file);
+@@ -853,34 +859,38 @@
+ {
+ 	struct linux_binprm bprm;
+ 	struct file *file;
++	struct page **pages;
+ 	int retval;
+-	int i;
++	int i, nr_pages;
+ 
+-	file = open_exec(filename);
++	bprm.file = file = open_exec(filename);
+ 
+ 	retval = PTR_ERR(file);
+ 	if (IS_ERR(file))
+ 		return retval;
+ 
+-	bprm.p = PAGE_SIZE*MAX_ARG_PAGES-sizeof(void *);
+-	memset(bprm.page, 0, MAX_ARG_PAGES*sizeof(bprm.page[0])); 
++	nr_pages = (exec_argsize + PAGE_SIZE-1) / PAGE_SIZE;
++	pages = kmalloc(sizeof(pages[0]) * nr_pages, GFP_KERNEL);
++	retval = -ENOMEM;
++	if (!pages)
++		goto out;
++	bprm.p = PAGE_SIZE*nr_pages-sizeof(void *);
++	memset(pages, 0, nr_pages*sizeof(pages[0])); 
+ 
++	bprm.nr_pages = nr_pages;
++	bprm.pages = pages;
+ 	bprm.file = file;
+ 	bprm.filename = filename;
+ 	bprm.sh_bang = 0;
+ 	bprm.loader = 0;
+ 	bprm.exec = 0;
+-	if ((bprm.argc = count(argv, bprm.p / sizeof(void *))) < 0) {
+-		allow_write_access(file);
+-		fput(file);
+-		return bprm.argc;
+-	}
++	retval = bprm.argc = count(argv, bprm.p / sizeof(void *));
++	if (retval < 0)
++		goto out;
+ 
+-	if ((bprm.envc = count(envp, bprm.p / sizeof(void *))) < 0) {
+-		allow_write_access(file);
+-		fput(file);
+-		return bprm.envc;
+-	}
++	retval = bprm.envc = count(envp, bprm.p / sizeof(void *));
++	if (retval < 0)
++		goto out;
+ 
+ 	retval = prepare_binprm(&bprm);
+ 	if (retval < 0) 
+@@ -900,20 +910,29 @@
+ 		goto out; 
+ 
+ 	retval = search_binary_handler(&bprm,regs);
+-	if (retval >= 0)
+-		/* execve success */
++	if (retval >= 0) {
++		/*
++		 * execve() success
++		 *
++		 * the argument pages now live in the process pagetables,
++		 * but the pages-array must be deallocated.
++		 */
++		kfree(pages);
+ 		return retval;
++	}
+ 
+ out:
+ 	/* Something went wrong, return the inode and free the argument pages*/
+-	allow_write_access(bprm.file);
+-	if (bprm.file)
+-		fput(bprm.file);
+-
+-	for (i = 0 ; i < MAX_ARG_PAGES ; i++) {
+-		struct page * page = bprm.page[i];
+-		if (page)
+-			__free_page(page);
++	if (file) {
++		allow_write_access(file);
++		fput(file);
++	}
++
++	if (pages) {
++		for (i = 0 ; i < nr_pages ; i++)
++			if (pages[i])
++				__free_page(pages[i]);
++		kfree(pages);
+ 	}
+ 
+ 	return retval;
+--- linux/fs/binfmt_elf.c.orig	Thu Sep 27 09:12:41 2001
++++ linux/fs/binfmt_elf.c	Thu Sep 27 09:15:26 2001
+@@ -107,7 +107,8 @@
+ 		  struct elfhdr * exec,
+ 		  unsigned long load_addr,
+ 		  unsigned long load_bias,
+-		  unsigned long interp_load_addr, int ibcs)
++		  unsigned long interp_load_addr,
++		  int ibcs, unsigned int max_argsize)
+ {
+ 	elf_caddr_t *argv;
+ 	elf_caddr_t *envp;
+@@ -198,8 +199,8 @@
+ 	current->mm->arg_start = (unsigned long) p;
+ 	while (argc-->0) {
+ 		__put_user((elf_caddr_t)(unsigned long)p,argv++);
+-		len = strnlen_user(p, PAGE_SIZE*MAX_ARG_PAGES);
+-		if (!len || len > PAGE_SIZE*MAX_ARG_PAGES)
++		len = strnlen_user(p, max_argsize);
++		if (!len || len > max_argsize)
+ 			return NULL;
+ 		p += len;
+ 	}
+@@ -207,8 +208,8 @@
+ 	current->mm->arg_end = current->mm->env_start = (unsigned long) p;
+ 	while (envc-->0) {
+ 		__put_user((elf_caddr_t)(unsigned long)p,envp++);
+-		len = strnlen_user(p, PAGE_SIZE*MAX_ARG_PAGES);
+-		if (!len || len > PAGE_SIZE*MAX_ARG_PAGES)
++		len = strnlen_user(p, max_argsize);
++		if (!len || len > max_argsize)
+ 			return NULL;
+ 		p += len;
+ 	}
+@@ -708,7 +709,8 @@
+ 			&elf_ex,
+ 			load_addr, load_bias,
+ 			interp_load_addr,
+-			(interpreter_type == INTERPRETER_AOUT ? 0 : 1));
++			(interpreter_type == INTERPRETER_AOUT ? 0 : 1),
++			bprm->nr_pages * PAGE_SIZE);
+ 	/* N.B. passed_fileno might not be initialized? */
+ 	if (interpreter_type == INTERPRETER_AOUT)
+ 		current->mm->arg_start += strlen(passed_fileno) + 1;
+--- linux/kernel/sysctl.c.orig	Thu Sep 27 08:50:58 2001
++++ linux/kernel/sysctl.c	Thu Sep 27 08:52:20 2001
+@@ -268,6 +268,8 @@
+ 	 &pgt_cache_water, 2*sizeof(int), 0644, NULL, &proc_dointvec},
+ 	{VM_PAGE_CLUSTER, "page-cluster", 
+ 	 &page_cluster, sizeof(int), 0644, NULL, &proc_dointvec},
++	{VM_EXEC_ARGSIZE, "exec-argsize", 
++	 &exec_argsize, sizeof(int), 0644, NULL, &proc_dointvec},
+ 	{0}
+ };
+ 
+--- linux/include/linux/binfmts.h.orig	Thu Sep 27 08:49:51 2001
++++ linux/include/linux/binfmts.h	Thu Sep 27 09:20:55 2001
+@@ -4,12 +4,7 @@
+ #include <linux/ptrace.h>
+ #include <linux/capability.h>
+ 
+-/*
+- * MAX_ARG_PAGES defines the number of pages allocated for arguments
+- * and envelope for the new program. 32 should suffice, this gives
+- * a maximum env+arg of 128kB w/4KB pages!
+- */
+-#define MAX_ARG_PAGES 32
++extern int exec_argsize;
+ 
+ /* sizeof(linux_binprm->buf) */
+ #define BINPRM_BUF_SIZE 128
+@@ -21,7 +16,8 @@
+  */
+ struct linux_binprm{
+ 	char buf[BINPRM_BUF_SIZE];
+-	struct page *page[MAX_ARG_PAGES];
++	int nr_pages;
++	struct page **pages;
+ 	unsigned long p; /* current top of mem */
+ 	int sh_bang;
+ 	struct file * file;
+--- linux/include/linux/sysctl.h.orig	Thu Sep 27 09:21:58 2001
++++ linux/include/linux/sysctl.h	Thu Sep 27 09:22:44 2001
+@@ -137,7 +137,8 @@
+ 	VM_PAGECACHE=7,		/* struct: Set cache memory thresholds */
+ 	VM_PAGERDAEMON=8,	/* struct: Control kswapd behaviour */
+ 	VM_PGT_CACHE=9,		/* struct: Set page table cache parameters */
+-	VM_PAGE_CLUSTER=10	/* int: set number of pages to swap together */
++	VM_PAGE_CLUSTER=10,	/* int: set number of pages to swap together */
++	VM_EXEC_ARGSIZE=11	/* int: maximum exec() argument size in bytes */
+ };
+ 
+ 

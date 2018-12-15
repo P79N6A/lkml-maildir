@@ -1,0 +1,154 @@
+Date: Wed, 20 Sep 2000 03:51:37 +0200
+From: "Andi Kleen" <>
+Subject: Re: networking todo, was Re: Linux-2.4.0-test9-pre2
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/9/19/137
+
+On Tue, Sep 19, 2000 at 06:13:38PM -0700, David S. Miller wrote:
+>    Date: Wed, 20 Sep 2000 03:14:10 +0200
+>    From: "Andi Kleen" <ak@suse.de>
+> 
+>    The ipid handling is still fishy, it will break when you talk to
+>    more destinations than the inetpeer cache can take (I fixed it in
+>    my local tree with the appended patch) 
+> 
+> I don't like this change, please work with Alexey on this one.
+What do you dislike ?  Stateless ipid looks much nicer to me than stateful
+one (and the "security" lost by not refetching the secret is minimal, 
+especially given the state of the random device on machines without diskio
+and keyboard input) 
+>    Receiver side SMP reordering is still there, but I'm not sure if it is
+>    fixable (but it'll surely hit people that cannot use Linux senders, I 
+>    just see the reports) 
+> 
+> Reordering is a non-issue for ipv4/ipv6, all of the massive TCP input
+> rewrite was strictly about dealing with this.  No SMP reordering
+> should cause any bogus fast retransmits etc. for example.
+You mean TCP output rewrite ? The fix was strictly sender side only 
+(I first thought one of the ack changes alexey did was an attempt at a 
+hackish receiver side solution, but he told me that was false) 
+> What is the problem?  Are you referering to the LAPB/X25 stuff?
+When you have a non linux 2.4 sender you lose.
+>    The TCP connect running out of ports problem is still there (I
+>    fixed it locally, but the changes are probably far too extensive
+>    for 2.4.x now)
+> 
+> I think people can change their ip_local_port_range and I really
+> consider this a non-issue, at least, it's not a 2.4.x show stopper.
+I agree.
+> 
+>    The TCP ISN computation is not SMP safe. 
+> 
+> "Big deal".  So how much effort will you go to to get how much more
+> protection and how much of it do we really need?  How less secure are
+> our TCP ISN's because of this?  Not a show-stopper.
+> 
+> I think you're reading too much tcp-impl :-)
+No, it has nothing to do with tcp-impl ;), I discovered it while playing
+with the ipids much earlier. With some bad luck could could get very similar
+ISNs, which is probably bad (an easy fix is to do the secret hash with a 
+stack copy instead of the static) 
+(but it is not a show stopper I agree)
+> 
+>    include/linux/snmp.h is probably still not properly aligned for all
+>    cache line sizes.
+> 
+> Read, and reread what Alexey tries to tell you over and over about
+> this.  It is not meant to be cache line aligned, it is meant to be a
+> power of two and nothing more.
+It has to be at least cache line aligned, otherwise the arrays wouldn't
+make any sense at all, the power of two would just be a (imho misguided but
+anyways) optimization.
+When I count correctly sizeof(udp_mib) is 16 bytes currently (lots of
+false sharing on 32/64byte cacheline sized architectures) and linux_mib
+is 288 bytes currently (does not make any sense at all)  
+>    UDP recvmsg error handling for csum errors is bogus (fix pending) 
+> 
+> Ok, send me a patch so I can see what the problem is.
+Appended.
+> 
+>    I also would like to remove the inetpeer cache code before 2.4.0, now
+>    that nobody managed to salvage tw recycling and ipid can do without it.
+> 
+> I would prefer not to, it seems to be too potentially destabilizing
+> for questionable and unknown gain (ie. we don't know if tw recycling
+> can be salvaged, so lets not take any changes).
+The "unknown gain" is just removing a lot of complexity => speed and less
+bugs.
+The only advantage I know left is saving pmtus for a bit longer, but
+I doubt it is worth the complexity.
+Do you have any specific plan for salvaging tw recycling ? Just keeping
+such an intrusive piece of code for benchmarks around looks wasteful
+to me.
+-Andi
+Index: net/ipv4/udp.c
+===================================================================
+RCS file: /cvs/linux/net/ipv4/udp.c,v
+retrieving revision 1.85
+diff -u -u -d -r1.85 udp.c
+--- net/ipv4/udp.c	2000/08/09 11:59:04	1.85
++++ net/ipv4/udp.c	2000/09/17 11:55:29
+@@ -493,8 +493,6 @@
+ 		if (usin->sin_family != AF_INET) {
+ 			if (usin->sin_family != AF_UNSPEC)
+ 				return -EINVAL;
+-			if (net_ratelimit())
+-				printk("Remind Kuznetsov, he has to repair %s eventually\n", current->comm);
+ 		}
+ 
+ 		ufh.daddr = usin->sin_addr.s_addr;
+@@ -678,6 +676,8 @@
+ 	if (flags & MSG_ERRQUEUE)
+ 		return ip_recv_error(sk, msg, len);
+ 
++
++ retry:
+ 	/*
+ 	 *	From here the generic datagram does a lot of the work. Come
+ 	 *	the finished NET3, it will do _ALL_ the work!
+@@ -733,26 +733,21 @@
+ csum_copy_err:
+ 	UDP_INC_STATS_BH(UdpInErrors);
+ 
+-	/* Clear queue. */
+-	if (flags&MSG_PEEK) {
+-		int clear = 0;
++	if (flags&(MSG_PEEK|MSG_DONTWAIT)) {
++		struct sk_buff *skb2; 
++
+ 		spin_lock_irq(&sk->receive_queue.lock);
+-		if (skb == skb_peek(&sk->receive_queue)) {
++		skb2 = skb_peek(&sk->receive_queue); 
++		if ((flags & MSG_PEEK) && skb == skb2) { 
+ 			__skb_unlink(skb, &sk->receive_queue);
+-			clear = 1;
+ 		}
+ 		spin_unlock_irq(&sk->receive_queue.lock);
+-		if (clear)
+-			kfree_skb(skb);
+-	}
+-
+-	skb_free_datagram(sk, skb);
+-
+-	/* 
+-	 * Error for blocking case is chosen to masquerade
+-   	 * as some normal condition.
+-	 */
+-	return (flags&MSG_DONTWAIT) ? -EAGAIN : -EHOSTUNREACH;	
++		skb_free_datagram(sk, skb); 
++		if ((flags & MSG_DONTWAIT) && !skb2) 
++			return -EAGAIN; 
++	} else 
++		skb_free_datagram(sk, skb);
++	goto retry; 		
+ }
+ 
+ int udp_connect(struct sock *sk, struct sockaddr *uaddr, int addr_len)
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+Please read the FAQ at 
+http://www.tux.org/lkml/

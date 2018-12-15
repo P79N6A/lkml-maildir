@@ -1,0 +1,162 @@
+Date: Tue, 16 Aug 2005 13:56:46 -0700
+From: Zachary Amsden <>
+Subject: Re: [PATCH 3/6] i386 virtualization - Make ldt a desc struct
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2005/8/16/223
+
+Chris Wright wrote:
+>* Zachary Amsden (zach@vmware.com) wrote:
+> 
+>
+>>Several reviewers noticed that initialization and destruction of the
+>>mm->context is unnecessary, since the entire MM struct is zeroed on
+>>allocation anyways.
+>> 
+>>
+>
+>well, on fork it should be just shallow copied rather than zeroed.
+> 
+>
+Right you are.  That turned out to be a really bad idea (TM).  Updated 
+my ldt test and got the expected panic with the BUG_ON left in.
+Zach
+[image]/*
+ * Copyright (c) 2005, Zachary Amsden (zach@vmware.com)
+ * This is licensed under the GPL.
+ */
+#include <stdio.h>
+#include <signal.h>
+#include <asm/ldt.h>
+#include <asm/segment.h>
+#include <sys/types.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <sched.h>
+#define __KERNEL__
+#include <asm/page.h>
+/*
+ * Spin modifying LDT entry 1 to get contention on the mm->context
+ * semaphore.
+ */
+void evil_child(void *addr)
+{
+	struct user_desc desc;
+	while (1) {
+		desc.entry_number = 1;
+		desc.base_addr = addr;
+		desc.limit = 1;
+		desc.seg_32bit = 1;
+		desc.contents = MODIFY_LDT_CONTENTS_CODE;
+		desc.read_exec_only = 0;
+		desc.limit_in_pages = 1;
+		desc.seg_not_present = 0;
+		desc.useable = 1;
+		if (modify_ldt(1, &desc, sizeof(desc)) != 0) {
+			perror("modify_ldt");
+			abort();
+		}
+	}
+	exit(0);
+}
+void catch_sig(int signo, struct sigcontext ctx)
+{
+	return;
+}
+void main(void)
+{
+        struct user_desc desc;
+        char *code;
+        unsigned long long tsc;
+	char *stack;
+	pid_t child; 
+	int i;
+	unsigned long long lasttsc = 0;
+        code = (char *)mmap(0, 8192, PROT_EXEC|PROT_READ|PROT_WRITE,
+                                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	/* Test 1 - CODE, 32-BIT, 2 page limit */
+        desc.entry_number = 0;
+        desc.base_addr = code;
+        desc.limit = 1;
+        desc.seg_32bit = 1;
+        desc.contents = MODIFY_LDT_CONTENTS_CODE;
+        desc.read_exec_only = 0;
+        desc.limit_in_pages = 1;
+        desc.seg_not_present = 0;
+        desc.useable = 1;
+        if (modify_ldt(1, &desc, sizeof(desc)) != 0) {
+                perror("modify_ldt");
+		abort();
+        }
+        printf("INFO: code base is 0x%08x\n", (unsigned)code);
+        code[0x0ffe] = 0x0f;  /* rdtsc */
+        code[0x0fff] = 0x31;
+        code[0x1000] = 0xcb;  /* lret */
+        __asm__ __volatile("lcall $7,$0xffe" : "=A" (tsc));
+        printf("INFO: TSC is 0x%016llx\n", tsc);
+	/*
+	 * Fork an evil child that shares the same MM context
+	 */
+	stack = malloc(8192);
+	child = clone(evil_child, stack, CLONE_VM, 0xb0b0);
+	if (child == -1) {
+		perror("clone");
+		abort();
+	}
+	/* Test 2 - CODE, 32-BIT, 4097 byte limit */
+        desc.entry_number = 512;
+        desc.base_addr = code;
+        desc.limit = 4096;
+        desc.seg_32bit = 1;
+        desc.contents = MODIFY_LDT_CONTENTS_CODE;
+        desc.read_exec_only = 0;
+        desc.limit_in_pages = 0;
+        desc.seg_not_present = 0;
+        desc.useable = 1;
+        if (modify_ldt(1, &desc, sizeof(desc)) != 0) {
+                perror("modify_ldt");
+		abort();
+        }
+        code[0x0ffe] = 0x0f;  /* rdtsc */
+        code[0x0fff] = 0x31;
+        code[0x1000] = 0xcb;  /* lret */
+        __asm__ __volatile("lcall $0x1007,$0xffe" : "=A" (tsc));
+	/*
+	 * Test 3 - CODE, 32-BIT, maximal LDT.  Race against evil
+	 * child while taking debug traps on LDT CS.
+	 */
+	for (i = 0; i < 1000; i++) {
+		signal(SIGTRAP, catch_sig);
+		desc.entry_number = 8191;
+		desc.base_addr = code;
+		desc.limit = 4097;
+		desc.seg_32bit = 1;
+		desc.contents = MODIFY_LDT_CONTENTS_CODE;
+		desc.read_exec_only = 0;
+		desc.limit_in_pages = 0;
+		desc.seg_not_present = 0;
+		desc.useable = 1;
+		if (modify_ldt(1, &desc, sizeof(desc)) != 0) {
+			perror("modify_ldt");
+			abort();
+		}
+		code[0x0ffe] = 0x0f;  /* rdtsc */
+		code[0x0fff] = 0x31;
+		code[0x1000] = 0xcc;  /* int3 */
+        	code[0x1001] = 0xcb;  /* lret */
+		__asm__ __volatile("lcall $0xffff,$0xffe" : "=A" (tsc));
+		if (tsc < lasttsc) {
+			printf("WARNING: TSC went backwards\n");
+		}
+		lasttsc = tsc;
+	}
+	if (kill(child, SIGTERM) != 0) {
+		perror("kill");
+		abort();
+	}
+	if (fork() == 0) {
+		printf("PASS: LDT code segment\n");
+	}
+}

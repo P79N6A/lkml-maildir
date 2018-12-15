@@ -1,0 +1,149 @@
+Date: Sat, 11 Sep 1999 15:43:37 +0200 (CEST)
+From: Andrea Arcangeli <>
+Subject: [patch] smp tlb flushing
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/9/11/54
+
+I don't understand completly why the smp_tlb_flush routines are playing
+with cpu_vm_mask.
+IMHO cpu_vm_mask should simply and only tell on which CPU a certain
+mm_struct is running on. It should tell on which CPUs current->active_mm
+is equal to the mm where we reading mm->cpu_vm_mask.
+This seems to me a sane semantic and it's easy to enforce it by touching
+the cpu-mask bit only while switching_mm in the scheduler code.
+The only detail to care about is to flush in memory the cpu_vm_mask
+changes before switching pgd and first writing the page-table
+changes and then reading the cpu_vm_mask. If some MM will switch CPU while
+we are doing the flush that's not a problem because while changing %%cr3
+such CPU will automatically flush the TLB.
+Currently I believe I am missing something... anyway the below patch seems
+to be fine here on 2-way SMP while running msync and swapouts in loop.
+diff -urN 2.3.18/arch/i386/kernel/irq.c 2.3.18-smpflush2/arch/i386/kernel/irq.c
+--- 2.3.18/arch/i386/kernel/irq.c	Wed Sep  8 00:25:40 1999
++++ 2.3.18-smpflush2/arch/i386/kernel/irq.c	Sat Sep 11 15:35:51 1999
+@@ -151,10 +151,7 @@
+ static inline void check_smp_invalidate(int cpu)
+ {
+ 	if (test_bit(cpu, &smp_invalidate_needed)) {
+-		struct mm_struct *mm = current->mm;
+ 		clear_bit(cpu, &smp_invalidate_needed);
+-		if (mm)
+-			atomic_set_mask(1 << cpu, &mm->cpu_vm_mask);
+ 		local_flush_tlb();
+ 	}
+ }
+diff -urN 2.3.18/arch/i386/kernel/smp.c 2.3.18-smpflush2/arch/i386/kernel/smp.c
+--- 2.3.18/arch/i386/kernel/smp.c	Wed Sep  8 18:18:45 1999
++++ 2.3.18-smpflush2/arch/i386/kernel/smp.c	Sat Sep 11 15:38:22 1999
+@@ -1635,10 +1635,7 @@
+ 			 * Take care of "crossing" invalidates
+ 			 */
+ 			if (test_bit(cpu, &smp_invalidate_needed)) {
+-				struct mm_struct *mm = current->mm;
+ 				clear_bit(cpu, &smp_invalidate_needed);
+-				if (mm)
+-					atomic_set_mask(1 << cpu, &mm->cpu_vm_mask);
+ 				local_flush_tlb();
+ 			}
+ 			--stuck;
+@@ -1660,39 +1657,33 @@
+  */	
+ void flush_tlb_current_task(void)
+ {
+-	unsigned long vm_mask = 1 << current->processor;
+-	struct mm_struct *mm = current->mm;
+-	unsigned long cpu_mask = mm->cpu_vm_mask & ~vm_mask;
++	unsigned long cpu_mask;
+ 
+-	mm->cpu_vm_mask = vm_mask;
++	mb();
++	cpu_mask = current->mm->cpu_vm_mask & ~(1 << smp_processor_id());
+ 	flush_tlb_others(cpu_mask);
+ 	local_flush_tlb();
+ }
+ 
+ void flush_tlb_mm(struct mm_struct * mm)
+ {
+-	unsigned long vm_mask = 1 << current->processor;
+-	unsigned long cpu_mask = mm->cpu_vm_mask & ~vm_mask;
++	unsigned long cpu_mask;
+ 
+-	mm->cpu_vm_mask = 0;
+-	if (current->active_mm == mm) {
+-		mm->cpu_vm_mask = vm_mask;
++	mb();
++	cpu_mask = mm->cpu_vm_mask & ~(1 << smp_processor_id());
++	if (current->active_mm == mm)
+ 		local_flush_tlb();
+-	}
+ 	flush_tlb_others(cpu_mask);
+ }
+ 
+ void flush_tlb_page(struct vm_area_struct * vma, unsigned long va)
+ {
+-	unsigned long vm_mask = 1 << current->processor;
+-	struct mm_struct *mm = vma->vm_mm;
+-	unsigned long cpu_mask = mm->cpu_vm_mask & ~vm_mask;
++	unsigned long cpu_mask;
+ 
+-	mm->cpu_vm_mask = 0;
+-	if (current->active_mm == mm) {
++	mb();
++	cpu_mask = vma->vm_mm->cpu_vm_mask & ~(1 << smp_processor_id());
++	if (current->active_mm == vma->vm_mm)
+ 		__flush_tlb_one(va);
+-		mm->cpu_vm_mask = vm_mask;
+-	}
+ 	flush_tlb_others(cpu_mask);
+ }
+ 
+@@ -1934,12 +1925,8 @@
+ 	struct task_struct *tsk = current;
+ 	unsigned int cpu = tsk->processor;
+ 
+-	if (test_and_clear_bit(cpu, &smp_invalidate_needed)) {
+-		struct mm_struct *mm = tsk->mm;
+-		if (mm)
+-			atomic_set_mask(1 << cpu, &mm->cpu_vm_mask);
++	if (test_and_clear_bit(cpu, &smp_invalidate_needed))
+ 		local_flush_tlb();
+-	}
+ 	ack_APIC_irq();
+ 
+ }
+diff -urN 2.3.18/include/asm-i386/mmu_context.h 2.3.18-smpflush2/include/asm-i386/mmu_context.h
+--- 2.3.18/include/asm-i386/mmu_context.h	Fri Sep 10 22:11:40 1999
++++ 2.3.18-smpflush2/include/asm-i386/mmu_context.h	Sat Sep 11 15:41:06 1999
+@@ -12,7 +12,6 @@
+ 
+ static inline void switch_mm(struct mm_struct *prev, struct mm_struct *next, struct task_struct *tsk, unsigned cpu)
+ {
+-
+ 	if (prev != next) {
+ 		/*
+ 		 * Re-load LDT if necessary
+@@ -20,11 +19,13 @@
+ 		if (prev->segments != next->segments)
+ 			load_LDT(next);
+ 
++		clear_bit(cpu, &prev->cpu_vm_mask);
++		set_bit(cpu, &next->cpu_vm_mask);
++		/* on i386 set_bit also reoder memory accesses on the CPU */
++
+ 		/* Re-load page tables */
+ 		asm volatile("movl %0,%%cr3": :"r" (__pa(next->pgd)));
+-		clear_bit(cpu, &prev->cpu_vm_mask);
+ 	}
+-	set_bit(cpu, &next->cpu_vm_mask);
+ }
+ 
+ #define activate_mm(prev, next) \
+Andrea
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

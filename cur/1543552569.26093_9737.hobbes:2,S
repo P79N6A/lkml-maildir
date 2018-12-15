@@ -1,0 +1,258 @@
+Date: Wed, 25 Oct 2000 14:44:58 -0400 (EDT)
+From: Alexander Viro <>
+Subject: Re: PATCH: killing read_ahead[]
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/10/25/114
+
+On Wed, 25 Oct 2000, Alexander Viro wrote:
+> I can do the proof-of-concept patch (below 10Kb, ext2 + generic code, with
+> the need to repeat the fs-specific parts for other filesystems) in an
+> hour. Clearance?
+OK, it didn't take an hour. Warning: completely untested, needs
+(trivial) changes to other filesystems.
+Rules: when you change i_size for inode with non-trivial ->a_ops -
+either call update_cached_size(inode) or do the equivalent by hands
+(e.g. generic_commit_write have to mess with i_size value to update the
+->size_in_pages and ->last_page_size - we already have them calculated).
+Ditto for the places where you set ->a_ops.
+Invariants:
+	inode->i_mapping->size_in_pages ==
+ (inode->i_size + PAGE_CACHE_SIZE - 1)>>PAGE_CACHE_SHIFT;
+	inode->i_size == ((....->size_in_pages-1)<<PAGE_CACHE_SHIFT) +
+....->last_page_size;
+Linus, what do you think about that? I can do the remaining filesystems
+and give it initial testing today.
+diff -urN rc10-pre5/fs/buffer.c rc10-pre5-size_in_pages/fs/buffer.c
+--- rc10-pre5/fs/buffer.c	Tue Oct 24 01:27:28 2000
++++ rc10-pre5-size_in_pages/fs/buffer.c	Wed Oct 25 17:46:25 2000
+@@ -1751,6 +1751,9 @@
+ 	kunmap(page);
+ 	if (pos > inode->i_size) {
+ 		inode->i_size = pos;
++		/* to is always positive */
++		page->mapping->size_in_pages = page->index+1;
++		page->mapping->last_page_size = to;
+ 		mark_inode_dirty(inode);
+ 	}
+ 	return 0;
+@@ -1835,19 +1838,22 @@
+ int block_write_full_page(struct page *page, get_block_t *get_block)
+ {
+ 	struct inode *inode = (struct inode*)page->mapping->host;
+-	unsigned long end_index = inode->i_size >> PAGE_CACHE_SHIFT;
++	unsigned long end_index = page->mapping->size_in_pages;
+ 	unsigned offset;
+ 	int err;
+ 
+ 	/* easy case */
+-	if (page->index < end_index)
+-		return __block_write_full_page(inode, page, get_block);
+-
+-	/* things got complicated... */
+-	offset = inode->i_size & (PAGE_CACHE_SIZE-1);
++	if (page->index+1 < end_index)
++		goto easy;
+ 	/* OK, are we completely out? */
+-	if (page->index >= end_index+1 || !offset)
++	if (page->index+1 > end_index)
+ 		return -EIO;
++
++	offset = inode->i_mapping->last_page_size;
++	/* Another easy case - 'partial' page is not */
++	if (offset == PAGE_CACHE_SIZE)
++		goto easy;
++
+ 	/* Sigh... will have to work, then... */
+ 	err = __block_prepare_write(inode, page, 0, offset, get_block);
+ 	if (!err) {
+@@ -1860,6 +1866,8 @@
+ 	}
+ 	ClearPageUptodate(page);
+ 	goto done;
++easy:
++	return __block_write_full_page(inode, page, get_block);
+ }
+ 
+ int generic_block_bmap(struct address_space *mapping, long block, get_block_t *get_block)
+diff -urN rc10-pre5/fs/ext2/inode.c rc10-pre5-size_in_pages/fs/ext2/inode.c
+--- rc10-pre5/fs/ext2/inode.c	Wed Oct  4 03:44:54 2000
++++ rc10-pre5-size_in_pages/fs/ext2/inode.c	Wed Oct 25 17:41:24 2000
+@@ -54,6 +54,8 @@
+ 	mark_inode_dirty(inode);
+ 	ext2_update_inode(inode, IS_SYNC(inode));
+ 	inode->i_size = 0;
++	inode.i_data->size_in_pages = 0;
++	inode.i_data->last_page_size = PAGE_CACHE_SIZE;
+ 	if (inode->i_blocks)
+ 		ext2_truncate (inode);
+ 	ext2_free_inode (inode);
+@@ -1063,6 +1065,7 @@
+ 		inode->i_op = &ext2_file_inode_operations;
+ 		inode->i_fop = &ext2_file_operations;
+ 		inode->i_mapping->a_ops = &ext2_aops;
++		update_cached_size(inode);
+ 	} else if (S_ISDIR(inode->i_mode)) {
+ 		inode->i_op = &ext2_dir_inode_operations;
+ 		inode->i_fop = &ext2_dir_operations;
+@@ -1072,6 +1075,7 @@
+ 		else {
+ 			inode->i_op = &page_symlink_inode_operations;
+ 			inode->i_mapping->a_ops = &ext2_aops;
++			update_cached_size(inode);
+ 		}
+ 	} else 
+ 		init_special_inode(inode, inode->i_mode,
+diff -urN rc10-pre5/fs/inode.c rc10-pre5-size_in_pages/fs/inode.c
+--- rc10-pre5/fs/inode.c	Tue Oct 24 01:27:29 2000
++++ rc10-pre5-size_in_pages/fs/inode.c	Wed Oct 25 17:39:28 2000
+@@ -529,6 +529,8 @@
+ 	inode->i_bdev = NULL;
+ 	inode->i_data.a_ops = &empty_aops;
+ 	inode->i_data.host = (void*)inode;
++	inode->i_data.size_in_pages = 0;
++	inode->i_data.last_page_size = PAGE_CACHE_SIZE;
+ 	inode->i_mapping = &inode->i_data;
+ }
+ 
+diff -urN rc10-pre5/include/linux/fs.h rc10-pre5-size_in_pages/include/linux/fs.h
+--- rc10-pre5/include/linux/fs.h	Tue Oct 24 01:27:36 2000
++++ rc10-pre5-size_in_pages/include/linux/fs.h	Wed Oct 25 17:31:40 2000
+@@ -366,6 +366,8 @@
+ 	struct vm_area_struct	*i_mmap;	/* list of private mappings */
+ 	struct vm_area_struct	*i_mmap_shared; /* list of shared mappings */
+ 	spinlock_t		i_shared_lock;  /* and spinlock protecting it */
++	unsigned long		size_in_pages;
++	unsigned		last_page_size;
+ };
+ 
+ struct block_device {
+@@ -456,6 +458,16 @@
+ #define I_LOCK		2
+ #define I_FREEING	4
+ #define I_CLEAR		8
++
++static inline void update_cached_size(struct inode *inode)
++{
++	loff_t size = inode->i_size;
++	inode->i_mapping.size_in_pages =
++			(size + PAGE_CACHE_SIZE - 1) >> PAGE_CACHE_SHIFT;
++	if ((size &= ~PAGE_CACHE_MASK) == 0)
++		size = PAGE_CACHE_SIZE;
++	inode->i_mapping.last_page_size = size;
++}
+ 
+ extern void __mark_inode_dirty(struct inode *);
+ static inline void mark_inode_dirty(struct inode *inode)
+diff -urN rc10-pre5/mm/filemap.c rc10-pre5-size_in_pages/mm/filemap.c
+--- rc10-pre5/mm/filemap.c	Tue Oct 24 01:27:38 2000
++++ rc10-pre5-size_in_pages/mm/filemap.c	Wed Oct 25 17:43:01 2000
+@@ -429,8 +429,7 @@
+  */
+ static inline int page_cache_read(struct file * file, unsigned long offset) 
+ {
+-	struct inode *inode = file->f_dentry->d_inode;
+-	struct address_space *mapping = inode->i_mapping;
++	struct address_space *mapping = file->f_dentry->d_inode->i_mapping;
+ 	struct page **hash = page_hash(mapping, offset);
+ 	struct page *page; 
+ 
+@@ -633,8 +632,7 @@
+  */
+ static void drop_behind(struct file * file, unsigned long index)
+ {
+-	struct inode *inode = file->f_dentry->d_inode;
+-	struct address_space *mapping = inode->i_mapping;
++	struct address_space *mapping = file->f_dentry->d_inode->i_mapping;
+ 	struct page **hash;
+ 	struct page *page;
+ 	unsigned long start;
+@@ -794,7 +792,7 @@
+ 	struct file * filp, struct inode * inode,
+ 	struct page * page)
+ {
+-	unsigned long end_index = inode->i_size >> PAGE_CACHE_SHIFT;
++	unsigned long end_index = inode->i_mapping->size_in_pages;
+ 	unsigned long index = page->index;
+ 	unsigned long max_ahead, ahead;
+ 	unsigned long raend;
+@@ -819,8 +817,8 @@
+ 			filp->f_rawin = 0;
+ 			filp->f_ralen = 1;
+ 			if (!max_ahead) {
+-				filp->f_raend  = index + filp->f_ralen;
+-				filp->f_rawin += filp->f_ralen;
++				filp->f_raend = index + 1;
++				filp->f_rawin = 1;
+ 			}
+ 		}
+ 	}
+@@ -966,14 +964,14 @@
+ 
+ 	for (;;) {
+ 		struct page *page, **hash;
+-		unsigned long end_index, nr;
++		unsigned nr;
+ 
+-		end_index = inode->i_size >> PAGE_CACHE_SHIFT;
+-		if (index > end_index)
++		if (index >= mapping->size_in_pages)
+ 			break;
++
+ 		nr = PAGE_CACHE_SIZE;
+-		if (index == end_index) {
+-			nr = inode->i_size & ~PAGE_CACHE_MASK;
++		if (index == mapping->size_in_pages - 1) {
++			nr = mapping->last_page_size;
+ 			if (nr <= offset)
+ 				break;
+ 		}
+@@ -1328,10 +1326,9 @@
+ {
+ 	int error;
+ 	struct file *file = area->vm_file;
+-	struct inode *inode = file->f_dentry->d_inode;
+-	struct address_space *mapping = inode->i_mapping;
++	struct address_space *mapping = file->f_dentry->d_inode->i_mapping;
+ 	struct page *page, **hash, *old_page;
+-	unsigned long size = (inode->i_size + PAGE_CACHE_SIZE - 1) >> PAGE_CACHE_SHIFT;
++	unsigned long size = mapping->size_in_pages;
+ 
+ 	unsigned long pgoff = ((address - area->vm_start) >> PAGE_CACHE_SHIFT) + area->vm_pgoff;
+ 
+@@ -1910,8 +1907,7 @@
+ 	if (!vma->vm_file)
+ 		return error;
+ 	file = vma->vm_file;
+-	size = (file->f_dentry->d_inode->i_size + PAGE_CACHE_SIZE - 1) >>
+-							PAGE_CACHE_SHIFT;
++	size = file->f_dentry->d_inode->i_mapping->size_in_pages;
+ 
+ 	start = ((start - vma->vm_start) >> PAGE_SHIFT) + vma->vm_pgoff;
+ 	if (end > vma->vm_end)
+diff -urN rc10-pre5/mm/memory.c rc10-pre5-size_in_pages/mm/memory.c
+--- rc10-pre5/mm/memory.c	Tue Oct 24 01:27:38 2000
++++ rc10-pre5-size_in_pages/mm/memory.c	Wed Oct 25 17:44:14 2000
+@@ -979,6 +979,7 @@
+ 	if (inode->i_size < offset)
+ 		goto do_expand;
+ 	inode->i_size = offset;
++	update_cached_size(inode);
+ 	truncate_inode_pages(mapping, offset);
+ 	spin_lock(&mapping->i_shared_lock);
+ 	if (!mapping->i_mmap && !mapping->i_mmap_shared)
+@@ -1013,6 +1014,7 @@
+ 		}
+ 	}
+ 	inode->i_size = offset;
++	update_cached_size(inode);
+ 	if (inode->i_op && inode->i_op->truncate)
+ 		inode->i_op->truncate(inode);
+ out:
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+Please read the FAQ at 
+http://www.tux.org/lkml/

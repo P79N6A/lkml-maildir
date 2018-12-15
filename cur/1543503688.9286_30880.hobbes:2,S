@@ -1,0 +1,267 @@
+Date: Fri, 23 Jul 1999 02:48:51 -0500 (CDT)
+From: Tim Hockin <>
+Subject: Patch: CLONE_PPID, CLONE_WAIT, CLONE_SUSPENDED
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/7/23/21
+
+Here is the result of all the various inputs on CLONE_PPID/CLONE_PPIDOK,
+CLONE_WAIT, and CLONE_SUSPENDED.  
+Comments?
+diff -ru clean-linux-2.2.10/fs/exec.c linux-2.2.10/fs/exec.c
+--- clean-linux-2.2.10/fs/exec.c	Sun Jun 13 10:50:04 1999
++++ linux-2.2.10/fs/exec.c	Thu Jul 22 03:17:00 1999
+@@ -846,9 +846,12 @@
+ 
+ 	if (retval >= 0)
+ 		retval = search_binary_handler(&bprm,regs);
+-	if (retval >= 0)
++	if (retval >= 0) {
++		/* clear any thread-special bits - JIC */
++		current->flags &= ~(PF_PPIDOK | PF_CLWAIT);
+ 		/* execve success */
+ 		return retval;
++	}
+ 
+ 	/* Something went wrong, return the inode and free the argument pages*/
+ 	if (bprm.dentry)
+diff -ru clean-linux-2.2.10/include/linux/sched.h linux-2.2.10/include/linux/sched.h
+--- clean-linux-2.2.10/include/linux/sched.h	Tue May 11 10:35:45 1999
++++ linux-2.2.10/include/linux/sched.h	Thu Jul 22 02:51:17 1999
+@@ -34,6 +34,10 @@
+ #define CLONE_PID	0x00001000	/* set if pid shared */
+ #define CLONE_PTRACE	0x00002000	/* set if we want to let tracing continue on the child too */
+ #define CLONE_VFORK	0x00004000	/* set if the parent wants the child to wake it up on mm_release */
++#define CLONE_PPIDOK	0x00008000	/* set if the child should be able to create siblings */
++#define CLONE_PPID	0x00010000	/* set if we want to create a sibling, not a child */
++#define CLONE_WAIT 	0x00020000	/* set if child is allowed to wait() for siblings */
++#define CLONE_SUSPENDED	0x00040000	/* create a process in the stopped state */
+ 
+ /*
+  * These are the constant used to fake the fixed-point load-average
+@@ -332,6 +336,8 @@
+ 
+ #define PF_USEDFPU	0x00100000	/* task used FPU this quantum (SMP) */
+ #define PF_DTRACE	0x00200000	/* delayed trace (used on m68k, i386) */
++#define PF_PPIDOK	0x00400000	/* task is allowed to use CLONE_PPID */
++#define PF_CLWAIT	0x00800000	/* allowed to wait for siblings */
+ 
+ /*
+  * Limit the stack by to some sane default: root can always
+diff -ru clean-linux-2.2.10/kernel/exit.c linux-2.2.10/kernel/exit.c
+--- clean-linux-2.2.10/kernel/exit.c	Fri Apr 30 08:13:37 1999
++++ linux-2.2.10/kernel/exit.c	Fri Jul 23 01:20:13 1999
+@@ -403,76 +403,90 @@
+ 	do_exit((error_code&0xff)<<8);
+ }
+ 
++/* to get around the ugly macro below */
++static inline void wait4_audit_ptree()
++{
++#ifdef DEBUG_PROC_TREE
++	audit_ptree();
++#endif
++}
++
++#define SYS_WAIT4_SEARCH(start_task)					\
++ 	for (p = (start_task); p ; p = p->p_osptr) {			\
++		if (pid>0) {						\
++			if (p->pid != pid || current->pid == pid)	\
++				continue;				\
++		} else if (!pid) {					\
++			if (p->pgrp != current->pgrp)			\
++				continue;				\
++		} else if (pid != -1) {					\
++			if (p->pgrp != -pid)				\
++				continue;				\
++		}							\
++		/* wait for cloned processes iff the __WCLONE flag is set */ \
++		if ((p->exit_signal != SIGCHLD) ^ ((options & __WCLONE) != 0)) \
++			continue;					\
++		flag = 1;						\
++		switch (p->state) {					\
++			case TASK_STOPPED:				\
++				if (!p->exit_code)			\
++					continue;			\
++				if (!(options & WUNTRACED) && !(p->flags & PF_PTRACED)) \
++					continue;			\
++				read_unlock(&tasklist_lock);		\
++				retval = ru ? getrusage(p, RUSAGE_BOTH, ru) : 0; \
++				if (!retval && stat_addr) 		\
++					retval = put_user((p->exit_code << 8) | 0x7f, stat_addr); \
++				if (!retval) {				\
++					p->exit_code = 0;		\
++					retval = p->pid;		\
++				}					\
++				goto end_wait4;				\
++			case TASK_ZOMBIE:				\
++				current->times.tms_cutime += p->times.tms_utime + p->times.tms_cutime; \
++				current->times.tms_cstime += p->times.tms_stime + p->times.tms_cstime; \
++				read_unlock(&tasklist_lock);		\
++				retval = ru ? getrusage(p, RUSAGE_BOTH, ru) : 0; \
++				if (!retval && stat_addr)		\
++					retval = put_user(p->exit_code, stat_addr); \
++				if (retval)				\
++					goto end_wait4; 		\
++				retval = p->pid;			\
++				if (p->p_opptr != p->p_pptr) {		\
++					write_lock_irq(&tasklist_lock);	\
++					REMOVE_LINKS(p);		\
++					p->p_pptr = p->p_opptr;		\
++					SET_LINKS(p);			\
++					write_unlock_irq(&tasklist_lock); \
++					notify_parent(p, SIGCHLD);	\
++				} else					\
++					release(p);			\
++				wait4_audit_ptree();			\
++				goto end_wait4;				\
++			default:					\
++				continue;				\
++		}							\
++	}								\
++
+ asmlinkage int sys_wait4(pid_t pid,unsigned int * stat_addr, int options, struct rusage * ru)
+ {
+ 	int flag, retval;
+ 	struct wait_queue wait = { current, NULL };
++	struct wait_queue wait_sib = { current, NULL };
+ 	struct task_struct *p;
+ 
+ 	if (options & ~(WNOHANG|WUNTRACED|__WCLONE))
+ 		return -EINVAL;
+ 
+ 	add_wait_queue(&current->wait_chldexit,&wait);
++	if (current->flags & PF_CLWAIT) 
++		add_wait_queue(&current->p_pptr->wait_chldexit,&wait_sib);
+ repeat:
+ 	flag = 0;
+ 	read_lock(&tasklist_lock);
+- 	for (p = current->p_cptr ; p ; p = p->p_osptr) {
+-		if (pid>0) {
+-			if (p->pid != pid)
+-				continue;
+-		} else if (!pid) {
+-			if (p->pgrp != current->pgrp)
+-				continue;
+-		} else if (pid != -1) {
+-			if (p->pgrp != -pid)
+-				continue;
+-		}
+-		/* wait for cloned processes iff the __WCLONE flag is set */
+-		if ((p->exit_signal != SIGCHLD) ^ ((options & __WCLONE) != 0))
+-			continue;
+-		flag = 1;
+-		switch (p->state) {
+-			case TASK_STOPPED:
+-				if (!p->exit_code)
+-					continue;
+-				if (!(options & WUNTRACED) && !(p->flags & PF_PTRACED))
+-					continue;
+-				read_unlock(&tasklist_lock);
+-				retval = ru ? getrusage(p, RUSAGE_BOTH, ru) : 0; 
+-				if (!retval && stat_addr) 
+-					retval = put_user((p->exit_code << 8) | 0x7f, stat_addr);
+-				if (!retval) {
+-					p->exit_code = 0;
+-					retval = p->pid;
+-				}
+-				goto end_wait4;
+-			case TASK_ZOMBIE:
+-				current->times.tms_cutime += p->times.tms_utime + p->times.tms_cutime;
+-				current->times.tms_cstime += p->times.tms_stime + p->times.tms_cstime;
+-				read_unlock(&tasklist_lock);
+-				retval = ru ? getrusage(p, RUSAGE_BOTH, ru) : 0;
+-				if (!retval && stat_addr)
+-					retval = put_user(p->exit_code, stat_addr);
+-				if (retval)
+-					goto end_wait4; 
+-				retval = p->pid;
+-				if (p->p_opptr != p->p_pptr) {
+-					write_lock_irq(&tasklist_lock);
+-					REMOVE_LINKS(p);
+-					p->p_pptr = p->p_opptr;
+-					SET_LINKS(p);
+-					write_unlock_irq(&tasklist_lock);
+-					notify_parent(p, SIGCHLD);
+-				} else
+-					release(p);
+-#ifdef DEBUG_PROC_TREE
+-				audit_ptree();
+-#endif
+-				goto end_wait4;
+-			default:
+-				continue;
+-		}
+-	}
++	SYS_WAIT4_SEARCH(current->p_cptr);
++	if (!flag && (current->flags & PF_CLWAIT)) 
++		SYS_WAIT4_SEARCH(current->p_pptr->p_cptr);
+ 	read_unlock(&tasklist_lock);
+ 	if (flag) {
+ 		retval = 0;
+@@ -488,6 +502,8 @@
+ 	retval = -ECHILD;
+ end_wait4:
+ 	remove_wait_queue(&current->wait_chldexit,&wait);
++	if (current->flags & PF_CLWAIT) 
++		remove_wait_queue(&current->p_pptr->wait_chldexit,&wait_sib);
+ 	return retval;
+ }
+ 
+diff -ru clean-linux-2.2.10/kernel/fork.c linux-2.2.10/kernel/fork.c
+--- clean-linux-2.2.10/kernel/fork.c	Mon Apr 12 12:44:26 1999
++++ linux-2.2.10/kernel/fork.c	Thu Jul 22 02:57:29 1999
+@@ -517,12 +517,18 @@
+ {
+ 	unsigned long new_flags = p->flags;
+ 
+-	new_flags &= ~(PF_SUPERPRIV | PF_USEDFPU | PF_VFORK);
++	new_flags &= ~(PF_SUPERPRIV | PF_USEDFPU | PF_VFORK 
++		       | PF_PPIDOK | PF_CLWAIT);
+ 	new_flags |= PF_FORKNOEXEC;
+ 	if (!(clone_flags & CLONE_PTRACE))
+ 		new_flags &= ~(PF_PTRACED|PF_TRACESYS);
+ 	if (clone_flags & CLONE_VFORK)
+ 		new_flags |= PF_VFORK;
++	if (clone_flags & CLONE_PPIDOK)
++		new_flags |= PF_PPIDOK;
++	if (clone_flags & CLONE_WAIT)
++		new_flags |= PF_CLWAIT;
++
+ 	p->flags = new_flags;
+ }
+ 
+@@ -587,7 +593,13 @@
+ 	p->next_run = p;
+ 	p->prev_run = p;
+ 
+-	p->p_pptr = p->p_opptr = current;
++	if (!(clone_flags & CLONE_PPID)) {
++		p->p_pptr = p->p_opptr = current;
++	} else if (current->flags & PF_PPIDOK) {
++		p->p_pptr = p->p_opptr = current->p_opptr;
++	} else {
++		goto bad_fork_cleanup;
++	}
+ 	p->p_cptr = NULL;
+ 	init_waitqueue(&p->wait_chldexit);
+ 	p->vfork_sem = NULL;
+@@ -668,7 +680,10 @@
+ 
+ 		p->next_run = NULL;
+ 		p->prev_run = NULL;
+-		wake_up_process(p);		/* do this last */
++		if (!(clone_flags & CLONE_SUSPENDED))
++			wake_up_process(p);	/* do this last */
++		else
++			p->state = TASK_STOPPED;
+ 	}
+ 	++total_forks;
+ bad_fork:
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

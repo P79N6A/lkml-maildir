@@ -1,0 +1,88 @@
+Date: Fri, 04 Mar 2005 19:54:45 +0000
+From: "Stephen C. Tweedie" <>
+Subject: [RFC] ext3/jbd race: releasing in-use journal_heads
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2005/3/4/283
+
+Hi all,
+For the past few months there has been a slow but steady trickle of
+reports of oopses in kjournald.  Recently I got a couple of reports that
+were repeatable enough to rerun with extra debugging code.
+It turns out that we're releasing a journal_head while it is still
+linked onto the transaction's t_locked_list.  The exact location is in
+journal_unmap_buffer().  On several exit paths, that does:
+		spin_unlock(&journal->j_list_lock); 
+		jbd_unlock_bh_state(bh);
+		spin_unlock(&journal->j_state_lock);
+		journal_put_journal_head(jh);
+releasing the jh *after* dropping the j_list_lock and j_state_lock.
+kjournald can then be doing journal_commit_transaction():
+	spin_lock(&journal->j_list_lock);
+...
+		if (buffer_locked(bh)) {
+			BUFFER_TRACE(bh, "locked");
+			if (!inverted_lock(journal, bh))
+				goto write_out_data;
+			__journal_unfile_buffer(jh);
+			__journal_file_buffer(jh, commit_transaction,
+						BJ_Locked);
+			jbd_unlock_bh_state(bh);
+The problem happens if journal_unmap_buffer()'s own put_journal_head()
+manages to get in between kjournald's *unfile_buffer and the following
+*file_buffer.  Because journal_unmap_buffer() has dropped its bh_state
+lock by this point, there's nothing to prevent this, leading to a
+variety of unpleasant situations.  In particular, the jh is unfiled at
+this point, so there's nothing to stop the put_journal_head() from
+freeing the memory we're just about to link onto the BJ_Locked list.
+I _think_ that the attached patch deals with this, but I'm still
+awaiting further testing to be sure.  I thought I might as well get some
+other ext3 eyes on it while I wait for that -- I'll let you know as soon
+as I hear back from the other testing.
+The patch works by making sure that the various exits from
+journal_unmap_buffer() always call journal_put_journal_head() *before*
+unlocking the j_list_lock.  This is correct according to the documented
+lock ranking, and it also matches the order in the existing main exit
+path at the end of the function.
+Cheers,
+  Stephen
+--- linux-2.6-ext3/fs/jbd/transaction.c.=K0000=.orig
++++ linux-2.6-ext3/fs/jbd/transaction.c
+@@ -1775,10 +1775,10 @@ static int journal_unmap_buffer(journal_
+ 			JBUFFER_TRACE(jh, "checkpointed: add to BJ_Forget");
+ 			ret = __dispose_buffer(jh,
+ 					journal->j_running_transaction);
++			journal_put_journal_head(jh);
+ 			spin_unlock(&journal->j_list_lock);
+ 			jbd_unlock_bh_state(bh);
+ 			spin_unlock(&journal->j_state_lock);
+-			journal_put_journal_head(jh);
+ 			return ret;
+ 		} else {
+ 			/* There is no currently-running transaction. So the
+@@ -1789,10 +1789,10 @@ static int journal_unmap_buffer(journal_
+ 				JBUFFER_TRACE(jh, "give to committing trans");
+ 				ret = __dispose_buffer(jh,
+ 					journal->j_committing_transaction);
++				journal_put_journal_head(jh);
+ 				spin_unlock(&journal->j_list_lock);
+ 				jbd_unlock_bh_state(bh);
+ 				spin_unlock(&journal->j_state_lock);
+-				journal_put_journal_head(jh);
+ 				return ret;
+ 			} else {
+ 				/* The orphan record's transaction has
+@@ -1813,10 +1813,10 @@ static int journal_unmap_buffer(journal_
+ 					journal->j_running_transaction);
+ 			jh->b_next_transaction = NULL;
+ 		}
++		journal_put_journal_head(jh);
+ 		spin_unlock(&journal->j_list_lock);
+ 		jbd_unlock_bh_state(bh);
+ 		spin_unlock(&journal->j_state_lock);
+-		journal_put_journal_head(jh);
+ 		return 0;
+ 	} else {
+ 		/* Good, the buffer belongs to the running transaction.

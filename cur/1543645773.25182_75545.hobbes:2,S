@@ -1,0 +1,263 @@
+Date: 01 Oct 2002 16:55:35 -0700
+From: Michael Hohnbaum <>
+Subject: [RFC] Simple NUMA scheduler patch
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2002/10/1/387
+
+Attached is a patch which provides a rudimentary NUMA scheduler.
+This patch basically does two things:
+* at exec() it finds the least loaded CPU to assign a task to;
+* at load_balance() (find_busiest_queue() actually) it favors 
+  cpus on the same node for taking tasks from.
+This has been tested on the IA32 based NUMAQ platform and shows
+performance gains for kernbench.  Various microbenchmarks also 
+show improvements and stickiness of processes to nodes.  Profiles
+show that the kernbench performance improvements are directly 
+attributable to the use of local memory caused by tasks running
+on the same node through their lifetime.
+I will be doing much more testing of this, and likely will be
+tweaking some of the algorithms based upon test results.  Any
+comments, suggestions, flames are welcome.
+Patch applies to 2.5.40 and makes use of the new NUMA topology
+API.  This scheduler change should work on other NUMA platforms
+with just the definition of the architecture specific macros in
+topology.h.
+-- 
+Michael Hohnbaum                      503-578-5486
+hohnbaum@us.ibm.com                   T/L 775-5486
+--- clean-2.5.40/kernel/sched.c	Tue Oct  1 13:48:34 2002
++++ linux-2.5.40/kernel/sched.c	Tue Oct  1 13:27:46 2002
+@@ -30,6 +30,9 @@
+ #include <linux/notifier.h>
+ #include <linux/delay.h>
+ #include <linux/timer.h>
++#if CONFIG_NUMA
++#include <asm/topology.h>
++#endif
+ 
+ /*
+  * Convert user-nice values [ -20 ... 0 ... 19 ]
+@@ -632,6 +635,121 @@ static inline unsigned int double_lock_b
+ 	return nr_running;
+ }
+ 
++#if CONFIG_NUMA
++/*
++ * find_busiest_queue - find the busiest runqueue.
++ */
++static inline runqueue_t *find_busiest_queue(runqueue_t *this_rq, int this_cpu, int idle, int *imbalance)
++{
++	int nr_running, load, max_load_on_node, max_load_off_node, i;
++	runqueue_t *busiest, *busiest_on_node, *busiest_off_node, *rq_src;
++
++	/*
++	 * We must look at each runqueue to update prev_nr_running.
++	 * As we do so, we find the busiest runqueue on the same
++	 * node, and the busiest runqueue off the node.  After
++	 * determining the busiest from each we first see if the
++	 * busiest runqueue on node meets the imbalance criteria.
++	 * If not, then we check the off queue runqueue.  Note that
++	 * we require a higher level of imbalance for choosing an
++	 * off node runqueue.
++	 *
++	 * For off-node, we only move at most one process, so imbalance
++	 * is always set to one for off-node runqueues.
++	 * 
++	 * We do this lockless to reduce cache-bouncing overhead,
++	 * we re-check the 'best' source CPU later on again, with
++	 * the lock held.
++	 *
++	 * Note that this routine is called with the current runqueue
++	 * locked, and if a runqueue is found (return != NULL), then
++	 * that runqueue is returned locked, also.
++	 *
++	 * We fend off statistical fluctuations in runqueue lengths by
++	 * saving the runqueue length during the previous load-balancing
++	 * operation and using the smaller one the current and saved lengths.
++	 * If a runqueue is long enough for a longer amount of time then
++	 * we recognize it and pull tasks from it.
++	 *
++	 * The 'current runqueue length' is a statistical maximum variable,
++	 * for that one we take the longer one - to avoid fluctuations in
++	 * the other direction. So for a load-balance to happen it needs
++	 * stable long runqueue on the target CPU and stable short runqueue
++	 * on the local runqueue.
++	 *
++	 * We make an exception if this CPU is about to become idle - in
++	 * that case we are less picky about moving a task across CPUs and
++	 * take what can be taken.
++	 */
++	if (idle || (this_rq->nr_running > this_rq->prev_nr_running[this_cpu]))
++		nr_running = this_rq->nr_running;
++	else
++		nr_running = this_rq->prev_nr_running[this_cpu];
++	if (nr_running < 1)
++		nr_running = 1;
++
++	busiest_on_node = NULL;
++	busiest_off_node = NULL;
++	busiest = NULL;
++	max_load_on_node = 1;
++	max_load_off_node = 1;
++	
++	for (i = 0; i < NR_CPUS; i++) {
++		if (!cpu_online(i))
++			continue;
++
++		rq_src = cpu_rq(i);
++		if (idle || (rq_src->nr_running < this_rq->prev_nr_running[i]))
++			load = rq_src->nr_running;
++		else
++			load = this_rq->prev_nr_running[i];
++
++		this_rq->prev_nr_running[i] = rq_src->nr_running;
++
++		if (__cpu_to_node(i) == __cpu_to_node(this_cpu)) {
++			if ((load > max_load_on_node) && (rq_src != this_rq)) {
++				busiest_on_node = rq_src;
++				max_load_on_node = load;
++			}
++		} else {
++			if (load > max_load_off_node)  {
++				busiest_off_node = rq_src;
++				max_load_off_node = load;
++			}
++		}
++	}
++	if (busiest_on_node) {
++		/* on node balancing happens if there is > 125% difference */
++		if (idle || ((nr_running*5)/4 < max_load_on_node)) {
++			busiest = busiest_on_node;
++			*imbalance = (max_load_on_node - nr_running) / 2;
++		}
++	}
++	if (busiest_off_node && !busiest) {
++		/* off node balancing requires 200% difference */
++		if (nr_running*2 >= max_load_off_node) 
++			return NULL;
++		busiest = busiest_off_node; 
++		*imbalance = 1;
++	} 
++	if (busiest) {
++		if (busiest == this_rq) {
++			return NULL;
++		}
++		nr_running = double_lock_balance(this_rq, busiest, this_cpu, idle, nr_running);
++		/*
++		 * Make sure nothing changed since we checked the
++		 * runqueue length.
++		 */
++		if (busiest->nr_running <= nr_running) {
++			spin_unlock(&busiest->lock);
++			busiest = NULL;
++		}
++	}
++	return busiest;
++}
++#else
++
+ /*
+  * find_busiest_queue - find the busiest runqueue.
+  */
+@@ -709,6 +827,7 @@ static inline runqueue_t *find_busiest_q
+ out:
+ 	return busiest;
+ }
++#endif /* CONFIG_NUMA */
+ 
+ /*
+  * pull_task - move a task from a remote runqueue to the local runqueue.
+@@ -2104,6 +2223,65 @@ __init int migration_init(void)
+ spinlock_t kernel_flag __cacheline_aligned_in_smp = SPIN_LOCK_UNLOCKED;
+ #endif
+ 
++#if CONFIG_NUMA
++/*
++ * If dest_cpu is allowed for this process, migrate the task to it.
++ * This is accomplished by forcing the cpu_allowed mask to only
++ * allow dest_cpu, which will force the cpu onto dest_cpu.  Then
++ * the cpu_allowed mask is restored.
++ */
++void sched_migrate_task(task_t *p, int dest_cpu)
++{
++	unsigned long old_mask;
++
++	old_mask = p->cpus_allowed;
++	if (!(old_mask & (1UL << dest_cpu)))
++		return;
++	/* force the process onto the specified CPU */
++	set_cpus_allowed(p, 1UL << dest_cpu);
++
++	/* restore the cpus allowed mask */
++	set_cpus_allowed(p, old_mask);
++}
++
++/*
++ * Find the least loaded CPU.  If the current runqueue is short enough
++ * just use it.
++ */
++static int sched_best_cpu(struct task_struct *p)
++{
++	int i, minload, best_cpu;
++	best_cpu = task_cpu(p);
++	
++	minload = cpu_rq(best_cpu)->nr_running;
++	/* if the current runqueue is only 2 long, don't look elsewhere */
++	if (minload <= 2)
++		return best_cpu;
++
++	for (i = 0; i < NR_CPUS; i++) {
++		if (!cpu_online(i))
++			continue;
++
++		if (minload > cpu_rq(i)->nr_running) {
++			minload = cpu_rq(i)->nr_running;
++			best_cpu = i;
++		}
++	}
++	return best_cpu;
++}
++
++void sched_balance_exec(void)
++{
++	int new_cpu;
++
++	if (numnodes > 1) {
++		new_cpu = sched_best_cpu(current);
++		if (new_cpu != smp_processor_id())
++			sched_migrate_task(current, new_cpu);
++	}
++}
++#endif /* CONFIG_NUMA */
++
+ extern void init_timers(void);
+ 
+ void __init sched_init(void)
+--- clean-2.5.40/fs/exec.c	Tue Oct  1 13:47:58 2002
++++ linux-2.5.40/fs/exec.c	Tue Oct  1 12:55:50 2002
+@@ -1001,6 +1001,8 @@ int do_execve(char * filename, char ** a
+ 	int retval;
+ 	int i;
+ 
++	sched_balance_exec();
++
+ 	file = open_exec(filename);
+ 
+ 	retval = PTR_ERR(file);
+--- clean-2.5.40/include/linux/sched.h	Tue Oct  1 13:48:30 2002
++++ linux-2.5.40/include/linux/sched.h	Tue Oct  1 12:55:51 2002
+@@ -166,6 +166,11 @@ extern void update_one_process(struct ta
+ 			       unsigned long system, int cpu);
+ extern void scheduler_tick(int user_tick, int system);
+ extern unsigned long cache_decay_ticks;
++#ifdef CONFIG_NUMA
++extern void sched_balance_exec(void);
++#else
++#define sched_balance_exec() {}
++#endif
+ 
+ 
+ #define	MAX_SCHEDULE_TIMEOUT	LONG_MAX

@@ -1,0 +1,344 @@
+Date: Sun, 31 Jan 1999 01:08:02 -0700 (MST)
+From: Ely Wilson <>
+Subject: Re: [patch] drivers/net/plip.c
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/1/31/16
+
+On Sat, 30 Jan 1999, Alexander Viro wrote:
+> On Sat, 30 Jan 1999, Ely Wilson wrote:
+> > the driver is *still* broken (as per 2.2.0-final release) and the initial
+> > bugfix (from 2.2.0-pre) did not fix the problem in 2.2.0, what it did was
+> > added a 1 in 4 chance that the code would not faulter.
+> 
+> 	Eli, could you care to show me other 3 of 4? Scenario, please.
+> Could you explain your changes, BTW? I mean, show the finite automate and
+> show disable/enable points on it. I *do* care for plip and aside of It
+> Works For Me (tm) stuff I'ld like to see where had I screwed up in my
+> analisys ;-/
+You caught me! I recount my initial statement, your code is superb, perfect,
+the idiology of all good and true.  My '1 in 4' lectural stupidity was
+brought on by my misunderstanding the state of the irq while in and
+returning from plip_send_packet(), and also not looking at how a failed
+return with a disabled irq would affect future operation of that routine.
+ Let me explain my misunderstanding.
+You enter plip_send_packet from plip_bh, plip_bh then passes the return
+value on to plip_bh_timeout_error for processing.  plip_bh_timeout_error
+then goes on to decide how to handle the error based on the return value and
+responses from the port.
+Ok, I bet that was fun putting together.  Now if plip_send_packet disables
+the irq, and it does, and then exits with a return value of TIMEOUT before
+enabling irq we face the same problem as before your patch.
+Here's what I _thought_ I saw: (*my comments*)
+/* PLIP_SEND_PACKET --- send a packet */
+static int
+plip_send_packet(struct device *dev, struct net_local *nl,
+                 struct plip_local *snd, struct plip_local *rcv)
+{
+        unsigned short data_addr = PAR_DATA(dev);
+        unsigned short nibble_timeout = nl->nibble;
+        unsigned char *lbuf;
+        unsigned char c0;
+        unsigned int cx;
+        if (snd->skb == NULL || (lbuf = snd->skb->data) == NULL) {
+                printk(KERN_DEBUG "%s: send skb lost\n", dev->name);
+                snd->state = PLIP_PK_DONE;
+                snd->skb = NULL;
+                return ERROR;
+        }
+        switch (snd->state) {
+        case PLIP_PK_TRIGGER:
+(*if all is normal the irq is enabled*)
+                if ((inb(PAR_STATUS(dev)) & 0xf8) != 0x80)
+                        return HS_TIMEOUT;
+                /* Trigger remote rx interrupt. */
+                outb(0x08, data_addr);
+                cx = nl->trigger;
+                while (1) {
+                        udelay(PLIP_DELAY_UNIT);
+                        spin_lock_irq(&nl->lock);
+                        if (nl->connection == PLIP_CN_RECEIVE) {
+                                spin_unlock_irq(&nl->lock);
+                                /* Interrupted. */
+                                nl->enet_stats.collisions++;
+(*if all is normal irq is enabled*)
+                                return OK;
+                        }
+                        c0 = inb(PAR_STATUS(dev));
+                        if (c0 & 0x08) {
+                                spin_unlock_irq(&nl->lock);
+                                DISABLE(dev->irq);
+(*get ready to work, we just disabled the irq*)
+                                synchronize_irq();
+                                if (nl->connection == PLIP_CN_RECEIVE) {
+                                        /* Interrupted.
+                                           We don't need to enable irq,
+                                           as it is soon disabled.    */
+                                        /* Yes, we do. New variant of
+                                           {enable,disable}_irq *counts*
+                                           them.  -- AV  */
+(*we know better now, so let's enable teh irq before we return*)
+                                        ENABLE(dev->irq);
+                                        nl->enet_stats.collisions++;
+                                        return OK;
+                                }
+                                outb(PAR_INTR_OFF, PAR_CONTROL(dev));
+                                if (net_debug > 2)
+                                        printk(KERN_DEBUG "%s: send
+start\n", dev->name);
+                                snd->state = PLIP_PK_LENGTH_LSB;
+                                snd->nibble = PLIP_NB_BEGIN;
+                                nl->timeout_count = 0;
+(*here we break from our while() block since that is what we do*)
+                                break;
+                        }
+                        spin_unlock_irq(&nl->lock);
+                        if (--cx == 0) {
+                                outb(0x00, data_addr);
+(*all is normal, irq should be enabled*)
+                                return HS_TIMEOUT;
+                        }
+                }
+        case PLIP_PK_LENGTH_LSB:
+(*all is great, woah! unless plip_send returns TIMEOUT*)
+                if (plip_send(nibble_timeout, data_addr,
+                              &snd->nibble, snd->length.b.lsb))
+                        return TIMEOUT;
+                snd->state = PLIP_PK_LENGTH_MSB;
+        case PLIP_PK_LENGTH_MSB:
+(*all is great, woah! unless plip_send returns TIMEOUT*)
+                 if (plip_send(nibble_timeout, data_addr,
+                              &snd->nibble, snd->length.b.msb))
+                        return TIMEOUT;
+                snd->state = PLIP_PK_DATA;
+                snd->byte = 0;
+                snd->checksum = 0;
+        case PLIP_PK_DATA:
+                do
+ (*all is great, woah! unless plip_send returns TIMEOUT*)
+ 			if (plip_send(nibble_timeout, data_addr,
+                                      &snd->nibble, lbuf[snd->byte]))
+                                return TIMEOUT;
+                while (++snd->byte < snd->length.h);
+                do
+                        snd->checksum += lbuf[--snd->byte];
+                while (snd->byte);
+                snd->state = PLIP_PK_CHECKSUM;
+        case PLIP_PK_CHECKSUM:
+(*all is great, woah! unless plip_send returns TIMEOUT*)
+               if (plip_send(nibble_timeout, data_addr,
+                              &snd->nibble, snd->checksum))
+                        return TIMEOUT;
+                nl->enet_stats.tx_bytes += snd->skb->len;
+                dev_kfree_skb(snd->skb);
+                nl->enet_stats.tx_packets++;
+                snd->state = PLIP_PK_DONE;
+        case PLIP_PK_DONE:
+                /* Close the connection */
+                outb (0x00, data_addr);
+                snd->skb = NULL;
+                if (net_debug > 2)
+                        printk(KERN_DEBUG "%s: send end\n", dev->name);
+                nl->connection = PLIP_CN_CLOSING;
+                nl->is_deferred = 1;
+                queue_task(&nl->deferred, &tq_timer);
+                outb(PAR_INTR_ON, PAR_CONTROL(dev));
+(*all went well, the sending operations in each stage went fine, so now we
+  enable teh irq so we don't break ourselves*)
+                ENABLE(dev->irq);
+                return OK;
+        }
+(*if we're here we probably don't care anyway, something like that.. :) *)
+        return OK;
+}
+Okay, there's my braindamage (I thought it was 4, why not 6, I didn't
+count?). Maybe just me, but now when we return from this routine to plip_bh
+with a value of TIMEOUT it gets passed on to plip_bh_timeout_error where we
+wind up with this logic: (*my comments*)
+static int
+plip_bh_timeout_error(struct device *dev, struct net_local *nl,
+                      struct plip_local *snd, struct plip_local *rcv,
+                      int error)
+{
+        unsigned char c0;
+        /*
+         * This is tricky. If we got here from the beginning of send (either
+         * with ERROR or HS_TIMEOUT) we have IRQ enabled. Otherwise it's
+         * already disabled. With the old variant of {enable,disable}_irq()
+         * extra disable_irq() was a no-op. Now it became mortal - it's
+         * unbalanced and thus we'll never re-enable IRQ (until rmmod plip,
+         * that is). So we have to treat HS_TIMEOUT and ERROR from send
+         * in a special way.
+         */
+        spin_lock_irq(&nl->lock);
+        if (nl->connection == PLIP_CN_SEND) {
+                if (error != ERROR) { /* Timeout */
+(*we have TIMEOUT so it's != ERROR, so let's enter this if() block and
+increment our nl->timeout_count field*)
+                        nl->timeout_count++;
+                        if ((error == HS_TIMEOUT
+                             && nl->timeout_count <= 10)
+                            || nl->timeout_count <= 3) {
+(*well, it's _not_ == HS_TIMEOUT, and let's assume nl->timeout_count == 4*)
+                                spin_unlock_irq(&nl->lock);
+                                /* Try again later */
+                                return TIMEOUT;
+                        }
+                        c0 = inb(PAR_STATUS(dev));
+(*here's that one message that floods my console now and then. Maybe
+becasue I have a p2 pumping bits into a 486 that chokes or whatever,
+I don't know, but it's so bad sometimes that I have been patching each new
+dev kernel I get to change timeout messages as is done in the patch I
+sent you*)
+                        printk(KERN_WARNING "%s: transmit
+timeout(%d,%02x)\n",
+                               dev->name, snd->state, c0);
+                } else
+                        error = HS_TIMEOUT;
+                nl->enet_stats.tx_errors++;
+                nl->enet_stats.tx_aborted_errors++;
+        } else if (nl->connection == PLIP_CN_RECEIVE) {
+                if (rcv->state == PLIP_PK_TRIGGER) {
+                        /* Transmission was interrupted. */
+                        spin_unlock_irq(&nl->lock);
+                        return OK;
+                }
+                if (error != ERROR) { /* Timeout */
+                        if (++nl->timeout_count <= 3) {
+                                spin_unlock_irq(&nl->lock);
+                                /* Try again later */
+                                return TIMEOUT;
+                        }
+                        c0 = inb(PAR_STATUS(dev));
+                        printk(KERN_WARNING "%s: receive
+timeout(%d,%02x)\n",
+                               dev->name, rcv->state, c0);
+                }
+                nl->enet_stats.rx_dropped++;
+        }
+(*we're going, and error == TIMEOUT still*)
+        rcv->state = PLIP_PK_DONE;
+        if (rcv->skb) {
+                kfree_skb(rcv->skb);
+                rcv->skb = NULL;
+        }
+        snd->state = PLIP_PK_DONE;
+        if (snd->skb) {
+                dev_kfree_skb(snd->skb);
+                snd->skb = NULL;
+        }
+(*we're going, and error == TIMEOUT still*)
+        spin_unlock_irq(&nl->lock);
+        if (error == HS_TIMEOUT) {
+(*uh oh, that might mean irq is still disabled*)
+                DISABLE(dev->irq);
+                synchronize_irq();
+        }
+        outb(PAR_INTR_OFF, PAR_CONTROL(dev));
+        dev->tbusy = 1;
+        nl->connection = PLIP_CN_ERROR;
+        outb(0x00, PAR_DATA(dev));
+        return TIMEOUT;
+}
+Unfortunately my machines don't agree with me. As much as I really really
+want this event to not happen, it must be, because I can't find any other
+explanation for the dead interface and endless transmit timeout messages
+that plague my machine with the current plip.c minus my patch.
+To explain my '1 in 4(or 5) chance' the chances would be that at any given
+point the state of irq could become unknown or 'out of sync' with the
+general operation of the driver.
+Something else I found while staring at the code last night was:
+plip_bh() passes ERROR as an error value to plip_bh_timeout_error(), in that
+function you will find this code:
+                if (error != ERROR) { /* Timeout */
+                        nl->timeout_count++;
+                        if ((error == HS_TIMEOUT
+                             && nl->timeout_count <= 10)
+                            || nl->timeout_count <= 3) {
+                                spin_unlock_irq(&nl->lock);
+                                /* Try again later */
+                                return TIMEOUT;
+                        }
+                        c0 = inb(PAR_STATUS(dev));
+                        printk(KERN_WARNING "%s: transmit
+timeout(%d,%02x)\n",
+                               dev->name, snd->state, c0);
+                } else
+                        error = HS_TIMEOUT;
+which effectively turns your ERROR into HS_TIMEOUT, which in turn makes a
+call to disable_irq()
+plip_receive_packet() (called from plip_bh)
+        switch (rcv->state) {
+        case PLIP_PK_TRIGGER:
+                DISABLE(dev->irq);
+(...snip)
+                                printk(KERN_DEBUG "%s: checksum error\n",
+dev->name);
+                        return ERROR;
+                }
+                rcv->state = PLIP_PK_DONE;
+This is unlikely to happen, and my problem lies within the sending operation
+(or so I think).  But this would produce the same result. I hadn't noticed
+this before, so..  I'll just fall back on the fact I'm not a kernel guru and
+I miss a lot of detail while trying to realize the concepts before me.
+That's it.  I just created macros that would prevent this event from
+happening in all cases.  And you want to hear some bold ass truth? It makes
+little difference.  My solution? I leave the irq alone by making the macros
+Functional-NOPs (; statements).  You want to know why?  I don't see any
+reason to disable the irq.  afaik the PLIP protocol itself relies on each
+end negotiating using PAR_CONTROL_INTER (parport.h) being written it's
+control line.  In the event the two ends de-sync the connection attempts to
+resume by sending an ack and continuing (or so I like to believe, hence,
+the secondary-purpose behind the protocol). If this is the case then
+disabling irq yields little or no benefit.
+I've been using this 'technique' for a few days now and have had no
+problems, I would like to have someone else's opinion on this though.  What
+advantage would be gained?  What problem should it be causing that I'm not
+seeing? if you want me to point out how this driver recovers when de-sync "i
+don't know, grep for 'collision'."
+As a final note on not managing the irq, my xfer is about equal to
+40kbyte/s, the same as under 2.1.1xx
+I look forward to responses, I'm a kernel hacker wanna-be and any
+information sent my way is appreciated, even if you do get verbal, at least
+I'll know. I'm still struggling (between my job and other responsibilities)
+to understand much of how the kernel works.  So most of what I'd thought is
+wrong is based on assumption.  Things you could help me understand so I can
+shut my trap next time I think something works:
+The state of the irq when bh_plip() is called?  I assumed irq is enabled.
+What happens if you disable irq from within a bh function? I assumed the
+state is left unchanged, so if you disable irq it remains disabled until re
+enabled.  And will it be re-enabled before the next call to a bh function? I
+assumed no since it didn't appear to be working that way.
+Your code was perfect. It just doesn't seem to work on my machine even
+though it's been working since last August when I found out about the PLIP
+driver in Linux. So, I threw it out and began working from an older plip.c
+that worked not but six days ago.  I'd *LOVE* to discuss this problem with
+someone (anyone) who knows something (anything) about the kernel, bh
+function handling internals and irq state surrounding this driver.
+  
+Otherwise I'm just stabbing into darkness.
+I tried to avoid HS_TIMEOUT in hopes there was a better solution, possibly
+one that Works For Me As Well As You(tm) (can we trademark that?).  I'm only
+basing this off the fact that it worked before, there was no HS_TIMEOUT
+before and that irq code was changed since then.
+                synchronize_irq();
+        }
+Just for the record, if irq needs a sync, it's handled within enable_irq(),
+i tried to point that out months ago but the only change made was the one
+line I made mention of it on.  I could care less, though, I'm capable.
+Okay, now what did you want?  Oh, of course, if you would like me to explain
+what you can read in the diff I sent you I can, but it's not terribly
+complicated. I had moved sections of code to more appropriate locations
+(such as #defines where you'd expect to find them, structs, functions et
+cetera), that might throw you off a bit.
+----------------------------------------------------------
+ ---- ely ---                   <plexus@ionet.net> ------
+"Persuasion consists of justifying the end by the means.."
+----------------------------------------------------------
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

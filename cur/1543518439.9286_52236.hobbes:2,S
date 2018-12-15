@@ -1,0 +1,191 @@
+Date: Wed, 8 Dec 1999 16:41:17 -0800 (PST)
+From: (Scott Lurndal)
+Subject: Per-Processor Data Page
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/12/8/194
+
+On Wed, 8 Dec 1999, Linus wrote:
+> On Wed, 8 Dec 1999, Richard Gooch wrote:
+> > 
+> > I don't see why the kernel can't map this magic page to the same
+> > virtual address for each process. I assumed you'd want to do that for
+> > code anyway.
+> 
+> So what is your argument with my approach then?
+> 
+> That's EXACTLY what I've been arguing the whole time. No MAP_INHERIT
+> anywhere, just a magic mapping that is always present.
+> 
+>		Linus
+I've been following a couple of threads lately on the kernel mailing list
+and the discussions have revolved around system calls, and access to kernel
+data from user mode.     I'd like to propose the following solution for 
+the ia32 architecture, which kind of melds together some ideas that have been
+tossing around in my head for a while.
+I did read Linus 'sucks eggs through a straw' command, but I don't believe
+that I agree at this time.  
+Note the solution as presented below is not novel and is used in various forms
+by at least two other ia32 unix operating systems.
+Thanks, 
+ scott lurndal
+ sgi
+(I'd also like to point out that one perhaps significant issue revolving around
+the sysenter instruction, introduced in the PII, is that it is fixed to
+ring 0 - the use of this instruction in place of int (linux) or lcall 
+(unixware et. al.), does make writing a virtual machine to execute linux 
+somewhat more difficult (where the virtual machine runs in ring 0, and 
+linux runs in ring 1 or 2).
+-----
+The Problems:
+  1) Obtaining a pointer to the current task_struct on ia32 architectures 
+     currently operates by masking the stack pointer (assuming it is 
+     correct) to obtain the base address of an 8-kilobyte area which 
+     provides both the task structure and the kernel stack for the 
+     process or clone thread.
+	Issues:
+	a) Kernel stack overflow (e.g. due to a module or driver ported from 
+	   another architecture which uses automatic storage rather than the 
+	   kernel memory allocator for medium size structures, or due to the use 
+	   of recursion in kernel code) can result in the wrong task structure 
+	   being used, and corresponding kernel data corruption or other
+	   panic situations.
+	b) Kernel stack overflow can result in corruption of the task structure, 
+	   often resulting in a situation that cannot be recovered from by 
+	   killing only the involved task.
+   2) Obtaining the processor number of the currently executing processor is 
+      either extremely expensive (asking the local APIC) or potentially 
+      error-prone (see issues with masking the stack pointer, above).
+   3) Collecting performance statistics for SMP machines currently causes 
+      unnecessary cache line contention due to the use of arrays of integers
+      indexed by processor number.    Currently, statistics such as context
+      switches are collected on a per-system basis; but such statistics are 
+      much more useful for performance evaluation if collected on a per-cpu
+      basis, and they could be easily collected in a per-processor data page.   
+      Likewise, a statistic such as system-calls should be collected on a per-cpu
+      basis. 
+ 
+   4) For pthreads, it is required to have a notion of thread private storage.
+      In liu of using a fixed register (which many risc architectures can 
+      afford to do), using a user-readable per-processor data page at a 
+      fixed virtual address can make it a trivial and efficient operation for
+      a thread to access a pointer to its private data. (User level threading
+      schemes, and M-N schemes can also use this mechanism, albeit with
+      a system call to establish a new value for the private data pointer)
+   5) Certain system calls such as the getpid family and gettimeofday are often
+      executed frequently by certain applications (for example, oracle issues
+      a copious number of gettimeofday calls to timestamp redo log records and
+      various transaction related operations), and the data could be trivally
+      and efficiently accessed through a user-readable per-processor data page. 
+   6) Kernel stacks must be fixed in size and aligned on 2-page boundaries.
+A Solution:
+   A solution to the above set of problems is to provide a fixed virtual mapping
+   to a pair of physical pages which are associated with each processor, and to
+   ensure that this mapping is used by a thread of execution when executing on 
+   said processor.  
+   For example, a physical page per processor could be associated with the 
+   virtual address 0xc0000000 with read/write access for ring 0 and no access 
+   for ring 1-3, while virtual address 0xc0001000 which has read/write access 
+   for ring 0 and read-only access for rings 1-3 can map to an additional 
+   physical page.
+   Thus, CURRENT on ia32 architectures would be a macro which simply accessed 
+   the word at some fixed offset from 0xc0000000 to get a pointer to the current
+   task structure (established at __switch_to time).  Likewise, to obtain the
+   current processor number, accessing a word at some fixed offset from 
+   0xc0000000 is all that is required. 
+   This proposal would separate kernel stack from kernel data structures and 
+   allow both variable sized kernel stacks, as well as allowing kernel stacks 
+   to grow into a guard page, if such a feature is desired. 
+   From the standpoint of a pthreads library, when it is required to obtain the 
+   thread private data pointer, a simple access to some fixed offset from 
+   0xc0001000 would suffice - likewise for the current pid, as well as the 
+   gettimeofday[1] value. 
+[1] gettimeofday being implemented in this fashion would require that when the
+    time value is updated by the kernel, it be updated on the user private page
+    for each CPU.   An additional alternative would be to make a third
+    virtually mapped page, e.g. 0xc0002000 be a system-wide shared page
+    with user readability for such things as struct timeval which aren't
+    processor dependent.
+How would this solution be implemented:
+   First, each potential thread of execution (kernel thread, process thread
+   and clone thread) must have its own set of page tables. 
+   Second, the sets of page tables that describe completely shared address 
+   spaces (e.g. for clones) must be related by some datastructure, e.g. an
+   additional linked list which links all related mm's together. 
+   Third, at context switch time (in __switch_to), the two physical pages 
+   assigned to the current processor are plugged into the page table entries
+   for virtual addresses 0xc0000000 and 0xc00001000 just before cr3 is
+   loaded.
+   Fourth, prior to dispatching to the new thread, some fields in the per-cpu
+   data pages are updated:
+(code added to __switch_to)
+	new_task->mm->kpdaptr = mycpu_kpda_pte;
+	new_task->mm->updaptr = mycpu_upda_pte;
+	movl mm->cr3, cr3
+	kpda->current = new_task;
+	upda->threadprivate = new_task->threadprivate;
+	upda->pid           = new_task->pid;
+	upda->ppid	    = new_task->ppid;
+typedef struct _kernel_data_area {
+	struct task_struct *current;	/* Task_struct running in this cpu */
+	int		    cpu;	/* Cpu # of this cpu */
+	int		    filler[100];
+	unsigned long long  context_switches;	/* Times cpu has ctx switched */
+	unsigned long long  system_calls;	/* # syscalls on this cpu */
+	/* etc */
+} kpda_t;
+#define KPDA	(*((kpda_t *)(0xc0000000)))
+#define CURRENT   KDPA->current
+typedef struct _user_data_area {
+	void 		 *threadprivate;	/* Thread private data */
+	int		filler[100];
+	struct timeval	tv;			/* Timeval for gettimeofday */
+	pid_t		pid;
+	pid_t		ppid;
+	/* etc */
+} upda_t;
+#define UPDA	(*((upda_t *)(0xc0001000)))
+----
+Cons:
+	1) during dispatching, linux currently will not reload the page
+	   tables (cr3) if the newly scheduled thread shares an address 
+	   space.     This optimization will no longer be possible.
+	2) During address space updates of shared address spaces, care must
+	   be taken to update all page tables for all threads/clones sharing
+	   the page tables and to invalidate any extant mappings for the 
+	   involved pages. 
+	   This can be implemented in a number of ways, including bringing all 
+	   cpus to a barrier while this address space is updated (expensive), 
+	   or bringing all cpus executing components of the shared address
+	   space to a barrier (less expensive) or invalidating the entries
+	   in all related page tables and forcing a tlb flush for the related
+	   tlb entries which will cause further accesses to the new pages 
+	   to fault into the kernel (least expensive, but most complicated).
+	   However, it is useful to note that each process will get its 
+	   own page directory, but they will share most page tables (except
+	   for the page table containing the virtual address range
+	   0xc0000000 - 0xc0001000).
+	
+Pros:
+	1) Decoupling the task_struct from the kernel stack makes many 
+	   enhancements of the kernel stack architecture possible including
+	   but not limited to:
+		1) Larger kernel stacks
+		2) Variable sized kernel stacks
+		3) Automatically growing kernel stacks.
+	2) The CPU can be determined efficiently and has no reliance on 
+	   correctness of the current task structure.
+	3) Thread-private data can be implemented efficiently. 
+	4) Some system calls, especially those that return static data,
+	   can be implemented very efficiently - not requiring a kernel 
+	   boundary crossing.
+----
+Comments?
+Flames?
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

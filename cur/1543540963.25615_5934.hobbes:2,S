@@ -1,0 +1,115 @@
+Date: Mon, 07 Aug 2000 10:41:17 -0600
+From: "Jeff V. Merkey" <>
+Subject: NWFS readpage() in 2.2.X -- after_unlock_page() not exported
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/8/7/89
+
+I am finishing the mmap() problems in NWFS and have tracked down the
+shared library problem:
+BUG IN DYNAMIC LINKER:  ld.so:  trld.c assertion () 
+that shows up when building the linux source tree from an NWFS volume. 
+The basic problem is in the page cache interface and some interface
+problems there.   There were also some concurrency problems with the VFS
+serializing access from multiple instances of 'sh' being invoked from
+the make utility above the FS.  I have had to implement my own
+readpage() function for this to work right since brw_page will copy data
+between the page cache and buffer cache and end up double buffering data
+between the NWFS LRU and the buffer cache.  I was under the assumption
+that readpage() and it's related functions were submitting page cache
+memory for direct IO rather than copy between the two, but after
+reviewing this in detail, I have discovered that this copying is going
+on, which means that there are cases where the Linux buffer cache can
+buffer blocks that I have flagged dirty or changed in the NWFS LRU,
+causign data inconsistencies.
+The obvious solution is to hook the page cache interface and redirect
+all the "copying" activity to the NWFS LRU.  This is very
+straightforward and simple on 2.4.X since the architecture has been
+improved to allow this stuff in the page cache interface in 2.4,X.
+2.2.X has hit a serious obstacle.  The function brw_page() has a dirty
+hook into the VM labeled after_unlock_page() that monkeys with the VM
+and swaps then frees the page.  This function is not exported, which
+results in my readpage() function sucking up all the memory in the
+system.  Is there a way around this?  I tried not incrementing the
+page->count field and the problem persists.   The reapage() function is
+attached.  With this fix the Linux kernel build on an NWFS volumes goes
+with a hitch (and runs really fast) but evetually runs the system out of
+memory.
+Code is attached:
+ int nwfs_readpage(struct file *file, struct page *page)
+{
+    struct dentry *dentry = file->f_dentry;
+    struct inode *inode = dentry->d_inode;
+    register VOLUME *volume = (VOLUME *)inode->i_sb->u.generic_sbp;
+    register HASH *hash = inode->u.generic_ip;
+    register ULONG block, vindex;
+    register LRU *lru;
+    int p[PAGE_SIZE / 512];
+    register int i;
+    BYTE *buffer;
+#if (VFS_VERBOSE)
+    NWFSPrint("readpage page_size-%d page_offset-%d %s\n", 
+                    (int)PAGE_SIZE, 
+		    (int)page->offset,
+		    hash->Name);
+#endif
+    atomic_inc(&page->count);
+    set_bit(PG_locked, &page->flags);
+    clear_bit(PG_uptodate, &page->flags);
+    clear_bit(PG_error, &page->flags);
+	
+    NWLockFile(hash);
+    
+    for (i=0, block = (page->offset >> 12); i < (PAGE_SIZE >> 12); i++,
+block++)
+       p[i] = NWFileMapBlock(volume, hash, block * IO_BLOCK_SIZE, 0);
+    
+    buffer = (BYTE *)page_address(page);
+    for (vindex = 0; vindex < (PAGE_SIZE >> 12); vindex++)
+    {
+       // found a hole or end of file encountered.
+       if ((!p[vindex]) || (p[vindex] == -1))
+       {
+          NWFSSet(&buffer[vindex * IO_BLOCK_SIZE], 0, IO_BLOCK_SIZE);
+          continue;
+       }
+       lru = ReadLRU(&DataLRU, volume, p[vindex], 1, DATA_PRIORITY, 
+                    (!vindex ? (PAGE_SIZE >> 12) : 1), 0);
+       if (lru)
+       {
+          if ((lru->bad_bits >> i) & 1)
+	  {
+             ReleaseLRU(&DataLRU, lru);
+	     NWUnlockFile(hash);
+             set_bit(PG_error, &page->flags);
+             clear_bit(PG_locked, &page->flags);
+             wake_up(&page->wait);
+             return -EIO;
+	  }
+          NWFSCopy(&buffer[vindex * IO_BLOCK_SIZE], lru->buffer,
+IO_BLOCK_SIZE);
+          ReleaseLRU(&DataLRU, lru);
+          continue;
+       }
+       NWUnlockFile(hash);
+       set_bit(PG_error, &page->flags);
+       clear_bit(PG_locked, &page->flags);
+       wake_up(&page->wait);
+       return -EIO;
+    }
+    
+    NWUnlockFile(hash);
+    set_bit(PG_uptodate, &page->flags);
+    clear_bit(PG_locked, &page->flags);
+    wake_up(&page->wait);
+    return 0;
+}
+Please advise,
+Jeff
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

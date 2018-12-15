@@ -1,0 +1,155 @@
+Date: Fri, 5 Sep 2003 19:48:00 -0700
+From: "Nakajima, Jun" <>
+Subject: [PATCH] idle using PNI monitor/mwait (take 3)
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2003/9/5/306
+
+Remade the patch for -mm6. We tested it by removing local_irq_enable()
+completely 
+(and it worked as far as we tested), but I think it would be a cheap
+"defensive" code. 
+Instead of removing it, I moved it to right before __mwait().
+Thanks,
+Jun
+---
+diff -ur /build/orig/linux-2.6.0-test4-mm6/arch/i386/kernel/cpu/intel.c
+linux-2.6.0-test4-mm6/arch/i386/kernel/cpu/intel.c
+--- /build/orig/linux-2.6.0-test4-mm6/arch/i386/kernel/cpu/intel.c
+2003-09-05 19:16:26.000000000 -0700
++++ linux-2.6.0-test4-mm6/arch/i386/kernel/cpu/intel.c	2003-09-05
+19:22:05.000000000 -0700
+@@ -12,6 +12,8 @@
+ 
+ #include "cpu.h"
+ 
++extern void select_idle_routine(const struct cpuinfo_x86 *c);
++
+ #ifdef CONFIG_X86_INTEL_USERCOPY
+ /*
+  * Alignment at which movsl is preferred for bulk memory copies.
+@@ -163,7 +165,7 @@
+ 	}
+ #endif
+ 
+-
++	select_idle_routine(c);
+ 	if (c->cpuid_level > 1) {
+ 		/* supports eax=2  call */
+ 		int i, j, n;
+diff -ur /build/orig/linux-2.6.0-test4-mm6/arch/i386/kernel/process.c
+linux-2.6.0-test4-mm6/arch/i386/kernel/process.c
+--- /build/orig/linux-2.6.0-test4-mm6/arch/i386/kernel/process.c
+2003-09-05 19:16:26.000000000 -0700
++++ linux-2.6.0-test4-mm6/arch/i386/kernel/process.c	2003-09-05
+19:23:01.000000000 -0700
+@@ -152,11 +152,56 @@
+ 	}
+ }
+ 
++/*
++ * This uses new MONITOR/MWAIT instructions on P4 processors with PNI, 
++ * which can obviate IPI to trigger checking of need_resched.
++ * We execute MONITOR against need_resched and enter optimized wait
+state 
++ * through MWAIT. Whenever someone changes need_resched, we would be
+woken 
++ * up from MWAIT (without an IPI).
++ */
++static void mwait_idle (void)
++{
++	if (!need_resched()) {
++		set_thread_flag(TIF_POLLING_NRFLAG);
++		do {
++			__monitor((void *)&current_thread_info()->flags,
+0, 0);
++			if (need_resched())
++				break;
++
++			local_irq_enable();
++			__mwait(0, 0);
++		} while (!need_resched());
++		clear_thread_flag(TIF_POLLING_NRFLAG);
++	}
++}
++
++void __init select_idle_routine(const struct cpuinfo_x86 *c)
++{
++	if (cpu_has(c, X86_FEATURE_MWAIT)) {
++		printk("Monitor/Mwait feature present.\n");
++		/* 
++		 * Skip, if setup has overridden idle.
++		 * Also, take care of system with asymmetric CPUs.
++		 * Use, mwait_idle only if all cpus support it.
++		 * If not, we fallback to default_idle()
++		 */
++		if (!pm_idle) {
++			pm_idle = mwait_idle;
++		}
++		return;
++	}
++	pm_idle = default_idle;
++	return;
++}
++
+ static int __init idle_setup (char *str)
+ {
+ 	if (!strncmp(str, "poll", 4)) {
+ 		printk("using polling idle threads.\n");
+ 		pm_idle = poll_idle;
++	} else if (!strncmp(str, "halt", 4)) {
++		printk("using halt in idle threads.\n");
++		pm_idle = default_idle;
+ 	}
+ 
+ 	return 1;
+diff -ur /build/orig/linux-2.6.0-test4-mm6/include/asm-i386/cpufeature.h
+linux-2.6.0-test4-mm6/include/asm-i386/cpufeature.h
+--- /build/orig/linux-2.6.0-test4-mm6/include/asm-i386/cpufeature.h
+2003-08-22 16:58:04.000000000 -0700
++++ linux-2.6.0-test4-mm6/include/asm-i386/cpufeature.h	2003-09-05
+19:22:05.000000000 -0700
+@@ -71,6 +71,8 @@
+ 
+ /* Intel-defined CPU features, CPUID level 0x00000001 (ecx), word 4 */
+ #define X86_FEATURE_EST		(4*32+ 7) /* Enhanced SpeedStep
+*/
++#define X86_FEATURE_MWAIT	(4*32+ 3) /* Monitor/Mwait support */
++
+ 
+ /* VIA/Cyrix/Centaur-defined CPU features, CPUID level 0xC0000001, word
+5 */
+ #define X86_FEATURE_XSTORE	(5*32+ 2) /* on-CPU RNG present (xstore
+insn) */
+diff -ur /build/orig/linux-2.6.0-test4-mm6/include/asm-i386/processor.h
+linux-2.6.0-test4-mm6/include/asm-i386/processor.h
+--- /build/orig/linux-2.6.0-test4-mm6/include/asm-i386/processor.h
+2003-09-05 19:17:03.000000000 -0700
++++ linux-2.6.0-test4-mm6/include/asm-i386/processor.h	2003-09-05
+19:22:05.000000000 -0700
+@@ -272,6 +272,22 @@
+ #define pc98 0
+ #endif
+ 
++static __inline__ void __monitor(const void *eax, unsigned long ecx, 
++		unsigned long edx)
++{
++	/* "monitor %eax,%ecx,%edx;" */
++	asm volatile(
++		".byte 0x0f,0x01,0xc8;"
++		: :"a" (eax), "c" (ecx), "d"(edx));
++}
++
++static __inline__ void __mwait(unsigned long eax, unsigned long ecx)
++{
++	/* "mwait %eax,%ecx;" */
++	asm volatile(
++		".byte 0x0f,0x01,0xc9;"
++		: :"a" (eax), "c" (ecx));
++}
+ 
+ /* from system description table in BIOS.  Mostly for MCA use, but
+ others may find it useful. */
+[unhandled content-type:application/octet-stream]

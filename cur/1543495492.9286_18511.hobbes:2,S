@@ -1,0 +1,180 @@
+Date: Wed, 12 May 1999 15:16:07 +0200
+From: Matthew Wilcox <>
+Subject: [VFS] move active filesystem
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/5/12/125
+
+Hi, Al.  You seem to be the most active developer in the VFS, and there
+seems to be no official maintainer for it, so I thought I'd try feeding
+this patch to you.
+Basically all this patch does is allow you to specify a new directory
+when remounting a filesystem.  I've had several people using it, and
+the one reported bug has been fixed.
+--- fs/super.c.orig	Wed May 12 03:37:47 1999
++++ fs/super.c	Wed May 12 14:34:34 1999
+@@ -49,7 +49,7 @@
+ 
+ extern int root_mountflags;
+ 
+-static int do_remount_sb(struct super_block *sb, int flags, char * data);
++static int do_remount_sb(struct vfsmount *vfsmnt, int flags, char * data);
+ 
+ /* this is initialized in init/main.c */
+ kdev_t ROOT_DEV;
+@@ -86,7 +86,6 @@
+ 		}
+ 
+ 	return ((struct vfsmount *)NULL);
+-	/* NOTREACHED */
+ }
+ 
+ static struct vfsmount *add_vfsmnt(struct super_block *sb,
+@@ -684,8 +683,11 @@
+ 		 * we just try to remount it readonly.
+ 		 */
+ 		retval = 0;
+-		if (!(sb->s_flags & MS_RDONLY))
+-			retval = do_remount_sb(sb, MS_RDONLY, 0);
++		if (!(sb->s_flags & MS_RDONLY)) {
++			struct vfsmount *vfsmnt = lookup_vfsmnt(sb->s_dev);
++			if (vfsmnt)
++				retval = do_remount_sb(vfsmnt, MS_RDONLY, 0);
++		}
+ 		return retval;
+ 	}
+ 
+@@ -911,11 +913,11 @@
+  * FS-specific mount options can't be altered by remounting.
+  */
+ 
+-static int do_remount_sb(struct super_block *sb, int flags, char *data)
++static int do_remount_sb(struct vfsmount *vfsmnt, int flags, char *data)
+ {
+ 	int retval;
+-	struct vfsmount *vfsmnt;
+-	
++	struct super_block *sb = vfsmnt->mnt_sb;
++
+ 	/*
+ 	 * Invalidate the inodes, as some mount options may be changed.
+ 	 * N.B. If we are changing media, we should check the return
+@@ -936,35 +938,62 @@
+ 			return retval;
+ 	}
+ 	sb->s_flags = (sb->s_flags & ~MS_RMT_MASK) | (flags & MS_RMT_MASK);
+-	vfsmnt = lookup_vfsmnt(sb->s_dev);
+-	if (vfsmnt)
+-		vfsmnt->mnt_flags = sb->s_flags;
++	vfsmnt->mnt_flags = sb->s_flags;
+ 	return 0;
+ }
+ 
+-static int do_remount(const char *dir,int flags,char *data)
++static int do_remount(const char *dev, const char *dir, int flags, char *data)
+ {
+-	struct dentry *dentry;
++	struct dentry *dev_d, *new_d, *old_d;
+ 	int retval;
++	struct vfsmount *vfsmnt;
++	struct super_block *sb;
+ 
+-	dentry = namei(dir);
+-	retval = PTR_ERR(dentry);
+-	if (!IS_ERR(dentry)) {
+-		struct super_block * sb = dentry->d_inode->i_sb;
++	dev_d = namei(dev);
++	retval = PTR_ERR(dev_d);
++	if (IS_ERR(dev_d))
++		return retval;
++	vfsmnt = lookup_vfsmnt(dev_d->d_inode->i_rdev);
++	retval = -EINVAL;
++	if (!vfsmnt)
++		goto out;
++	sb = vfsmnt->mnt_sb;
+ 
+-		retval = -EINVAL;
+-		if (dentry == sb->s_root) {
+-			/*
+-			 * Shrink the dcache and sync the device.
+-			 */
+-			shrink_dcache_sb(sb);
+-			fsync_dev(sb->s_dev);
+-			if (flags & MS_RDONLY)
+-				acct_auto_close(sb->s_dev);
+-			retval = do_remount_sb(sb, flags, data);
+-		}
+-		dput(dentry);
+-	}
++	/*
++	 * Shrink the dcache and sync the device.
++	 */
++	shrink_dcache_sb(sb);
++	fsync_dev(sb->s_dev);
++	if (flags & MS_RDONLY)
++		acct_auto_close(sb->s_dev);
++	retval = do_remount_sb(vfsmnt, flags, data);
++	if (retval)
++		goto out;
++
++	new_d = namei(dir);
++	if (new_d == sb->s_root)
++		goto dput_and_out;
++	retval = -ENOTDIR;
++	if (!S_ISDIR(new_d->d_inode->i_mode))
++		goto dput_and_out;
++	retval = -EBUSY;
++	if ((new_d->d_covers != new_d) || (new_d->d_sb == sb))
++		goto dput_and_out;
++
++	retval = 0;
++	old_d = sb->s_root->d_covers;
++	new_d->d_mounts = old_d->d_mounts;
++	old_d->d_mounts = old_d;
++	sb->s_root->d_covers = new_d;
++	new_d = old_d;			/* free the old one instead */
++
++	kfree(vfsmnt->mnt_dirname);
++	if ((vfsmnt->mnt_dirname = (char *) kmalloc(strlen(dir)+1, GFP_KERNEL)) != (char *)NULL)
++		strcpy(vfsmnt->mnt_dirname, dir);
++dput_and_out:
++	dput(new_d);
++out:
++	dput(dev_d);
+ 	return retval;
+ }
+ 
+@@ -1031,7 +1060,7 @@
+ 		retval = copy_mount_options (data, &page);
+ 		if (retval < 0)
+ 			goto out;
+-		retval = do_remount(dir_name,
++		retval = do_remount(dev_name, dir_name,
+ 				    new_flags & ~MS_MGC_MSK & ~MS_REMOUNT,
+ 				    (char *) page);
+ 		free_page(page);
+--- fs/ChangeLog.orig	Wed May 12 14:48:34 1999
++++ fs/ChangeLog	Wed May 12 14:51:50 1999
+@@ -143,6 +143,10 @@
+ 		do. Fixed.
+ 	* rmdir of immutable/append-only directory shouldn't be allowed. Fixed.
+ 
++Wed May 12 14:47:49 1999 Matthew Wilcox <willy@bofh.ai>
++	* super.c: Allow moving an active fs from one mount point to
++		another.
++
+ Remains unfixed:
+ 	* UMSDOS_rename is broken. Call it with the dest. existing and being an
+ 		empty directory and you've got EBUSY. At least it doesn't do
+-- 
+Matthew Wilcox <willy@bofh.ai>
+"Windows and MacOS are products, contrived by engineers in the service of
+specific companies. Unix, by contrast, is not so much a product as it is a
+painstakingly compiled oral history of the hacker subculture." - N Stephenson
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

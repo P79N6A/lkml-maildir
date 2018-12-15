@@ -1,0 +1,152 @@
+Date: Tue, 28 Sep 1999 16:14:13 +0200 (CEST)
+From: Andrea Arcangeli <>
+Subject: Re: possible spinlock optimizations
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/9/28/80
+
+On Tue, 28 Sep 1999, Manfred wrote:
+>1) spin_lock_irq(): What about enabling interrupts while spinning?
+Looks a very good idea to me ;). I think it worth to do that as the
+changes are minimal and we are going to waste some cpu cycle while
+spinning anyway so we have all the time for running sti. I think the only
+additional RL cost will be the cli run every time we exit from the slow
+path (but the slow path is just sloww).
+I implemented it on 2.3.18ac9. I am writing this with it applyed.
+--- 2.3.18ac9/include/linux/spinlock.h.~1~	Tue Sep 28 02:57:39 1999
++++ 2.3.18ac9/include/linux/spinlock.h	Tue Sep 28 15:41:57 1999
+@@ -1,20 +1,30 @@
+ #ifndef __LINUX_SPINLOCK_H
+ #define __LINUX_SPINLOCK_H
+ 
++#ifdef __SMP__
++#include <asm/spinlock.h>
++#endif
++
+ /*
+  * These are the generic versions of the spinlocks and read-write
+  * locks..
+  */
+ #define spin_lock_irqsave(lock, flags)		do { local_irq_save(flags);       spin_lock(lock); } while (0)
++#ifndef __HAVE_ARCH_SPIN_LOCK_IRQ
+ #define spin_lock_irq(lock)			do { local_irq_disable();         spin_lock(lock); } while (0)
++#endif
+ #define spin_lock_bh(lock)			do { local_bh_disable();          spin_lock(lock); } while (0)
+ 
+ #define read_lock_irqsave(lock, flags)		do { local_irq_save(flags);       read_lock(lock); } while (0)
++#ifndef __HAVE_ARCH_READ_LOCK_IRQ
+ #define read_lock_irq(lock)			do { local_irq_disable();         read_lock(lock); } while (0)
++#endif
+ #define read_lock_bh(lock)			do { local_bh_disable();          read_lock(lock); } while (0)
+ 
+ #define write_lock_irqsave(lock, flags)		do { local_irq_save(flags);      write_lock(lock); } while (0)
++#ifndef __HAVE_ARCH_WRITE_LOCK_IRQ
+ #define write_lock_irq(lock)			do { local_irq_disable();        write_lock(lock); } while (0)
++#endif
+ #define write_lock_bh(lock)			do { local_bh_disable();         write_lock(lock); } while (0)
+ 
+ #define spin_unlock_irqrestore(lock, flags)	do { spin_unlock(lock);  local_irq_restore(flags); } while (0)
+@@ -29,10 +39,8 @@
+ #define write_unlock_irq(lock)			do { write_unlock(lock); local_irq_enable();       } while (0)
+ #define write_unlock_bh(lock)			do { write_unlock(lock); local_bh_enable();        } while (0)
+ 
+-#ifdef __SMP__
+-#include <asm/spinlock.h>
+ 
+-#else /* !SMP */
++#ifndef __SMP__ /* !SMP */
+ 
+ #define DEBUG_SPINLOCKS	0	/* 0 == no debugging, 1 == maintain lock state, 2 == full debug */
+ 
+--- 2.3.18ac9/include/asm-i386/spinlock.h	Tue Sep 14 14:35:57 1999
++++ /tmp/spinlock.h	Tue Sep 28 15:56:04 1999
+@@ -35,6 +35,20 @@
+ 	"jmp 1b\n" \
+ 	".previous"
+ 
++#define spin_lock_irq_string \
++	"\n1:\t" \
++	"cli\n\t" \
++	"lock ; btsl $0,%0\n\t" \
++	"jc 2f\n" \
++	".section .text.lock,\"ax\"\n" \
++	"2:\t" \
++	"sti\n\t" \
++	"3:\t" \
++	"testb $1,%0\n\t" \
++	"jne 3b\n\t" \
++	"jmp 1b\n" \
++	".previous"
++
+ #define spin_unlock_string \
+ 	"lock ; btrl $0,%0"
+ 
+@@ -43,6 +57,12 @@
+ 	spin_lock_string \
+ 	:"=m" (__dummy_lock(lock)))
+ 
++#define __HAVE_ARCH_SPIN_LOCK_IRQ
++#define spin_lock_irq(lock) \
++__asm__ __volatile__( \
++	spin_lock_irq_string \
++	:"=m" (__dummy_lock(lock)))
++
+ #define spin_unlock(lock) \
+ __asm__ __volatile__( \
+ 	spin_unlock_string \
+@@ -85,6 +105,21 @@
+ 		     ".previous" \
+ 		     :"=m" (__dummy_lock(&(rw)->lock)))
+ 
++#define __HAVE_ARCH_READ_LOCK_IRQ
++#define read_lock_irq(rw) \
++	asm volatile("\n1:\t" \
++		     "cli\n\t" \
++		     "lock ; incl %0\n\t" \
++		     "js 2f\n" \
++		     ".section .text.lock,\"ax\"\n" \
++		     "2:\tlock ; decl %0\n" \
++		     "sti\n\t" \
++		     "3:\tcmpl $0,%0\n\t" \
++		     "js 3b\n\t" \
++		     "jmp 1b\n" \
++		     ".previous" \
++		     :"=m" (__dummy_lock(&(rw)->lock)))
++
+ #define read_unlock(rw) \
+ 	asm volatile("lock ; decl %0" \
+ 		:"=m" (__dummy_lock(&(rw)->lock)))
+@@ -99,6 +134,25 @@
+ 		     "3:\tlock ; btrl $31,%0\n" \
+ 		     "4:\tcmp $0,%0\n\t" \
+ 		     "jne 4b\n\t" \
++		     "jmp 1b\n" \
++		     ".previous" \
++		     :"=m" (__dummy_lock(&(rw)->lock)))
++
++#define __HAVE_ARCH_WRITE_LOCK_IRQ
++#define write_lock_irq(rw) \
++	asm volatile("\n1:\t" \
++		     "cli\n\t" \
++		     "lock ; btsl $31,%0\n\t" \
++		     "jc 4f\n" \
++		     "2:\ttestl $0x7fffffff,%0\n\t" \
++		     "jne 3f\n" \
++		     ".section .text.lock,\"ax\"\n" \
++		     "3:\tlock ; btrl $31,%0\n" \
++		     "4:\t" \
++		     "sti\n\t" \
++		     "5:\t" \
++		     "cmp $0,%0\n\t" \
++		     "jne 5b\n\t" \
+ 		     "jmp 1b\n" \
+ 		     ".previous" \
+ 		     :"=m" (__dummy_lock(&(rw)->lock)))
+Andrea
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

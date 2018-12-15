@@ -1,0 +1,165 @@
+Date: Tue, 08 Mar 2005 12:53:37 +0000
+From: "Stephen C. Tweedie" <>
+Subject: Re: [RFC] ext3/jbd race: releasing in-use journal_heads
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2005/3/8/147
+
+Hi,
+On Mon, 2005-03-07 at 21:08, Stephen C. Tweedie wrote:
+> Right, that was what I was thinking might be possible.  But for now I've
+> just done the simple patch --- make sure we don't clear
+> jh->b_transaction when we're just refiling buffers from one list to
+> another.  That should have the desired effect here without dangerous
+> messing around with locks.
+And here it is; it has had about 3 hours' testing in conjunction with
+the O_DIRECT livelock fix so far, running fsx and fsstress in parallel. 
+This one is higher-risk than the previous simple fix.  However, it has
+other advantages: the original patch closed the race completely in the
+one place I know for sure it was showing up, but this version removes
+the opportunity for that particular race in the first place by avoiding
+temporary jh->b_transaction=NULL conditions completely during temporary
+list refiling.
+I'll try to get some targetted testing done by the people who were able
+to reproduce this in the first place, too.
+--Stephen
+Fix destruction of in-use journal_head
+journal_put_journal_head() can destroy a journal_head at any time as
+long as the jh's b_jcount is zero and b_transaction is NULL.  It has no
+locking protection against the rest of the journaling code, as the lock
+it uses to protect b_jcount and bh->b_private is not used elsewhere in
+jbd.
+However, there are small windows where b_transaction is getting set
+temporarily to NULL during normal operations; typically this is
+happening in 
+			__journal_unfile_buffer(jh);
+ 			__journal_file_buffer(jh, ...);
+call pairs, as __journal_unfile_buffer() will set b_transaction to NULL
+and __journal_file_buffer() re-sets it afterwards.  A truncate running
+in parallel can lead to journal_unmap_buffer() destroying the jh if it
+occurs between these two calls.
+Fix this by adding a variant of __journal_unfile_buffer() which is only
+used for these temporary jh unlinks, and which leaves the b_transaction
+field intact so that we never leave a window open where b_transaction is
+NULL.
+Additionally, trap this error if it does occur, by checking against
+jh->b_jlist being non-null when we destroy a jh.
+Signed-off-by: Stephen Tweedie <sct@redhat.com>
+--- linux-2.6-ext3/fs/jbd/commit.c.=K0003=.orig
++++ linux-2.6-ext3/fs/jbd/commit.c
+@@ -258,7 +258,7 @@ write_out_data:
+ 			BUFFER_TRACE(bh, "locked");
+ 			if (!inverted_lock(journal, bh))
+ 				goto write_out_data;
+-			__journal_unfile_buffer(jh);
++			__journal_temp_unlink_buffer(jh);
+ 			__journal_file_buffer(jh, commit_transaction,
+ 						BJ_Locked);
+ 			jbd_unlock_bh_state(bh);
+--- linux-2.6-ext3/fs/jbd/journal.c.=K0003=.orig
++++ linux-2.6-ext3/fs/jbd/journal.c
+@@ -1767,6 +1767,7 @@ static void __journal_remove_journal_hea
+ 		if (jh->b_transaction == NULL &&
+ 				jh->b_next_transaction == NULL &&
+ 				jh->b_cp_transaction == NULL) {
++			J_ASSERT_JH(jh, jh->b_jlist == BJ_None);
+ 			J_ASSERT_BH(bh, buffer_jbd(bh));
+ 			J_ASSERT_BH(bh, jh2bh(jh) == bh);
+ 			BUFFER_TRACE(bh, "remove journal_head");
+--- linux-2.6-ext3/fs/jbd/transaction.c.=K0003=.orig
++++ linux-2.6-ext3/fs/jbd/transaction.c
+@@ -1044,7 +1044,12 @@ int journal_dirty_data(handle_t *handle,
+ 			/* journal_clean_data_list() may have got there first */
+ 			if (jh->b_transaction != NULL) {
+ 				JBUFFER_TRACE(jh, "unfile from commit");
+-				__journal_unfile_buffer(jh);
++				__journal_temp_unlink_buffer(jh);
++				/* It still points to the committing
++				 * transaction; move it to this one so
++				 * that the refile assert checks are
++				 * happy. */
++				jh->b_transaction = handle->h_transaction;
+ 			}
+ 			/* The buffer will be refiled below */
+ 
+@@ -1058,7 +1063,8 @@ int journal_dirty_data(handle_t *handle,
+ 		if (jh->b_jlist != BJ_SyncData && jh->b_jlist != BJ_Locked) {
+ 			JBUFFER_TRACE(jh, "not on correct data list: unfile");
+ 			J_ASSERT_JH(jh, jh->b_jlist != BJ_Shadow);
+-			__journal_unfile_buffer(jh);
++			__journal_temp_unlink_buffer(jh);
++			jh->b_transaction = handle->h_transaction;
+ 			JBUFFER_TRACE(jh, "file as data");
+ 			__journal_file_buffer(jh, handle->h_transaction,
+ 						BJ_SyncData);
+@@ -1233,8 +1239,6 @@ int journal_forget (handle_t *handle, st
+ 
+ 		JBUFFER_TRACE(jh, "belongs to current transaction: unfile");
+ 
+-		__journal_unfile_buffer(jh);
+-
+ 		/* 
+ 		 * We are no longer going to journal this buffer.
+ 		 * However, the commit of this transaction is still
+@@ -1248,8 +1252,10 @@ int journal_forget (handle_t *handle, st
+ 		 */
+ 
+ 		if (jh->b_cp_transaction) {
++			__journal_temp_unlink_buffer(jh);
+ 			__journal_file_buffer(jh, transaction, BJ_Forget);
+ 		} else {
++			__journal_unfile_buffer(jh);
+ 			journal_remove_journal_head(bh);
+ 			__brelse(bh);
+ 			if (!buffer_jbd(bh)) {
+@@ -1469,7 +1475,7 @@ __blist_del_buffer(struct journal_head *
+  *
+  * Called under j_list_lock.  The journal may not be locked.
+  */
+-void __journal_unfile_buffer(struct journal_head *jh)
++void __journal_temp_unlink_buffer(struct journal_head *jh)
+ {
+ 	struct journal_head **list = NULL;
+ 	transaction_t *transaction;
+@@ -1486,7 +1492,7 @@ void __journal_unfile_buffer(struct jour
+ 
+ 	switch (jh->b_jlist) {
+ 	case BJ_None:
+-		goto out;
++		return;
+ 	case BJ_SyncData:
+ 		list = &transaction->t_sync_datalist;
+ 		break;
+@@ -1519,7 +1525,11 @@ void __journal_unfile_buffer(struct jour
+ 	jh->b_jlist = BJ_None;
+ 	if (test_clear_buffer_jbddirty(bh))
+ 		mark_buffer_dirty(bh);	/* Expose it to the VM */
+-out:
++}
++
++void __journal_unfile_buffer(struct journal_head *jh)
++{
++	__journal_temp_unlink_buffer(jh);
+ 	jh->b_transaction = NULL;
+ }
+ 
+@@ -1929,7 +1939,7 @@ void __journal_file_buffer(struct journa
+ 	}
+ 
+ 	if (jh->b_transaction)
+-		__journal_unfile_buffer(jh);
++		__journal_temp_unlink_buffer(jh);
+ 	jh->b_transaction = transaction;
+ 
+ 	switch (jlist) {
+@@ -2012,7 +2022,7 @@ void __journal_refile_buffer(struct jour
+ 	 */
+ 
+ 	was_dirty = test_clear_buffer_jbddirty(bh);
+-	__journal_unfile_buffer(jh);
++	__journal_temp_unlink_buffer(jh);
+ 	jh->b_transaction = jh->b_next_transaction;
+ 	jh->b_next_transaction = NULL;
+ 	__journal_file_buffer(jh, jh->b_transaction, BJ_Metadata);

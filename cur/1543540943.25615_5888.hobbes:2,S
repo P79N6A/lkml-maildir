@@ -1,0 +1,296 @@
+Date: Mon, 7 Aug 2000 13:45:21 +0100 (BST)
+From: Mark Hemment <>
+Subject: [PATCH] kmem_cache_shrink() - return pages released
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/8/7/43
+
+Linus, all,
+  The attached patch modifies the Slab's kmem_cache_shrink() to return the
+number of pages released.  This requirement was mentioned in the comments
+in both the inode and dcache code.
+  The results of a kmem_cache_shrink() are now returned from both
+shrink_dcache_memory() and shrink_icache_memory(), and used in the main
+loop in do_try_to_free_pages().
+  Also, after studying the behaviour of the buffer-head slab cache and
+kmem_cache_reap(), I found that an explicit shrink of that slab cache from
+do_try_to_free_pages() is good for system behaviour under low memory
+conditions.
+  After a call to shrink_mmap(), the buffer-head cache will usually have
+several free slabs.  These slabs will not be reaped until another call to
+do_try_to_free_pages() - and then not every time (kmem_cache_reap() only
+examines a number of caches on each call - not them all).  This leaves
+several (in some cases, many) pages of wasted memory in the cache.
+  Note: the buffer code has its own list of unused buffer heads, which act
+as a cushion to the slab cache, so reaping the unused pages from the cache
+isn't taking all the unused buffer-heads away.  Also, internal
+fragmentation in the buffer-head slab cache results in slabs in which are
+only partially active - so kmem_cache_alloc(bh_cachep,) will still
+(normally) succeed in the near future without needing to allocate new
+slabs.
+  I've also pushed down the percentage of free slabs reaped from a cache
+in kmem_cache_reap().  For most caches, the current reaping algorithm is
+far too aggressive.  Rather than re-write it at this stage, a simple
+tuning down of the percentage (from 80% to 50%) works well for almost all
+caches (the only exception seems to be the buffer-head cache, which is
+now explicity shrunk anyway).
+Mark
+diff -ur -X ignore --new-file linux-2.4.0-test5/fs/buffer.c mem-2.4.0-test5/fs/buffer.c
+--- linux-2.4.0-test5/fs/buffer.c	Fri Jul 28 00:47:16 2000
++++ mem-2.4.0-test5/fs/buffer.c	Mon Aug  7 11:35:17 2000
+@@ -1068,6 +1068,21 @@
+ }
+ 
+ /*
++ * After reaping some pages from the page-cache, vmscan may call
++ * this function to flush buffer-heads out of their slab cache.
++ */
++uint
++shrink_buffer_heads(uint gfp_mask)
++{
++	/*
++	 * Shoudn't be called before the buffer-head cache is set-up,
++	 * but allow for it.
++	 */
++	if (bh_cachep)
++		return kmem_cache_shrink(bh_cachep, gfp_mask);
++}
++
++/*
+  * Reserve NR_RESERVED buffer heads for async IO requests to avoid
+  * no-buffer-head deadlock.  Return NULL on failure; waiting for
+  * buffer heads is now handled in create_buffers().
+diff -ur -X ignore --new-file linux-2.4.0-test5/fs/dcache.c mem-2.4.0-test5/fs/dcache.c
+--- linux-2.4.0-test5/fs/dcache.c	Fri Jul 28 00:47:16 2000
++++ mem-2.4.0-test5/fs/dcache.c	Mon Aug  7 11:27:20 2000
+@@ -559,14 +559,8 @@
+ 	if (priority)
+ 		count = dentry_stat.nr_unused / priority;
+ 	prune_dcache(count);
+-	/* FIXME: kmem_cache_shrink here should tell us
+-	   the number of pages freed, and it should
+-	   work in a __GFP_DMA/__GFP_HIGHMEM behaviour
+-	   to free only the interesting pages in
+-	   function of the needs of the current allocation. */
+-	kmem_cache_shrink(dentry_cache);
+ 
+-	return 0;
++	return kmem_cache_shrink(dentry_cache, gfp_mask);
+ }
+ 
+ #define NAME_ALLOC_LEN(len)	((len+16) & ~15)
+diff -ur -X ignore --new-file linux-2.4.0-test5/fs/inode.c mem-2.4.0-test5/fs/inode.c
+--- linux-2.4.0-test5/fs/inode.c	Thu Jul 13 00:24:41 2000
++++ mem-2.4.0-test5/fs/inode.c	Mon Aug  7 11:27:06 2000
+@@ -461,14 +461,8 @@
+ 	if (priority)
+ 		count = inodes_stat.nr_unused / priority;
+ 	prune_icache(count);
+-	/* FIXME: kmem_cache_shrink here should tell us
+-	   the number of pages freed, and it should
+-	   work in a __GFP_DMA/__GFP_HIGHMEM behaviour
+-	   to free only the interesting pages in
+-	   function of the needs of the current allocation. */
+-	kmem_cache_shrink(inode_cachep);
+ 
+-	return 0;
++	return kmem_cache_shrink(inode_cachep, gfp_mask);
+ }
+ 
+ /*
+diff -ur -X ignore --new-file linux-2.4.0-test5/include/linux/fs.h mem-2.4.0-test5/include/linux/fs.h
+--- linux-2.4.0-test5/include/linux/fs.h	Mon Jul 31 11:58:19 2000
++++ mem-2.4.0-test5/include/linux/fs.h	Mon Aug  7 10:58:08 2000
+@@ -244,6 +244,7 @@
+ 
+ typedef void (bh_end_io_t)(struct buffer_head *bh, int uptodate);
+ void init_buffer(struct buffer_head *, bh_end_io_t *, void *);
++uint shrink_buffer_heads(uint);
+ 
+ #define __buffer_state(bh, state)	(((bh)->b_state & (1UL << BH_##state)) != 0)
+ 
+diff -ur -X ignore --new-file linux-2.4.0-test5/include/linux/slab.h mem-2.4.0-test5/include/linux/slab.h
+--- linux-2.4.0-test5/include/linux/slab.h	Mon Jul 31 11:58:19 2000
++++ mem-2.4.0-test5/include/linux/slab.h	Mon Aug  7 11:30:12 2000
+@@ -52,7 +52,7 @@
+ 				       void (*)(void *, kmem_cache_t *, unsigned long),
+ 				       void (*)(void *, kmem_cache_t *, unsigned long));
+ extern int kmem_cache_destroy(kmem_cache_t *);
+-extern int kmem_cache_shrink(kmem_cache_t *);
++extern uint kmem_cache_shrink(kmem_cache_t *, uint);
+ extern void *kmem_cache_alloc(kmem_cache_t *, int);
+ extern void kmem_cache_free(kmem_cache_t *, void *);
+ 
+diff -ur -X ignore --new-file linux-2.4.0-test5/mm/slab.c mem-2.4.0-test5/mm/slab.c
+--- linux-2.4.0-test5/mm/slab.c	Thu Jul 13 00:24:38 2000
++++ mem-2.4.0-test5/mm/slab.c	Mon Aug  7 13:04:41 2000
+@@ -838,7 +838,7 @@
+ 	return ret;
+ }
+ 
+-static int __kmem_cache_shrink(kmem_cache_t *cachep)
++static int __kmem_cache_shrink(kmem_cache_t *cachep, uint *released)
+ {
+ 	slab_t *slabp;
+ 	int ret;
+@@ -869,10 +869,17 @@
+ 
+ 		spin_unlock_irq(&cachep->spinlock);
+ 		kmem_slab_destroy(cachep, slabp);
++
++		if (released) {
++			/* don't need the cache's spinlock to read the order */
++			*released += (1<<cachep->gfporder);
++		}
++
+ 		spin_lock_irq(&cachep->spinlock);
+ 	}
+ 	ret = !list_empty(&cachep->slabs);
+ 	spin_unlock_irq(&cachep->spinlock);
++
+ 	return ret;
+ }
+ 
+@@ -881,14 +888,21 @@
+  * @cachep: The cache to shrink.
+  *
+  * Releases as many slabs as possible for a cache.
+- * To help debugging, a zero exit status indicates all slabs were released.
++ * Returns the number of pages released.
++ *
++ * Note: gfp_mask is currently ignored.
+  */
+-int kmem_cache_shrink(kmem_cache_t *cachep)
++uint kmem_cache_shrink(kmem_cache_t *cachep, uint gfp_mask)
+ {
++	uint	released;
++
+ 	if (!cachep || in_interrupt() || !is_chained_kmem_cache(cachep))
+ 		BUG();
+ 
+-	return __kmem_cache_shrink(cachep);
++	released = 0;
++	(void) __kmem_cache_shrink(cachep, &released);
++
++	return released;
+ }
+ 
+ /**
+@@ -920,7 +934,7 @@
+ 	list_del(&cachep->next);
+ 	up(&cache_chain_sem);
+ 
+-	if (__kmem_cache_shrink(cachep)) {
++	if (__kmem_cache_shrink(cachep, NULL)) {
+ 		printk(KERN_ERR "kmem_cache_destroy: Can't free all objects %p\n",
+ 		       cachep);
+ 		down(&cache_chain_sem);
+@@ -1787,8 +1801,8 @@
+ 
+ 	spin_lock_irq(&best_cachep->spinlock);
+ perfect:
+-	/* free only 80% of the free slabs */
+-	best_len = (best_len*4 + 1)/5;
++	/* free only 50% of the free slabs */
++	best_len = (best_len + 1)/2;
+ 	for (scan = 0; scan < best_len; scan++) {
+ 		struct list_head *p;
+ 
+diff -ur -X ignore --new-file linux-2.4.0-test5/mm/vmscan.c mem-2.4.0-test5/mm/vmscan.c
+--- linux-2.4.0-test5/mm/vmscan.c	Tue Jul 18 20:31:33 2000
++++ mem-2.4.0-test5/mm/vmscan.c	Mon Aug  7 12:56:34 2000
+@@ -478,6 +478,9 @@
+ 	int priority;
+ 	int count = FREE_COUNT;
+ 	int swap_count;
++	int ret;
++
++	ret = 1;	/* assume success */
+ 
+ 	/* Always trim SLAB caches when memory gets low. */
+ 	kmem_cache_reap(gfp_mask);
+@@ -503,21 +506,16 @@
+ 		/* Try to get rid of some shared memory pages.. */
+ 		if (gfp_mask & __GFP_IO) {
+ 			/*
+-			 * don't be too light against the d/i cache since
+-		   	 * shrink_mmap() almost never fail when there's
+-		   	 * really plenty of memory free. 
++			 * Don't be too light against the d/i caches since
++			 * shrink_mmap() almost never fails when there is
++			 * plenty of memory free. 
+ 			 */
+ 			count -= shrink_dcache_memory(priority, gfp_mask);
+ 			count -= shrink_icache_memory(priority, gfp_mask);
+-			/*
+-			 * Not currently working, see fixme in shrink_?cache_memory
+-			 * In the inner funtions there is a comment:
+-			 * "To help debugging, a zero exit status indicates
+-			 *  all slabs were released." (-arca?)
+-			 * lets handle it in a primitive but working way...
+-			 *	if (count <= 0)
+-			 *		goto done;
+-			 */
++
++			if (count <= 0)
++				goto done;
++
+ 			if (!keep_kswapd_awake())
+ 				goto done;
+ 
+@@ -546,12 +544,48 @@
+ 		if (!--count)
+ 			goto done;
+ 	}
+-	/* Return 1 if any page is freed, or
+-	 * there are no more memory pressure   */
+-	return (count < FREE_COUNT || !memory_pressure());
+- 
++
++	/*
++	 * Return 1 if any page is freed, or
++	 * there are no more memory pressure.
++	 */
++	if (count < FREE_COUNT)
++		goto done;
++
++	if (!memory_pressure())
++		goto done;
++
++	ret = 0;	/* failed! */
+ done:
+-	return 1;
++
++	/*
++	 * shrink_mmap() is always called.  It could have released many
++	 * buffer-heads, overflowing the buffer-head unused list and causing
++	 * the heads to be pushed back into their slab cache.
++	 * Call into the buffer code, to get it to shrink back the buffer-head
++	 * slab cache.  There is probably a better use for the memory they are
++	 * occupying.
++	 * shrink_mmap() could return a status, indicating try_to_free_buffers()
++	 * has succeeded and the heads should be shrunk.  But experimentation
++	 * has shown it is almost always worthwhile shrinking the buffer-head
++	 * cache, so do it unconditionally.
++	 *
++	 * Note: Could wait for the next call, and let kmem_cache_reap() take
++	 *	 care of them, but it may not find them (it only scans a set
++	 *	 number of caches) and we want the memory now.  The buffer-head
++	 *	 code has its own list of unused buffer-heads, which acts as a
++	 *	 cushion to the slab cache, so we're (probably) not releasing
++	 *	 buffer-heads which will be needed in the immediate future.
++	 */
++	if (shrink_buffer_heads(gfp_mask)) {
++		/*
++		 * Shrunk, so some pages were released - overwrite a failure
++		 * status
++		 */
++		ret = 1;
++	}
++
++	return ret;
+ }
+ 
+ DECLARE_WAIT_QUEUE_HEAD(kswapd_wait);

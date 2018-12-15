@@ -1,0 +1,116 @@
+Date: Thu, 12 Jun 2003 17:56:50 -0500
+From: Dave McCracken <>
+Subject: Re: [PATCH] Fix vmtruncate race and distributed filesystem race
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2003/6/12/278
+
+--On Thursday, June 12, 2003 14:44:18 -0700 Andrew Morton <akpm@digeo.com>
+wrote:
+> Well it is not "worse".  Futzing with i_sem in do_no_page() is pretty
+> gross. You could add vm_ops->prevalidate() or something if it worries you.
+Actually I've been studying the logic.  I don't think we need to serialize
+with i_sem at all.  i_size has already been changed, so just doing a retry
+immediately will be safe.  Distributed filesystems should also be safe as
+long as they mark the page invalid before they call invalidate_mmap_range().
+I like your idea of doing an atomic_t instead of a seqlock.  The original
+idea from Andrea implied there was a range of time it was unstable, but
+with this scheme a single increment is sufficient.
+I also think if we can solve both the vmtruncate and the distributed file
+system races without adding any vm_ops, we should.
+Here's a new patch.  Does this look better?
+Dave
+======================================================================
+Dave McCracken          IBM Linux Base Kernel Team      1-512-838-3059
+dmccr@us.ibm.com                                        T/L   678-3059
+--- 2.5.70-mm8/./drivers/mtd/devices/blkmtd.c	2003-05-26 20:00:21.000000000 -0500
++++ 2.5.70-mm8-trunc/./drivers/mtd/devices/blkmtd.c	2003-06-12 16:57:52.000000000 -0500
+@@ -1189,6 +1189,7 @@ static int __init init_blkmtd(void)
+   INIT_LIST_HEAD(&mtd_rawdevice->as.locked_pages);
+   mtd_rawdevice->as.host = NULL;
+   init_MUTEX(&(mtd_rawdevice->as.i_shared_sem));
++  atomic_set(&(mtd_rawdevice->as.truncate_count), 0);
+ 
+   mtd_rawdevice->as.a_ops = &blkmtd_aops;
+   INIT_LIST_HEAD(&mtd_rawdevice->as.i_mmap);
+--- 2.5.70-mm8/./include/linux/fs.h	2003-06-12 13:37:28.000000000 -0500
++++ 2.5.70-mm8-trunc/./include/linux/fs.h	2003-06-12 17:00:04.000000000 -0500
+@@ -323,6 +323,7 @@ struct address_space {
+ 	struct list_head	i_mmap;		/* list of private mappings */
+ 	struct list_head	i_mmap_shared;	/* list of shared mappings */
+ 	struct semaphore	i_shared_sem;	/* protect both above lists */
++	atomic_t		truncate_count;	/* Cover race condition with truncate */
+ 	unsigned long		dirtied_when;	/* jiffies of first page dirtying */
+ 	int			gfp_mask;	/* how to allocate the pages */
+ 	struct backing_dev_info *backing_dev_info; /* device readahead, etc */
+--- 2.5.70-mm8/./fs/inode.c	2003-06-12 13:37:22.000000000 -0500
++++ 2.5.70-mm8-trunc/./fs/inode.c	2003-06-12 16:59:30.000000000 -0500
+@@ -185,6 +185,7 @@ void inode_init_once(struct inode *inode
+ 	INIT_RADIX_TREE(&inode->i_data.page_tree, GFP_ATOMIC);
+ 	spin_lock_init(&inode->i_data.page_lock);
+ 	init_MUTEX(&inode->i_data.i_shared_sem);
++	atomic_set(&inode->i_data.truncate_count, 0);
+ 	INIT_LIST_HEAD(&inode->i_data.private_list);
+ 	spin_lock_init(&inode->i_data.private_lock);
+ 	INIT_LIST_HEAD(&inode->i_data.i_mmap);
+--- 2.5.70-mm8/./mm/swap_state.c	2003-05-26 20:00:39.000000000 -0500
++++ 2.5.70-mm8-trunc/./mm/swap_state.c	2003-06-12 16:59:53.000000000 -0500
+@@ -44,6 +44,7 @@ struct address_space swapper_space = {
+ 	.i_mmap		= LIST_HEAD_INIT(swapper_space.i_mmap),
+ 	.i_mmap_shared	= LIST_HEAD_INIT(swapper_space.i_mmap_shared),
+ 	.i_shared_sem	= __MUTEX_INITIALIZER(swapper_space.i_shared_sem),
++	.truncate_count  = ATOMIC_INIT(0),
+ 	.private_lock	= SPIN_LOCK_UNLOCKED,
+ 	.private_list	= LIST_HEAD_INIT(swapper_space.private_list),
+ };
+--- 2.5.70-mm8/./mm/memory.c	2003-06-12 13:37:31.000000000 -0500
++++ 2.5.70-mm8-trunc/./mm/memory.c	2003-06-12 17:51:55.000000000 -0500
+@@ -1138,6 +1138,8 @@ invalidate_mmap_range(struct address_spa
+ 			hlen = ULONG_MAX - hba + 1;
+ 	}
+ 	down(&mapping->i_shared_sem);
++	/* Protect against page fault */
++	atomic_inc(&mapping->truncate_count);
+ 	if (unlikely(!list_empty(&mapping->i_mmap)))
+ 		invalidate_mmap_range_list(&mapping->i_mmap, hba, hlen);
+ 	if (unlikely(!list_empty(&mapping->i_mmap_shared)))
+@@ -1390,8 +1392,10 @@ do_no_page(struct mm_struct *mm, struct 
+ 	unsigned long address, int write_access, pte_t *page_table, pmd_t *pmd)
+ {
+ 	struct page * new_page;
++	struct address_space *mapping;
+ 	pte_t entry;
+ 	struct pte_chain *pte_chain;
++	unsigned sequence;
+ 	int ret;
+ 
+ 	if (!vma->vm_ops || !vma->vm_ops->nopage)
+@@ -1400,6 +1404,9 @@ do_no_page(struct mm_struct *mm, struct 
+ 	pte_unmap(page_table);
+ 	spin_unlock(&mm->page_table_lock);
+ 
++	mapping = vma->vm_file->f_dentry->d_inode->i_mapping;
++retry:
++	sequence = atomic_read(&mapping->truncate_count);
+ 	new_page = vma->vm_ops->nopage(vma, address & PAGE_MASK, 0);
+ 
+ 	/* no page was available -- either SIGBUS or OOM */
+@@ -1428,6 +1435,16 @@ do_no_page(struct mm_struct *mm, struct 
+ 	}
+ 
+ 	spin_lock(&mm->page_table_lock);
++	/*
++	 * For a file-backed vma, someone could have truncated or otherwise
++	 * invalidated this page.  If invalidate_mmap_range got called,
++	 * retry getting the page.
++	 */
++	if (unlikely(sequence != atomic_read(&mapping->truncate_count))) {
++		spin_unlock(&mm->page_table_lock);
++		page_cache_release(new_page);
++		goto retry;
++	}
+ 	page_table = pte_offset_map(pmd, address);
+ 
+ 	/*

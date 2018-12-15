@@ -1,0 +1,139 @@
+Date: Thu, 10 Jan 2008 15:30:46 +0800
+From: Fengguang Wu <>
+Subject: Re: regression: 100% io-wait with 2.6.24-rcX
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2008/1/10/20
+
+Joerg,
+Can you try the attached patches? Thank you.
+I cannot reliably reproduce the bug yet.
+Fengguang
+ mm/filemap_xip.c |    1 +
+ 1 files changed, 1 insertion(+)
+Index: linux/mm/filemap_xip.c
+===================================================================
+--- linux.orig/mm/filemap_xip.c
++++ linux/mm/filemap_xip.c
+@@ -431,6 +431,7 @@ xip_truncate_page(struct address_space *
+ 			return PTR_ERR(page);
+ 	}
+ 	zero_user_page(page, offset, length, KM_USER0);
++	set_page_dirty(page);
+ 	return 0;
+ }
+ EXPORT_SYMBOL_GPL(xip_truncate_page);---
+ mm/page-writeback.c |   29 +++++++++++++++++++++++++++++
+ 1 file changed, 29 insertions(+)
+--- linux-2.6.24-git17.orig/mm/page-writeback.c
++++ linux-2.6.24-git17/mm/page-writeback.c
+@@ -98,6 +98,26 @@ EXPORT_SYMBOL(laptop_mode);
+ 
+ /* End of sysctl-exported parameters */
+ 
++#define writeback_debug_report(n, wbc) do {                               \
++	__writeback_debug_report(n, wbc, __FILE__, __LINE__, __FUNCTION__); \
++} while (0)
++
++void __writeback_debug_report(long n, struct writeback_control *wbc,
++		const char *file, int line, const char *func)
++{
++	printk(KERN_DEBUG "%s %d %s: %s(%d) %ld "
++			"global %lu %lu %lu "
++			"wc %c%c tw %ld sk %ld\n",
++			file, line, func,
++			current->comm, current->pid, n,
++			global_page_state(NR_FILE_DIRTY),
++			global_page_state(NR_WRITEBACK),
++			global_page_state(NR_UNSTABLE_NFS),
++			wbc->encountered_congestion ? 'C':'_',
++			wbc->more_io ? 'M':'_',
++			wbc->nr_to_write,
++			wbc->pages_skipped);
++}
+ 
+ static void background_writeout(unsigned long _min_pages);
+ 
+@@ -395,6 +415,7 @@ static void balance_dirty_pages(struct a
+ 			pages_written += write_chunk - wbc.nr_to_write;
+ 			get_dirty_limits(&background_thresh, &dirty_thresh,
+ 				       &bdi_thresh, bdi);
++			writeback_debug_report(pages_written, &wbc);
+ 		}
+ 
+ 		/*
+@@ -421,6 +442,7 @@ static void balance_dirty_pages(struct a
+ 			break;		/* We've done our duty */
+ 
+ 		congestion_wait(WRITE, HZ/10);
++		writeback_debug_report(-pages_written, &wbc);
+ 	}
+ 
+ 	if (bdi_nr_reclaimable + bdi_nr_writeback < bdi_thresh &&
+@@ -515,6 +537,11 @@ void throttle_vm_writeout(gfp_t gfp_mask
+ 			global_page_state(NR_WRITEBACK) <= dirty_thresh)
+                         	break;
+                 congestion_wait(WRITE, HZ/10);
++		printk(KERN_DEBUG "throttle_vm_writeout: "
++				"congestion_wait on %lu+%lu > %lu\n",
++				global_page_state(NR_UNSTABLE_NFS),
++				global_page_state(NR_WRITEBACK),
++				dirty_thresh);
+ 
+ 		/*
+ 		 * The caller might hold locks which can prevent IO completion
+@@ -557,6 +584,7 @@ static void background_writeout(unsigned
+ 		wbc.pages_skipped = 0;
+ 		writeback_inodes(&wbc);
+ 		min_pages -= MAX_WRITEBACK_PAGES - wbc.nr_to_write;
++		writeback_debug_report(min_pages, &wbc);
+ 		if (wbc.nr_to_write > 0 || wbc.pages_skipped > 0) {
+ 			/* Wrote less than expected */
+ 			if (wbc.encountered_congestion || wbc.more_io)
+@@ -630,6 +658,7 @@ static void wb_kupdate(unsigned long arg
+ 		wbc.encountered_congestion = 0;
+ 		wbc.nr_to_write = MAX_WRITEBACK_PAGES;
+ 		writeback_inodes(&wbc);
++		writeback_debug_report(nr_to_write, &wbc);
+ 		if (wbc.nr_to_write > 0) {
+ 			if (wbc.encountered_congestion || wbc.more_io)
+ 				congestion_wait(WRITE, HZ/10);Subject: track redirty_tail() calls
+It helps a lot to know how redirty_tail() are called.
+Cc: Ken Chen <kenchen@google.com>
+Cc: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Fengguang Wu <wfg@mail.ustc.edu.cn>
+---
+ fs/fs-writeback.c |   16 +++++++++++++++-
+ 1 file changed, 15 insertions(+), 1 deletion(-)
+--- linux-2.6.24-git17.orig/fs/fs-writeback.c
++++ linux-2.6.24-git17/fs/fs-writeback.c
+@@ -164,12 +164,26 @@ static void redirty_tail(struct inode *i
+ 	list_move(&inode->i_list, &sb->s_dirty);
+ }
+ 
++#define requeue_io(inode)						\
++	do {								\
++		__requeue_io(inode, __LINE__);				\
++	} while (0)
++
+ /*
+  * requeue inode for re-scanning after sb->s_io list is exhausted.
+  */
+-static void requeue_io(struct inode *inode)
++static void __requeue_io(struct inode *inode, int line)
+ {
+ 	list_move(&inode->i_list, &inode->i_sb->s_more_io);
++
++	printk(KERN_DEBUG "requeue_io %d: inode %lu size %llu at %02x:%02x(%s)\n",
++			line,
++			inode->i_ino,
++			i_size_read(inode),
++			MAJOR(inode->i_sb->s_dev),
++			MINOR(inode->i_sb->s_dev),
++			inode->i_sb->s_id
++			);
+ }
+ 
+ static void inode_sync_complete(struct inode *inode)

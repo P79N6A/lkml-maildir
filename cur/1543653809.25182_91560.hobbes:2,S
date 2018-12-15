@@ -1,0 +1,578 @@
+Date: Thu, 21 Nov 2002 14:45:50 -0600 (CST)
+From: Patrick Mochel <>
+Subject: Re: [BUG] sysfs on 2.5.48 unable to remove files while in use
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2002/11/21/169
+
+Ok, I've had a chance to play with it a bit..
+The kprobes patch didn't apply to current -bk. Attached is an updated 
+patch. I also have some comments on your 'noisy' patch, but first..
+> I can see this with a little kprobes example code that I have
+> been playing with that will create entries like:
+> 
+> /sysfsroot/noisy/0xc0107ae0/sys_fork
+> 
+> when someone uses that driver to insert a kernel probe
+> at 0xc0107ae0 that will printk "sys_fork".
+It seems that having a pure sysfs implementation would be superior, 
+instead of having to use a character device to write to. After looking 
+into this, I realize that a couple of pieces of infrastructure are needed, 
+so I'm working on that, and will post a modified version of your module 
+once I'm done..
+> What I have noticed, is that if I create a new probe
+> (which will create the sysfs entry), open a new shell and
+> cd to /sysfsroot/noisy/0xc0107ae0, and then use my
+> driver to remove the probe (which will remove the
+> sysfs entry), then /sysfsroot/noisy/0xc0107ae0 doesn't
+> go away after I cd out of the shell.
+> 
+> >From then on any attempts to create new sysfs entries
+> do not show up in /sysfsroot/ until I unload/load my driver
+> again.
+> 
+> It seems like this could be an issue with some real code
+> (not just this stupid play code of mine), like maybe hotswap
+> code that updates sysfs entries.
+Yes, it was a real bug. I've mucked with the method to do file and 
+directory deletion, and it turns out that the way I was doing it was 
+wrong. I've gone back to mimmicking vfs_unlink() and vfs_rmdir(), which I 
+shouldn't have diverged from in the first place. (doing d_delete() after 
+low-level unlinking, instead of d_invalidate() before it). 
+Appended to this email is my current working patch to sysfs, including 
+fixes discussed and posted yesterday. I've pushed these to Linus, though 
+he appears to be away. I'll push again, with this fix in the next day or 
+so. 
+Please try this patch and let me know if you still experience the problem 
+you're seeing.
+Concerning your patch: 
+> +config NOISY
+'Noisy' seems like such a generic name, and the description doesn't seem 
+to imply its dependence on kprobes. Maybe KPROBES_NOISY? And, you should 
+put it under KPROBES, under DEBUG_KERNEL.
+> diff -urN linux-2.5.48-kprobes/drivers/char/noisy.c
+> linux-2.5.48-kprobes-patched/drivers/char/noisy.c
+> +static struct list_head probe_list;
+> +struct nprobe {
+> +	struct list_head list;
+> +	struct kprobe probe;
+> +	char message[MAX_MSG_SIZE + 1];
+> +	struct attribute attr;
+> +	struct kobject kobj;
+> +};
+struct subsystem has a list, and kobject and entry, so you don't have to 
+do it yourself..
+> +static ssize_t noisy_write(struct file *file, const char *buf, size_t
+> count,
+> +			   loff_t *ppos)
+> +{
+> +	struct nprobe *n = 0;
+> +	size_t ret = -ENOMEM;
+> +	char *tmp = 0;
+> +
+> +	if (count > MAX_MSG_SIZE) {
+> +		printk(KERN_CRIT
+> +		       "noisy: Input buffer (%i bytes) is too big!\n",
+> +		       count);
+> +		ret = -EINVAL;
+> +		goto out;
+> +	}
+> +
+> +	tmp = kmalloc(count + 1, GFP_KERNEL);
+> +	if (!tmp) {
+> +		ret = -ENOMEM;
+> +		goto out;
+> +	}
+This should be memset to 0. 
+> +	n = kmalloc(sizeof(struct nprobe), GFP_KERNEL);
+> +	if (!n) {
+> +		ret = -ENOMEM;
+> +		goto out;
+> +	}
+> +	memset(n, '\0', sizeof(struct nprobe));
+> +
+> +	if (copy_from_user((void *)tmp, (void *)buf, count)) {
+> +		ret = -ENOMEM;
+> +		goto out;
+> +	}
+> +	tmp[count] = '\0';
+> +
+> +	if (2 != sscanf(tmp, "0x%x %s", &(n->probe).addr, n->message)) {
+> +		ret = -EINVAL;
+> +		goto out;
+> +	}
+You don't free n if you get an error from copy_from_user() or sscanf(). 
+> +	(n->attr).name = n->message;
+> +	(n->attr).mode = S_IRUGO;
+Instead of doing this, you should just declare a static attribute called
+'message' and have the contents be the message. This will save you from 
+initializing it each time, and save you 4 bytes in struct nprobe. 
+Something like this should work:
+struct noisy_attribute {
+	struct attribute attr;
+	ssize_t (*read)(struct nprobe *,char *,size_t,loff_t);
+};
+static ssize_t noisy_attr_show(struct kobject * kobj, struct attribute * 
+attr,
+			       char * page, size_t count, loff_t off)
+{
+	struct nprobe * n = container_of(kobj,struct nprobe,kobj);
+	struct noisy_attribute * noisy_attr = container_of(attr,struct 
+noisy_attribute,attr);
+	ssize_t ret = 0;
+	return noisy_attr->show ? noisy_attr->show(n,page,count,off);
+}
+static struct sysfs_ops noisy_sysfs_ops = {
+	.show	= noisy_attr_show,
+};
+/* Default Attribute */
+static ssize_t noisy_message_read(struct nprobe * n, char * page, size_t 
+count, loff_t off)
+{
+	return off ? snprintf(page,MAX_MSG_SIZE,"%s",n->message);
+}
+static struct noisy_attribute attr_message = {
+	.attr	= { .name = "message", .mode = S_IRUGO },
+};
+static struct attribute * default_attrs[] = {
+	&attr_message.attr,
+	NULL,
+};
+/*
+ * sysfs stuff
+ */
+struct subsystem noisy_subsys = {
+	.kobj	= { .name = "noisy" },
+	.default_attrs	= default_attrs,
+	.sysfs_ops	= noisy_sysfs_ops,
+};
+Note that this will also save you from manually having to create and 
+teardown the file when the kobject is registered and unregistered. 
+	-pat
+--- linux-2.5-virgin/fs/sysfs/inode.c	Wed Nov 20 12:13:06 2002
++++ linux-2.5-core/fs/sysfs/inode.c	Thu Nov 21 13:51:32 2002
+@@ -23,6 +23,8 @@
+  * Please see Documentation/filesystems/sysfs.txt for more information.
+  */
+ 
++#undef DEBUG 
++
+ #include <linux/list.h>
+ #include <linux/init.h>
+ #include <linux/pagemap.h>
+@@ -94,9 +96,10 @@
+ 
+ 	if (!dentry->d_inode) {
+ 		inode = sysfs_get_inode(dir->i_sb, mode, dev);
+-		if (inode)
++		if (inode) {
+ 			d_instantiate(dentry, inode);
+-		else
++			dget(dentry);
++		} else
+ 			error = -ENOSPC;
+ 	} else
+ 		error = -EEXIST;
+@@ -142,17 +145,6 @@
+ 	return error;
+ }
+ 
+-static int sysfs_unlink(struct inode *dir, struct dentry *dentry)
+-{
+-	struct inode *inode = dentry->d_inode;
+-	down(&inode->i_sem);
+-	dentry->d_inode->i_nlink--;
+-	up(&inode->i_sem);
+-	d_invalidate(dentry);
+-	dput(dentry);
+-	return 0;
+-}
+-
+ /**
+  *	sysfs_read_file - read an attribute. 
+  *	@file:	file pointer.
+@@ -173,17 +165,11 @@
+ sysfs_read_file(struct file *file, char *buf, size_t count, loff_t *ppos)
+ {
+ 	struct attribute * attr = file->f_dentry->d_fsdata;
+-	struct sysfs_ops * ops = NULL;
+-	struct kobject * kobj;
++	struct sysfs_ops * ops = file->private_data;
++	struct kobject * kobj = file->f_dentry->d_parent->d_fsdata;
+ 	unsigned char *page;
+ 	ssize_t retval = 0;
+ 
+-	kobj = file->f_dentry->d_parent->d_fsdata;
+-	if (kobj && kobj->subsys)
+-		ops = kobj->subsys->sysfs_ops;
+-	if (!ops || !ops->show)
+-		return 0;
+-
+ 	if (count > PAGE_SIZE)
+ 		count = PAGE_SIZE;
+ 
+@@ -234,16 +220,11 @@
+ sysfs_write_file(struct file *file, const char *buf, size_t count, loff_t *ppos)
+ {
+ 	struct attribute * attr = file->f_dentry->d_fsdata;
+-	struct sysfs_ops * ops = NULL;
+-	struct kobject * kobj;
++	struct sysfs_ops * ops = file->private_data;
++	struct kobject * kobj = file->f_dentry->d_parent->d_fsdata;
+ 	ssize_t retval = 0;
+ 	char * page;
+ 
+-	kobj = file->f_dentry->d_parent->d_fsdata;
+-	if (kobj && kobj->subsys)
+-		ops = kobj->subsys->sysfs_ops;
+-	if (!ops || !ops->store)
+-		return -EINVAL;
+ 
+ 	page = (char *)__get_free_page(GFP_KERNEL);
+ 	if (!page)
+@@ -275,21 +256,72 @@
+ 	return retval;
+ }
+ 
+-static int sysfs_open_file(struct inode * inode, struct file * filp)
++static int check_perm(struct inode * inode, struct file * file)
+ {
+-	struct kobject * kobj;
++	struct kobject * kobj = kobject_get(file->f_dentry->d_parent->d_fsdata);
++	struct attribute * attr = file->f_dentry->d_fsdata;
++	struct sysfs_ops * ops = NULL;
+ 	int error = 0;
+ 
+-	kobj = filp->f_dentry->d_parent->d_fsdata;
+-	if ((kobj = kobject_get(kobj))) {
+-		struct attribute * attr = filp->f_dentry->d_fsdata;
+-		if (!attr)
+-			error = -EINVAL;
+-	} else
+-		error = -EINVAL;
++	if (!kobj || !attr)
++		goto Einval;
++	
++	if (kobj->subsys)
++		ops = kobj->subsys->sysfs_ops;
++
++	/* No sysfs operations, either from having no subsystem,
++	 * or the subsystem have no operations.
++	 */
++	if (!ops)
++		goto Eaccess;
++
++	/* File needs write support.
++	 * The inode's perms must say it's ok, 
++	 * and we must have a store method.
++	 */
++	if (file->f_mode & FMODE_WRITE) {
++
++		if (!(inode->i_mode & S_IWUGO))
++			goto Eperm;
++		if (!ops->store)
++			goto Eaccess;
++
++	}
++
++	/* File needs read support.
++	 * The inode's perms must say it's ok, and we there
++	 * must be a show method for it.
++	 */
++	if (file->f_mode & FMODE_READ) {
++		if (!(inode->i_mode & S_IRUGO))
++			goto Eperm;
++		if (!ops->show)
++			goto Eaccess;
++	}
++
++	/* No error? Great, store the ops in file->private_data
++	 * for easy access in the read/write functions.
++	 */
++	file->private_data = ops;
++	goto Done;
++
++ Einval:
++	error = -EINVAL;
++	goto Done;
++ Eaccess:
++	error = -EACCES;
++	goto Done;
++ Eperm:
++	error = -EPERM;
++ Done:
+ 	return error;
+ }
+ 
++static int sysfs_open_file(struct inode * inode, struct file * filp)
++{
++	return check_perm(inode,filp);
++}
++
+ static int sysfs_release(struct inode * inode, struct file * filp)
+ {
+ 	struct kobject * kobj = filp->f_dentry->d_parent->d_fsdata;
+@@ -541,7 +573,8 @@
+ 		/* make sure dentry is really there */
+ 		if (victim->d_inode && 
+ 		    (victim->d_parent->d_inode == dir->d_inode)) {
+-			sysfs_unlink(dir->d_inode,victim);
++			simple_unlink(dir->d_inode,victim);
++			d_delete(victim);
+ 		}
+ 	}
+ 	up(&dir->d_inode->i_sem);
+@@ -599,19 +632,16 @@
+ 	list_for_each_safe(node,next,&dentry->d_subdirs) {
+ 		struct dentry * d = list_entry(node,struct dentry,d_child);
+ 		/* make sure dentry is still there */
+-		if (d->d_inode)
+-			sysfs_unlink(dentry->d_inode,d);
++		if (d->d_inode) {
++			simple_unlink(dentry->d_inode,d);
++			d_delete(dentry);
++		}
+ 	}
+ 
+-	d_invalidate(dentry);
+-	if (simple_empty(dentry)) {
+-		dentry->d_inode->i_nlink -= 2;
+-		dentry->d_inode->i_flags |= S_DEAD;
+-		parent->d_inode->i_nlink--;
+-	}
+ 	up(&dentry->d_inode->i_sem);
+-	dput(dentry);
+-
++	d_invalidate(dentry);
++	simple_rmdir(parent->d_inode,dentry);
++	d_delete(dentry);
+ 	up(&parent->d_inode->i_sem);
+ 	dput(parent);
+ }
+@@ -622,4 +652,3 @@
+ EXPORT_SYMBOL(sysfs_remove_link);
+ EXPORT_SYMBOL(sysfs_create_dir);
+ EXPORT_SYMBOL(sysfs_remove_dir);
+-MODULE_LICENSE("GPL");===== arch/i386/Kconfig 1.10 vs edited =====
+--- 1.10/arch/i386/Kconfig	Mon Nov 18 11:52:31 2002
++++ edited/arch/i386/Kconfig	Thu Nov 21 11:20:31 2002
+@@ -1551,6 +1551,15 @@
+ 	  Say Y here if you are developing drivers or trying to debug and
+ 	  identify kernel problems.
+ 
++config KPROBES
++	bool "Kprobes"
++	depends on DEBUG_KERNEL
++	help
++	  Kprobes allows you to trap at almost any kernel address, using
++	  register_kprobe(), and providing a callback function.  This is useful
++	  for kernel debugging, non-intrusive instrumentation and testing.  If
++	  in doubt, say "N".
++
+ config DEBUG_STACKOVERFLOW
+ 	bool "Check for stack overflows"
+ 	depends on DEBUG_KERNEL
+===== arch/i386/kernel/Makefile 1.29 vs edited =====
+--- 1.29/arch/i386/kernel/Makefile	Thu Nov  7 11:26:45 2002
++++ edited/arch/i386/kernel/Makefile	Thu Nov 21 11:20:31 2002
+@@ -29,6 +29,7 @@
+ obj-$(CONFIG_PROFILING)		+= profile.o
+ obj-$(CONFIG_EDD)             	+= edd.o
+ obj-$(CONFIG_MODULES)		+= module.o
++obj-$(CONFIG_KPROBES)		+= kprobes.o
+ 
+ EXTRA_AFLAGS   := -traditional
+ 
+===== arch/i386/kernel/entry.S 1.46 vs edited =====
+--- 1.46/arch/i386/kernel/entry.S	Wed Nov 20 12:56:06 2002
++++ edited/arch/i386/kernel/entry.S	Thu Nov 21 11:20:31 2002
+@@ -405,9 +405,16 @@
+ 	jmp ret_from_exception
+ 
+ ENTRY(debug)
++	pushl $-1			# mark this as an int
++	SAVE_ALL
++	movl %esp,%edx
+ 	pushl $0
+-	pushl $do_debug
+-	jmp error_code
++	pushl %edx
++	call do_debug
++	addl $8,%esp
++	testl %eax,%eax 
++	jnz restore_all
++	jmp ret_from_exception
+ 
+ ENTRY(nmi)
+ 	pushl %eax
+@@ -420,9 +427,16 @@
+ 	RESTORE_ALL
+ 
+ ENTRY(int3)
++	pushl $-1			# mark this as an int
++	SAVE_ALL
++	movl %esp,%edx
+ 	pushl $0
+-	pushl $do_int3
+-	jmp error_code
++	pushl %edx
++	call do_int3
++	addl $8,%esp
++	testl %eax,%eax 
++	jnz restore_all
++	jmp ret_from_exception
+ 
+ ENTRY(overflow)
+ 	pushl $0
+===== arch/i386/kernel/traps.c 1.36 vs edited =====
+--- 1.36/arch/i386/kernel/traps.c	Mon Nov 18 12:10:45 2002
++++ edited/arch/i386/kernel/traps.c	Thu Nov 21 11:20:48 2002
+@@ -24,6 +24,7 @@
+ #include <linux/interrupt.h>
+ #include <linux/highmem.h>
+ #include <linux/kallsyms.h>
++#include <linux/kprobes.h>
+ 
+ #ifdef CONFIG_EISA
+ #include <linux/ioport.h>
+@@ -404,7 +405,6 @@
+ }
+ 
+ DO_VM86_ERROR_INFO( 0, SIGFPE,  "divide error", divide_error, FPE_INTDIV, regs->eip)
+-DO_VM86_ERROR( 3, SIGTRAP, "int3", int3)
+ DO_VM86_ERROR( 4, SIGSEGV, "overflow", overflow)
+ DO_VM86_ERROR( 5, SIGSEGV, "bounds", bounds)
+ DO_ERROR_INFO( 6, SIGILL,  "invalid operand", invalid_op, ILL_ILLOPN, regs->eip)
+@@ -420,6 +420,9 @@
+ {
+ 	if (regs->eflags & VM_MASK)
+ 		goto gp_in_vm86;
++	
++	if (kprobe_running() && kprobe_fault_handler(regs, 13))
++		return;
+ 
+ 	if (!(regs->xcs & 3))
+ 		goto gp_in_kernel;
+@@ -551,6 +554,17 @@
+ 	nmi_callback = dummy_nmi_callback;
+ }
+ 
++asmlinkage int do_int3(struct pt_regs *regs, long error_code)
++{
++	if (kprobe_handler(regs))
++		return 1;
++	/* This is an interrupt gate, because kprobes wants interrupts
++           disabled.  Normal trap handlers don't. */
++	restore_interrupts(regs);
++	do_trap(3, SIGTRAP, "int3", 1, regs, error_code, NULL);
++	return 0;
++}
++
+ /*
+  * Our handling of the processor debug registers is non-trivial.
+  * We do not clear them on entry and exit from the kernel. Therefore
+@@ -573,7 +587,7 @@
+  * find every occurrence of the TF bit that could be saved away even
+  * by user code)
+  */
+-asmlinkage void do_debug(struct pt_regs * regs, long error_code)
++asmlinkage int do_debug(struct pt_regs * regs, long error_code)
+ {
+ 	unsigned int condition;
+ 	struct task_struct *tsk = current;
+@@ -581,6 +595,12 @@
+ 
+ 	__asm__ __volatile__("movl %%db6,%0" : "=r" (condition));
+ 
++	if (post_kprobe_handler(regs))
++		return 1;
++
++	/* Interrupts not disabled for normal trap handling. */
++	restore_interrupts(regs);
++
+ 	/* Mask out spurious debug traps due to lazy DR7 setting */
+ 	if (condition & (DR_TRAP0|DR_TRAP1|DR_TRAP2|DR_TRAP3)) {
+ 		if (!tsk->thread.debugreg[7])
+@@ -631,15 +651,15 @@
+ 	__asm__("movl %0,%%db7"
+ 		: /* no output */
+ 		: "r" (0));
+-	return;
++	return 0;
+ 
+ debug_vm86:
+ 	handle_vm86_trap((struct kernel_vm86_regs *) regs, error_code, 1);
+-	return;
++	return 0;
+ 
+ clear_TF:
+ 	regs->eflags &= ~TF_MASK;
+-	return;
++	return 0;
+ }
+ 
+ /*
+@@ -803,6 +823,8 @@
+ 	struct task_struct *tsk = current;
+ 	clts();		/* Allow maths ops (or we recurse) */
+ 
++	if (kprobe_running() && kprobe_fault_handler(&regs, 7))
++		return;
+ 	if (!tsk->used_math)
+ 		init_fpu(tsk);
+ 	restore_fpu(tsk);
+@@ -896,9 +918,9 @@
+ #endif
+ 
+ 	set_trap_gate(0,&divide_error);
+-	set_trap_gate(1,&debug);
++	_set_gate(idt_table+1,14,3,&debug); /* debug trap for kprobes */
+ 	set_intr_gate(2,&nmi);
+-	set_system_gate(3,&int3);	/* int3-5 can be called from all */
++	_set_gate(idt_table+3,14,3,&int3); /* int3-5 can be called from all */
+ 	set_system_gate(4,&overflow);
+ 	set_system_gate(5,&bounds);
+ 	set_trap_gate(6,&invalid_op);
+===== arch/i386/mm/fault.c 1.20 vs edited =====
+--- 1.20/arch/i386/mm/fault.c	Sat Oct 12 06:11:03 2002
++++ edited/arch/i386/mm/fault.c	Thu Nov 21 11:20:31 2002
+@@ -19,6 +19,7 @@
+ #include <linux/init.h>
+ #include <linux/tty.h>
+ #include <linux/vt_kern.h>		/* For unblank_screen() */
++#include <linux/kprobes.h>
+ 
+ #include <asm/system.h>
+ #include <asm/uaccess.h>
+@@ -162,6 +163,9 @@
+ 
+ 	/* get the address */
+ 	__asm__("movl %%cr2,%0":"=r" (address));
++
++	if (kprobe_running() && kprobe_fault_handler(regs, 14))
++		return;
+ 
+ 	/* It's safe to allow irq's after cr2 has been saved */
+ 	if (regs->eflags & X86_EFLAGS_IF)
+===== kernel/Makefile 1.21 vs edited =====
+--- 1.21/kernel/Makefile	Mon Nov 18 22:51:14 2002
++++ edited/kernel/Makefile	Thu Nov 21 11:20:31 2002
+@@ -4,7 +4,7 @@
+ 
+ export-objs = signal.o sys.o kmod.o workqueue.o ksyms.o pm.o exec_domain.o \
+ 		printk.o platform.o suspend.o dma.o module.o cpufreq.o \
+-		profile.o rcupdate.o intermodule.o
++		profile.o rcupdate.o intermodule.o kprobes.o
+ 
+ obj-y     = sched.o fork.o exec_domain.o panic.o printk.o profile.o \
+ 	    exit.o itimer.o time.o softirq.o resource.o \
+@@ -21,6 +21,7 @@
+ obj-$(CONFIG_CPU_FREQ) += cpufreq.o
+ obj-$(CONFIG_BSD_PROCESS_ACCT) += acct.o
+ obj-$(CONFIG_SOFTWARE_SUSPEND) += suspend.o
++obj-$(CONFIG_KPROBES) += kprobes.o
+ 
+ ifneq ($(CONFIG_IA64),y)
+ # According to Alan Modra <alan@linuxcare.com.au>, the -fno-omit-frame-pointer is

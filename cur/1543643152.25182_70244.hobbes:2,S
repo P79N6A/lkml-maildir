@@ -1,0 +1,126 @@
+Date: Thu, 12 Sep 2002 12:34:32 +0100
+From: David Howells <>
+Subject: Re: [PATCH] per-interrupt stacks - try 2
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2002/9/12/77
+
+> per-CPU per-IRQ i mean, of course. It's a basic performance issue, on SMP
+> we do not want dirty IRQ stacks to bounce between CPUs ...
+Do you have benchmarks or something to show that is this actually a
+_significant_ problem?
+After all, unless you bind the interrupts to particular IRQs, loads of data -
+including the irq_desc[] table - are going to be bouncing too.
+I'm not convinced that it's going to be worth doing stacks on a per-CPU basis,
+and not a per-IRQ basis. The only way I can see that it could be a problem is
+that if it will be permitted to enter handle_IRQ_event() on two or more
+different CPUs simultaneously for the same IRQ, provided that do_IRQ() itself
+switches the stack just around the call to handle_IRQ_event() [see attached].
+I think, however, that per-CPU softirq stacks would be a good idea, as these
+are used quite capaciously by TCP/IP.
+David
+asmlinkage unsigned int do_IRQ(struct pt_regs regs)
+{	
+	/* 
+	 * We ack quickly, we don't want the irq controller
+	 * thinking we're snobs just because some other CPU has
+	 * disabled global interrupts (we have already done the
+	 * INT_ACK cycles, it's too late to try to pretend to the
+	 * controller that we aren't taking the interrupt).
+	 *
+	 * 0 return value means that this irq is already being
+	 * handled by some other CPU. (or is disabled)
+	 */
+	int irq = regs.orig_eax & 0xff; /* high bits used in ret_from_ code  */
+	int cpu = smp_processor_id();
+	irq_desc_t *desc = irq_desc + irq;
+	struct thread_info *curctx;
+	struct irqaction *action;
+	union irq_ctx *irqctx;
+	unsigned int status;
+	irq_enter();
+	kstat.irqs[cpu][irq]++;
+	spin_lock(&desc->lock);
+	desc->handler->ack(irq);
+	/*
+	  REPLAY is when Linux resends an IRQ that was dropped earlier
+	  WAITING is used by probe to mark irqs that are being tested
+	*/
+	status = desc->status & ~(IRQ_REPLAY | IRQ_WAITING);
+	status |= IRQ_PENDING; /* we _want_ to handle it */
+	/*
+	 * If the IRQ is disabled for whatever reason, we cannot
+	 * use the action we have.
+	 */
+	action = NULL;
+	if (likely(!(status & (IRQ_DISABLED | IRQ_INPROGRESS)))) {
+		action = desc->action;
+		status &= ~IRQ_PENDING; /* we commit to handling */
+		status |= IRQ_INPROGRESS; /* we are handling it */
+	}
+	desc->status = status;
+	/*
+	 * If there is no IRQ handler or it was disabled, exit early.
+	 Since we set PENDING, if another processor is handling
+	 a different instance of this same irq, the other processor
+	 will take care of it.
+	*/
+	if (unlikely(!action))
+		goto out;
+	/*
+	 * Edge triggered interrupts need to remember
+	 * pending events.
+	 * This applies to any hw interrupts that allow a second
+	 * instance of the same irq to arrive while we are in do_IRQ
+	 * or in the handler. But the code here only handles the _second_
+	 * instance of the irq, not the third or fourth. So it is mostly
+	 * useful for irq hardware that does not mask cleanly in an
+	 * SMP environment.
+	 */
+	curctx = current_thread_info();
+	irqctx = desc->hardirq_stack;
+	irqctx->tinfo.task = curctx->task;
+	for (;;) {
+		u32 *isp;
+		spin_unlock(&desc->lock);
+		/* build the stack frame on the IRQ stack */
+		isp = (u32*) ((char*)irqctx + sizeof(*irqctx));
+		*--isp = (u32) action;
+		*--isp = (u32) &regs;
+		*--isp = (u32) irq;
+		asm volatile(
+			"	movl	%1,%%eax	\n"
+			"	xchgl	%%ebx,%%esp	\n"
+			"	call	*%%eax		\n"
+			"	xchgl	%%ebx,%%esp	\n"
+			:
+			: "b"(isp), "i"(handle_IRQ_event)
+			: "memory", "cc", "eax", "edx", "ecx"
+			);
+		spin_lock(&desc->lock);
+		
+		if (likely(!(desc->status & IRQ_PENDING)))
+			break;
+		desc->status &= ~IRQ_PENDING;
+	}
+	irqctx->tinfo.task = NULL;
+	desc->status &= ~IRQ_INPROGRESS;
+ out:
+	/*
+	 * The ->end() handler has to deal with interrupts which got
+	 * disabled while the handler was running.
+	 */
+	desc->handler->end(irq);
+	spin_unlock(&desc->lock);
+	irq_exit();
+	return 1;
+}
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+More majordomo info at  
+http://vger.kernel.org/majordomo-info.html
+Please read the FAQ at  
+http://www.tux.org/lkml/

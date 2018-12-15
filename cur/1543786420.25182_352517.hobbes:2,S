@@ -1,0 +1,362 @@
+Date: Wed, 21 Sep 2005 23:29:13 +0200
+From: Eric Dumazet <>
+Subject: [PATCH 1/3] netfilter : 3 patches to boost ip_tables performance
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2005/9/21/268
+
+Patch 1/3
+1) No more one rwlock_t protecting the 'curtain'
+One major bottleneck on SMP machines is the fact that one rwlock
+is taken in ipt_do_table() entry and exit. That 2 atomic operations are
+the killer, and even if multiple readers can work together on the same table
+(using read_lock_bh()), the cache line containing rwlock still must be
+taken exclusively by each CPU at entry/exit of ipt_do_table().
+As existing code already use separate copies of the data for each cpu, it is
+very easy to convert the central rwlock to separate rwlocks, allocated
+percpu (and NUMA aware).
+When a cpu enters ipt_do_table(), it can locks its local copy, touching a
+cache line that is not used by other cpus. Further operations are done on
+'local' copy of the data.
+When a sum of all counters must be done, we can write_lock each part at a
+time, instead of locking all the parts, reducing the lock contention.
+Note1 : I also optimized get_counters(), using a SET_COUNTER() for the first 
+cpu, avoiding a memset() and ADD_COUNTER() if SMP on other cpus.
+Signed-off-by: Eric Dumazet <dada1@cosmosbay.com>
+--- linux-2.6/include/linux/netfilter_ipv4/ip_tables.h	2005-09-13 05:12:09.000000000 +0200
++++ linux-2.6-ed/include/linux/netfilter_ipv4/ip_tables.h	2005-09-21 17:42:07.000000000 +0200
+@@ -445,7 +445,11 @@
+ 	unsigned int valid_hooks;
+ 
+ 	/* Lock for the curtain */
++#ifdef CONFIG_SMP
++	rwlock_t *lock_p; /* one lock per cpu */
++#else
+ 	rwlock_t lock;
++#endif
+ 
+ 	/* Man behind the curtain... */
+ 	struct ipt_table_info *private;
+--- linux-2.6.14-rc1.p1/net/ipv4/netfilter/ip_nat_rule.c	2005-09-13 05:12:09.000000000 +0200
++++ linux-2.6.14-rc1/net/ipv4/netfilter/ip_nat_rule.c	2005-09-21 17:44:01.000000000 +0200
+@@ -93,7 +93,6 @@
+ static struct ipt_table nat_table = {
+ 	.name		= "nat",
+ 	.valid_hooks	= NAT_VALID_HOOKS,
+-	.lock		= RW_LOCK_UNLOCKED,
+ 	.me		= THIS_MODULE,
+ };
+ 
+--- linux-2.6.14-rc1.p1/net/ipv4/netfilter/iptable_filter.c	2005-09-13 05:12:09.000000000 +0200
++++ linux-2.6.14-rc1/net/ipv4/netfilter/iptable_filter.c	2005-09-21 17:45:20.000000000 +0200
+@@ -77,7 +77,6 @@
+ static struct ipt_table packet_filter = {
+ 	.name		= "filter",
+ 	.valid_hooks	= FILTER_VALID_HOOKS,
+-	.lock		= RW_LOCK_UNLOCKED,
+ 	.me		= THIS_MODULE
+ };
+ 
+--- linux-2.6.14-rc1.p1/net/ipv4/netfilter/iptable_mangle.c	2005-09-13 05:12:09.000000000 +0200
++++ linux-2.6.14-rc1/net/ipv4/netfilter/iptable_mangle.c	2005-09-21 17:45:20.000000000 +0200
+@@ -107,7 +107,6 @@
+ static struct ipt_table packet_mangler = {
+ 	.name		= "mangle",
+ 	.valid_hooks	= MANGLE_VALID_HOOKS,
+-	.lock		= RW_LOCK_UNLOCKED,
+ 	.me		= THIS_MODULE,
+ };
+ 
+--- linux-2.6.14-rc1.p1/net/ipv4/netfilter/iptable_raw.c	2005-09-13 05:12:09.000000000 +0200
++++ linux-2.6.14-rc1/net/ipv4/netfilter/iptable_raw.c	2005-09-21 17:45:20.000000000 +0200
+@@ -82,7 +82,6 @@
+ static struct ipt_table packet_raw = { 
+ 	.name = "raw", 
+ 	.valid_hooks =  RAW_VALID_HOOKS, 
+-	.lock = RW_LOCK_UNLOCKED, 
+ 	.me = THIS_MODULE
+ };
+ 
+--- linux-2.6.14-rc1.p1/net/ipv4/netfilter/ip_tables.c	2005-09-19 19:56:12.000000000 +0200
++++ linux-2.6.14-rc1/net/ipv4/netfilter/ip_tables.c	2005-09-21 23:49:13.000000000 +0200
+@@ -110,6 +110,7 @@
+ static LIST_HEAD(ipt_target);
+ static LIST_HEAD(ipt_match);
+ static LIST_HEAD(ipt_tables);
++#define SET_COUNTER(c,b,p) do { (c).bcnt = (b); (c).pcnt = (p); } while(0)
+ #define ADD_COUNTER(c,b,p) do { (c).bcnt += (b); (c).pcnt += (p); } while(0)
+ 
+ #ifdef CONFIG_SMP
+@@ -273,6 +274,9 @@
+ 	const char *indev, *outdev;
+ 	void *table_base;
+ 	struct ipt_entry *e, *back;
++#ifdef CONFIG_SMP
++	rwlock_t *lock_p;
++#endif
+ 
+ 	/* Initialization */
+ 	ip = (*pskb)->nh.iph;
+@@ -287,7 +291,18 @@
+ 	 * match it. */
+ 	offset = ntohs(ip->frag_off) & IP_OFFSET;
+ 
++#ifdef CONFIG_SMP
++	/*
++	 * We expand read_lock_bh() here because we need to get
++	 * the address of this cpu rwlock_t
++	 */
++	local_bh_disable();
++	preempt_disable();
++	lock_p = per_cpu_ptr(table->lock_p, smp_processor_id());
++	_raw_read_lock(lock_p);
++#else
+ 	read_lock_bh(&table->lock);
++#endif
+ 	IP_NF_ASSERT(table->valid_hooks & (1 << hook));
+ 	table_base = (void *)table->private->entries
+ 		+ TABLE_OFFSET(table->private, smp_processor_id());
+@@ -396,7 +411,11 @@
+ #ifdef CONFIG_NETFILTER_DEBUG
+ 	((struct ipt_entry *)table_base)->comefrom = 0xdead57ac;
+ #endif
++#ifdef CONFIG_SMP
++	read_unlock_bh(lock_p);
++#else
+ 	read_unlock_bh(&table->lock);
++#endif
+ 
+ #ifdef DEBUG_ALLOW_ALL
+ 	return NF_ACCEPT;
+@@ -930,6 +949,30 @@
+ 	return ret;
+ }
+ 
++static void ipt_table_global_lock(struct ipt_table *table)
++{
++#ifdef CONFIG_SMP
++	int cpu;
++	for_each_cpu(cpu) {
++		write_lock_bh(per_cpu_ptr(table->lock_p, cpu));
++	}
++#else
++	write_lock_bh(&table->lock);
++#endif
++}
++
++static void ipt_table_global_unlock(struct ipt_table *table)
++{
++#ifdef CONFIG_SMP
++	int cpu;
++	for_each_cpu(cpu) {
++		write_unlock_bh(per_cpu_ptr(table->lock_p, cpu));
++	}
++#else
++	write_unlock_bh(&table->lock);
++#endif
++}
++
+ static struct ipt_table_info *
+ replace_table(struct ipt_table *table,
+ 	      unsigned int num_counters,
+@@ -954,24 +997,25 @@
+ #endif
+ 
+ 	/* Do the substitution. */
+-	write_lock_bh(&table->lock);
++	ipt_table_global_lock(table);
+ 	/* Check inside lock: is the old number correct? */
+ 	if (num_counters != table->private->number) {
+ 		duprintf("num_counters != table->private->number (%u/%u)\n",
+ 			 num_counters, table->private->number);
+-		write_unlock_bh(&table->lock);
++		ipt_table_global_unlock(table);
+ 		*error = -EAGAIN;
+ 		return NULL;
+ 	}
+ 	oldinfo = table->private;
+ 	table->private = newinfo;
+ 	newinfo->initial_entries = oldinfo->initial_entries;
+-	write_unlock_bh(&table->lock);
++	ipt_table_global_unlock(table);
+ 
+ 	return oldinfo;
+ }
+ 
+ /* Gets counters. */
++#ifdef CONFIG_SMP
+ static inline int
+ add_entry_to_counter(const struct ipt_entry *e,
+ 		     struct ipt_counters total[],
+@@ -982,22 +1026,71 @@
+ 	(*i)++;
+ 	return 0;
+ }
++#endif
++static inline int
++set_entry_to_counter(const struct ipt_entry *e,
++		     struct ipt_counters total[],
++		     unsigned int *i)
++{
++	SET_COUNTER(total[*i], e->counters.bcnt, e->counters.pcnt);
++
++	(*i)++;
++	return 0;
++}
+ 
++/*
++ * if table is NULL, no locking should be done
++ */
+ static void
+-get_counters(const struct ipt_table_info *t,
++get_counters(struct ipt_table *table,
++		const struct ipt_table_info *t,
+ 	     struct ipt_counters counters[])
+ {
+-	unsigned int cpu;
+ 	unsigned int i;
++#ifdef CONFIG_SMP
++	unsigned int cpu;
++	unsigned int curcpu;
++
++	curcpu = get_cpu();
++
++	if (table)
++		write_lock_bh(per_cpu_ptr(table->lock_p, curcpu));
++	i = 0;
++	IPT_ENTRY_ITERATE(t->entries + TABLE_OFFSET(t, curcpu),
++			  t->size,
++			  set_entry_to_counter,
++			  counters,
++			  &i);
++	if (table)
++		write_unlock_bh(per_cpu_ptr(table->lock_p, curcpu));
+ 
+-	for (cpu = 0; cpu < num_possible_cpus(); cpu++) {
++	for_each_cpu(cpu) {
++		if (cpu == curcpu)
++			continue;
++		if (table)
++			write_lock_bh(per_cpu_ptr(table->lock_p, cpu));
+ 		i = 0;
+ 		IPT_ENTRY_ITERATE(t->entries + TABLE_OFFSET(t, cpu),
+ 				  t->size,
+ 				  add_entry_to_counter,
+ 				  counters,
+ 				  &i);
++		if (table)
++			write_unlock_bh(per_cpu_ptr(table->lock_p, cpu));
+ 	}
++	put_cpu();
++#else
++	if (table)
++		write_lock_bh(&table->lock);
++	i = 0;
++	IPT_ENTRY_ITERATE(t->entries,
++			  t->size,
++			  set_entry_to_counter,
++			  counters,
++			  &i);
++	if (table)
++		write_unlock_bh(&table->lock);
++#endif
+ }
+ 
+ static int
+@@ -1020,10 +1113,7 @@
+ 		return -ENOMEM;
+ 
+ 	/* First, sum counters... */
+-	memset(counters, 0, countersize);
+-	write_lock_bh(&table->lock);
+-	get_counters(table->private, counters);
+-	write_unlock_bh(&table->lock);
++	get_counters(table, table->private, counters);
+ 
+ 	/* ... then copy entire thing from CPU 0... */
+ 	if (copy_to_user(userptr, table->private->entries, total_size) != 0) {
+@@ -1183,7 +1273,7 @@
+ 		module_put(t->me);
+ 
+ 	/* Get the old counters. */
+-	get_counters(oldinfo, counters);
++	get_counters(NULL, oldinfo, counters);
+ 	/* Decrease module usage counts and free resource */
+ 	IPT_ENTRY_ITERATE(oldinfo->entries, oldinfo->size, cleanup_entry,NULL);
+ 	vfree(oldinfo);
+@@ -1235,6 +1325,9 @@
+ 	struct ipt_counters_info tmp, *paddc;
+ 	struct ipt_table *t;
+ 	int ret = 0;
++#ifdef CONFIG_SMP
++	rwlock_t *lockp;
++#endif
+ 
+ 	if (copy_from_user(&tmp, user, sizeof(tmp)) != 0)
+ 		return -EFAULT;
+@@ -1257,7 +1350,12 @@
+ 		goto free;
+ 	}
+ 
++#ifdef CONFIG_SMP
++	lockp = per_cpu_ptr(t->lock_p, get_cpu());
++	write_lock_bh(lockp);
++#else
+ 	write_lock_bh(&t->lock);
++#endif
+ 	if (t->private->number != paddc->num_counters) {
+ 		ret = -EINVAL;
+ 		goto unlock_up_free;
+@@ -1270,7 +1368,12 @@
+ 			  paddc->counters,
+ 			  &i);
+  unlock_up_free:
++#ifdef CONFIG_SMP
++	write_unlock_bh(lockp);
++	put_cpu();
++#else
+ 	write_unlock_bh(&t->lock);
++#endif
+ 	up(&ipt_mutex);
+ 	module_put(t->me);
+  free:
+@@ -1456,7 +1559,17 @@
+ 	struct ipt_table_info *newinfo;
+ 	static struct ipt_table_info bootstrap
+ 		= { 0, 0, 0, { 0 }, { 0 }, { } };
+-
++#ifdef CONFIG_SMP
++	int cpu;
++	if (!table->lock_p) {
++		if ((table->lock_p = alloc_percpu(rwlock_t)) == NULL)
++			return -ENOMEM;
++	}
++	for_each_cpu(cpu)
++		rwlock_init(per_cpu_ptr(table->lock_p, cpu));
++#else
++	rwlock_init(&table->lock);
++#endif
+ 	newinfo = vmalloc(sizeof(struct ipt_table_info)
+ 			  + SMP_ALIGN(repl->size) * num_possible_cpus());
+ 	if (!newinfo)
+@@ -1497,7 +1610,6 @@
+ 	/* save number of initial entries */
+ 	table->private->initial_entries = table->private->number;
+ 
+-	rwlock_init(&table->lock);
+ 	list_prepend(&ipt_tables, table);
+ 
+  unlock:
+@@ -1519,6 +1631,10 @@
+ 	IPT_ENTRY_ITERATE(table->private->entries, table->private->size,
+ 			  cleanup_entry, NULL);
+ 	vfree(table->private);
++#ifdef CONFIG_SMP
++	free_percpu(table->lock_p);
++	table->lock_p = NULL;
++#endif
+ }
+ 
+ /* Returns 1 if the port is matched by the range, 0 otherwise */

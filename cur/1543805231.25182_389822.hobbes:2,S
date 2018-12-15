@@ -1,0 +1,178 @@
+Date: Wed, 25 Jan 2006 15:55:44 +0900
+From: Fernando Luis Vazquez Cao <>
+Subject: [PATCH 5/5] stack overflow safe kdump (2.6.16-rc1-i386) - private nmi stack
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2006/1/25/15
+
+Use a private NMI stack.
+Signed-off-by: Fernando Vazquez <fernando@intellilink.co.jp>
+--- 
+diff -urNp linux-2.6.16-rc1/arch/i386/kernel/irq.c linux-2.6.16-rc1-sov/arch/i386/kernel/irq.c
+--- linux-2.6.16-rc1/arch/i386/kernel/irq.c	2006-01-25 14:28:30.000000000 +0900
++++ linux-2.6.16-rc1-sov/arch/i386/kernel/irq.c	2006-01-25 15:18:08.000000000 +0900
+@@ -37,11 +37,6 @@ void ack_bad_irq(unsigned int irq)
+ /*
+  * per-CPU IRQ handling contexts (thread information and stack)
+  */
+-union irq_ctx {
+-	struct thread_info      tinfo;
+-	u32                     stack[THREAD_SIZE/sizeof(u32)];
+-};
+-
+ static union irq_ctx *hardirq_ctx[NR_CPUS];
+ static union irq_ctx *softirq_ctx[NR_CPUS];
+ #endif
+@@ -154,6 +149,8 @@ void irq_ctx_init(int cpu)
+ 
+ 	printk("CPU %u irqstacks, hard=%p soft=%p\n",
+ 		cpu,hardirq_ctx[cpu],softirq_ctx[cpu]);
++
++	nmi_ctx_init(cpu);
+ }
+ 
+ void irq_ctx_exit(int cpu)
+diff -urNp linux-2.6.16-rc1/arch/i386/kernel/traps.c linux-2.6.16-rc1-sov/arch/i386/kernel/traps.c
+--- linux-2.6.16-rc1/arch/i386/kernel/traps.c	2006-01-25 15:17:51.000000000 +0900
++++ linux-2.6.16-rc1-sov/arch/i386/kernel/traps.c	2006-01-25 15:18:08.000000000 +0900
+@@ -674,6 +674,13 @@ static int dummy_nmi_callback(struct pt_
+  
+ static nmi_callback_t nmi_callback = dummy_nmi_callback;
+ 
++#ifdef CONFIG_4KSTACKS
++/*
++ * per-CPU NMI handling contexts (thread information and stack)
++ */
++static union irq_ctx *nmi_ctx[NR_CPUS];
++#endif /* CONFIG_4KSTACKS */
++
+ static fastcall unsigned int __do_nmi(struct pt_regs * regs, long error_code)
+ {
+ 	int cpu;
+@@ -688,7 +695,43 @@ static fastcall unsigned int __do_nmi(st
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_4KSTACKS
++#define _do_nmi(regs, error_code, nmih)					\
++{									\
++	union irq_ctx *curctx, *nmictx;					\
++	u32 *isp;							\
++									\
++	curctx = (union irq_ctx *) current_thread_info();		\
++	nmictx = nmi_ctx[safe_smp_processor_id()];			\
++									\
++	/*								\
++	 * This is where we switch to the NMI stack.			\
++	 */								\
++	if (curctx != nmictx) {						\
++		int arg1, arg2, ebx;					\
++									\
++		/* build the stack frame on the IRQ stack */		\
++		isp = (u32*) ((char *)nmictx + sizeof(*nmictx)); 	\
++		if (!virt_addr_valid(curctx))				\
++			nmictx->tinfo.task = NULL;			\
++		else							\
++			nmictx->tinfo.task = curctx->tinfo.task;	\
++		nmictx->tinfo.previous_esp = current_stack_pointer;	\
++									\
++		asm volatile (						\
++			"	xchgl	%%ebx,%%esp	\n"		\
++			"	call	"#nmih"		\n"		\
++			"	movl	%%ebx,%%esp	\n"		\
++			: "=a" (arg1), "=d" (arg2), "=b" (ebx)		\
++			:  "0" (regs),  "1" (error_code), "2" (isp)	\
++			: "memory", "cc", "ecx"				\
++		);							\
++	} else								\
++		nmih(regs, error_code);					\
++}
++#else /* CONFIG_4KSTACKS */
+ #define _do_nmi(regs, error_code, nmih) nmih(regs, error_code);
++#endif /* CONFIG_4KSTACKS */
+ 
+ fastcall void do_nmi(struct pt_regs * regs, long error_code)
+ {
+@@ -727,6 +770,46 @@ void set_crash_nmi_callback(nmi_callback
+ }
+ EXPORT_SYMBOL_GPL(set_crash_nmi_callback);
+ 
++#ifdef CONFIG_4KSTACKS
++
++/*
++ * These should really be __section__(".bss.page_aligned") as well, but
++ * gcc's 3.0 and earlier don't handle that correctly.
++ * NOTE: support for gcc 3.0 and earlier will eventually be dropped
++ */
++
++static char nmi_stack[NR_CPUS * THREAD_SIZE]
++		__attribute__((__aligned__(THREAD_SIZE)));
++
++/*
++ * Allocate per-cpu stacks for NMI processing
++ */
++void nmi_ctx_init(int cpu)
++{
++	union irq_ctx *irqctx;
++
++	if (nmi_ctx[cpu])
++		return;
++
++	irqctx = (union irq_ctx*) &nmi_stack[cpu*THREAD_SIZE];
++	irqctx->tinfo.task		= NULL;
++	irqctx->tinfo.exec_domain	= NULL;
++	irqctx->tinfo.cpu		= cpu;
++	irqctx->tinfo.preempt_count	= HARDIRQ_OFFSET;
++	irqctx->tinfo.addr_limit	= MAKE_MM_SEG(0);
++
++	nmi_ctx[cpu] = irqctx;
++
++	printk("CPU %u nmistack=%p\n", cpu, nmi_ctx[cpu]);
++}
++
++void nmi_ctx_exit(int cpu)
++{
++	nmi_ctx[cpu] = NULL;
++}
++
++#endif /* CONFIG_4KSTACKS */
++
+ #ifdef CONFIG_KPROBES
+ fastcall void __kprobes do_int3(struct pt_regs *regs, long error_code)
+ {
+diff -urNp linux-2.6.16-rc1/include/asm-i386/irq.h linux-2.6.16-rc1-sov/include/asm-i386/irq.h
+--- linux-2.6.16-rc1/include/asm-i386/irq.h	2006-01-25 14:28:34.000000000 +0900
++++ linux-2.6.16-rc1-sov/include/asm-i386/irq.h	2006-01-25 15:18:08.000000000 +0900
+@@ -26,12 +26,21 @@ static __inline__ int irq_canonicalize(i
+ #endif
+ 
+ #ifdef CONFIG_4KSTACKS
+-  extern void irq_ctx_init(int cpu);
+-  extern void irq_ctx_exit(int cpu);
++union irq_ctx {
++	struct thread_info	tinfo;
++	u32			stack[THREAD_SIZE/sizeof(u32)];
++};
++
++extern void irq_ctx_init(int cpu);
++extern void irq_ctx_exit(int cpu);
++extern void nmi_ctx_init(int cpu);
++extern void nmi_ctx_exit(int cpu);
+ # define __ARCH_HAS_DO_SOFTIRQ
+ #else
+ # define irq_ctx_init(cpu) do { } while (0)
+ # define irq_ctx_exit(cpu) do { } while (0)
++# define nmi_ctx_init(cpu) do { } while (0)
++# define nmi_ctx_exit(cpu) do { } while (0)
+ #endif
+ 
+ #ifdef CONFIG_IRQBALANCE
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+More majordomo info at  
+http://vger.kernel.org/majordomo-info.html
+Please read the FAQ at  
+http://www.tux.org/lkml/

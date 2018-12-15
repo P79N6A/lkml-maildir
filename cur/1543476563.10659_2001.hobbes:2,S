@@ -1,0 +1,1124 @@
+Date: Sun, 10 Jan 1999 20:37:45 +0100 (MET)
+From: "Peter T. Breuer" <>
+Subject: Re: latest patch [this time with 64 bit .from and cleanups]
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/1/10/379
+
+"A month of sundays ago Pavel Machek wrote:"
+> 
+> Would you mind if I put this code on the webpage?
+Here is the present NBD patch against 2.0.36.  It should be binary
+compatible with the 2.1 userspace daemons.  Bear in mind that this code
+is developed under 2.0.25 and appears very safe there, but has caused a
+couple of unexplained lockups under 2.0.36 when reading or writing large
+files (>0.3MB) under a raid fs.  It's mysterious.  I thought it was a
+problem with the semaphore/spurious interrupt, but it's not.  I'd be
+grateful for a fix.  The problem is sporadic on my big machine,
+repeatable on my laptop (2.0.35).  2.0.25 is perfectly stable with this
+code.
+My test setup is a raid5 combo of two nbd devices to a remote server
+providing two 2MB files to play with.  A raid5'ed ext2fs exists on
+them.
+Personalities : [4 raid5]
+read_ahead 0 sectors
+md0 : active raid5 [dev 2b:00] [dev 2b:01] 1984 blocks level 5, 32k chunk,
+      algorithm 2 [2/2] [UU]
+Filesystem         1024-blocks  Used Available Capacity Mounted on
+/dev/md0                1917     382     1436     21%   /mnt
+I can run ckraid and e2fsck -c without problems. This patch should go to
+alan cox or somebody competent for further checking. By all means put it on
+your page.  I can't nail the remaining problem.  What happens is that we
+get the head of the request queue equals the following part of the
+queue, which implies that we duplicated the current request or forgot to
+remove the previous one.  I've made the code return in those
+circumstances (grep "I did not expect") in the hopes of allowing the
+kernel to clean up nicely from it.
+Peter
+--- linux-2.0.36/drivers/block/Config.in.pre-nbd	Mon Jul 13 22:47:27 1998
++++ linux-2.0.36/drivers/block/Config.in	Sat Jan  9 22:31:59 1999
+@@ -41,6 +41,7 @@
+ comment 'Additional Block Devices'
+ 
+ tristate 'Loopback device support' CONFIG_BLK_DEV_LOOP
++tristate 'Network block device support' CONFIG_BLK_DEV_NBD
+ bool 'Multiple devices driver support' CONFIG_BLK_DEV_MD
+ if [ "$CONFIG_BLK_DEV_MD" = "y" ]; then
+   tristate '   Linear (append) mode' CONFIG_MD_LINEAR
+--- linux-2.0.36/drivers/block/ll_rw_blk.c.pre-nbd	Mon Jul 13 22:47:28 1998
++++ linux-2.0.36/drivers/block/ll_rw_blk.c	Sat Jan  9 22:31:59 1999
+@@ -384,7 +384,7 @@
+ /* look for a free request. */
+        /* Loop uses two requests, 1 for loop and 1 for the real device.
+         * Cut max_req in half to avoid running out and deadlocking. */
+-        if (major == LOOP_MAJOR)
++        if (major == LOOP_MAJOR || major == NBD_MAJOR)
+ 	     max_req >>= 1;
+ 
+ 	/*
+@@ -394,7 +394,8 @@
+ 	req = blk_dev[major].current_request;
+ 	if (!req) {
+ 		/* MD and loop can't handle plugging without deadlocking */
+-		if (major != MD_MAJOR && major != LOOP_MAJOR)
++		if (major != MD_MAJOR && major != LOOP_MAJOR &&
++                    major != NBD_MAJOR)
+ 			plug_device(blk_dev + major);
+ 	} else switch (major) {
+ 	     case IDE0_MAJOR:	/* same as HD_MAJOR */
+@@ -603,7 +604,7 @@
+ 	}
+ 	buffersize = PAGE_SIZE / nb;
+ 
+-	if (major == LOOP_MAJOR)
++	if (major == LOOP_MAJOR || major == NBD_MAJOR)
+ 	     max_req >>= 1;
+ 	for (j=0, i=0; i<nb;)
+ 	{
+@@ -729,5 +730,8 @@
+ #ifdef CONFIG_BLK_DEV_MD
+ 	md_init();
+ #endif CONFIG_BLK_DEV_MD
++#ifdef CONFIG_BLK_DEV_NBD
++	nbd_init();
++#endif CONFIG_BLK_DEV_NBD
+ 	return 0;
+ }
+--- linux-2.0.36/drivers/block/Makefile.pre-nbd	Mon Jul 13 22:47:27 1998
++++ linux-2.0.36/drivers/block/Makefile	Sat Jan  9 22:31:59 1999
+@@ -155,4 +155,12 @@
+ 
+ endif
+ 
++ifeq ($(CONFIG_BLK_DEV_NBD),y)
++L_OBJS += nbd.o
++else
++  ifeq ($(CONFIG_BLK_DEV_NBD),m)
++  M_OBJS += nbd.o
++  endif
++endif
++
+ include $(TOPDIR)/Rules.make
+--- linux-2.0.36/drivers/block/nbd.c.pre-nbd	Sat Jan  9 22:31:59 1999
++++ linux-2.0.36/drivers/block/nbd.c	Sun Jan 10 19:40:51 1999
+@@ -0,0 +1,835 @@
++/*
++ * Network block device - make block devices work over TCP
++ *
++ * Note that you can not swap over this thing. Seems to work but
++ * deadlocks sometimes - you can not swap over TCP in general.
++ * 
++ * Copyright 1997 Pavel Machek <pavel@elf.mj.gts.cz>
++ * 
++ * (part of code stolen from loop.c)
++ *
++ * 97-3-25 compiled 0-th version, not yet tested it 
++ *   (it did not work, BTW) (later that day) HEY! it works!
++ *   (bit later) hmm, not that much... 2:00am next day:
++ *   yes, it works, but it gives something like 50kB/sec
++ * 97-3-28 it's completely strange - when using 1024 byte "packets"
++ *   it gives 50kB/sec and CPU idle; with 2048 bytes it gives
++ *   500kB/sec (and CPU loaded 100% as it should be) (all done
++ *   against localhost)
++ * 97-4-1 complete rewrite to make it possible for many requests at 
++ *   once to be processed
++ * 97-4-1 23:57 rewrite once again to make it work :-(
++ * 97-4-3 00:02 hmm, it does not work.
++ * 97-4-3 23:06 hmm, it will need one more rewrite :-)
++ * 97-4-10 It looks like it's working and stable. But I still do not
++ *  have any recovery from lost connection...
++ * (setq tab-width 4)
++ * 97-4-11 Making protocol independent of endianity etc.
++ * 97-4-15 Probably one more rewrite, since it loses requests under
++ *  heavy loads
++ * 97-9-13 Cosmetic changes
++ *
++ * possible FIXME: make set_sock / set_blksize / set_size / do_it one syscall
++ * why not: would need verify_area and friends, would share yet another 
++ *          structure with userland
++ *
++ * FIXME: not module-safe
++ *
++ * 98-12-18 modules now OK ptb@it.uc3m.es (Peter Breuer) ported to
++ * 2.0.*. + better debugging. Still possible lockup in connection with APM
++ * and spurious interrupt - only on write. Error treatment should
++ * be improved. After 100 errors from end_request the kernel can
++ * do anything. We should catch it ourselves.
++ */
++
++#define PARANOIA
++#include <linux/major.h>
++
++#include <linux/module.h>
++
++#include <linux/fs.h>
++#include <linux/stat.h>
++#include <linux/errno.h>
++
++#include <asm/segment.h>
++/*#include <asm/uaccess.h> */
++#include <asm/byteorder.h>
++
++#define MAJOR_NR NBD_MAJOR
++#include <linux/nbd.h>
++
++#define NBD_USE_SEMAPHORE 1
++
++static int nbd_blksizes[MAX_NBD];  /* = {1024, 1024,}; */
++static int nbd_sizes[MAX_NBD];     /* = {0x7fffffff, 0x7fffffff,}; */
++static int nbd_bytesizes[MAX_NBD]; /* all inits done in init now PTB 132 */
++
++static struct nbd_device nbd_dev[MAX_NBD];
++
++#if 0 || defined (DEBUG)     /* edit 0/1 or define DEBUG PTB */
++#define NBD_DEBUG( s...) printk( KERN_DEBUG "NBD: " s )
++#else
++#define NBD_DEBUG( s...)
++#endif
++
++#define NBD_ERROR( s...) printk( KERN_ERR   "NBD: " s )
++#define NBD_ALERT( s...) printk( KERN_ALERT "NBD: " s )
++#define NBD_INFO( s...)  printk( KERN_INFO  "NBD: " s )
++
++#define NBD_FAIL( s ) { \
++  NBD_ERROR( s "(result %d).\n" , result ); \
++  goto error_out; \
++}
++#define NBD_HARDFAIL( s ) { \
++  NBD_ERROR( s "(result %d).\n" , result ); \
++  lo->harderror = result; \
++  goto hard_error_out; \
++}
++
++/* define always - who cares about two bytes? PTB */
++static int nbd_requests_in;
++static int nbd_requests_out;
++
++static int
++nbd_open (struct inode *inode, struct file *file)
++{
++    int dev;
++    struct nbd_device *nbdev;
++
++    NBD_DEBUG( "nbd_open: entered\n" );
++
++    if (1 && !inode && file) { /* added by ptb for 2.0.35. Necessary? */
++          inode = file->f_inode;       /* PTB */
++    }     
++    if (!inode) {
++	NBD_ERROR ("nbd_open - null inode.\n");
++        NBD_DEBUG( "nbd_open: exited INVAL\n" );
++	return -EINVAL;
++    }
++
++    NBD_DEBUG( "nbd_open: have inode %x\n" , (unsigned)inode );
++
++    dev = MINOR (inode->i_rdev);
++
++    if (dev >= MAX_NBD) {
++	NBD_ERROR ("nbd_open - too many (%d) devices open\n" , dev);
++        NBD_DEBUG( "nbd_open: exited NODEV\n" );
++	return -ENODEV;
++    }
++
++    NBD_DEBUG( "nbd_open: have minor device %d\n" , dev );
++
++    nbdev = &nbd_dev[dev];
++    nbdev->refcnt++;
++
++    NBD_DEBUG( "nbd_open: increment minor %d reference count\n" , dev );
++    MOD_INC_USE_COUNT;
++
++    if (NBD_USE_SEMAPHORE && !(nbdev->flags & NBD_INITIALISED)) { /* 2.1.132 */
++		nbdev->queue_lock = MUTEX;
++		nbdev->flags |= NBD_INITIALISED;
++    }
++
++    NBD_DEBUG( "nbd_open: exited OK\n" );
++    return 0;
++}
++
++/*
++ *  Send or receive packet.
++ */
++static
++int
++nbd_xmit (int send, struct socket *sock, char *buf, int size)
++{
++    unsigned long oldfs;
++    int result = 0;
++    struct msghdr msg;
++    struct iovec iov;
++    sigset_t oldset;
++
++    NBD_DEBUG( "nbd_xmit: entered\n" );
++
++    oldfs = get_fs ();
++    set_fs (get_ds ());
++
++    do {
++
++	iov.iov_base    = buf;
++	iov.iov_len     = size;
++	msg.msg_name    = NULL;
++	msg.msg_namelen = 0;
++	msg.msg_iov     = &iov;
++	msg.msg_iovlen  = 1;
++	msg.msg_control = NULL;
++	msg.msg_namelen = 0;	/* PTB 132 */
++	msg.msg_controllen = 0;
++	msg.msg_flags   = 0;
++
++        NBD_DEBUG ("nbd_xmit: saving signal set\n");
++        /* this should (could?) go outside the do loop for PTB 132 */
++        oldset = current->blocked;	/* PTB 57 */
++        current->blocked = ~0UL;	/* PTB 57 */
++
++	if (send) {
++	    result = sock->ops->sendmsg (sock, &msg, size, 0, 0);
++	    NBD_DEBUG ("nbd_xmit: sent packet size %d wanted %d\n"
++		   , result , size);
++	} else {
++	    result = sock->ops->recvmsg (sock, &msg, size, 0, 0, 0);
++	    NBD_DEBUG ("nbd_xmit: received packet size %d requested %d\n"
++		   , result , size);
++        }
++
++        NBD_DEBUG ("nbd_xmit: restoring signal set\n");
++        /* this should (could?) go outside the do loop for PTB 132 */
++        current->blocked = oldset;	/* PTB 57 */
++
++	if (result <= 0) {
++#ifdef PARANOIA
++	    NBD_ERROR ("Xmit - sock=%d at buf=%d, size=%d returned %d.\n"
++	    , (int) sock , (int) buf , size , result);
++#endif
++	    break;
++	}
++
++	size -= result;
++	buf  += result;
++
++    } while (size > 0);
++
++    set_fs (oldfs);
++    NBD_DEBUG ("nbd_xmit: exited with %d\n" , result);
++    return result;
++}
++
++/* htonll is not available in 2.0 kernels (lifted from cliserv.h here)
++ * but could just be __swab64 from byetorder*.h
++ * PTB
++ */
++
++#ifdef WORDS_BIGENDIAN   /* FIXME PTB */
++static __u64
++ntohll (__u64 a)
++{
++    return a;
++}
++#else
++static __u64
++ntohll (u64 a)
++{
++    __u32 lo = a & ((1ULL<<32)-1);
++    __u32 hi = a >> 32;
++    lo = ntohl (lo);
++    hi = ntohl (hi);
++    return ((__u64) lo) << 32 | (__u64) hi;
++}
++#endif              
++#define htonll ntohll
++
++void
++nbd_send_req (struct socket *sock, struct request *req)
++{
++    int result;
++    struct nbd_request request;
++
++    NBD_DEBUG( "nbd_send_req: entered\n" );
++
++    request.magic = htonl (NBD_REQUEST_MAGIC);
++    request.type  = htonl (req->cmd);
++    request.from  = htonll(req->sector * 512);
++    request.len   = htonl (req->current_nr_sectors * 512);
++    memcpy (request.handle, &req, sizeof (req));
++
++    NBD_DEBUG( "nbd_send_req: make handle %x\n" , (unsigned)req);
++
++    result = nbd_xmit (1, sock, (char *) &request, sizeof (request));
++
++    if (result <= 0)
++	NBD_FAIL ("Sendmsg failed for control in nbd_send_req.");
++
++    if (req->cmd == WRITE) {
++	NBD_DEBUG ("nbd_send_req: write data\n");
++	result = nbd_xmit (1, sock, req->buffer, req->current_nr_sectors * 512);
++	if (result <= 0)
++	    NBD_FAIL ("Send data failed in nbd_send_req.");
++    }
++
++    NBD_DEBUG ("nbd_send_req: exited OK\n");
++    return;
++
++  error_out:
++    req->errors++;
++    NBD_DEBUG ("nbd_send_req: exited NBD_FAIL\n");
++    return;
++}
++
++
++struct request *		
++/* NULL returned = something went wrong, inform userspace       */
++nbd_read_stat (struct nbd_device *lo)
++{
++    int result;
++    struct nbd_reply reply;
++    struct request *xreq, *req;
++
++    NBD_DEBUG( "nbd_read_stat: entered\n" );
++
++    reply.magic = 0;
++
++    result = nbd_xmit (0, lo->sock, (char *) &reply, sizeof (reply));
++
++    if (result <= 0)
++	NBD_HARDFAIL ("Recv control failed in nbd_read_stat ");
++    
++    memcpy (&xreq, reply.handle, sizeof (xreq));
++
++    req = lo->tail;
++
++    if (xreq != req) {
++	NBD_DEBUG ("nbd_read_stat: fatal: Bad handle %x, expected %x !\n"
++	       , (int) xreq , (int) req);
++	NBD_FAIL ("Unexpected handle received in nbd_read_stat "); /* PTB 132 */
++    } 
++
++    NBD_DEBUG ("nbd_read_stat: ok, got handle %x\n" , (unsigned)req);
++
++    if (ntohl (reply.magic) != NBD_REPLY_MAGIC)
++	NBD_HARDFAIL ("Not enough magic in nbd_read_stat ");
++
++    if (ntohl (reply.error))
++	NBD_FAIL ("Other side returned error in nbd_read_stat ");
++
++    if (req->cmd == READ) {
++	NBD_DEBUG ("nbd_read_stat: read data\n");
++	result = nbd_xmit (0, lo->sock, req->buffer,
++	             req->current_nr_sectors * 512);
++	if (result <= 0)
++	    NBD_HARDFAIL ("Recv data failed in nbd_read_stat ");
++    }
++
++    NBD_DEBUG ("nbd_read_stat: done.\n");
++    NBD_DEBUG ("nbd_read_stat: exited OK\n");
++    return req;
++
++/* Can we get here? Yes, if other side returns error */
++  error_out:
++    req->errors++;
++    NBD_DEBUG ("nbd_read_stat: exited FAIL\n");
++    return req;
++
++  hard_error_out:
++    NBD_DEBUG ("nbd_read_stat: exited HARDFAIL\n");
++    return NULL;
++}
++
++void
++nbd_do_it (struct nbd_device *lo)
++{
++    struct request *req;
++
++    NBD_DEBUG( "nbd_do_it: entered\n" );
++
++    while (1) {
++	req = nbd_read_stat (lo);
++	if (!req) {
++	    NBD_DEBUG ("nbd_do_it: exited req=0\n");
++	    return;
++        }
++
++        if (NBD_USE_SEMAPHORE) {
++	    NBD_DEBUG ("nbd_do_it: wait on semaphore %d available\n" , lo->queue_lock.count);
++	    down (&lo->queue_lock);
++	    NBD_DEBUG ("nbd_do_it: acquired semaphore\n");
++        }
++
++#ifdef PARANOIA
++	if (req != lo->tail) {
++	    NBD_ALERT ("I have a problem in nbd_do_it...\n");
++	}
++	if (lo != &nbd_dev[MINOR (req->rq_dev)]) {
++	    NBD_ALERT ("request corrupted in nbd_do_it!\n");
++            /* skip the lo->tail = lo->tail->next */
++	    goto next;
++	}
++	if (lo->magic != LO_MAGIC) {
++	    NBD_ALERT ("nbd_dev[] corrupted: Not enough magic in nbd_do_it\n");
++            if (NBD_USE_SEMAPHORE) {
++                up (&lo->queue_lock);
++	        NBD_DEBUG ("nbd_do_it: released semaphore\n");
++            }
++	    NBD_DEBUG ("nbd_do_it: exited bad magic\n");
++	    return;
++	}
++#endif
++	nbd_end_request (req);
++	if (lo->tail == lo->head) {
++#ifdef PARANOIA
++	    if (lo->tail->next) {
++		NBD_ERROR ("I did not expect this in nbd_do_it\n");
++		/* PTB - seems best to force a kernel error and hope
++		 * that the hihger layers do well by us */
++	        NBD_DEBUG ("nbd_do_it: exited unexpectedly.\n");
++	        return;
++            }
++#endif
++	    lo->head = NULL;
++	}
++	lo->tail = lo->tail->next;
++
++        next:			/* PTB 132 */
++        if (NBD_USE_SEMAPHORE) {
++	    up (&lo->queue_lock);
++	    NBD_DEBUG ("nbd_do_it: released semaphore\n");
++        }
++    }
++}
++
++void
++nbd_clear_que (struct nbd_device *lo)
++{
++    struct request *req;
++
++    NBD_DEBUG( "nbd_clear_que: entered\n" );
++
++    while (1) {
++	req = lo->tail;
++	if (!req) {
++	    NBD_DEBUG ("nbd_clear_que: exited req=0\n");
++	    return;
++        }
++#ifdef PARANOIA
++	if (lo != &nbd_dev[MINOR (req->rq_dev)]) {
++	    NBD_ALERT ("request corrupted when clearing!\n");
++	    continue;
++	}
++	if (lo->magic != LO_MAGIC) {
++	    NBD_ERROR ("nbd_dev[] corrupted: Not enough magic when clearing!\n");
++	    NBD_DEBUG ("nbd_clear_que: exited bad magic\n");
++	    return;
++	}
++#endif
++	req->errors++;
++	nbd_end_request (req);
++	if (lo->tail == lo->head) {
++#ifdef PARANOIA
++	    if (lo->tail->next)
++		NBD_ERROR ("I did not assume this in nbd_clear_que\n");
++#endif
++	    lo->head = NULL;
++	}
++	lo->tail = lo->tail->next;
++    }
++}
++
++/*
++ * We always wait for result of write, for now. It would be nice to make it optional
++ * in future
++ * if ((req->cmd == WRITE) && (lo->flags & NBD_WRITE_NOCHK)) 
++ *   { printk( "Warning: Ignoring result!\n"); nbd_end_request( req ); }
++ */
++
++#undef NBD_FAIL
++#define NBD_FAIL( s ) { \
++  NBD_ERROR( "minor %d: " s "\n" , dev ); \
++  goto error_out; \
++}
++
++static void
++do_nbd_request (void)
++{
++    struct request *req;
++    int dev;
++    struct nbd_device *lo;
++
++    NBD_DEBUG( "do_ndb_request: entered\n" );
++
++    while (CURRENT) {
++
++	req = CURRENT;
++	dev = MINOR (req->rq_dev);
++        NBD_DEBUG( "do_ndb_request: request on minor %d\n" , dev) ; 
++
++#ifdef PARANOIA
++	if (dev >= MAX_NBD)
++	    NBD_FAIL ("Minor too big in do_ndb_request.");	
++#endif
++	lo = &nbd_dev[dev];
++	if (!lo->file)
++	    NBD_FAIL ("Request when not-ready in do_nbd_request.");
++	if ((req->cmd == WRITE) && (lo->flags & NBD_READ_ONLY))
++	    NBD_FAIL ("Write on read-only in do_nbd_request");
++#ifdef PARANOIA
++	if (lo->magic != LO_MAGIC)
++	    NBD_FAIL ("nbd[] is not magical in do_nbd_request!");
++	nbd_requests_in++;
++#endif
++	req->errors = 0;
++
++	/* nbd_send_req (lo->sock, req);  * Why does this block? PTB 55   */
++	CURRENT = CURRENT->next;
++	req->next = NULL;
++
++        if (NBD_USE_SEMAPHORE) {
++            NBD_DEBUG ("do_ndb_request: wait on semaphore %d available\n" , lo->queue_lock.count);
++            down (&lo->queue_lock);
++            NBD_DEBUG ("do_ndb_request: acquired semaphore\n");
++        }
++	if (lo->head == NULL) {
++	    lo->head = req;
++	    lo->tail = req;
++	} else {
++	    lo->head->next = req;
++	    lo->head = req;
++	}
++	nbd_send_req (lo->sock, req);	/* Why does this block? PTB 132   */
++        if (NBD_USE_SEMAPHORE) {
++	    up (&lo->queue_lock);
++            NBD_DEBUG ("do_ndb_request: released semaphore\n");
++        }
++	continue;
++
++      error_out:
++	req->errors++;
++	nbd_end_request (req);
++	CURRENT = CURRENT->next;
++    }
++    NBD_DEBUG ("do_ndb_request: exited\n");
++    return;
++}
++
++static int
++/* introduced by PTB for better modularity */
++nbd_clr_sock (struct nbd_device *lo, kdev_t dev)
++{
++    NBD_DEBUG( "ndb_clr_sock: entered\n" );
++
++    if (lo->head || lo->tail) {
++	NBD_ERROR ("Some requests are in progress -> can not turn off.\n");
++	NBD_DEBUG ("ndb_clr_sock: exited BUSY\n");
++	return -EBUSY;
++    }
++    if (!lo->file) {
++	NBD_DEBUG ("ndb_clr_sock: exited INVAL\n");
++	return -EINVAL;
++    }
++    lo->file->f_count--;
++    lo->file = NULL;
++    lo->sock = NULL;
++    if (1) { /* added by ptb */
++      invalidate_buffers (dev);
++    }
++    if (0) { /* added by ptb - not OK when we lose contact and don't clr ! */
++      NBD_DEBUG ("nbd_clr_sock: decrement minor device %d reference count.\n" , dev);
++      MOD_DEC_USE_COUNT;
++    }
++    NBD_DEBUG( "ndb_clr_sock: exited OK\n" );
++    return 0;
++}
++
++static int
++/* introduced by PTB for better modularity */
++nbd_set_sock (struct nbd_device *lo, kdev_t dev, unsigned int arg)
++{
++    struct file *file;
++    struct inode *inode;
++
++    NBD_DEBUG( "ndb_set_sock: entered with arg %d on minor %d\n"
++          , arg , MINOR(dev) );
++
++    if (1 && lo->file) {	/* PTB 132 */
++	NBD_DEBUG ("ndb_set_sock: exited BUSY\n");
++	return -EBUSY;
++    }
++    file = current->files->fd[arg];
++    if (!file) {
++	NBD_ALERT ("nbd_set_sock: NULL file?!?\n");
++	NBD_DEBUG ("ndb_set_sock: exited BADF\n");
++	return -EBADF;
++    }
++    NBD_DEBUG( "nbd_set_sock: got file %ld\n" , (long)file );
++    inode = file->f_inode;	/* PTB */
++    /* N.B. Should verify that it's a socket */
++    if (!inode) {
++	NBD_ALERT ("nbd_set_sock: NULL inode?!?\n");
++	NBD_DEBUG ("ndb_set_sock: exited INVAL\n");
++	return -EINVAL;
++    }
++    NBD_DEBUG( "nbd_set_sock: got inode %x\n" , (unsigned)inode );
++    if (0) { /* added by ptb */
++	int error = blkdev_open (inode, file);
++	if (error) {
++	    NBD_ALERT ("nbd_set_sock: cannot blkdev_open.\n");
++	    NBD_DEBUG( "ndb_set_sock: exited with error %d\n" , error );
++	    return error;
++        }
++        NBD_DEBUG( "nbd_set_sock: opened blkdev\n" );
++    }
++    if (1) { /* added by ptb */
++	invalidate_inode_pages (inode);
++    }
++    if (0) { /* added by ptb */
++	if (IS_RDONLY (inode) || is_read_only (dev)) {
++	    lo->flags |= NBD_READ_ONLY;
++	    set_device_ro (dev, 1);
++            NBD_DEBUG( "nbd_set_sock: set device ro\n" );
++	}
++	else  {
++	    set_device_ro (dev, 0);
++            NBD_DEBUG( "nbd_set_sock: set device rw\n" );
++        }
++    }
++    file->f_count++;
++    NBD_DEBUG( "nbd_set_sock: incremented file reference count\n" );
++    lo->sock = &inode->u.socket_i;
++    NBD_DEBUG( "nbd_set_sock: set socket reference on inode %x\n"
++        , (unsigned)inode );
++    lo->file = file;
++    NBD_DEBUG( "nbd_set_sock: set file reference to %ld\n" , (long)file );
++    if (0) { /* added by PTB - not good since can't guarantee to clear again */
++        NBD_DEBUG( "nbd_set_sock: increment minor %d reference count\n" , dev );
++        MOD_INC_USE_COUNT;
++    }
++    NBD_DEBUG( "ndb_set_sock: exited OK\n" );
++    return 0;
++}
++
++static int
++/* introduced by PTB for better modularity */
++nbd_set_blksize (int dev, unsigned int arg)
++{
++    NBD_DEBUG ("ndb_set_blksize: entered with arg %x (%u) on minor %d\n"
++           , arg , arg , dev);
++    if ((arg & 511) || (arg > PAGE_SIZE)) {
++	NBD_ERROR ("nbd_ioctl: blksize too big (%u)\n" , arg);
++	NBD_DEBUG ("ndb_set_blksize: exited INVAL\n");
++	return -EINVAL;
++    }
++    nbd_blksizes[dev] = arg;
++    NBD_DEBUG ("ndb_set_blksize: set blksize to %d \n" , nbd_blksizes[dev]);
++    if (0) { /* PTB 132 !! NONSENSENSICAL size correction !! */
++      nbd_sizes[dev] = arg / nbd_blksizes[dev];
++    } else {  /* PTB  - must be better! ? */
++      nbd_sizes[dev] = nbd_bytesizes[dev] / nbd_blksizes[dev];
++    }
++    NBD_DEBUG ("ndb_set_blksize: set size to %d \n" , nbd_sizes[dev]);
++    NBD_DEBUG ("ndb_set_blksize: exited OK\n");
++    return 0;
++}
++ 
++static int
++/* introduced by PTB for better modularity */
++nbd_set_size (int dev, unsigned int arg)
++{
++    NBD_DEBUG ("ndb_set_size: entered with arg %x (%u) on minor %d\n"
++           , arg , arg , dev);
++    if (1) {		/* PTB 132 */
++      nbd_bytesizes[dev] = arg;
++      nbd_sizes[dev] = arg / nbd_blksizes[dev];
++    } else {            /* PTB 55  */
++      nbd_sizes[dev] = arg;
++    }
++    NBD_DEBUG ("ndb_set_size: exited OK\n");
++    return 0;
++}
++
++
++static int
++nbd_ioctl (struct inode *inode, struct file *file,
++	   unsigned int cmd, unsigned long arg)
++{
++    struct nbd_device *lo;
++    int dev;
++
++    NBD_DEBUG( "ndb_ioctl: entered with arg %ld\n" , arg );
++
++    if (!suser ()) {
++	NBD_ERROR ("nbd_ioctl: caller must be root.\n");
++	NBD_DEBUG ("ndb_ioctl: exited PERM\n");
++	return -EPERM;
++    }
++    if (!inode) {
++	NBD_ERROR ("nbd_ioctl: given bad inode.\n");
++	NBD_DEBUG ("ndb_ioctl: exited INVAL\n");
++	return -EINVAL;
++    }
++    if (MAJOR (inode->i_rdev) != MAJOR_NR) {
++	NBD_ERROR ("nbd_ioctl: pseudo-major != %d\n" , MAJOR_NR);
++	NBD_DEBUG ("ndb_ioctl: exited NODEV\n");
++	return -ENODEV;
++    }
++    dev = MINOR (inode->i_rdev);
++    if (dev >= MAX_NBD) {
++	NBD_ERROR ("nbd_ioctl: tried to open too many devices, %d\n" , dev);
++	NBD_DEBUG ("ndb_ioctl: exited NODEV\n");
++	return -ENODEV;
++    }
++    lo = &nbd_dev[dev];
++    switch (cmd) {
++          int err;
++
++      case NBD_CLEAR_SOCK:
++          NBD_DEBUG ("nbd_ioctl: NBD_CLEAR_SOCK %ld\n" , arg);
++	  err = nbd_clr_sock (lo, inode->i_rdev);
++          NBD_DEBUG( "ndb_ioctl: exited with %d\n" , err );
++          return err;
++
++      case NBD_SET_SOCK:
++          NBD_DEBUG ("nbd_ioctl: NBD_SET_SOCK %ld\n" , arg);
++	  err = nbd_set_sock (lo, inode->i_rdev, arg);
++          NBD_DEBUG( "ndb_ioctl: exited with %d\n" , err );
++          return err;
++
++      case NBD_SET_BLKSIZE:
++          NBD_DEBUG ("nbd_ioctl: NBD_SET_BLKSIZE %ld\n" , arg);
++	  err = nbd_set_blksize (dev, arg);
++	  NBD_DEBUG ("ndb_ioctl: exited with %d\n" , err);
++	  return err;
++
++      case NBD_SET_SIZE:
++          NBD_DEBUG ("nbd_ioctl: NBD_SET_SIZE %ld\n" , arg);
++	  err = nbd_set_size (dev, arg);
++	  NBD_DEBUG ("ndb_ioctl: exited with %d\n" , err);
++	  return err;
++
++      case NBD_DO_IT:
++          NBD_DEBUG ("nbd_ioctl: NBD_DO_IT %ld\n" , arg);
++	  if (!lo->file) {
++	      NBD_ERROR ("nbd_ioctl: no file\n");
++              NBD_DEBUG( "ndb_ioctl: exited INVAL\n" );
++	      return -EINVAL;
++          }
++	  nbd_do_it (lo);
++	  err = lo->harderror;
++          NBD_DEBUG( "ndb_ioctl: exited with %d\n" , err );
++	  return err;
++
++      case NBD_CLEAR_QUE:
++          NBD_DEBUG ("nbd_ioctl: NBD_CLEAR_QUE %ld\n" , arg);
++	  nbd_clear_que (lo);
++          err = 0;
++          NBD_DEBUG( "ndb_ioctl: exited OK\n" );
++	  return err;
++
++/* let this be compiled in always - it's useful. PTB */
++      case NBD_PRINT_DEBUG:
++          NBD_DEBUG ("nbd_ioctl: NBD_PRINT_DEBUG");
++	  NBD_INFO ("device %d: head = %x, tail = %x. Global: in %d, out %d\n"
++            , dev , (int) lo->head , (int) lo->tail
++            , nbd_requests_in , nbd_requests_out);
++          err = 0;
++          NBD_DEBUG( "ndb_ioctl: exited OK\n" );
++	  return err;
++
++      case BLKGETSIZE:		/* PTB 132 */
++	  NBD_DEBUG ("nbd_ioctl: BLKGETSIZE %ld\n" , arg);
++	  put_user (nbd_bytesizes[dev] / 512, (long *) arg);
++          err = 0;
++	  NBD_DEBUG ("ndb_ioctl: exited OK\n");
++	  return err;
++    }
++    NBD_DEBUG ("ndb_ioctl: exited INVAL\n");
++    return -EINVAL;
++}
++
++static void /* int -> void PTB */
++nbd_release (struct inode *inode, struct file *file)
++{
++    struct nbd_device *lo;
++    int dev;
++
++    NBD_DEBUG( "ndb_release: entered\n" );
++
++    if (!inode) {
++	NBD_ALERT ("nbd_release: null inode.\n");
++	NBD_DEBUG ("ndb_release: exited NODEV\n");
++	return;
++    }
++    dev = MINOR (inode->i_rdev);
++    if (dev >= MAX_NBD) {
++	NBD_ALERT ("nbd_release: too many open devices.\n");
++	NBD_DEBUG ("ndb_release: exited NODEV\n");
++	return;
++    }
++    fsync_dev (inode->i_rdev);
++    lo = &nbd_dev[dev];
++    if (lo->refcnt <= 0) {
++	NBD_ALERT ("nbd_release: refcount(%d) <= 0\n" , lo->refcnt);
++    }
++    lo->refcnt--;
++    /* N.B. Doesn't lo->file need an fput?? */
++    NBD_DEBUG ("nbd_release: decrement minor device %d reference count.\n" , dev);
++    MOD_DEC_USE_COUNT;
++    NBD_DEBUG( "ndb_release: exited OK\n" );
++    return;
++}
++
++static struct file_operations nbd_fops =
++{
++    NULL,			/* lseek - default */
++    block_read,			/* read - general block-dev read */
++    block_write,		/* write - general block-dev write */
++    NULL,			/* readdir - bad */
++    NULL,			/* select */
++    nbd_ioctl,			/* ioctl */
++    NULL,			/* mmap */
++    nbd_open,			/* open */
++    nbd_release			/* release */
++};
++
++/*
++ * And here should be modules and kernel interface 
++ *  (Just smiley confuses emacs :-)
++ */
++
++#ifdef MODULE
++#define nbd_init init_module
++#endif
++
++int
++nbd_init (void)
++{
++    int i;
++    NBD_DEBUG( "ndb_init: entered\n" );
++
++    NBD_INFO ("Network Block Device support by pavel@elf.mj.gts.cz\n");
++    NBD_INFO ("Network Block Device port to 2.0 by ptb@it.uc3m.es\n");
++    if (register_blkdev (MAJOR_NR, "nbd", &nbd_fops)) {
++	NBD_ERROR ("Unable to get major number %d for NBD\n" , MAJOR_NR);
++	return -EIO;
++    }
++#ifdef MODULE
++    NBD_INFO ("registered device at major %d\n" , MAJOR_NR);
++#endif
++    blk_dev[MAJOR_NR].request_fn = DEVICE_REQUEST;
++    blksize_size[MAJOR_NR] = nbd_blksizes;
++    blk_size[MAJOR_NR] = nbd_sizes;
++    blk_dev[MAJOR_NR].request_fn = do_nbd_request;	/* PTB 132 (was DEVICE_REQUEST) */
++    for (i = 0; i < MAX_NBD; i++) {
++	memset (&nbd_dev[i], 0, sizeof (struct nbd_device));
++	nbd_dev[i].magic = LO_MAGIC;
++	nbd_blksizes[i] = 1024;                            /* PTB 132 */
++	nbd_bytesizes[i] = 0x7fffffff;                     /* PTB 132 */
++	nbd_sizes[i] = nbd_bytesizes[i] / nbd_blksizes[i]; /* PTB 132 */
++    }
++    NBD_DEBUG( "ndb_init: exited OK\n" );
++    return 0;
++}
++
++#ifdef MODULE
++void
++cleanup_module (void)
++{
++    if (unregister_blkdev (MAJOR_NR, "nbd") != 0)
++	NBD_ALERT ("cleanup_module failed\n");
++    else
++	NBD_INFO ("module cleaned up.\n");
++}
++#endif
++
++
++/* Compile line:
++ *
++ *  gcc -O2 -D__KERNEL__ -DMODULE -xc -c nbd.c -o nbd.o
++ *
++ *  (possibly with -DMODVERSIONS also). PTB
++ */
+--- linux-2.0.36/include/linux/blk.h.pre-nbd	Wed Oct 14 04:52:17 1998
++++ linux-2.0.36/include/linux/blk.h	Sat Jan  9 22:55:48 1999
+@@ -87,6 +87,9 @@
+ #ifdef CONFIG_BLK_DEV_MD
+ extern int md_init(void);
+ #endif CONFIG_BLK_DEV_MD
++#ifdef CONFIG_BLK_DEV_NBD
++extern int nbd_init(void);
++#endif CONFIG_BLK_DEV_NBD
+ 
+ extern void set_device_ro(kdev_t dev,int flag);
+ void add_blkdev_randomness(int major);
+@@ -310,6 +313,14 @@
+ #define DEVICE_ON(device)
+ #define DEVICE_OFF(device)
+ 
++#elif (MAJOR_NR == NBD_MAJOR)
++
++#define DEVICE_NAME "Network Block Device"
++#define DEVICE_REQUEST do_nbd_request
++#define DEVICE_NR(device) (MINOR(device))
++#define DEVICE_ON(device)
++#define DEVICE_OFF(device)
++
+ #endif /* MAJOR_NR == whatever */
+ 
+ #if (MAJOR_NR != SCSI_TAPE_MAJOR)
+@@ -380,16 +391,25 @@
+ void ide_end_request(byte uptodate, ide_hwgroup_t *hwgroup) {
+ 	struct request *req = hwgroup->rq;
+ #else
++#ifndef ENDREQ_NOCURRENT
+ static void end_request(int uptodate) {
+ 	struct request *req = CURRENT;
++#else
++static void end_request(struct request *req, int uptodate ) {
++#endif /* ENDREQ_NOCURRENT */
+ #endif /* IDE_DRIVER */
+ 	struct buffer_head * bh;
+ 	int nsect;
+ 
+ 	req->errors = 0;
+ 	if (!uptodate) {
++#ifdef DEVICE_NAME
++               printk("end_request: I/O error, dev %s (%s), sector %lu\n",
++                       kdevname(req->rq_dev), DEVICE_NAME, req->sector);
++#else   
+ 		printk("end_request: I/O error, dev %s, sector %lu\n",
+ 			kdevname(req->rq_dev), req->sector);
++#endif
+ 		if ((bh = req->bh) != NULL) {
+ 			nsect = bh->b_size >> 9;
+ 			req->nr_sectors--;
+--- linux-2.0.36/include/linux/major.h.pre-nbd	Mon Jul 13 22:47:39 1998
++++ linux-2.0.36/include/linux/major.h	Sat Jan  9 22:31:59 1999
+@@ -64,6 +64,7 @@
+ #define NETLINK_MAJOR	36
+ #define IDETAPE_MAJOR	37
+ #define Z2RAM_MAJOR	37
++#define NBD_MAJOR	43
+ #define RISCOM8_NORMAL_MAJOR 48
+ #define RISCOM8_CALLOUT_MAJOR 49
+ #define MKISS_MAJOR	55
+--- linux-2.0.36/include/linux/nbd.h.pre-nbd	Sat Jan  9 22:31:59 1999
++++ linux-2.0.36/include/linux/nbd.h	Sun Jan 10 19:47:59 1999
+@@ -0,0 +1,112 @@
++#ifndef LINUX_NBD_H
++#define LINUX_NBD_H
++
++/* unsigned comments are Pavel's originals for 2.1.*
++ *   pavel@atrey.karlin.mff.cuni.cz (Pavel Machek)
++ * comments marked PTB are from
++ *   ptb@it.uc3m.es (Peter T. Breuer)
++ */
++
++#include <asm/types.h>
++
++/* these should be _IO( 0xab, X ) with X=0 to 6 for 132 but I won't make
++ * trouble for myself until I know it works this way PTB
++ */
++
++#define NBD_SET_SOCK    0x4E00
++#define NBD_SET_BLKSIZE 0x4E01
++#define NBD_SET_SIZE    0x4E02
++#define NBD_DO_IT       0x4E03
++#define NBD_CLEAR_SOCK  0x4E04
++#define NBD_CLEAR_QUE   0x4E05
++#define NBD_PRINT_DEBUG 0x4E06
++
++#ifdef MAJOR_NR
++/* we are included from the kernel nbd.c file so put kernel stuff here PTB */
++
++#include <linux/locks.h>
++#include <linux/config.h>
++
++/* CURRENT is defined this way in blk.h so I'll ifndef it. We could
++ * (should?) include blk.h too if we include nbd.h and not define CURRENT
++ * PTB
++ */
++
++#ifndef CURRENT
++#define CURRENT (blk_dev[MAJOR_NR].current_request)
++#endif /* CURRENT */
++
++#define ENDREQ_NOCURRENT
++#define LOCAL_END_REQUEST
++
++#include <linux/blk.h>
++
++/* define always - I've enabled the corresponding ioctl unconditionally. PTB */
++extern int nbd_requests_in;
++extern int nbd_requests_out;
++
++static void nbd_end_request(struct request *req) {
++#ifdef PARANOIA
++    nbd_requests_out++;
++#endif /* PARANOIA */
++   /* this is elaborated in 2.1.132 but I don't think there's support
++    * or need for that elaboration in 2.0.* PTB
++    */
++   end_request( req, !req->errors );
++}
++
++#define MAX_NBD 128
++#endif /* MAJOR_NR */
++
++struct nbd_device {
++  int refcnt;	
++  int flags;
++  int harderror;		/* Code of hard error			*/
++#define NBD_READ_ONLY   0x0001
++#define NBD_WRITE_NOCHK 0x0002
++#define NBD_INITIALISED 0x0004
++  struct socket * sock;
++  struct file * file; 		/* If == NULL, device is not ready, yet	*/
++  int magic;			/* FIXME: not if debugging is off	*/
++  struct request *head;	        /* Requests are added here...		*/
++  struct request *tail;
++  struct semaphore queue_lock;  /* PTB 132 */
++};
++
++/* This now IS in some kind of include file...	*/
++
++/* PTB 132 */ 
++#define NBD_REQUEST_MAGIC 0x25609513
++#define NBD_REPLY_MAGIC 0x67446698     
++/* Do *not* use magics: 0x12560953 0x96744668. 
++ */
++
++#define LO_MAGIC 0x68797548
++
++#define NBD_REQUEST_MAGIC_T  __u32
++#define NBD_REQUEST_TYPE_T   __u32
++#define NBD_REQUEST_HANDLE_T char
++#define NBD_REQUEST_FROM_T   __u64
++#define NBD_REQUEST_LEN_T    __u32
++#define NBD_REPLY_MAGIC_T    __u32
++#define NBD_REPLY_ERROR_T    __u32
++#define NBD_REPLY_HANDLE_T   char
++
++#assert NBD_IS_REQUEST_FROM_T(__u64)
++
++struct nbd_request {
++  NBD_REQUEST_MAGIC_T  magic;
++  NBD_REQUEST_TYPE_T   type;			/* == READ || == WRITE 	*/
++  NBD_REQUEST_HANDLE_T handle[8];
++  NBD_REQUEST_FROM_T   from;                    /* 64 bit PTB 132 */
++  NBD_REQUEST_LEN_T    len;
++} ;
++
++struct nbd_reply {
++  NBD_REPLY_MAGIC_T    magic;
++  NBD_REPLY_ERROR_T    error;		/* 0 = ok, else error	*/
++  NBD_REPLY_HANDLE_T   handle[8];	/* handle you got from request	*/
++} ;
++
++
++#endif /* LINUX_NBD_H */
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

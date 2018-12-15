@@ -1,0 +1,414 @@
+Date: Sun, 16 May 1999 15:22:42 +0200
+From: Andi Kleen <>
+Subject: [PATCH] copy_strings cleanup for 2.3.2
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/5/16/153
+
+[This is a retransmit because I didn't see my earlier patch in 2.3.2. If
+ you don't like it for some reason please tell me.]
+This patch cleans up copy_strings considerably:
+I removed
+the set_fs games in copy_strings, because the case from_kmem==2 (argv in
+kernel but values in user space) is never used in 2.2, and seems to be
+rather useless. Instead I splitted it in two new functions: 
+copy_strings for the common case of getting argv and its values from
+user memory, and 
+copy_strings_kernel for getting both from kernel memory. This avoids 
+unnecessary checking in the fast path (all callers changed) and the code
+generally looks more pleasant.
+In addition I cleaned the error checking up, it now does correct
+copy_from_user() checking and out-of-memory is reported as such, not E2BIG.
+I also documented one assumption in exec.c: the exec error cleanups 
+assume that free_page can take a NULL argument.
+The sys_sparc32.c change has not been tested, because I don't have a sparc.
+Patch against 2.3.2. 
+Please add it to the next 2.3. Thanks, 
+-Andi
+Index: linux/kernel/ksyms.c
+===================================================================
+RCS file: /vger/u4/cvs/linux/kernel/ksyms.c,v
+retrieving revision 1.111
+diff -u -u -r1.111 ksyms.c
+--- ksyms.c	1999/05/15 05:02:49	1.111
++++ ksyms.c	1999/05/16 12:22:25
+@@ -344,6 +344,7 @@
+ /* Program loader interfaces */
+ EXPORT_SYMBOL(setup_arg_pages);
+ EXPORT_SYMBOL(copy_strings);
++EXPORT_SYMBOL(copy_strings_kernel);
+ EXPORT_SYMBOL(do_execve);
+ EXPORT_SYMBOL(flush_old_exec);
+ EXPORT_SYMBOL(open_dentry);
+Index: linux/arch/sparc64/kernel/sys_sparc32.c
+===================================================================
+RCS file: /vger/u4/cvs/linux/arch/sparc64/kernel/sys_sparc32.c,v
+retrieving revision 1.107
+diff -u -u -r1.107 sys_sparc32.c
+--- sys_sparc32.c	1999/03/05 13:21:02	1.107
++++ sys_sparc32.c	1999/05/16 12:22:31
+@@ -2682,7 +2682,7 @@
+  */
+ static unsigned long
+ copy_strings32(int argc,u32 * argv,unsigned long *page,
+-	       unsigned long p)
++	       unsigned long p, int *err)
+ {
+ 	u32 str;
+ 
+@@ -2691,11 +2691,15 @@
+ 		int len;
+ 		unsigned long pos;
+ 
+-		get_user(str, argv+argc);
+-		if (!str) panic("VFS: argc is wrong");
++		if (get_user(str, argv+argc) || !str) { 
++			*err = -EFAULT;
++			return 0;
++		}
+ 		len = strlen_user((char *)A(str));	/* includes the '\0' */
+-		if (p < len)	/* this shouldn't happen - 128kB */
++		if (p < len) {	/* this shouldn't happen - 128kB */
++			*err = -E2BIG;
+ 			return 0;
++		}
+ 		p -= len; pos = p;
+ 		while (len) {
+ 			char *pag;
+@@ -2704,12 +2708,17 @@
+ 			offset = pos % PAGE_SIZE;
+ 			if (!(pag = (char *) page[pos/PAGE_SIZE]) &&
+ 			    !(pag = (char *) page[pos/PAGE_SIZE] =
+-			      (unsigned long *) get_free_page(GFP_USER)))
++			      (unsigned long *) get_free_page(GFP_USER))) { 
++				*err = -ENOMEM;
+ 				return 0;
++			}
+ 			bytes_to_copy = PAGE_SIZE - offset;
+ 			if (bytes_to_copy > len)
+ 				bytes_to_copy = len;
+-			copy_from_user(pag + offset, (char *)A(str), bytes_to_copy);
++			if (copy_from_user(pag + offset, (char *)A(str), bytes_to_copy)) {
++				*err = -EFAULT;
++				return 0;
++			}
+ 			pos += bytes_to_copy;
+ 			str += bytes_to_copy;
+ 			len -= bytes_to_copy;
+@@ -2756,12 +2765,10 @@
+ 	retval = prepare_binprm(&bprm);
+ 	
+ 	if(retval>=0) {
+-		bprm.p = copy_strings(1, &bprm.filename, bprm.page, bprm.p, 2);
++		bprm.p = copy_strings_kernel(1, &bprm.filename, bprm.page, bprm.p, &retval);
+ 		bprm.exec = bprm.p;
+ 		bprm.p = copy_strings32(bprm.envc,envp,bprm.page,bprm.p);
+ 		bprm.p = copy_strings32(bprm.argc,argv,bprm.page,bprm.p);
+-		if (!bprm.p)
+-			retval = -E2BIG;
+ 	}
+ 
+ 	if(retval>=0)
+Index: linux/include/linux/binfmts.h
+===================================================================
+RCS file: /vger/u4/cvs/linux/include/linux/binfmts.h,v
+retrieving revision 1.16
+diff -u -u -r1.16 binfmts.h
+--- binfmts.h	1998/04/12 06:17:26	1.16
++++ binfmts.h	1999/05/16 12:22:31
+@@ -65,8 +65,10 @@
+ extern int flush_old_exec(struct linux_binprm * bprm);
+ extern unsigned long setup_arg_pages(unsigned long p, struct linux_binprm * bprm);
+ extern unsigned long copy_strings(int argc,char ** argv,unsigned long *page,
+-		unsigned long p, int from_kmem);
+-
++				  unsigned long p, int *err); 
++extern unsigned long copy_strings_kernel(int argc,char ** argv,
++					 unsigned long *page,
++					 unsigned long p, int *err);
+ extern void compute_creds(struct linux_binprm *binprm);
+ 
+ /* this eventually goes away */
+Index: linux/fs/binfmt_elf.c
+===================================================================
+RCS file: /vger/u4/cvs/linux/fs/binfmt_elf.c,v
+retrieving revision 1.87
+diff -u -u -r1.87 binfmt_elf.c
+--- binfmt_elf.c	1999/05/10 23:23:11	1.87
++++ binfmt_elf.c	1999/05/16 12:22:36
+@@ -573,11 +573,11 @@
+ 		  passed_p = passed_fileno;
+ 
+ 		  if (elf_interpreter) {
+-		    bprm->p = copy_strings(1,&passed_p,bprm->page,bprm->p,2);
++		    bprm->p = copy_strings_kernel(1,&passed_p,bprm->page,bprm->p,
++						  &retval);
+ 		    bprm->argc++;
+ 		  }
+ 		}
+-		retval = -E2BIG;
+ 		if (!bprm->p)
+ 			goto out_free_dentry;
+ 	}
+Index: linux/fs/binfmt_em86.c
+===================================================================
+RCS file: /vger/u4/cvs/linux/fs/binfmt_em86.c,v
+retrieving revision 1.7
+diff -u -u -r1.7 binfmt_em86.c
+--- binfmt_em86.c	1998/08/26 10:30:37	1.7
++++ binfmt_em86.c	1999/05/16 12:22:36
+@@ -65,16 +65,16 @@
+ 	 * user environment and arguments are stored.
+ 	 */
+ 	remove_arg_zero(bprm);
+-	bprm->p = copy_strings(1, &bprm->filename, bprm->page, bprm->p, 2);
++	bprm->p = copy_strings_kernel(1, &bprm->filename, bprm->page, bprm->p, &etval);
+ 	bprm->argc++;
+ 	if (i_arg) {
+-		bprm->p = copy_strings(1, &i_arg, bprm->page, bprm->p, 2);
++		bprm->p = copy_strings_kernel(1, &i_arg, bprm->page, bprm->p, &retval);
+ 		bprm->argc++;
+ 	}
+-	bprm->p = copy_strings(1, &i_name, bprm->page, bprm->p, 2);
++	bprm->p = copy_strings_kernel(1, &i_name, bprm->page, bprm->p, &retval);
+ 	bprm->argc++;
+ 	if (!bprm->p) 
+-		return -E2BIG;
++		return retval;
+ 	/*
+ 	 * OK, now restart the process with the interpreter's inode.
+ 	 * Note that we use open_namei() as the name is now in kernel
+Index: linux/fs/binfmt_java.c
+===================================================================
+RCS file: /vger/u4/cvs/linux/fs/binfmt_java.c,v
+retrieving revision 1.9
+diff -u -u -r1.9 binfmt_java.c
+--- binfmt_java.c	1998/08/26 10:30:37	1.9
++++ binfmt_java.c	1999/05/16 12:22:37
+@@ -67,15 +67,15 @@
+ 		i_name++;
+ 	else
+ 		i_name = bprm->filename;
+-	bprm->p = copy_strings(1, &i_name, bprm->page, bprm->p, 2);
++	bprm->p = copy_strings_kernel(1, &i_name, bprm->page, bprm->p, &retval);
+ 	bprm->argc++;
+ 
+ 	i_name = binfmt_java_interpreter;
+-	bprm->p = copy_strings(1, &i_name, bprm->page, bprm->p, 2);
++	bprm->p = copy_strings(1, &i_name, bprm->page, bprm->p, &retval);
+ 	bprm->argc++;
+ 
+ 	if (!bprm->p) 
+-		return -E2BIG;
++		return retval; 
+ 	/*
+ 	 * OK, now restart the process with the interpreter's dentry.
+ 	 */
+@@ -114,15 +114,15 @@
+ 	 */
+ 	remove_arg_zero(bprm);
+ 	i_name = bprm->filename;
+-	bprm->p = copy_strings(1, &i_name, bprm->page, bprm->p, 2);
++	bprm->p = copy_strings_kernel(1, &i_name, bprm->page, bprm->p, &retval);
+ 	bprm->argc++;
+ 
+ 	i_name = binfmt_java_appletviewer;
+-	bprm->p = copy_strings(1, &i_name, bprm->page, bprm->p, 2);
++	bprm->p = copy_strings_kernel(1, &i_name, bprm->page, bprm->p, &retval);
+ 	bprm->argc++;
+ 
+ 	if (!bprm->p) 
+-		return -E2BIG;
++		return retval;
+ 	/*
+ 	 * OK, now restart the process with the interpreter's dentry.
+ 	 */
+Index: linux/fs/binfmt_misc.c
+===================================================================
+RCS file: /vger/u4/cvs/linux/fs/binfmt_misc.c,v
+retrieving revision 1.13
+diff -u -u -r1.13 binfmt_misc.c
+--- binfmt_misc.c	1999/01/03 08:14:11	1.13
++++ binfmt_misc.c	1999/05/16 12:22:38
+@@ -210,11 +210,10 @@
+ 
+ 	/* Build args for interpreter */
+ 	remove_arg_zero(bprm);
+-	bprm->p = copy_strings(1, &bprm->filename, bprm->page, bprm->p, 2);
++	bprm->p = copy_strings_kernel(1, &bprm->filename, bprm->page, bprm->p, &retval);
+ 	bprm->argc++;
+-	bprm->p = copy_strings(1, &iname_addr, bprm->page, bprm->p, 2);
++	bprm->p = copy_strings_kernel(1, &iname_addr, bprm->page, bprm->p, &retval);
+ 	bprm->argc++;
+-	retval = -E2BIG;
+ 	if (!bprm->p)
+ 		goto _ret;
+ 	bprm->filename = iname;	/* for binfmt_script */
+Index: linux/fs/binfmt_script.c
+===================================================================
+RCS file: /vger/u4/cvs/linux/fs/binfmt_script.c,v
+retrieving revision 1.10
+diff -u -u -r1.10 binfmt_script.c
+--- binfmt_script.c	1998/08/26 10:30:39	1.10
++++ binfmt_script.c	1999/05/16 12:22:38
+@@ -66,16 +66,18 @@
+ 	 * user environment and arguments are stored.
+ 	 */
+ 	remove_arg_zero(bprm);
+-	bprm->p = copy_strings(1, &bprm->filename, bprm->page, bprm->p, 2);
++	bprm->p = copy_strings_kernel(1, &bprm->filename, bprm->page, bprm->p,
++				      &retval);
+ 	bprm->argc++;
+ 	if (i_arg) {
+-		bprm->p = copy_strings(1, &i_arg, bprm->page, bprm->p, 2);
++		bprm->p = copy_strings_kernel(1, &i_arg, bprm->page, bprm->p, 
++					      &retval);
+ 		bprm->argc++;
+ 	}
+-	bprm->p = copy_strings(1, &i_name, bprm->page, bprm->p, 2);
++	bprm->p = copy_strings_kernel(1, &i_name, bprm->page, bprm->p, &retval);
+ 	bprm->argc++;
+ 	if (!bprm->p) 
+-		return -E2BIG;
++		return retval;
+ 	/*
+ 	 * OK, now restart the process with the interpreter's dentry.
+ 	 */
+Index: linux/fs/exec.c
+===================================================================
+RCS file: /vger/u4/cvs/linux/fs/exec.c,v
+retrieving revision 1.73
+diff -u -u -r1.73 exec.c
+--- exec.c	1999/05/08 03:02:34	1.73
++++ exec.c	1999/05/16 12:22:40
+@@ -225,44 +225,25 @@
+  * 'copy_string()' copies argument/envelope strings from user
+  * memory to free pages in kernel mem. These are in a format ready
+  * to be put directly into the top of new user memory.
+- *
+- * Modified by TYT, 11/24/91 to add the from_kmem argument, which specifies
+- * whether the string and the string array are from user or kernel segments:
+- * 
+- * from_kmem     argv *        argv **
+- *    0          user space    user space
+- *    1          kernel space  user space
+- *    2          kernel space  kernel space
+- * 
+- * We do this by playing games with the fs segment register.  Since it
+- * is expensive to load a segment register, we try to avoid calling
+- * set_fs() unless we absolutely have to.
+  */
+ unsigned long copy_strings(int argc,char ** argv,unsigned long *page,
+-		unsigned long p, int from_kmem)
++		unsigned long p, int *err)
+ {
+ 	char *str;
+-	mm_segment_t old_fs;
+ 
+ 	if (!p)
+-		return 0;	/* bullet-proofing */
+-	old_fs = get_fs();
+-	if (from_kmem==2)
+-		set_fs(KERNEL_DS);
++		return 0;	/* needed for chained error handling. */
+ 	while (argc-- > 0) {
+ 		int len;
+ 		unsigned long pos;
+ 
+-		if (from_kmem == 1)
+-			set_fs(KERNEL_DS);
+-		get_user(str, argv+argc);
+-		if (!str)
+-			panic("VFS: argc is wrong");
+-		if (from_kmem == 1)
+-			set_fs(old_fs);
++		if (get_user(str, argv+argc) || !str) { 
++			*err = -EFAULT;
++			return 0; 
++		}
+ 		len = strlen_user(str);	/* includes the '\0' */
+ 		if (p < len) {	/* this shouldn't happen - 128kB */
+-			set_fs(old_fs);
++			*err = -E2BIG; 
+ 			return 0;
+ 		}
+ 		p -= len;
+@@ -275,24 +256,38 @@
+ 			if (!(pag = (char *) page[pos/PAGE_SIZE]) &&
+ 			    !(pag = (char *) page[pos/PAGE_SIZE] =
+ 			      (unsigned long *) get_free_page(GFP_USER))) {
+-				if (from_kmem==2)
+-					set_fs(old_fs);
++				*err = -ENOMEM; 
+ 				return 0;
+ 			}
+ 			bytes_to_copy = PAGE_SIZE - offset;
+ 			if (bytes_to_copy > len)
+ 				bytes_to_copy = len;
+-			copy_from_user(pag + offset, str, bytes_to_copy);
++			if (copy_from_user(pag + offset, str, bytes_to_copy)) {
++				*err = -EFAULT;
++				return 0;
++			}
+ 			pos += bytes_to_copy;
+ 			str += bytes_to_copy;
+ 			len -= bytes_to_copy;
+ 		}
+ 	}
+-	if (from_kmem==2)
+-		set_fs(old_fs);
+ 	return p;
+ }
+ 
++/*
++ * Like copy_strings, but copy argv and argv values from kernel memory.
++ */
++unsigned long copy_strings_kernel(int argc,char ** argv,unsigned long *page,
++		unsigned long p, int *err)
++{
++	unsigned long r; 
++	mm_segment_t oldfs = get_fs();
++	set_fs(KERNEL_DS); 
++	r = copy_strings(argc, argv, page, p, err);
++	set_fs(oldfs);
++	return r; 
++}
++
+ unsigned long setup_arg_pages(unsigned long p, struct linux_binprm * bprm)
+ {
+ 	unsigned long stack_base;
+@@ -832,12 +827,11 @@
+ 	retval = prepare_binprm(&bprm);
+ 	
+ 	if (retval >= 0) {
+-		bprm.p = copy_strings(1, &bprm.filename, bprm.page, bprm.p, 2);
++		bprm.p = copy_strings_kernel(1, &bprm.filename, bprm.page,bprm.p,
++					     &retval);
+ 		bprm.exec = bprm.p;
+-		bprm.p = copy_strings(bprm.envc,envp,bprm.page,bprm.p,0);
+-		bprm.p = copy_strings(bprm.argc,argv,bprm.page,bprm.p,0);
+-		if (!bprm.p)
+-			retval = -E2BIG;
++		bprm.p = copy_strings(bprm.envc,envp,bprm.page,bprm.p,&retval);
++		bprm.p = copy_strings(bprm.argc,argv,bprm.page,bprm.p,&retval);
+ 	}
+ 
+ 	if (retval >= 0)
+@@ -850,6 +844,8 @@
+ 	if (bprm.dentry)
+ 		dput(bprm.dentry);
+ 
++	/* Assumes that free_page() can take a NULL argument. */ 
++	/* I hope this is ok for all architectures */ 
+ 	for (i=0 ; i<MAX_ARG_PAGES ; i++)
+ 		free_page(bprm.page[i]);
+ 
+-- 
+This is like TV. I don't like TV.
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

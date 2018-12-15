@@ -1,0 +1,347 @@
+Date: Sat, 25 Aug 2001 02:48:28 +0200
+From: Roger Larsson <>
+Subject: [PATCH][RFC] simpler __alloc_pages{_limit}
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2001/8/24/145
+
+Hi again,
+[two typos corrected from the version at linux-mm]
+I read through __alloc_pages again and found out that allocs with order > 0
+are not treated nicely.
+To begin with if order > 0 then direct_reclaim will be false even if it is
+allowed to wait...
+This version allows "direct_reclaim" with order > 0 !
+How?
+Like we finally end up doing anyway...
+reclaiming pages and freeing.
+While adding this I thought why not always do it like this,
+even with order == 0?
+since it will allow for merging of pages to higher orders.
+Before returning a page that was not mergeable...
+Doing this - the code started to collaps...
+__alloc_pages_limit could suddenly handle all special cases!
+(with small functional differences)
+Comments?
+/RogerL
+-- 
+Roger Larsson
+Skellefteå
+Sweden
+*******************************************
+Patch prepared by: roger.larsson@norran.net
+Name of file: patches/patch-2.4.8-pre3-alloc_pages_limit-R2
+*******************************************
+Patch prepared by: roger.larsson@norran.net
+Name of file: /home/roger/patches/patch-2.4.8-pre3-alloc_pages_limit-R2
+--- linux/mm/page_alloc.c.orig	Thu Aug 23 22:02:04 2001
++++ linux/mm/page_alloc.c	Sat Aug 25 01:47:02 2001
+@@ -212,9 +212,12 @@
+ 	return NULL;
+ }
+ 
+-#define PAGES_MIN	0
+-#define PAGES_LOW	1
+-#define PAGES_HIGH	2
++#define PAGES_MEMALLOC  0
++#define PAGES_CRITICAL  1
++#define PAGES_MIN	2
++#define PAGES_LOW	3
++#define PAGES_HIGH	4
++#define PAGES_LOW_FREE  5
+ 
+ /*
+  * This function does the dirty work for __alloc_pages
+@@ -228,7 +231,7 @@
+ 
+ 	for (;;) {
+ 		zone_t *z = *(zone++);
+-		unsigned long water_mark;
++		unsigned long water_mark, free_min;
+ 
+ 		if (!z)
+ 			break;
+@@ -239,10 +242,25 @@
+ 		 * We allocate if the number of free + inactive_clean
+ 		 * pages is above the watermark.
+ 		 */
++
++		free_min = z->pages_min;
++
+ 		switch (limit) {
++			case PAGES_MEMALLOC:
++				free_min = water_mark = 1;
++				break;
++			case PAGES_CRITICAL:
++				/* XXX: is pages_min/4 a good amount to reserve for this? */
++				free_min = water_mark = z->pages_min / 4;
++				break;
+ 			default:
+ 			case PAGES_MIN:
+-				water_mark = z->pages_min;
++				water_mark = z->pages_min; /*  + (1 << order) - 1; */
++				break;
++			case PAGES_LOW_FREE:
++				free_min = water_mark = z->pages_low;
++				if (direct_reclaim)
++					printk(KERN_WARNING "__alloc_free_limit(PAGES_FREE && direct_reclaim = 1)\n");
+ 				break;
+ 			case PAGES_LOW:
+ 				water_mark = z->pages_low;
+@@ -251,23 +269,44 @@
+ 				water_mark = z->pages_high;
+ 		}
+ 
+-		if (z->free_pages + z->inactive_clean_pages >= water_mark) {
+-			struct page *page = NULL;
+-			/* If possible, reclaim a page directly. */
+-			if (direct_reclaim)
+-				page = reclaim_page(z);
+-			/* If that fails, fall back to rmqueue. */
+-			if (!page)
+-				page = rmqueue(z, order);
+-			if (page)
+-				return page;
+-		}
++
++
++		if (z->free_pages + z->inactive_clean_pages < water_mark) 
++			continue;
++
++		do {
++			/*
++			 * Reclaim a page from the inactive_clean list.
++			 * low water mark. Free all reclaimed pages to
++			 * give them a chance to merge to higher orders.
++			 */
++			if (direct_reclaim) {
++				struct page *reclaim = reclaim_page(z);
++				if (reclaim) {
++					__free_page(reclaim);
++				} else if (z->inactive_clean_pages > 0) {
++					printk(KERN_ERR "reclaim_pages failed but there are inactive_clean_pages\n");
++					break;
++				}
++			}
++				
++			/* Always alloc via rmqueue */
++			if (z->free_pages >= free_min)
++			{
++				struct page *page = rmqueue(z, order);
++				if (page)
++					return page;
++			}
++
++			/* if it is possible to make progress by retrying - do it */
++		} while (direct_reclaim && z->inactive_clean_pages);
+ 	}
+ 
+ 	/* Found nothing. */
+ 	return NULL;
+ }
+ 
++
+ #ifndef CONFIG_DISCONTIGMEM
+ struct page *_alloc_pages(unsigned int gfp_mask, unsigned long order)
+ {
+@@ -281,7 +320,6 @@
+  */
+ struct page * __alloc_pages(unsigned int gfp_mask, unsigned long order, zonelist_t *zonelist)
+ {
+-	zone_t **zone;
+ 	int direct_reclaim = 0;
+ 	struct page * page;
+ 
+@@ -300,34 +338,24 @@
+ 
+ 	/*
+ 	 * Can we take pages directly from the inactive_clean
+-	 * list?
++	 * list? __alloc_pages_limit now handles any 'order'.
+ 	 */
+-	if (order == 0 && (gfp_mask & __GFP_WAIT))
++	if (gfp_mask & __GFP_WAIT)
+ 		direct_reclaim = 1;
+ 
+-try_again:
+ 	/*
+ 	 * First, see if we have any zones with lots of free memory.
+ 	 *
+ 	 * We allocate free memory first because it doesn't contain
+ 	 * any data ... DUH!
+ 	 */
+-	zone = zonelist->zones;
+-	for (;;) {
+-		zone_t *z = *(zone++);
+-		if (!z)
+-			break;
+-		if (!z->size)
+-			BUG();
++	page = __alloc_pages_limit(zonelist, order, PAGES_LOW_FREE, 0);
++	if (page)
++		return page;
+ 
+-		if (z->free_pages >= z->pages_low) {
+-			page = rmqueue(z, order);
+-			if (page)
+-				return page;
+-		} else if (z->free_pages < z->pages_min &&
+-					waitqueue_active(&kreclaimd_wait)) {
+-				wake_up_interruptible(&kreclaimd_wait);
+-		}
++	/* "all" requested zones has less than LOW free memory, start kreclaimd */
++	if (waitqueue_active(&kreclaimd_wait)) {
++		wake_up_interruptible(&kreclaimd_wait);
+ 	}
+ 
+ 	/*
+@@ -356,7 +384,7 @@
+ 
+ 	/*
+ 	 * OK, none of the zones on our zonelist has lots
+-	 * of pages free.
++	 * of pages free or a higher order alloc did not succeed
+ 	 *
+ 	 * We wake up kswapd, in the hope that kswapd will
+ 	 * resolve this situation before memory gets tight.
+@@ -371,6 +399,8 @@
+ 	 * - if we don't have __GFP_IO set, kswapd may be
+ 	 *   able to free some memory we can't free ourselves
+ 	 */
++
++
+ 	wakeup_kswapd();
+ 	if (gfp_mask & __GFP_WAIT) {
+ 		__set_current_state(TASK_RUNNING);
+@@ -385,6 +415,7 @@
+ 	 * Kswapd should, in most situations, bring the situation
+ 	 * back to normal in no time.
+ 	 */
++try_again:
+ 	page = __alloc_pages_limit(zonelist, order, PAGES_MIN, direct_reclaim);
+ 	if (page)
+ 		return page;
+@@ -398,40 +429,21 @@
+ 	 * - we're /really/ tight on memory
+ 	 * 	--> try to free pages ourselves with page_launder
+ 	 */
+-	if (!(current->flags & PF_MEMALLOC)) {
++	if (!(current->flags & PF_MEMALLOC) &&
++	    (gfp_mask & __GFP_WAIT)) {
+ 		/*
+-		 * Are we dealing with a higher order allocation?
+-		 *
+-		 * Move pages from the inactive_clean to the free list
+-		 * in the hope of creating a large, physically contiguous
+-		 * piece of free memory.
++		 * Move pages from the inactive_dirty to the inactive_clean
+ 		 */
+-		if (order > 0 && (gfp_mask & __GFP_WAIT)) {
+-			zone = zonelist->zones;
+-			/* First, clean some dirty pages. */
+-			current->flags |= PF_MEMALLOC;
+-			page_launder(gfp_mask, 1);
+-			current->flags &= ~PF_MEMALLOC;
+-			for (;;) {
+-				zone_t *z = *(zone++);
+-				if (!z)
+-					break;
+-				if (!z->size)
+-					continue;
+-				while (z->inactive_clean_pages) {
+-					struct page * page;
+-					/* Move one page to the free list. */
+-					page = reclaim_page(z);
+-					if (!page)
+-						break;
+-					__free_page(page);
+-					/* Try if the allocation succeeds. */
+-					page = rmqueue(z, order);
+-					if (page)
+-						return page;
+-				}
+-			}
+-		}
++
++		/* First, clean some dirty pages. */
++		current->flags |= PF_MEMALLOC;
++		page_launder(gfp_mask, 1);
++		current->flags &= ~PF_MEMALLOC;
++
++		page = __alloc_pages_limit(zonelist, order, PAGES_MIN, direct_reclaim); 
++		if (page)
++			return page;
++
+ 		/*
+ 		 * When we arrive here, we are really tight on memory.
+ 		 * Since kswapd didn't succeed in freeing pages for us,
+@@ -447,17 +459,15 @@
+ 		 * any progress freeing pages, in that case it's better
+ 		 * to give up than to deadlock the kernel looping here.
+ 		 */
+-		if (gfp_mask & __GFP_WAIT) {
+-			if (!order || total_free_shortage()) {
+-				int progress = try_to_free_pages(gfp_mask);
+-				if (progress || (gfp_mask & __GFP_FS))
+-					goto try_again;
+-				/*
+-				 * Fail in case no progress was made and the
+-				 * allocation may not be able to block on IO.
+-				 */
+-				return NULL;
+-			}
++		if (!order || total_free_shortage()) {
++			int progress = try_to_free_pages(gfp_mask);
++			if (progress || (gfp_mask & __GFP_FS))
++				goto try_again;
++			/*
++			 * Fail in case no progress was made and the
++			 * allocation may not be able to block on IO.
++			 */
++			return NULL;
+ 		}
+ 	}
+ 
+@@ -471,35 +481,11 @@
+ 	 * in the system, otherwise it would be just too easy to
+ 	 * deadlock the system...
+ 	 */
+-	zone = zonelist->zones;
+-	for (;;) {
+-		zone_t *z = *(zone++);
+-		struct page * page = NULL;
+-		if (!z)
+-			break;
+-		if (!z->size)
+-			BUG();
+-
+-		/*
+-		 * SUBTLE: direct_reclaim is only possible if the task
+-		 * becomes PF_MEMALLOC while looping above. This will
+-		 * happen when the OOM killer selects this task for
+-		 * instant execution...
+-		 */
+-		if (direct_reclaim) {
+-			page = reclaim_page(z);
+-			if (page)
+-				return page;
+-		}
+-
+-		/* XXX: is pages_min/4 a good amount to reserve for this? */
+-		if (z->free_pages < z->pages_min / 4 &&
+-				!(current->flags & PF_MEMALLOC))
+-			continue;
+-		page = rmqueue(z, order);
+-		if (page)
+-			return page;
+-	}
++	page = __alloc_pages_limit(zonelist, order,
++				   current->flags & PF_MEMALLOC ? PAGES_MEMALLOC : PAGES_CRITICAL,
++				   direct_reclaim); 
++	if (page)
++		return page;
+ 
+ 	/* No luck.. */
+ 	printk(KERN_ERR "__alloc_pages: %lu-order allocation failed.\n", order);

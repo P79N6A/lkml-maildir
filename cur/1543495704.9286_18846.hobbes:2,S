@@ -1,0 +1,269 @@
+Date: Thu, 13 May 1999 19:29:48 -0400
+From: Zack Weinberg <>
+Subject: All the problems with 2.2.8/2.3.x and bdflush/update
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/5/15/1
+
+I wrote the fs/buffer.c changes in 2.2.8 that are causing so many
+problems.  I'm debugging as fast as I can.  Here are some notes.
+1. Don't run update with 2.2.8.  It's unnecessary and it's causing
+filesystem corruption for some people.  This has to be a bug somewhere
+else in the kernel; update is simply calling sync() every thirty
+seconds.
+2. If you want your disks to spin down, try mounting filesystems with
+noatime.  I do not like the idea of postponing writes indefinitely at
+all.
+3. The appended patch should correct the buffer backlog problems
+observed by Steve Willer.  It is NOT ready to go into the official
+kernel, but I would appreciate any comments.  Versus 2.2.8; may need
+slight adjustment to apply to 2.3.1pre.
+4. Under some conditions, 2.2.8 will get stuck in unlink().  sysrq-P
+indicates it's spinning forever in ext2_truncate.  The process that
+called unlink() is un-interruptible and permanently in `R' state.
+Other processes proceed.  Init can't reboot the system, but sysrq
+will.  If you remount RO and sync first, the file systems come up
+clean, with the file that caused the problem unlinked.  This may be
+related to the filesystem corruption problems reported by Michael
+Warfield.
+5. The truncate problem is made *worse* by the appended patch: it goes
+from sometimes happening to always happening when I run bonnie.  I
+suspect a race of some kind in ext2/truncate.c.
+6. I am not on linux-kernel except via a web archive.  Please, if you
+have anything to say about buffer.c, mail me directly.
+zw
+--- buffer.c.228	Wed May 12 18:23:34 1999
++++ buffer.c	Thu May 13 19:24:44 1999
+@@ -24,6 +24,9 @@
+  * - RMK
+  */
+ 
++/* Rewritten bdflush() - self tuning, simplified logic, no need for
++   userspace update. -zw */
++
+ #include <linux/malloc.h>
+ #include <linux/locks.h>
+ #include <linux/errno.h>
+@@ -41,6 +44,8 @@
+ #include <asm/io.h>
+ #include <asm/bitops.h>
+ 
++#define max(a,b) ((a)>(b)?(a):(b))
++
+ #define NR_SIZES 7
+ static char buffersize_index[65] =
+ {-1,  0,  1, -1,  2, -1, -1, -1, 3, -1, -1, -1, -1, -1, -1, -1,
+@@ -94,7 +99,7 @@
+ 	struct {
+ 		int nfract;  /* Percentage of buffer cache dirty to 
+ 				activate bdflush */
+-		int ndirty;  /* Maximum number of dirty blocks to write out per
++		int ndirty;  /* Average number of dirty blocks to write out per
+ 				wake-cycle */
+ 		int nrefill; /* Number of clean buffers to try to obtain
+ 				each time we call refill */
+@@ -110,7 +115,7 @@
+ 		int dummy3;    /* unused */
+ 	} b_un;
+ 	unsigned int data[N_PARAM];
+-} bdf_prm = {{40, 500, 64, 256, 5, 30*HZ, 5*HZ, 1884, 2}};
++} bdf_prm = {{40, 250, 64, 256, 5, 30*HZ, 5*HZ, 1884, 2}};
+ 
+ /* These are the min and max parameter values that we will allow to be assigned */
+ int bdflush_min[N_PARAM] = {  0,  10,    5,   25,  1,   1*HZ,   1*HZ, 1, 1};
+@@ -1578,11 +1583,13 @@
+  *	(otherwise we go into an infinite busy-loop).
+  * 3) Quit writing loop blocks if a freelist went low (avoids deadlock
+  *	with running out of free buffers for loop's "real" device).
+-*/
++ *
++ * Returns the number of dirty buffers written out.
++ */
+ 
+-static inline void sync_old_buffers(void)
++static int sync_old_buffers(int all)
+ {
+-	int i;
++	int i, limit;
+ 	int ndirty = 0;
+ 	int wrta_cmd = WRITEA;
+ #ifdef DEBUG
+@@ -1616,10 +1623,16 @@
+ 
+  restart:
+ 	bh = lru_list[BUF_DIRTY];
+-	if(bh) 
+-		for (i = nr_buffers_type[BUF_DIRTY];
+-		     i-- > 0 && ndirty < bdf_prm.b_un.ndirty; 
+-		     bh = next) {
++	if (bh) {
++		if (all)
++			limit = nr_buffers_type[BUF_DIRTY];
++		else
++			limit = max(bdf_prm.b_un.ndirty * 2,
++				    nr_buffers * bdf_prm.b_un.nfract/100);
++#ifdef DEBUG
++		printk("limit=%d,", limit);
++#endif
++		for (i = 0; i < limit; i++) {
+ 			/* We may have stalled while waiting for
+ 			   I/O to complete. */
+ 			if(bh->b_list != BUF_DIRTY)
+@@ -1644,22 +1657,30 @@
+ 			next->b_count++;
+ 			bh->b_count++;
+ 			ndirty++;
++#ifdef DEBUG
++			nwritten++;
++#endif
+ 			bh->b_flushtime = 0;
+ 			if (MAJOR(bh->b_dev) == LOOP_MAJOR) {
+ 				ll_rw_block(wrta_cmd,1, &bh);
+ 				wrta_cmd = WRITEA;
+-				if (buffer_dirty(bh))
++				if (buffer_dirty(bh)) {
+ 					--ndirty;
++#ifdef DEBUG
++					--nwritten;
++#endif
++				}
+ 			}
+ 			else
+ 				ll_rw_block(WRITE, 1, &bh);
+ 			bh->b_count--;
+ 			next->b_count--;
++			bh = next;
+ 		}
+-	/* If we didn't write anything, but there are still
+-	 * dirty buffers, then make the next write to a
+-	 * loop device to be a blocking write.
+-	 * This lets us block--which we _must_ do! */
++	}
++	/* If we didn't write anything and there are dirty
++	 * buffers, make the next write to a loop device be a
++	 * blocking write.  This lets us block--which we _must_ do! */
+ 	if (ndirty == 0
+ 	    && nr_buffers_type[BUF_DIRTY] > 0 && wrta_cmd != WRITE) {
+ 		wrta_cmd = WRITE;
+@@ -1671,9 +1692,9 @@
+ 	printk("wrote %d/%d buffers...", nwritten, ndirty);
+ #endif
+ 	run_task_queue(&tq_disk);
++	return ndirty;
+ }
+ 
+-
+ /* This is the interface to bdflush.  As we get more sophisticated, we can
+  * pass tuning parameters to this "process", to adjust how it behaves. 
+  * We would want to verify each parameter, however, to make sure that it 
+@@ -1730,8 +1751,10 @@
+ 
+ int bdflush(void * unused) 
+ {
+-	long remaining = HZ * bdf_prm.b_un.interval;
++	long old_interv, scale_interv;
++	long remaining;
+ 	struct task_struct *tsk = current;
++	int ndirty;
+ 
+ 	/*
+ 	 *	We have a bare-bones task_struct, and really should fill
+@@ -1746,6 +1769,8 @@
+ 	sigfillset(&tsk->blocked);
+ 	bdflush_tsk = tsk;
+ 
++	old_interv = bdf_prm.b_un.interval;
++	remaining = scale_interv = old_interv * HZ;
+ 	/*
+ 	 *	As a kernel thread we want to tamper with system buffers
+ 	 *	and other internals and thus be subject to the SMP locking
+@@ -1757,13 +1782,14 @@
+ 		tsk->state = TASK_INTERRUPTIBLE;
+ 		remaining = schedule_timeout(remaining);
+ 
+-#ifdef DEBUG
+-		printk("bdflush() activated...");
+-#endif
+ 		CHECK_EMERGENCY_SYNC
+ 
+ 		if (remaining == 0) {
++#ifdef DEBUG
++			printk("bdflush awakens...");
++#endif
+ 			/*
++			 * Spontaneous wakeup. 
+ 			 * Also try to flush inodes and supers, since
+ 			 * otherwise there would be no way of ensuring
+ 			 * that these quantities ever get written
+@@ -1773,13 +1799,58 @@
+ 			 */
+ 			sync_supers(0);
+ 			sync_inodes(0);
+-			remaining = HZ * bdf_prm.b_un.interval;
++			ndirty = sync_old_buffers(1);
++
++			/* We tune the frequency of spontaneous
++			   bdflush wakeups such that on average
++			   ndirty buffers are written back on each
++			   cycle.  However, we will always wake up at
++			   least once every 100 secs and never more
++			   than once a second.  The tuning is
++			   logarithmic, so it's very coarse. */
++			if (bdf_prm.b_un.interval != old_interv) {
++				old_interv = bdf_prm.b_un.interval;
++				scale_interv = old_interv * HZ;
++			} else {
++				if (ndirty - 10 < bdf_prm.b_un.ndirty) {
++					scale_interv *= 2;
++					if (scale_interv > 100*HZ)
++						scale_interv = 100*HZ;
++#ifdef DEBUG
++					printk("interval now %ld, ",
++					       scale_interv);
++#endif
++				} else if (ndirty + 10 > bdf_prm.b_un.ndirty) {
++					scale_interv /= 2;
++					if (scale_interv < HZ)
++						scale_interv = HZ;
++#ifdef DEBUG
++					printk("interval now %ld, ",
++					       scale_interv);
++#endif
++				}
++			}
++			remaining = scale_interv;
++				
++		} else {
++#ifdef DEBUG
++			printk("bdflush activated...");
++#endif
++		/* We are called due to low memory.  Flush until we have
++		   enough. */
++			ndirty = sync_old_buffers(0);
++			/* We clearly aren't waking up often enough.
++			   Cut the interval in half, and if it's less
++			   than remaining, reset remaining. */
++			scale_interv /= 2;
++			if (scale_interv < HZ)
++				scale_interv = HZ;
++			if (remaining > scale_interv)
++				remaining = scale_interv;
++#ifdef DEBUG
++			printk("interval now %ld, ", scale_interv);
++#endif
+ 		}
+-			
+-		/* Keep flushing till there aren't very many dirty buffers */
+-		do {
+-			sync_old_buffers();
+-		} while(nr_buffers_type[BUF_DIRTY] > nr_buffers * bdf_prm.b_un.nfract/100);
+ 
+ 		wake_up(&bdflush_done);
+ #ifdef DEBUG
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

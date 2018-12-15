@@ -1,0 +1,661 @@
+Date: Tue, 17 Aug 1999 00:48:02 -0400 (EDT)
+From: Chuck Lever <>
+Subject: clustering page-ins, pt II
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/8/17/39
+
+hi jamie, and whomever else is interested -
+this is a second draft of the mmap readahead implementation i've been
+playing with, against 2.3.13.  changes include:
+1.  added "premap" function that allocates pmd/pte's in anticipation
+    of faults to map pages that are read ahead
+2.  fixed some bugs in sequential fault detection logic
+3.  variable read-ahead trigger point
+4.  read-ahead context protected by a spinlock
+5.  incorporated last week's fix for the zero-page map bug
+this patch still doesn't:
++  unreference behind (i'm not sure yet how to make this work reasonably
+   in all cases)
++  adjust the cluster size for random faults
+diff -ruN linux-2.3.13-ref/fs/file_table.c linux/fs/file_table.c
+--- linux-2.3.13-ref/fs/file_table.c	Sun Aug 15 15:00:43 1999
++++ linux/fs/file_table.c	Sun Aug 15 23:01:22 1999
+@@ -64,6 +64,7 @@
+ 		f->f_version = ++event;
+ 		f->f_uid = current->fsuid;
+ 		f->f_gid = current->fsgid;
++		spin_lock_init(&f->f_ralock);
+ 		file_list_lock();
+ 		list_add(&f->f_list, &anon_list);
+ 		file_list_unlock();
+diff -ruN linux-2.3.13-ref/include/linux/fs.h linux/include/linux/fs.h
+--- linux-2.3.13-ref/include/linux/fs.h	Sun Aug 15 15:11:14 1999
++++ linux/include/linux/fs.h	Mon Aug 16 23:20:06 1999
+@@ -412,7 +412,12 @@
+ 	unsigned int 		f_flags;
+ 	mode_t			f_mode;
+ 	loff_t			f_pos;
++
++	/* read-ahead context */
++	spinlock_t		f_ralock;
+ 	unsigned long 		f_reada, f_ramax, f_raend, f_ralen, f_rawin;
++#define f_lastpage f_ramax
++
+ 	struct fown_struct	f_owner;
+ 	unsigned int		f_uid, f_gid;
+ 	int			f_error;
+diff -ruN linux-2.3.13-ref/include/linux/mm.h linux/include/linux/mm.h
+--- linux-2.3.13-ref/include/linux/mm.h	Sun Aug 15 15:11:14 1999
++++ linux/include/linux/mm.h	Mon Aug 16 23:20:06 1999
+@@ -12,6 +12,7 @@
+ extern unsigned long num_physpages;
+ extern void * high_memory;
+ extern int page_cluster;
++extern unsigned cluster_shift, cluster_pages, cluster_bytes;
+ 
+ #include <asm/page.h>
+ #include <asm/atomic.h>
+diff -ruN linux-2.3.13-ref/mm/filemap.c linux/mm/filemap.c
+--- linux-2.3.13-ref/mm/filemap.c	Sun Aug 15 15:01:14 1999
++++ linux/mm/filemap.c	Mon Aug 16 23:19:36 1999
+@@ -33,6 +33,9 @@
+  *
+  * finished 'unifying' the page and buffer cache and SMP-threaded the
+  * page-cache, 21.05.1999, Ingo Molnar <mingo@redhat.com>
++ *
++ * filemap_nopage clean-up and "mapped file" read-ahead.
++ * 15.08.1999, Chuck Lever <cel@monkey.org>, idea by Jamie Lokier.
+  */
+ 
+ atomic_t page_cache_size = ATOMIC_INIT(0);
+@@ -500,39 +503,63 @@
+ }
+ 
+ /*
+- * Try to read ahead in the file. "page_cache" is a potentially free page
+- * that we could use for the cache (if it is 0 we can try to create one,
+- * this is all overlapped with the IO on the previous page finishing anyway)
++ * This adds the requested page to the page cache if it isn't already there,
++ * and schedules an I/O to read in its contents from disk.
+  */
+-static unsigned long try_to_read_ahead(struct file * file,
+-				unsigned long offset, unsigned long page_cache)
++static inline void page_cache_read(struct file * file, unsigned long offset)
+ {
++	unsigned long new_page;
+ 	struct inode *inode = file->f_dentry->d_inode;
++	struct page ** hash = page_hash(inode, offset);
+ 	struct page * page;
+-	struct page ** hash;
+ 
+-	offset &= PAGE_CACHE_MASK;
+-	switch (page_cache) {
+-	case 0:
+-		page_cache = page_cache_alloc();
+-		if (!page_cache)
+-			break;
+-	default:
+-		if (offset >= inode->i_size)
+-			break;
+-		hash = page_hash(inode, offset);
+-		page = page_cache_entry(page_cache);
+-		if (!add_to_page_cache_unique(page, inode, offset, hash)) {
+-			/*
+-			 * We do not have to check the return value here
+-			 * because it's a readahead.
+-			 */
+-			inode->i_op->readpage(file, page);
+-			page_cache = 0;
+-			page_cache_release(page);
+-		}
++	spin_lock(&pagecache_lock);
++	page = __find_page_nolock(inode, offset, *hash);
++	spin_unlock(&pagecache_lock);
++	if (page)
++		return;
++
++	new_page = page_cache_alloc();
++	if (!new_page)
++		return;
++	page = page_cache_entry(new_page);
++
++	if (!add_to_page_cache_unique(page, inode, offset, hash)) {
++		inode->i_op->readpage(file, page);
++		page_cache_release(page);
++		return;
++	}
++
++	/*
++	 * We arrive here in the unlikely event that someone
++	 * raced with us and added our page to the cache first.
++	 */
++	page_cache_free(new_page);
++	return;
++}
++
++/*
++ * Read in an entire cluster at once, and prepare for it to
++ * be mapped into a vm area.
++ */
++extern void premap_page(struct vm_area_struct *, unsigned long);
++
++static void read_cluster_premap(struct vm_area_struct * vma,
++	unsigned long offset)
++{
++	struct file * file = vma->vm_file;
++	off_t filesize = file->f_dentry->d_inode->i_size;
++	unsigned long pages = cluster_pages;
++
++	offset = (offset >> cluster_shift) << cluster_shift;
++
++	while ((pages-- > 0) && (offset < filesize)) {
++		page_cache_read(file, offset);
++		premap_page(vma, offset);
++		offset += PAGE_CACHE_SIZE;
+ 	}
+-	return page_cache;
++
++	return;
+ }
+ 
+ /* 
+@@ -813,9 +840,8 @@
+ 	return max_readahead[MAJOR(inode->i_dev)][MINOR(inode->i_dev)];
+ }
+ 
+-static inline unsigned long generic_file_readahead(int reada_ok,
+-	struct file * filp, struct inode * inode,
+-	unsigned long ppos, struct page * page, unsigned long page_cache)
++static void generic_file_readahead(int reada_ok, struct file * filp,
++	struct inode * inode, unsigned long ppos, struct page * page)
+ {
+ 	unsigned long max_ahead, ahead;
+ 	unsigned long raend;
+@@ -879,8 +905,7 @@
+ 	ahead = 0;
+ 	while (ahead < max_ahead) {
+ 		ahead += PAGE_CACHE_SIZE;
+-		page_cache = try_to_read_ahead(filp, raend + ahead,
+-						page_cache);
++		page_cache_read(filp, raend + ahead);
+ 	}
+ /*
+  * If we tried to read ahead some pages,
+@@ -912,7 +937,7 @@
+ #endif
+ 	}
+ 
+-	return page_cache;
++	return;
+ }
+ 
+ /*
+@@ -1046,7 +1071,8 @@
+  * Ok, the page was not immediately readable, so let's try to read ahead while we're at it..
+  */
+ page_not_up_to_date:
+-		page_cache = generic_file_readahead(reada_ok, filp, inode, pos & PAGE_CACHE_MASK, page, page_cache);
++		generic_file_readahead(reada_ok, filp, inode,
++					pos & PAGE_CACHE_MASK, page);
+ 
+ 		if (Page_Uptodate(page))
+ 			goto page_ok;
+@@ -1067,7 +1093,8 @@
+ 				goto page_ok;
+ 
+ 			/* Again, try some read-ahead while waiting for the page to finish.. */
+-			page_cache = generic_file_readahead(reada_ok, filp, inode, pos & PAGE_CACHE_MASK, page, page_cache);
++			generic_file_readahead(reada_ok, filp, inode,
++						pos & PAGE_CACHE_MASK, page);
+ 			wait_on_page(page);
+ 			if (Page_Uptodate(page))
+ 				goto page_ok;
+@@ -1269,31 +1296,154 @@
+ }
+ 
+ /*
+- * Semantics for shared and private memory areas are different past the end
+- * of the file. A shared mapping past the last page of the file is an error
+- * and results in a SIGBUS, while a private mapping just maps in a zero page.
++ * Actually read ahead a window's worth of the file, and adjust the
++ * file's read-ahead context.
++ */
++static void do_cluster_readahead(struct vm_area_struct * vma,
++	unsigned long cl_offset)
++{
++	struct file * file = vma->vm_file;
++	int cl_count = file->f_rawin >> cluster_shift;
++	unsigned long ra_offset = cl_offset + cluster_bytes;
++	off_t filesize = file->f_dentry->d_inode->i_size;
++
++#if 0
++	printk("do_cluster_readahead: reading ahead %d cluster(s) "
++		"starting at offset %lu in file 0x%08x\n",
++			cl_count, ra_offset, (unsigned) file);
++#endif
++
++	/*
++	 * Schedule reads for the clusters we want.
++	 */
++	while (cl_count-- && (ra_offset < filesize)) {
++		read_cluster_premap(vma, ra_offset);
++		ra_offset += cluster_bytes;
++	}       
++	run_task_queue(&tq_disk);
++
++	/*
++	 * Adjust this file's read-ahead context.
++	 */
++	if (ra_offset < filesize) {
++		/* remember where we stopped reading ahead */
++		file->f_raend = ra_offset;
++
++		/* open the read-ahead window a bit more */
++		if (file->f_rawin <
++		    get_max_readahead(file->f_dentry->d_inode)) {
++			file->f_rawin += file->f_rawin;
++		}
++
++		return;
++	}
++
++	/*
++	 * Read-ahead went off the end of the file.
++	 */
++	file->f_raend = ra_offset - cluster_bytes;
++	file->f_rawin = 0;
++
++	return;
++}
++
++/*
++ * See if cluster read-ahead is appropriate.
++ */
++static void try_cluster_readahead(struct vm_area_struct * vma,
++	unsigned long pg_offset)
++{
++	struct file * file = vma->vm_file;
++	unsigned long cl_offset =
++		(pg_offset >> cluster_shift) << cluster_shift;
++
++	/*
++	 * This lock protects the file's read-ahead context.
++	 * If a file is shared, more than one context update
++	 * can occur simultaneously.
++	 */
++	spin_lock(&file->f_ralock);
++
++	/*
++	 * If not a sequential access, then reset read-ahead context.
++	 */
++	if (pg_offset != (file->f_lastpage + PAGE_CACHE_SIZE)) {
++		file->f_reada = 0;
++		file->f_rawin = cluster_bytes;
++		file->f_raend = cl_offset + file->f_rawin;
++	}
++	file->f_lastpage = pg_offset;
++
++	if ((pg_offset > file->f_raend) ||
++	    ((pg_offset + file->f_rawin) < file->f_raend))
++		file->f_raend = cl_offset + file->f_rawin;
++
++	/*
++	 * If we're at the start of a cluster, start assuming
++	 * sequential accesses.
++	 */
++	if (pg_offset == cl_offset)
++		file->f_reada = 1;
++
++	/*
++	 * We're done if the window is closed -- it means we hit EOF
++	 * while reading ahead.
++	 */
++	if (file->f_rawin == 0)
++		goto out;
++
++	/*
++	 * If we've monotonically sequentially faulted into the last
++	 * half-window of previously read-ahead data, then schedule
++	 * page-ins for the next window's worth of the file.
++	 */
++	if (!file->f_reada)
++		goto out;
++
++#if 0
++	printk("try_cluster_readahead: "
++		"pg_offset %lu  trigger %lu  raend  %lu\n",
++			pg_offset, (file->f_rawin >> 1), file->f_raend);
++#endif
++	if ((pg_offset + (file->f_rawin >> 1)) == file->f_raend)
++		do_cluster_readahead(vma, cl_offset);
++
++out:
++	spin_unlock(&file->f_ralock);
++	return;
++}
++
++/*
++ * filemap_nopage() is invoked via the vma operations vector for a
++ * mapped memory region to read in file data during a page fault.
+  *
+  * The goto's are kind of ugly, but this streamlines the normal case of having
+  * it in the page cache, and handles the special cases reasonably without
+  * having a lot of duplicated code.
+- *
+- * WSH 06/04/97: fixed a memory leak and moved the allocation of new_page
+- * ahead of the wait if we're sure to need it.
+  */
+-static unsigned long filemap_nopage(struct vm_area_struct * area, unsigned long address, int no_share)
++static unsigned long filemap_nopage(struct vm_area_struct * area,
++	unsigned long address, int copy)
+ {
+ 	struct file * file = area->vm_file;
+ 	struct dentry * dentry = file->f_dentry;
+ 	struct inode * inode = dentry->d_inode;
+-	unsigned long offset, reada, i;
+ 	struct page * page, **hash;
+-	unsigned long old_page, new_page;
++	unsigned long offset, old_page, new_page = 0;
+ 	int error;
+ 
+-	new_page = 0;
+-	offset = (address & PAGE_MASK) - area->vm_start + area->vm_offset;
+-	if (offset >= inode->i_size && (area->vm_flags & VM_SHARED) && area->vm_mm == current->mm)
+-		goto no_page;
++	offset = address - area->vm_start + area->vm_offset;
++
++	/*
++	 * Semantics for shared and private memory areas are different
++	 * past the end of the file. A shared mapping past the last page
++	 * of the file is an error and results in a SIGBUS, while a
++	 * private mapping just maps in a zero page.
++	 * XXX - at some point, this should return a unique value to
++	 *       indicate to the caller that this isn't OOM or EIO.
++	 */
++	if ((offset >= inode->i_size) &&
++	    (area->vm_flags & VM_SHARED) && (area->vm_mm == current->mm))
++		return 0;
+ 
+ 	/*
+ 	 * Do we have something in the page cache already?
+@@ -1304,39 +1454,34 @@
+ 	if (!page)
+ 		goto no_cached_page;
+ 
+-found_page:
+ 	/*
+ 	 * Ok, found a page in the page cache, now we need to check
+ 	 * that it's up-to-date.  First check whether we'll need an
+ 	 * extra page -- better to overlap the allocation with the I/O.
+ 	 */
+-	if (no_share && !new_page) {
++	if (copy) {
+ 		new_page = page_cache_alloc();
+ 		if (!new_page)
+-			goto failure;
++			goto no_page;
+ 	}
+ 
+-	if (!Page_Uptodate(page)) {
+-		lock_page(page);
+-		if (!Page_Uptodate(page))
+-			goto page_not_uptodate;
+-		UnlockPage(page);
+-	}
++	if (!Page_Uptodate(page))
++		goto page_not_uptodate;
+ 
+ success:
+ 	/*
+-	 * Found the page and have a reference on it, need to check sharing
+-	 * and possibly copy it over to another page..
++	 * Try read-ahead, but short-circuit small files and
++	 * accesses at the front of files.
+ 	 */
+-	old_page = page_address(page);
+-	if (!no_share) {
+-		/*
+-		 * Ok, we can share the cached page directly.. Get rid
+-		 * of any potential extra pages.
+-		 */
+-		if (new_page)
+-			page_cache_free(new_page);
++	if (offset >= cluster_bytes)
++		try_cluster_readahead(area, offset);
+ 
++	/*
++	 * Found the page and have a reference on it, need to check
++	 * sharing and possibly copy it over to another page..
++	 */
++	old_page = page_address(page);
++	if (!copy) {
+ 		flush_page_to_ram(old_page);
+ 		return old_page;
+ 	}
+@@ -1351,53 +1496,40 @@
+ 
+ no_cached_page:
+ 	/*
+-	 * Try to read in an entire cluster at once.
+-	 */
+-	reada   = offset;
+-	reada >>= PAGE_CACHE_SHIFT + page_cluster;
+-	reada <<= PAGE_CACHE_SHIFT + page_cluster;
+-
+-	for (i = 1 << page_cluster; i > 0; --i, reada += PAGE_CACHE_SIZE)
+-		new_page = try_to_read_ahead(file, reada, new_page);
+-
+-	if (!new_page)
+-		new_page = page_cache_alloc();
+-	if (!new_page)
+-		goto no_page;
+-
+-	/*
+-	 * During getting the above page we might have slept,
+-	 * so we need to re-check the situation with the page
+-	 * cache.. The page we just got may be useful if we
+-	 * can't share, so don't get rid of it here.
++	 * If the requested offset is in our file, try to read a whole
++	 * cluster of pages at once.
+ 	 */
+-	page = __find_get_page(inode, offset, hash);
+-	if (page)
+-		goto found_page;
+-
++	if (offset < inode->i_size)
++		read_cluster_premap(area, offset);
++	else
+ 	/*
+-	 * Now, create a new page-cache page from the page we got
++	 * We're off the end of a privately mapped file, so we need
++	 * to map a zero page.
+ 	 */
+-	page = page_cache_entry(new_page);
+-	if (add_to_page_cache_unique(page, inode, offset, hash))
+-		goto retry_find;
++		page_cache_read(file, offset);
+ 
+ 	/*
+-	 * Now it's ours and locked, we can do initial IO to it:
++	 * The page we want has now been added to the page cache.
++	 * In the unlikely event that someone removed it in the
++	 * meantime, we'll just come back here and read it again.
+ 	 */
+-	new_page = 0;
++	goto retry_find;
+ 
+ page_not_uptodate:
++	lock_page(page);
++	if (Page_Uptodate(page)) {
++		UnlockPage(page);
++		goto success;
++	}
++
+ 	error = inode->i_op->readpage(file, page);
+ 
+ 	if (!error) {
+ 		wait_on_page(page);
+-		if (PageError(page))
+-			goto page_read_error;
+-		goto success;
++		if (Page_Uptodate(page))
++			goto success;
+ 	}
+ 
+-page_read_error:
+ 	/*
+ 	 * Umm, take care of errors if the page isn't up-to-date.
+ 	 * Try to re-read it _once_. We do this synchronously,
+@@ -1408,21 +1540,20 @@
+ 		PAGE_BUG(page);
+ 	ClearPageError(page);
+ 	error = inode->i_op->readpage(file, page);
+-	if (error)
+-		goto failure;
+-	wait_on_page(page);
+-	if (Page_Uptodate(page))
+-		goto success;
++	if (!error) {
++		wait_on_page(page);
++		if (Page_Uptodate(page))
++			goto success;
++	}
+ 
+ 	/*
+ 	 * Things didn't work out. Return zero to tell the
+ 	 * mm layer so, possibly freeing the page cache page first.
+ 	 */
+-failure:
+-	page_cache_release(page);
+ 	if (new_page)
+ 		page_cache_free(new_page);
+ no_page:
++	page_cache_release(page);
+ 	return 0;
+ }
+ 
+@@ -1932,4 +2063,16 @@
+ 	if (!page_hash_table)
+ 		panic("Failed to allocate page hash table\n");
+ 	memset(page_hash_table, 0, PAGE_HASH_SIZE * sizeof(struct page *));
++
++	/* Use a smaller cluster for memory <16MB or <32MB */
++	if (num_physpages < ((16 * 1024 * 1024) >> PAGE_SHIFT))
++		page_cluster = 2;
++	else if (num_physpages < ((32 * 1024 * 1024) >> PAGE_SHIFT))
++		page_cluster = 3;
++	else
++		page_cluster = 4;
++
++	cluster_pages = 1 << page_cluster;
++	cluster_shift = PAGE_CACHE_SHIFT + page_cluster;
++	cluster_bytes = 1 << cluster_shift;
+ }
+diff -ruN linux-2.3.13-ref/mm/memory.c linux/mm/memory.c
+--- linux-2.3.13-ref/mm/memory.c	Sun Aug 15 15:01:14 1999
++++ linux/mm/memory.c	Mon Aug 16 22:54:42 1999
+@@ -926,7 +926,18 @@
+ 	spin_unlock(&inode->i_shared_lock);
+ }
+ 
+-
++/*
++ * This function is used during read-ahead to prepare in advance
++ * pages to be mapped into an address space.  Right now it just
++ * pre-allocates page table data structures if they don't exist.
++ */
++void premap_page(struct vm_area_struct * vma, unsigned long address)
++{
++	pmd_t * pmd = pmd_alloc(pgd_offset(vma->vm_mm, address), address);
++ 
++	if (pmd)
++		pte_alloc(pmd, address);
++}
+ 
+ /* 
+  * Primitive swap readahead code. We simply read an aligned block of
+@@ -943,7 +954,7 @@
+ 	
+ 	offset = (offset >> page_cluster) << page_cluster;
+ 
+-	i = 1 << page_cluster;
++	i = cluster_pages;
+ 	do {
+ 		/* Don't read-ahead past the end of the swap area */
+ 		if (offset >= swapdev->max)
+@@ -1004,7 +1015,7 @@
+ }
+ 
+ /*
+- * This only needs the MM semaphore
++ * This needs the MM semaphore.
+  */
+ static int do_anonymous_page(struct task_struct * tsk, struct vm_area_struct * vma, pte_t *page_table, int write_access, unsigned long addr)
+ {
+@@ -1034,8 +1045,7 @@
+  * As this is called only for pages that do not currently exist, we
+  * do not need to flush old virtual caches or the TLB.
+  *
+- * This is called with the MM semaphore and the kernel lock held.
+- * We need to release the kernel lock as soon as possible..
++ * This is called with the MM semaphore held.
+  */
+ static int do_no_page(struct task_struct * tsk, struct vm_area_struct * vma,
+ 	unsigned long address, int write_access, pte_t *page_table)
+@@ -1047,9 +1057,9 @@
+ 		return do_anonymous_page(tsk, vma, page_table, write_access, address);
+ 
+ 	/*
+-	 * The third argument is "no_share", which tells the low-level code
+-	 * to copy, not share the page even if sharing is possible.  It's
+-	 * essentially an early COW detection.
++	 * The third argument tells the low-level code to copy, not share
++	 * the page, even if sharing is possible.  It's essentially an
++	 * early COW detection.
+ 	 */
+ 	page = vma->vm_ops->nopage(vma, address & PAGE_MASK, (vma->vm_flags & VM_SHARED)?0:write_access);
+ 	if (!page)
+diff -ruN linux-2.3.13-ref/mm/swap.c linux/mm/swap.c
+--- linux-2.3.13-ref/mm/swap.c	Sat Jan  9 01:54:16 1999
++++ linux/mm/swap.c	Sun Aug 15 23:44:50 1999
+@@ -40,7 +40,9 @@
+ };
+ 
+ /* How many pages do we try to swap or page in/out together? */
+-int page_cluster = 4; /* Default value modified in swap_setup() */
++/* Default value modified in page_cache_init() */
++int page_cluster = 4;
++unsigned cluster_shift, cluster_pages, cluster_bytes;
+ 
+ /* We track the number of pages currently being asynchronously swapped
+    out, so that we don't try to swap TOO many pages out at once */
+@@ -68,13 +70,4 @@
+  * Perform any setup for the swap system
+  */
+ 
+-void __init swap_setup(void)
+-{
+-	/* Use a smaller cluster for memory <16MB or <32MB */
+-	if (num_physpages < ((16 * 1024 * 1024) >> PAGE_SHIFT))
+-		page_cluster = 2;
+-	else if (num_physpages < ((32 * 1024 * 1024) >> PAGE_SHIFT))
+-		page_cluster = 3;
+-	else
+-		page_cluster = 4;
+-}
++void __init swap_setup(void) { }
+	- Chuck Lever
+--
+corporate:	<chuckl@netscape.com>
+personal:	<chucklever@netscape.net> or <cel@monkey.org>
+The Linux Scalability project:
+	
+http://www.citi.umich.edu/projects/linux-scalability/
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

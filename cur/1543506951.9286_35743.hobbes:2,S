@@ -1,0 +1,302 @@
+Date: Wed, 25 Aug 1999 15:34:11 -0400
+From: "William R. Dieter" <>
+Subject: Re: siginfo->si_addr for SIGSEGV
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/8/25/88
+
+Steve Jankowski wrote:
+> 
+> I'm trying to port some code that uses SA_SIGINFO to get the address
+> of a memory fault in a SIGSEGV handler.  However, I found that si_addr
+> (of siginfo_t) is always 0.
+I am working with a project that wants to do the same thing. 
+Unfortunately, you are correct.  The siginfo structure does not get set
+for non-rt signals.  For the general case, the problem is non-trivial
+because any number of signals can be sent while the siginfo is queued.
+One solution is to dynamically allocate the siginfo structure exactly
+the same way that the rt signals do it, but there is always a chance
+that the dynamic allocation will fail.  For signals sent by a system
+call that is not so bad because the system call can return an error, but
+for something like SIGSEGV, you cannot really tell the kernel to retry
+later.  In that case you can still send the signal, but the siginfo
+structure will be filled with zeroes (which your application will have
+to handle).
+Another possibility would be to statically allocate an array of siginfo
+structures (one for each kind of signal) in the task struct. Statically
+allocating an array of structures has be rejected as a solution because
+it would add about 4 KB to the task struct and it still does not handle
+the case where you get two signals of the same kind.
+> So, my port is basically non-starter without si_addr for SIGSEGV.
+> Getting the port done is critical as it will allow me to work at
+> home, away from the free Cokes and Power Bars in the break room...
+> wait, I sense danger.
+I have attached a patch for linux-2.2.10 (and probably other 2.2
+kernels) that works for i386 architectures and a program to test the
+patch.  You may have to modify arch/xxx/mm/fault.c for other
+architectures (although it sounds like m68k is already set).  This patch
+is an ugly hack in that only adds siginfo for SIGSEGV, but you can use
+it as a work around.  The patch doesn't fix any other signals.  It also
+only handles one SIGSEGV at a time, which is only a problem if you try
+sending a SIGSEGV with kill.
+<
+http://www.dcs.uky.edu/~dieter/linux/segv-info-patch.html>
+ has a more
+general patch for 2.0 kernels.
+I do not know if anyone is working on adding siginfo for the general
+case or non-rt signals.  If I get time, I might try making a patch that
+dynamically allocates the siginfo structure just like the non-rt case.
+Bill.
+dieter@dcs.uky.edudiff -Nur /usr/src/linux-2.2.10/arch/i386/mm/fault.c linux-2.2.10/arch/i386/mm/fault.c
+--- /usr/src/linux-2.2.10/arch/i386/mm/fault.c	Sun Nov 22 12:38:19 1998
++++ linux-2.2.10/arch/i386/mm/fault.c	Mon Aug 23 21:30:57 1999
+@@ -185,10 +185,14 @@
+ 
+ 	/* User mode accesses just cause a SIGSEGV */
+ 	if (error_code & 4) {
++	  	siginfo_t info;
+ 		tsk->tss.cr2 = address;
+ 		tsk->tss.error_code = error_code;
+ 		tsk->tss.trap_no = 14;
+-		force_sig(SIGSEGV, tsk);
++		info.si_signo = SIGSEGV;
++		info.si_code = SEGV_ACCERR;
++		info.si_addr = (void *)address;
++		force_sig_info(SIGSEGV, &info, tsk);
+ 		return;
+ 	}
+ 
+diff -Nur /usr/src/linux-2.2.10/include/linux/sched.h linux-2.2.10/include/linux/sched.h
+--- /usr/src/linux-2.2.10/include/linux/sched.h	Tue Jul  6 14:04:37 1999
++++ linux-2.2.10/include/linux/sched.h	Mon Aug 23 21:32:57 1999
+@@ -310,6 +310,7 @@
+ 	struct signal_struct *sig;
+ 	sigset_t signal, blocked;
+ 	struct signal_queue *sigqueue, **sigqueue_tail;
++	struct signal_queue segv_info;
+ 	unsigned long sas_ss_sp;
+ 	size_t sas_ss_size;
+ };
+@@ -332,6 +333,7 @@
+ 
+ #define PF_USEDFPU	0x00100000	/* task used FPU this quantum (SMP) */
+ #define PF_DTRACE	0x00200000	/* delayed trace (used on m68k, i386) */
++#define PF_SEGVINFOINUSE 0x00400000	/* sigsegv with info pending */
+ 
+ /*
+  * Limit the stack by to some sane default: root can always
+diff -Nur /usr/src/linux-2.2.10/kernel/fork.c linux-2.2.10/kernel/fork.c
+--- /usr/src/linux-2.2.10/kernel/fork.c	Mon Apr 12 15:44:26 1999
++++ linux-2.2.10/kernel/fork.c	Mon Aug 23 22:10:23 1999
+@@ -596,6 +596,7 @@
+ 	sigemptyset(&p->signal);
+ 	p->sigqueue = NULL;
+ 	p->sigqueue_tail = &p->sigqueue;
++	p->flags &= ~PF_SEGVINFOINUSE;
+ 
+ 	p->it_real_value = p->it_virt_value = p->it_prof_value = 0;
+ 	p->it_real_incr = p->it_virt_incr = p->it_prof_incr = 0;
+diff -Nur /usr/src/linux-2.2.10/kernel/signal.c linux-2.2.10/kernel/signal.c
+--- /usr/src/linux-2.2.10/kernel/signal.c	Mon Jun  7 19:14:21 1999
++++ linux-2.2.10/kernel/signal.c	Mon Aug 23 22:09:46 1999
+@@ -59,7 +59,10 @@
+ 
+ 	while (q) {
+ 		n = q->next;
+-		kmem_cache_free(signal_queue_cachep, q);
++		if (q->info.si_signo == SIGSEGV)
++		  	t->flags &= ~PF_SEGVINFOINUSE;
++		else 
++		  	kmem_cache_free(signal_queue_cachep, q);
+ 		nr_queued_signals--;
+ 		q = n;
+ 	}
+@@ -131,7 +134,43 @@
+ 		int reset = 1;
+ 
+ 		/* Collect the siginfo appropriate to this signal.  */
+-		if (sig < SIGRTMIN) {
++		if (sig == SIGSEGV) {
++			struct signal_queue *q, **pp;
++			pp = &current->sigqueue;
++			q = current->sigqueue;
++
++			/* Find the one we're interested in ... */
++			for ( ; q ; pp = &q->next, q = q->next)
++				if (q->info.si_signo == sig)
++					break;
++			if (q) {
++				if ((*pp = q->next) == NULL)
++					current->sigqueue_tail = pp;
++				*info = q->info;
++				current->flags &= ~PF_SEGVINFOINUSE;
++				nr_queued_signals--;
++				
++				/* then see if this signal is still pending. */
++				q = *pp;
++				while (q) {
++					if (q->info.si_signo == sig) {
++						reset = 0;
++						break;
++					}
++					q = q->next;
++				}
++			} else {
++				/* Ok, it wasn't in the queue.  It must have
++				   been sent either by a non-rt mechanism and
++				   we ran out of queue space.  So zero out the
++				   info.  */
++				info->si_signo = sig;
++				info->si_errno = 0;
++				info->si_code = 0;
++				info->si_pid = 0;
++				info->si_uid = 0;
++			}
++		} else if (sig < SIGRTMIN) {
+ 			/* XXX: As an extension, support queueing exactly
+ 			   one non-rt signal if SA_SIGINFO is set, so that
+ 			   we can get more detailed information about the
+@@ -304,7 +343,54 @@
+ 	if (ignored_signal(sig, t))
+ 		goto out;
+ 
+-	if (sig < SIGRTMIN) {
++	if (sig == SIGSEGV) {
++ 		if (sigismember(&t->signal, sig))
++ 			goto out;
++
++	        if (nr_queued_signals < max_queued_signals
++		    && !(t->flags & PF_SEGVINFOINUSE) ) {
++			struct signal_queue *q;
++
++		  	q = &t->segv_info;
++			t->flags |= PF_SEGVINFOINUSE;
++		        nr_queued_signals++;
++			q->next = NULL;
++			*t->sigqueue_tail = q;
++			t->sigqueue_tail = &q->next;
++			switch ((unsigned long) info) {
++			case 0:
++				q->info.si_signo = sig;
++				q->info.si_errno = 0;
++				q->info.si_code = SI_USER;
++				q->info.si_pid = current->pid;
++				q->info.si_uid = current->uid;
++				break;
++			case 1:
++				q->info.si_signo = sig;
++				q->info.si_errno = 0;
++				q->info.si_code = SI_KERNEL;
++				q->info.si_pid = 0;
++				q->info.si_uid = 0;
++				break;
++			default:
++				q->info = *info;
++				break;
++			}
++		} else {
++			/* If this was sent by a rt mechanism, try again.  */
++			/* unless signal is unblockable or coming from
++			   the kernel. */
++			/* TODO: is this condition correct? -wrd */
++			if (((unsigned long)info) != 1
++			    && (info == NULL || info->si_code < 0)) {
++				ret = -EAGAIN;
++				goto out;
++			}
++			/* Otherwise, mention that the signal is pending,
++			   but don't queue the info.  */
++		}
++	  
++	} else if (sig < SIGRTMIN) {
+ 		/* Non-real-time signals are not queued.  */
+ 		/* XXX: As an extension, support queueing exactly one
+ 		   non-rt signal if SA_SIGINFO is set, so that we can
+@@ -861,7 +947,22 @@
+ 			    sig == SIGWINCH))) {
+ 			/* So dequeue any that might be pending.
+ 			   XXX: process-wide signals? */
+-			if (sig >= SIGRTMIN &&
++		  	if (sig == SIGSEGV) {
++				struct signal_queue *q, **pp;
++				pp = &current->sigqueue;
++				q = current->sigqueue;
++				while (q) {
++					if (q->info.si_signo != sig)
++						pp = &q->next;
++					else {
++						*pp = q->next;
++						current->flags &= ~PF_SEGVINFOINUSE;
++						nr_queued_signals--;
++					}
++					q = *pp;
++				}
++
++			} else if (sig >= SIGRTMIN &&
+ 			    sigismember(&current->signal, sig)) {
+ 				struct signal_queue *q, **pp;
+ 				pp = &current->sigqueue;/*
+ * mprotect.c
+ *
+ * A simple program to test if the signal handler can find the address of
+ * a segmentation fault.
+ *
+ * History
+ * -------
+ * $Log: mprotect.c,v $
+ * Revision 1.3  1999/01/22  21:45:29  dieter
+ * Changed 0x%p to %p in the printfs for linux.
+ *
+ * Revision 1.2  1999/01/22  21:40:28  dieter
+ * Tried to make messages less ambiguous.
+ *
+ * Revision 1.1  1999/01/22  21:33:49  dieter
+ * Initial revision
+ *
+ */
+#ifdef SOLARIS
+#include <siginfo.h>
+#endif
+#include <unistd.h>
+#include <stdio.h>
+#include <sys/types.h>
+#include <sys/mman.h>
+#include <signal.h>
+char mem[8192];
+int pagesize;
+char *where;
+void handler(int cause, siginfo_t *info, void *uap) {
+        printf( "SIGSEGV raised at address %p\n", info->si_addr);
+	if (mprotect(where, pagesize, PROT_READ | PROT_WRITE)) {
+		perror("mprotect");
+        	exit(1);
+    	}
+}
+int main(int argc, char *argv[])
+{ 
+	struct sigaction sa;
+	sa.sa_sigaction = handler;
+	sigemptyset(&sa.sa_mask);
+	sa.sa_flags = SA_SIGINFO;
+        if (sigaction (SIGSEGV, &sa, 0)) {
+            	perror("sigaction");
+		exit(1);
+        }
+	pagesize = sysconf(_SC_PAGESIZE);
+	where = (char *)(((int) (mem + pagesize-1) / pagesize) * pagesize);
+	*where = 'f';
+        if (mprotect(where, pagesize, PROT_READ)) {
+        	perror("mprotect");
+		exit(1);
+	}
+        printf( "What is at %p is '%c'\n", where, *where);
+        printf( "About to write 'a' (should run SIGSEGV handler)\n");
+        *where = 'a';
+        printf( "What is at %p is '%c'\n", where, *where);
+        printf( "About to write 'b' (should not get SIGSEGV)\n");
+        *where = 'b';
+        printf( "What is at %p is '%c'\n", where, *where);
+	return(0);
+}

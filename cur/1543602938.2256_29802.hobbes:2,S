@@ -1,0 +1,217 @@
+Date: Sat, 29 Sep 2001 16:55:40 +0200
+From: Benjamin Herrenschmidt <>
+Subject: [PATCH] multi-floppy rd loading fix
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2001/9/29/44
+
+Hi Linus, Alan !
+The enclosed patch was written by some users to fix a problem with
+multiple-floppy ramdisk load on some PowerMac machines. I'm not
+familiar enough with some of that code so I may have missed some
+issues there and would like your feedback on this patch.
+Basically, the problem we have is that the floppy controller won't
+let you eject the disk (remember, we have electric ejection mecanism
+on Mac) if it's "enabled", that is if the floppy driver is opened.
+The purpose of this patch is to close the floppy blkdev and re-open
+it when switching from one disk to the next one.
+If it sounds ok, then please include it in your next kernel,
+Regards,
+Ben.
+diff -ur linux-2.4.9-ben0/drivers/block/rd.c linux-2.4.6/drivers/block/rd.c
+--- linux-2.4.9-ben0-o/drivers/block/rd.c	Sun Aug 19 20:59:29 2001
++++ linux-2.4.9-ben0-t/drivers/block/rd.c	Mon Aug 27 21:46:38 2001
+@@ -40,6 +40,9 @@
+  *
+  * Make block size and block size shift for RAM disks a global macro
+  * and set blk_size for -ENOSPC,     Werner Fink <werner@suse.de>, Apr '99
++ *
++ * Add support for compressed fs images split across >1 disk, eject floppy
++ * after loading each disk,     Leigh Brown <leigh@solinno.co.uk>, Aug '01
+  */
+ 
+ #include <linux/config.h>
+@@ -85,7 +88,7 @@
+ #define BUILD_CRAMDISK
+ 
+ void rd_load(void);
+-static int crd_load(struct file *fp, struct file *outfp);
++static int crd_load(struct file *fp, struct file *outfp, kdev_t device,
+struct inode *inode);
+ 
+ #ifdef CONFIG_BLK_DEV_INITRD
+ static int initrd_users;
+@@ -466,7 +469,7 @@
+  *	romfs
+  * 	gzip
+  */
+-static int __init 
++int __init 
+ identify_ramdisk_image(kdev_t device, struct file *fp, int start_block)
+ {
+ 	const int size = 512;
+@@ -570,9 +573,8 @@
+ 	char *buf;
+ 	unsigned short rotate = 0;
+ 	unsigned short devblocks = 0;
+-#if !defined(CONFIG_ARCH_S390) && !defined(CONFIG_PPC_ISERIES)
+ 	char rotator[4] = { '|' , '/' , '-' , '\\' };
+-#endif
++
+ 	ram_device = MKDEV(MAJOR_NR, unit);
+ 
+ 	if ((inode = get_empty_inode()) == NULL)
+@@ -609,7 +611,7 @@
+ 
+ 	if (nblocks == 0) {
+ #ifdef BUILD_CRAMDISK
+-		if (crd_load(&infile, &outfile) == 0)
++		if (crd_load(&infile, &outfile, device, inode) == 0)
+ 			goto successful_load;
+ #else
+ 		printk(KERN_NOTICE
+@@ -660,20 +662,29 @@
+ 			printk("done disk #%d.\n", i/devblocks);
+ 			rotate = 0;
+ 			invalidate_buffers(device);
++			if (infile.f_op->fsync)
++				infile.f_op->fsync(&infile, infile.f_dentry, 0);
++			else
++				printk("RAMDISK: can't sync\n");
++			if (infile.f_op->ioctl)
++				infile.f_op->ioctl(inode, &infile, FDEJECT, 0);
+ 			if (infile.f_op->release)
+ 				infile.f_op->release(inode, &infile);
+-			printk("Please insert disk #%d and press ENTER\n", i/devblocks+1);
++
++			printk(KERN_NOTICE "Please insert disk #%d "
++			       "and press ENTER\n", i/devblocks+1);
+ 			wait_for_keypress();
+ 			if (blkdev_open(inode, &infile) != 0)  {
+ 				printk("Error opening disk.\n");
+ 				goto done;
+ 			}
+ 			infile.f_pos = 0;
+-			printk("Loading disk #%d... ", i/devblocks+1);
++			printk(KERN_NOTICE "Loading disk #%d ... ",
++			       i/devblocks+1);
+ 		}
+ 		infile.f_op->read(&infile, buf, BLOCK_SIZE, &infile.f_pos);
+ 		outfile.f_op->write(&outfile, buf, BLOCK_SIZE, &outfile.f_pos);
+-#if !defined(CONFIG_ARCH_S390) && !defined(CONFIG_PPC_ISERIES)
++#if !defined(CONFIG_ARCH_S390)
+ 		if (!(i % 16)) {
+ 			printk("%c\b", rotator[rotate & 0x3]);
+ 			rotate++;
+@@ -787,6 +798,15 @@
+ static int exit_code;
+ static long bytes_out;
+ static struct file *crd_infp, *crd_outfp;
++static kdev_t crd_device;
++static struct inode *crd_inode;
++static unsigned short disk_count __initdata = 1;
++
++#if !defined(CONFIG_ARCH_S390) && !defined(CONFIG_PPC_ISERIES)
++static char rotator[4] __initdata = { '|' , '/' , '-' , '\\' };
++static unsigned short block_count __initdata = 0;
++static unsigned short rotate __initdata = 0;
++#endif
+ 
+ #define get_byte()  (inptr < insize ? inbuf[inptr++] : fill_inbuf())
+ 		
+@@ -839,10 +859,45 @@
+ 	
+ 	insize = crd_infp->f_op->read(crd_infp, inbuf, INBUFSIZ,
+ 				      &crd_infp->f_pos);
+-	if (insize == 0) return -1;
++	if (insize == 0) {
++		printk("done disk #%d.\n", disk_count);
++		disk_count++;
++
++		invalidate_buffers(crd_device);
++		if (crd_infp->f_op->fsync)
++			crd_infp->f_op->fsync(crd_infp, crd_infp->f_dentry, 0);
++		else
++			printk("RAMDISK: can't sync\n");
++		if (crd_infp->f_op->ioctl)
++			crd_infp->f_op->ioctl(crd_inode, crd_infp, FDEJECT, 0);
++		if (crd_infp->f_op->release)
++			crd_infp->f_op->release(crd_inode, crd_infp);
+ 
+-	inptr = 1;
++		printk(KERN_NOTICE
++		       "Please insert disk #%d and press ENTER\n", disk_count);
++		wait_for_keypress();
++		if (blkdev_open(crd_inode, crd_infp) != 0) {
++			printk(KERN_ERR "Error opening disk.\n");
++			return -1;
++		}
++		crd_infp->f_pos = 0;
++		printk(KERN_NOTICE "Loading disk #%d ... ", disk_count);
++		insize = crd_infp->f_op->read(crd_infp, inbuf, INBUFSIZ,
++					      &crd_infp->f_pos);
++		if (insize == 0) {
++			printk(KERN_ERR "Error reading from disk.\n");
++			return -1;
++		}
++	}
++#if !defined(CONFIG_ARCH_S390) && !defined(CONFIG_PPC_ISERIES)
++	if (!(block_count % 9)) {
++		printk("%c\b", rotator[rotate & 0x3]);
++		rotate++;
++	}
++	block_count++;
++#endif
+ 
++	inptr = 1;
+ 	return inbuf[0];
+ }
+ 
+@@ -874,7 +929,7 @@
+ }
+ 
+ static int __init 
+-crd_load(struct file * fp, struct file *outfp)
++crd_load(struct file * fp, struct file *outfp, kdev_t device, struct
+inode *inode)
+ {
+ 	int result;
+ 
+@@ -887,6 +942,8 @@
+ 
+ 	crd_infp = fp;
+ 	crd_outfp = outfp;
++	crd_device = device;
++	crd_inode = inode;
+ 	inbuf = kmalloc(INBUFSIZ, GFP_KERNEL);
+ 	if (inbuf == 0) {
+ 		printk(KERN_ERR "RAMDISK: Couldn't allocate gzip buffer\n");
+@@ -898,8 +955,13 @@
+ 		kfree(inbuf);
+ 		return -1;
+ 	}
++
++	printk(KERN_NOTICE "RAMDISK: Loading compressed image into ram disk... ");
+ 	makecrc();
+ 	result = gunzip();
++	if (!result)
++		printk("done disk #%d.\n", disk_count);
++
+ 	kfree(inbuf);
+ 	kfree(window);
+ 	return result;
+diff -ur linux-2.4.9-ben0/drivers/block/swim3.c linux-2.4.6/drivers/
+block/swim3.c
+--- linux-2.4.9-ben0-o/drivers/block/swim3.c	Sun Aug 19 20:59:30 2001
++++ linux-2.4.9-ben0-t/drivers/block/swim3.c	Mon Aug 27 21:01:40 2001
+@@ -36,7 +36,7 @@
+ #include <linux/devfs_fs_kernel.h>
+ 
+ static int floppy_blocksizes[2] = {512,512};
+-static int floppy_sizes[2] = {2880,2880};
++static int floppy_sizes[2] = {1440,1440};
+ 
+ #define MAX_FLOPPIES	2
+ [unhandled content-type:application/x-gzip]

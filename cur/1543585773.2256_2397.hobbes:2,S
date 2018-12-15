@@ -1,0 +1,445 @@
+Date: Sun, 25 Mar 2001 20:51:13 +0200 (CEST)
+From: Ingo Molnar <>
+Subject: Re: [patch] pae-2.4.3-A4
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2001/3/25/60
+
+On Sun, 25 Mar 2001, Linus Torvalds wrote:
+> So my suggestion for PAE is:
+>
+>  - populate in gdb_alloc() (ie just do the three "alloc_page()" calls to
+>    allocate the PMD's immediately)
+>
+>    NOTE: This makes the race go away, and will actually speed things up as
+>    we will pretty much in practice always populate the PGD _anyway_, the
+>    way the VM areas are laid out.
+>
+>  - make "pgd_present()" always return 1.
+>
+>    NOTE: This will speed up the page table walkers anyway. It will also
+>    avoid the problem above.
+>
+>  - make "free_pmd()" a no-op.
+>
+> All of the above will (a) simplify things (b) remove special cases and
+> (c) remove actual and existing bugs.
+yep, this truly makes things so much easier and cleaner! There was only
+one thing missing to make it work:
+   - make "pgd_clear()" a no-op.
+[the reason for the slightly more complex pgd_alloc_slow() code is to
+support non-default virtual memory splits as well, where the number of
+user pgds is not necesserily 3.]
+plus i took to opportunity to reduce the allocation size of PAE-pgds.
+Their size is only 32 bytes, and we allocated a full page. Now the code
+kmalloc()s a 32 byte cacheline for the pgd. (there is a hardware
+constraint on alignment: this cacheline must be at least 16-byte aligned,
+which is true for the current kmalloc() code.) So the per-process cost is
+reduced by almost 4 KB.
+and i got rid of pgalloc-[2|3]level.h - with the pmds merged into the pgd
+logic the algorithmic difference between 2-level and this pseudo-3-level
+PAE paging is not that big anymore. The pgtable-[2|3]level.h files are
+still separate.
+the attached pae-2.4.3-B2 patch (against 2.4.3-pre7) compiles & boots just
+fine both in PAE and non-PAE mode. The patch removes 217 lines, and adds
+only 78 lines.
+	Ingo
+--- linux/include/asm-i386/pgalloc-3level.h.orig	Sun Mar 25 18:55:05 2001
++++ linux/include/asm-i386/pgalloc-3level.h	Sun Mar 25 22:38:41 2001
+@@ -1,45 +0,0 @@
+-#ifndef _I386_PGALLOC_3LEVEL_H
+-#define _I386_PGALLOC_3LEVEL_H
+-
+-/*
+- * Intel Physical Address Extension (PAE) Mode - three-level page
+- * tables on PPro+ CPUs. Page-table allocation routines.
+- *
+- * Copyright (C) 1999 Ingo Molnar <mingo@redhat.com>
+- */
+-
+-extern __inline__ pmd_t *pmd_alloc_one(void)
+-{
+-	pmd_t *ret = (pmd_t *)__get_free_page(GFP_KERNEL);
+-
+-	if (ret)
+-		memset(ret, 0, PAGE_SIZE);
+-	return ret;
+-}
+-
+-extern __inline__ pmd_t *pmd_alloc_one_fast(void)
+-{
+-	unsigned long *ret;
+-
+-	if ((ret = pmd_quicklist) != NULL) {
+-		pmd_quicklist = (unsigned long *)(*ret);
+-		ret[0] = 0;
+-		pgtable_cache_size--;
+-	} else
+-		ret = (unsigned long *)get_pmd_slow();
+-	return (pmd_t *)ret;
+-}
+-
+-extern __inline__ void pmd_free_fast(pmd_t *pmd)
+-{
+-	*(unsigned long *)pmd = (unsigned long) pmd_quicklist;
+-	pmd_quicklist = (unsigned long *) pmd;
+-	pgtable_cache_size++;
+-}
+-
+-extern __inline__ void pmd_free_slow(pmd_t *pmd)
+-{
+-	free_page((unsigned long)pmd);
+-}
+-
+-#endif /* _I386_PGALLOC_3LEVEL_H */
+--- linux/include/asm-i386/pgalloc.h.orig	Sun Mar 25 18:56:25 2001
++++ linux/include/asm-i386/pgalloc.h	Sun Mar 25 23:11:23 2001
+@@ -11,37 +11,56 @@
+ #define pte_quicklist (current_cpu_data.pte_quick)
+ #define pgtable_cache_size (current_cpu_data.pgtable_cache_sz)
+ 
+-#define pmd_populate(pmd, pte)		set_pmd(pmd, __pmd(_PAGE_TABLE + __pa(pte)))
+-
+-#if CONFIG_X86_PAE
+-# include <asm/pgalloc-3level.h>
+-#else
+-# include <asm/pgalloc-2level.h>
+-#endif
++#define pmd_populate(pmd, pte) \
++		set_pmd(pmd, __pmd(_PAGE_TABLE + __pa(pte)))
+ 
+ /*
+- * Allocate and free page tables. The xxx_kernel() versions are
+- * used to allocate a kernel page table - this turns on ASN bits
+- * if any.
++ * Allocate and free page tables.
+  */
+ 
++#if CONFIG_X86_PAE
++
++extern void *kmalloc(size_t, int);
++extern void kfree(const void *);
++
+ extern __inline__ pgd_t *get_pgd_slow(void)
+ {
+-	pgd_t *ret = (pgd_t *)__get_free_page(GFP_KERNEL);
++	int i;
++	pgd_t *pgd = kmalloc(PTRS_PER_PGD * sizeof(pgd_t), GFP_KERNEL);
++
++	if (pgd) {
++		for (i = 0; i < USER_PTRS_PER_PGD; i++) {
++			unsigned long pmd = __get_free_page(GFP_KERNEL);
++			if (!pmd)
++				goto out_oom;
++			clear_page(pmd);
++			set_pgd(pgd + i, __pgd(1 + __pa(pmd)));
++		}
++		memcpy(pgd + USER_PTRS_PER_PGD, swapper_pg_dir + USER_PTRS_PER_PGD, (PTRS_PER_PGD - USER_PTRS_PER_PGD) * sizeof(pgd_t));
++	}
++	return pgd;
++out_oom:
++	for (i--; i >= 0; i--)
++		free_page((unsigned long)__va(pgd_val(pgd[i])-1));
++	kfree(pgd);
++	return NULL;
++}
+ 
+-	if (ret) {
+-#if CONFIG_X86_PAE
+-		int i;
+-		for (i = 0; i < USER_PTRS_PER_PGD; i++)
+-			__pgd_clear(ret + i);
+ #else
+-		memset(ret, 0, USER_PTRS_PER_PGD * sizeof(pgd_t));
+-#endif
+-		memcpy(ret + USER_PTRS_PER_PGD, swapper_pg_dir + USER_PTRS_PER_PGD, (PTRS_PER_PGD - USER_PTRS_PER_PGD) * sizeof(pgd_t));
++
++extern __inline__ pgd_t *get_pgd_slow(void)
++{
++	pgd_t *pgd = (pgd_t *)__get_free_page(GFP_KERNEL);
++
++	if (pgd) {
++		memset(pgd, 0, USER_PTRS_PER_PGD * sizeof(pgd_t));
++		memcpy(pgd + USER_PTRS_PER_PGD, swapper_pg_dir + USER_PTRS_PER_PGD, (PTRS_PER_PGD - USER_PTRS_PER_PGD) * sizeof(pgd_t));
+ 	}
+-	return ret;
++	return pgd;
+ }
+ 
++#endif
++
+ extern __inline__ pgd_t *get_pgd_fast(void)
+ {
+ 	unsigned long *ret;
+@@ -64,7 +83,15 @@
+ 
+ extern __inline__ void free_pgd_slow(pgd_t *pgd)
+ {
++#if CONFIG_X86_PAE
++	int i;
++
++	for (i = 0; i < USER_PTRS_PER_PGD; i++)
++		free_page((unsigned long)__va(pgd_val(pgd[i])-1));
++	kfree(pgd);
++#else
+ 	free_page((unsigned long)pgd);
++#endif
+ }
+ 
+ static inline pte_t *pte_alloc_one(void)
+@@ -72,7 +99,8 @@
+ 	pte_t *pte;
+ 
+ 	pte = (pte_t *) __get_free_page(GFP_KERNEL);
+-	clear_page(pte);
++	if (pte)
++		clear_page(pte);
+ 	return pte;
+ }
+ 
+@@ -100,7 +128,6 @@
+ 	free_page((unsigned long)pte);
+ }
+ 
+-#define pte_free_kernel(pte)	pte_free_slow(pte)
+ #define pte_free(pte)		pte_free_slow(pte)
+ #define pgd_free(pgd)		free_pgd_slow(pgd)
+ #define pgd_alloc()		get_pgd_fast()
+@@ -108,12 +135,15 @@
+ /*
+  * allocating and freeing a pmd is trivial: the 1-entry pmd is
+  * inside the pgd, so has no extra memory associated with it.
+- * (In the PAE case we free the page.)
++ * (In the PAE case we free the pmds as part of the pgd.)
+  */
+-#define pmd_free_one(pmd)	free_pmd_slow(pmd)
+ 
+-#define pmd_free_kernel		pmd_free
+-#define pmd_alloc_kernel	pmd_alloc
++#define pmd_alloc_one_fast()		({ BUG(); ((pmd_t *)1); })
++#define pmd_alloc_one()			({ BUG(); ((pmd_t *)2); })
++#define pmd_free_slow(x)		do { } while (0)
++#define pmd_free_fast(x)		do { } while (0)
++#define pmd_free(x)			do { } while (0)
++#define pgd_populate(pmd, pte)		BUG()
+ 
+ extern int do_check_pgt_cache(int, int);
+ 
+--- linux/include/asm-i386/pgtable.h.orig	Sun Mar 25 19:03:58 2001
++++ linux/include/asm-i386/pgtable.h	Sun Mar 25 23:34:02 2001
+@@ -243,12 +243,6 @@
+ /* page table for 0-4MB for everybody */
+ extern unsigned long pg0[1024];
+ 
+-/*
+- * Handling allocation failures during page table setup.
+- */
+-extern void __handle_bad_pmd(pmd_t * pmd);
+-extern void __handle_bad_pmd_kernel(pmd_t * pmd);
+-
+ #define pte_present(x)	((x).pte_low & (_PAGE_PRESENT | _PAGE_PROTNONE))
+ #define pte_clear(xp)	do { set_pte(xp, __pte(0)); } while (0)
+ 
+--- linux/include/asm-i386/pgalloc-2level.h.orig	Sun Mar 25 22:36:30 2001
++++ linux/include/asm-i386/pgalloc-2level.h	Sun Mar 25 22:38:47 2001
+@@ -1,16 +0,0 @@
+-#ifndef _I386_PGALLOC_2LEVEL_H
+-#define _I386_PGALLOC_2LEVEL_H
+-
+-/*
+- * traditional i386 two-level paging, page table allocation routines:
+- * We don't have any real pmd's, and this code never triggers because
+- * the pgd will always be present..
+- */
+-#define pmd_alloc_one_fast()		({ BUG(); ((pmd_t *)1); })
+-#define pmd_alloc_one()			({ BUG(); ((pmd_t *)2); })
+-#define pmd_free_slow(x)		do { } while (0)
+-#define pmd_free_fast(x)		do { } while (0)
+-#define pmd_free(x)			do { } while (0)
+-#define pgd_populate(pmd, pte)		BUG()
+-
+-#endif /* _I386_PGALLOC_2LEVEL_H */
+--- linux/include/asm-i386/pgtable-3level.h.orig	Sun Mar 25 23:22:35 2001
++++ linux/include/asm-i386/pgtable-3level.h	Sun Mar 25 23:28:41 2001
+@@ -33,17 +33,9 @@
+ #define pgd_ERROR(e) \
+ 	printk("%s:%d: bad pgd %p(%016Lx).\n", __FILE__, __LINE__, &(e), pgd_val(e))
+ 
+-/*
+- * Subtle, in PAE mode we cannot have zeroes in the top level
+- * page directory, the CPU enforces this. (ie. the PGD entry
+- * always has to have the present bit set.) The CPU caches
+- * the 4 pgd entries internally, so there is no extra memory
+- * load on TLB miss, despite one more level of indirection.
+- */
+-#define EMPTY_PGD (__pa(empty_zero_page) + 1)
+-#define pgd_none(x)	(pgd_val(x) == EMPTY_PGD)
++extern inline int pgd_none(pgd_t pgd)		{ return 0; }
+ extern inline int pgd_bad(pgd_t pgd)		{ return 0; }
+-extern inline int pgd_present(pgd_t pgd)	{ return !pgd_none(pgd); }
++extern inline int pgd_present(pgd_t pgd)	{ return 1; }
+ 
+ /* Rules for using set_pte: the pte being assigned *must* be
+  * either not present or in a state where the hardware will
+@@ -63,21 +55,12 @@
+ 		set_64bit((unsigned long long *)(pgdptr),pgd_val(pgdval))
+ 
+ /*
+- * Pentium-II errata A13: in PAE mode we explicitly have to flush
+- * the TLB via cr3 if the top-level pgd is changed... This was one tough
+- * thing to find out - guess i should first read all the documentation
+- * next time around ;)
++ * Pentium-II erratum A13: in PAE mode we explicitly have to flush
++ * the TLB via cr3 if the top-level pgd is changed...
++ * We do not let the generic code free and clear pgd entries due to
++ * this erratum.
+  */
+-extern inline void __pgd_clear (pgd_t * pgd)
+-{
+-	set_pgd(pgd, __pgd(EMPTY_PGD));
+-}
+-
+-extern inline void pgd_clear (pgd_t * pgd)
+-{
+-	__pgd_clear(pgd);
+-	__flush_tlb();
+-}
++extern inline void pgd_clear (pgd_t * pgd) { }
+ 
+ #define pgd_page(pgd) \
+ ((unsigned long) __va(pgd_val(pgd) & PAGE_MASK))
+--- linux/arch/i386/mm/init.c.orig	Sun Mar 25 19:02:05 2001
++++ linux/arch/i386/mm/init.c	Sun Mar 25 23:33:37 2001
+@@ -40,77 +40,6 @@
+ static unsigned long totalram_pages;
+ static unsigned long totalhigh_pages;
+ 
+-/*
+- * BAD_PAGE is the page that is used for page faults when linux
+- * is out-of-memory. Older versions of linux just did a
+- * do_exit(), but using this instead means there is less risk
+- * for a process dying in kernel mode, possibly leaving an inode
+- * unused etc..
+- *
+- * BAD_PAGETABLE is the accompanying page-table: it is initialized
+- * to point to BAD_PAGE entries.
+- *
+- * ZERO_PAGE is a special page that is used for zero-initialized
+- * data and COW.
+- */
+-
+-/*
+- * These are allocated in head.S so that we get proper page alignment.
+- * If you change the size of these then change head.S as well.
+- */
+-extern char empty_bad_page[PAGE_SIZE];
+-#if CONFIG_X86_PAE
+-extern pmd_t empty_bad_pmd_table[PTRS_PER_PMD];
+-#endif
+-extern pte_t empty_bad_pte_table[PTRS_PER_PTE];
+-
+-/*
+- * We init them before every return and make them writable-shared.
+- * This guarantees we get out of the kernel in some more or less sane
+- * way.
+- */
+-#if CONFIG_X86_PAE
+-static pmd_t * get_bad_pmd_table(void)
+-{
+-	pmd_t v;
+-	int i;
+-
+-	set_pmd(&v, __pmd(_PAGE_TABLE + __pa(empty_bad_pte_table)));
+-
+-	for (i = 0; i < PAGE_SIZE/sizeof(pmd_t); i++)
+-		empty_bad_pmd_table[i] = v;
+-
+-	return empty_bad_pmd_table;
+-}
+-#endif
+-
+-static pte_t * get_bad_pte_table(void)
+-{
+-	pte_t v;
+-	int i;
+-
+-	v = pte_mkdirty(mk_pte_phys(__pa(empty_bad_page), PAGE_SHARED));
+-
+-	for (i = 0; i < PAGE_SIZE/sizeof(pte_t); i++)
+-		empty_bad_pte_table[i] = v;
+-
+-	return empty_bad_pte_table;
+-}
+-
+-
+-
+-void __handle_bad_pmd(pmd_t *pmd)
+-{
+-	pmd_ERROR(*pmd);
+-	set_pmd(pmd, __pmd(_PAGE_TABLE + __pa(get_bad_pte_table())));
+-}
+-
+-void __handle_bad_pmd_kernel(pmd_t *pmd)
+-{
+-	pmd_ERROR(*pmd);
+-	set_pmd(pmd, __pmd(_KERNPG_TABLE + __pa(get_bad_pte_table())));
+-}
+-
+ int do_check_pgt_cache(int low, int high)
+ {
+ 	int freed = 0;
+@@ -289,10 +218,8 @@
+ 
+ 	pgd_base = swapper_pg_dir;
+ #if CONFIG_X86_PAE
+-	for (i = 0; i < PTRS_PER_PGD; i++) {
+-		pgd = pgd_base + i;
+-		__pgd_clear(pgd);
+-	}
++	for (i = 0; i < PTRS_PER_PGD; i++)
++		set_pgd(pgd_base + i, __pgd(1 + __pa(empty_zero_page)));
+ #endif
+ 	i = __pgd_offset(PAGE_OFFSET);
+ 	pgd = pgd_base + i;
+--- linux/arch/i386/kernel/head.S.orig	Sun Mar 25 19:04:23 2001
++++ linux/arch/i386/kernel/head.S	Sun Mar 25 19:04:57 2001
+@@ -415,23 +415,6 @@
+ ENTRY(empty_zero_page)
+ 
+ .org 0x5000
+-ENTRY(empty_bad_page)
+-
+-.org 0x6000
+-ENTRY(empty_bad_pte_table)
+-
+-#if CONFIG_X86_PAE
+-
+- .org 0x7000
+- ENTRY(empty_bad_pmd_table)
+-
+- .org 0x8000
+-
+-#else
+-
+- .org 0x7000
+-
+-#endif
+ 
+ /*
+  * This starts the data section. Note that the above is all
+--- linux/MAINTAINERS.orig	Sun Mar 25 19:23:13 2001
++++ linux/MAINTAINERS	Sun Mar 25 19:24:46 2001
+@@ -1454,6 +1454,11 @@
+ L:	linux-x25@vger.kernel.org
+ S:	Maintained
+ 
++X86 3-LEVEL PAGING (PAE) SUPPORT
++P:	Ingo Molnar
++M:	mingo@redhat.com
++S:	Maintained
++
+ Z85230 SYNCHRONOUS DRIVER
+ P:	Alan Cox
+ M:	alan@redhat.com

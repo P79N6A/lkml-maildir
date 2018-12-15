@@ -1,0 +1,85 @@
+Date: Mon, 1 Dec 2008 20:15:55 +0100
+From: Oleg Nesterov <>
+Subject: Re: BUG? "Call fasync() functions without the BKL" is racy
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2008/12/1/251
+
+On 12/01, Andi Kleen wrote:
+>
+> Oleg Nesterov wrote:
+>>
+>> Let's suppose we have the tasks T1, T2, T3 which share the same file,
+>> all do sys_fcntl(file, F_SETFL) in parallel. file->f_flags == 0.
+>>
+>> setfl(arg) does:
+>>
+>> 	if ((arg ^ filp->f_flags) & FASYNC)
+>> // --- WINDOW_1 ---
+>> 		filp->f_op->fasync(fd, filp, (arg & FASYNC) != 0)
+>> // --- WINDOW_2 ---
+>> 	filp->f_flags = arg;
+>>
+>> T1 calls setfl(FASYNC), preempted in WINDOW_1.
+>>
+>> T2 calls setfl(FASYNC), does all job and returns.
+>>
+>> T3 calls setfl(0), sees ->f_flags & FASYNC, does ->fasync(on => 0),
+>> preempted in WINDOW_2.
+>>
+>> T1 resumes, does ->fasync(on => 1) again, update ->f_flags (it
+>> already has FASYNC) and returns.
+>>
+>> T3 resumes, and clears FASYNC from ->f_flags.
+>>
+>>
+>>
+>> Now, this file was added into some "struct fasync_struct", but
+>> ->f_flags doesn't have FASYNC. This means __fput() will skip
+>> ->fasync(on => 0) and the next kill_fasync() can crash because
+>> fa_file points to the freed/reused memory.
+>
+> Nasty. Thanks for catching.
+Actually, this is more simple. Somehow I missed that setf() _always_
+updates ->f_flags, so we have a trivial race with 2 threads.
+>>
+>> I think a238b790d5f99c7832f9b73ac8847025815b85f7 should be reverted.
+>> Or do you see the better fix?
+>
+> Hmm, about checking for this case and retrying?
+>
+> Or put a fasync mutex into files_struct.
+Perhaps, we can add O_LOCK_FLAGS, then something like
+	--- a/fs/fcntl.c
+	+++ b/fs/fcntl.c
+	@@ -175,6 +175,15 @@ static int setfl(int fd, struct file * f
+		if (error)
+			return error;
+	 
+	+	spin_lock(&current->files->file_lock);
+	+	if (!(filp->f_flags & O_LOCK_FLAGS))
+	+		filp->f_flags |= O_LOCK_FLAGS;
+	+	else
+	+		error = -EAGAIN;
+	+	spin_unlock(&current->files->file_lock);
+	+	if (error) /* pretend ->f_flags was changed after us */
+	+		return 0;
+	+
+		if ((arg ^ filp->f_flags) & FASYNC) {
+			if (filp->f_op && filp->f_op->fasync) {
+				error = filp->f_op->fasync(fd, filp, (arg & FASYNC) != 0);
+	@@ -183,7 +192,8 @@ static int setfl(int fd, struct file * f
+			}
+		}
+	 
+	-	filp->f_flags = (arg & SETFL_MASK) | (filp->f_flags & ~SETFL_MASK);
+	+	filp->f_flags = (arg & SETFL_MASK) |
+	+			(filp->f_flags & ~(SETFL_MASK | O_LOCK_FLAGS));
+	  out:
+		return error;
+	 }
+What do you think?
+(btw, ioctl_fioasync() calls lock_kernel() but it doesn't protect ->f_flags)
+Oleg.

@@ -1,0 +1,361 @@
+Date: Sun, 27 Feb 2000 17:12:19 +0100
+From: Martin Schenk <>
+Subject: [patch] adaptive semaphores: better performance for "short semaphores"  or "long spinlocks"
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/2/27/89
+
+This patch adds two functions (down_spin and down_adapt) that try
+to address the problems of
+- semaphores that are generally held for a very short time, so
+  scheduling on contention is very inefficient in most cases,
+  but still necessary in some others (to avoid deadlocks)
+- spinlocks that are occasionally held for a long time, so scheduling
+  would be efficient in some cases - but that have sometimes to be
+  taken where scheduling simply is not allowed.
+There is a more detailed description in the comments of the first patch.
+The second patch just changes some function declarations in lockmeter.c
+to allow compiling with CONFIG_LOCKMETER.
+Hope this is considered useful,
+Martin
+PS: My next mail contains a small patch to pipe.c that uses down_adapt
+to
+solve a SMP performance problem with pipes.--- /home/martin/linuxelf-2.3.orig/arch/i386/kernel/semaphore.c	Thu Dec  9 18:36:16 1999
++++ semaphore.c	Sun Feb 27 16:18:13 2000
+@@ -11,6 +11,7 @@
+  *	2 of the License, or (at your option) any later version.
+  *
+  * rw semaphores implemented November 1999 by Benjamin LaHaise <bcrl@redhat.com>
++ * down_spin and down_adapt implemented February 2000 by Martin Schenk <schenkm@ping.at>
+  */
+ #include <linux/config.h>
+ #include <linux/sched.h>
+@@ -55,6 +56,201 @@
+ 
+ static spinlock_t semaphore_lock = SPIN_LOCK_UNLOCKED;
+ 
++/*
++   down_spin and down_adapt: spinning semaphore variants
++   
++   down_spin spins on a semaphore as if it were a spinlock, see
++             below for a use for this.
++   down_adapt spins for a short time (SPINCOUNT loops) if there
++             is no one else sleeping on the lock. If it can't get
++             the lock after this time or someone is already sleeping,
++             it behaves like a normal semaphore and schedules.
++             
++   There are 2 potential uses for these functions:
++   - a semaphore where most of the waiting is very short term
++     (a few microseconds), but you can't use a spinlock because
++     it might deadlock in some cases.
++     
++     In this case use down_adapt when you expect to wait for a
++     short time - this will save you the overhead of putting your
++     process on the waitqueue, scheduling and removing your process
++     from the waitqueue.
++     DON'T use down_spin in this case: it DEADLOCKS like a spinlock !
++     
++   - a spinlock where some of the waiting is taking a long time
++     (a few milliseconds), but you can't use a semaphore because you
++     need to take the lock in places where you can't schedule.
++     
++     In this case use down_spin in the places where scheduling is not
++     allowed, and down_adapt in the other places where you can wait.
++     IMPORTANT:
++     You cannot use this where you would need spin_lock_irq,
++     it could lead to a DEADLOCK.
++     You cannot use down_adapt when you are not allowed to schedule
++     (because you hold other spinlocks, ...)
++     If you follow these rules and still get deadlocks, you should also
++     get them using normal spinlocks ;-)
++     
++   NOTE: a process spinning on down_spin or down_adapt is more likely
++   to get the lock than a process that is sleeping - so if you need
++   fairness better don't mix down_adapt and down
++   
++ */
++
++#ifdef CONFIG_LOCKMETER
++
++/*
++        simple lockmetering for __down_spin and __down_adapt:
++        
++        - does not count locks that succeed without waiting
++        - does not measure hold times
++        - wait times are time spent spinning
++        - "REJECT": counts the times when __down_adapt had to
++          begin scheduling
++          
++        It is easy to recognize these locks in the output
++        of lockstat: they always have 100% "contention"
++ 
++        If you want to optimize SPINCOUNT, lock at
++        - the maximum wait time
++          If you think it is too high, lower SPINCOUNT
++          [this does not make sense when you use both down_spin
++          and down_adapt: the maximum value is most likely from 
++          down_spin - better look at the average value then]
++          a value of 500 = about 8 microseconds on my dual PIII-450
++          
++        - "REJECT"-count
++          If your REJECT count is too high, either your SPINCOUNT
++          is very low or you should use down()
++          (it does not make sense to spin if you have to schedule
++           anyway)
++          [ if you use this as a replacement for a spinlock, a
++            high "REJECT"-count is a good thing - it means you
++            actually do useful work instead of spinning - unless
++            your REJECT count is so high you are holding a scheduling
++            competition instead of working ]
++        
++ */          
++#include <linux/lockmeter.h>
++
++extern void lstat_update(void *lock_ptr, void *ra, int action);
++extern void lstat_update_time(void *lock_ptr, void *caller_ra, int action,
++	uint32_t ticks);
++#endif
++
++#define SPINCOUNT 500   /* number of times __down_adapt "spins" before
++                           scheduling */
++                          
++
++void __down_spin(struct semaphore * sem)
++{
++#ifdef CONFIG_LOCKMETER
++        void *ra=(void*)((unsigned long)__builtin_return_address(1)&~3);
++        uint32_t start_cycles = get_cycles();
++#endif
++	spin_lock_irq(&semaphore_lock);
++	sem->sleepers++;
++	for (;;) {
++		int sleepers = sem->sleepers;
++
++		/*
++		 * Add "everybody else" into it. They aren't
++		 * playing, because we own the spinlock.
++		 */
++		if (!atomic_add_negative(sleepers - 1, &sem->count)) {
++			sem->sleepers = 0;
++			break;
++		}
++		sem->sleepers = 1;	/* us - see -1 above */
++		spin_unlock_irq(&semaphore_lock);
++
++                while(atomic_read(&sem->count)<0);    /* spin ! */
++
++		spin_lock_irq(&semaphore_lock);
++	}
++	spin_unlock_irq(&semaphore_lock);
++#ifdef CONFIG_LOCKMETER
++        lstat_update_time(sem, ra, LSTAT_ACT_SPIN,
++                          get_cycles() - start_cycles);
++#endif
++	/* wake_up(&sem->wait);    should not be necessary, see commentary
++                                   in __down_adapt
++         */
++}
++
++void __down_adapt(struct semaphore * sem)
++{
++        int spincount=SPINCOUNT;
++#ifdef CONFIG_LOCKMETER
++        void *ra=(void*)((unsigned long)__builtin_return_address(1)&~3);
++        uint32_t start_cycles = get_cycles();
++#endif
++        spin_lock_irq(&semaphore_lock);
++        if (!sem->sleepers++) { /* try spinning only when nobody is sleeping */
++                int sleepers=(volatile int)sem->sleepers;
++                if (!atomic_add_negative(sleepers - 1, &sem->count))
++                        goto spin_out;
++                sem->sleepers = 1;
++                spin_unlock_irq(&semaphore_lock);
++
++                for (; atomic_read(&sem->count)<0 && spincount; spincount--);
++
++                spin_lock_irq(&semaphore_lock);
++                sleepers=(volatile int)sem->sleepers;
++                if (!atomic_add_negative(sleepers - 1, &sem->count)) {
++spin_out:
++                        sem->sleepers=0;
++                        spin_unlock_irq(&semaphore_lock);
++                        /*
++                                wake_up(&sem->wait); 
++                                should not be necessary (if another
++                                process was sleeping, __up should have
++                                woken it)
++                        */
++#ifdef CONFIG_LOCKMETER
++                        lstat_update_time(sem, ra, LSTAT_ACT_SPIN,
++                                          get_cycles() - start_cycles);
++#endif
++                        return;
++                }
++                sem->sleepers=1;
++        }
++#ifdef CONFIG_LOCKMETER
++        lstat_update(sem, ra, LSTAT_ACT_REJECT);
++#endif
++        {       /* doing this holding semaphore_lock is not very nice,
++                   but I think it's better than doing it at the top of
++                   the function - where we might not need it */
++                struct task_struct *tsk=current;
++                DECLARE_WAITQUEUE(wait, tsk);
++                tsk->state = TASK_UNINTERRUPTIBLE|TASK_EXCLUSIVE;
++                add_wait_queue_exclusive(&sem->wait, &wait);
++
++                for(;;) {                        
++                        int sleepers = sem->sleepers;
++
++                        /*
++                         * Add "everybody else" into it. They aren't
++                         * playing, because we own the spinlock.
++                         */
++                        if (!atomic_add_negative(sleepers - 1, &sem->count)) {
++                                sem->sleepers = 0;
++                                break;
++                        }
++                        sem->sleepers = 1;	/* us - see -1 above */
++                        spin_unlock_irq(&semaphore_lock);
++
++                        schedule();
++                        tsk->state = TASK_UNINTERRUPTIBLE|TASK_EXCLUSIVE;
++                        spin_lock_irq(&semaphore_lock);
++                }
++                spin_unlock_irq(&semaphore_lock);
++                remove_wait_queue(&sem->wait, &wait);
++                tsk->state = TASK_RUNNING;
++                wake_up(&sem->wait); /* we have to wake the next sleeper */
++        }
++}
++
+ void __down(struct semaphore * sem)
+ {
+ 	struct task_struct *tsk = current;
+@@ -177,6 +373,35 @@
+  * registers (%eax, %edx and %ecx) except %eax when used as a return
+  * value..
+  */
++
++asm(
++".align 4\n"
++".globl __down_spin_failed\n"
++"__down_spin_failed:\n\t"
++	"pushl %eax\n\t"
++	"pushl %edx\n\t"
++	"pushl %ecx\n\t"
++	"call __down_spin\n\t"
++	"popl %ecx\n\t"
++	"popl %edx\n\t"
++	"popl %eax\n\t"
++	"ret"
++);
++
++asm(
++".align 4\n"
++".globl __down_adapt_failed\n"
++"__down_adapt_failed:\n\t"
++	"pushl %eax\n\t"
++	"pushl %edx\n\t"
++	"pushl %ecx\n\t"
++	"call __down_adapt\n\t"
++	"popl %ecx\n\t"
++	"popl %edx\n\t"
++	"popl %eax\n\t"
++	"ret"
++);
++
+ asm(
+ ".align 4\n"
+ ".globl __down_failed\n"
+--- /home/martin/linuxelf-2.3.orig/include/asm-i386/semaphore.h	Fri Feb 25 16:12:59 2000
++++ semaphore.h	Sat Feb 26 00:25:51 2000
+@@ -88,11 +88,15 @@
+ 	sema_init(sem, 0);
+ }
+ 
++asmlinkage void __down_spin_failed(void /* special register calling convention */);
++asmlinkage void __down_adapt_failed(void /* special register calling convention */);
+ asmlinkage void __down_failed(void /* special register calling convention */);
+ asmlinkage int  __down_failed_interruptible(void  /* params in registers */);
+ asmlinkage int  __down_failed_trylock(void  /* params in registers */);
+ asmlinkage void __up_wakeup(void /* special register calling convention */);
+ 
++asmlinkage void __down_spin(struct semaphore * sem);
++asmlinkage void __down_adapt(struct semaphore * sem);
+ asmlinkage void __down(struct semaphore * sem);
+ asmlinkage int  __down_interruptible(struct semaphore * sem);
+ asmlinkage int  __down_trylock(struct semaphore * sem);
+@@ -103,6 +107,47 @@
+  * "down_failed" is a special asm handler that calls the C
+  * routine that actually waits. See arch/i386/lib/semaphore.S
+  */
++
++extern inline void down_spin(struct semaphore * sem)
++{
++#if WAITQUEUE_DEBUG
++	CHECK_MAGIC(sem->__magic);
++#endif
++
++	__asm__ __volatile__(
++		"# atomic down operation\n\t"
++		LOCK "decl (%0)\n\t"     /* --sem->count */
++		"js 2f\n"
++		"1:\n"
++		".section .text.lock,\"ax\"\n"
++		"2:\tcall __down_spin_failed\n\t"
++		"jmp 1b\n"
++		".previous"
++		:/* no outputs */
++		:"c" (sem)
++		:"memory");
++}
++
++extern inline void down_adapt(struct semaphore * sem)
++{
++#if WAITQUEUE_DEBUG
++	CHECK_MAGIC(sem->__magic);
++#endif
++
++	__asm__ __volatile__(
++		"# atomic down operation\n\t"
++		LOCK "decl (%0)\n\t"     /* --sem->count */
++		"js 2f\n"
++		"1:\n"
++		".section .text.lock,\"ax\"\n"
++		"2:\tcall __down_adapt_failed\n\t"
++		"jmp 1b\n"
++		".previous"
++		:/* no outputs */
++		:"c" (sem)
++		:"memory");
++}
++
+ extern inline void down(struct semaphore * sem)
+ {
+ #if WAITQUEUE_DEBUG--- /home/martin/linuxelf-2.3.orig/kernel/lockmeter.c	Fri Feb 25 16:49:50 2000
++++ lockmeter.c	Sun Feb 27 16:19:20 2000
+@@ -99,8 +99,8 @@
+ 	return(index);
+ }
+ 
+-static void
+-lstat_update (
++/* not static: gets called by arch-i386/kernel/semaphore.c */
++void lstat_update (
+ 	void	*lock_ptr,
+ 	void	*caller_ra,
+ 	int	action)
+@@ -143,8 +143,8 @@
+ 	return;
+ }
+ 
+-static void
+-lstat_update_time (
++/* not static: gets called by arch-i386/kernel/semaphore.c */
++void lstat_update_time (
+ 	void	*lock_ptr,
+ 	void	*caller_ra,
+ 	int	action,

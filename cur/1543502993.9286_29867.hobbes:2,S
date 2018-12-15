@@ -1,0 +1,187 @@
+Date: Fri, 16 Jul 1999 17:48:29 -0700 (PDT)
+From: "B. James Phillippe" <>
+Subject: [PATCH] sleep_on_release for cleanup_module()
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/7/16/145
+
+Greetings,
+Some of us have run into a problem where we are writing a module which
+wants to start a kernel thread (at some point) during init_module and then
+kill it in cleanup_module.  The problem we have is how to wait until the
+process is truly gone (release()'d) before proceeding with cleanup_module.
+If cleanup_module returns before the thread is truly gone, you can get a
+kernel Oops.
+Here is a patch which adds a new function, sleep_on_release(tsk) which
+takes as it's argument a pointer to struct_task struct on which to wait.
+The caller will sleep until this process has been waited for via sys_wait4
+and release()'d.  It also takes into account that the process could be gone
+before the function is even called.
+I have done a little bit of testing on this and it seems to work fairly
+well.  It does solve my problem, anyway.  Please take a look and let me
+know what you think.  If this is the right approach, I'd like to see
+something like it in 2.3 (this patch is against 2.2.10).
+thanks,
+-bp
+--
+# bryan at terran dot org
+# 
+http://www.terran.org/~bryan
+Index: include/linux/sched.h
+===================================================================
+RCS file: /v/CVS-kernel/linux-2.2/include/linux/sched.h,v
+retrieving revision 1.1.1.1
+diff -u -r1.1.1.1 sched.h
+--- include/linux/sched.h	1999/06/15 22:48:58	1.1.1.1
++++ include/linux/sched.h	1999/07/16 23:43:01
+@@ -113,6 +113,7 @@
+  */
+ extern rwlock_t tasklist_lock;
+ extern spinlock_t runqueue_lock;
++extern rwlock_t release_lock;
+ 
+ extern void sched_init(void);
+ extern void init_idle(void);
+@@ -208,6 +209,11 @@
+ 		{ {{0,}}, }, \
+ 		SPIN_LOCK_UNLOCKED }
+ 
++struct release_queue {
++	struct task_struct *task;
++	struct release_queue *next;
++};
++
+ /*
+  * Some day this will be a full-fledged user tracking system..
+  * Right now it is only used to track how many processes a
+@@ -267,6 +273,9 @@
+ 	/* Pointer to task[] array linkage. */
+ 	struct task_struct **tarray_ptr;
+ 
++	/* Processes blocked on release() of this process */
++	struct release_queue *wait_release;
++
+ 	struct wait_queue *wait_chldexit;	/* for wait4() */
+ 	struct semaphore *vfork_sem;		/* for vfork() */
+ 	unsigned long policy, rt_priority;
+@@ -356,6 +365,7 @@
+ /* proc links*/ &init_task,&init_task,NULL,NULL,NULL, \
+ /* pidhash */	NULL, NULL, \
+ /* tarray */	&task[0], \
++/* release */	NULL, \
+ /* chld wait */	NULL, NULL, \
+ /* timeout */	SCHED_OTHER,0,0,0,0,0,0,0, \
+ /* timer */	{ NULL, NULL, 0, 0, it_real_fn }, \
+@@ -471,6 +481,7 @@
+ extern void FASTCALL(interruptible_sleep_on(struct wait_queue ** p));
+ extern long FASTCALL(interruptible_sleep_on_timeout(struct wait_queue ** p,
+ 						    signed long timeout));
++extern void FASTCALL(sleep_on_release(struct task_struct * tsk));
+ extern void FASTCALL(wake_up_process(struct task_struct * tsk));
+ 
+ #define wake_up(x)			__wake_up((x),TASK_UNINTERRUPTIBLE | TASK_INTERRUPTIBLE)
+Index: kernel/exit.c
+===================================================================
+RCS file: /v/CVS-kernel/linux-2.2/kernel/exit.c,v
+retrieving revision 1.1.1.1
+diff -u -r1.1.1.1 exit.c
+--- kernel/exit.c	1999/06/15 22:48:56	1.1.1.1
++++ kernel/exit.c	1999/07/16 23:01:56
+@@ -463,8 +463,17 @@
+ 					SET_LINKS(p);
+ 					write_unlock_irq(&tasklist_lock);
+ 					notify_parent(p, SIGCHLD);
+-				} else
++				} else {
++					struct release_queue *release_head;
++					read_lock(&release_lock);
++					release_head = p->wait_release;
+ 					release(p);
++					read_unlock(&release_lock);
++					while (release_head) {
++						wake_up_process(release_head->task);
++						release_head = release_head->next;
++					}
++				}
+ #ifdef DEBUG_PROC_TREE
+ 				audit_ptree();
+ #endif
+Index: kernel/ksyms.c
+===================================================================
+RCS file: /v/CVS-kernel/linux-2.2/kernel/ksyms.c,v
+retrieving revision 1.1.1.1
+diff -u -r1.1.1.1 ksyms.c
+--- kernel/ksyms.c	1999/06/15 22:48:57	1.1.1.1
++++ kernel/ksyms.c	1999/07/16 21:31:04
+@@ -305,10 +305,12 @@
+ 
+ /* process management */
+ EXPORT_SYMBOL(__wake_up);
++EXPORT_SYMBOL(wake_up_process);
+ EXPORT_SYMBOL(sleep_on);
+ EXPORT_SYMBOL(sleep_on_timeout);
+ EXPORT_SYMBOL(interruptible_sleep_on);
+ EXPORT_SYMBOL(interruptible_sleep_on_timeout);
++EXPORT_SYMBOL(sleep_on_release);
+ EXPORT_SYMBOL(schedule);
+ EXPORT_SYMBOL(schedule_timeout);
+ EXPORT_SYMBOL(jiffies);
+Index: kernel/sched.c
+===================================================================
+RCS file: /v/CVS-kernel/linux-2.2/kernel/sched.c,v
+retrieving revision 1.1.1.1
+diff -u -r1.1.1.1 sched.c
+--- kernel/sched.c	1999/06/15 22:48:56	1.1.1.1
++++ kernel/sched.c	1999/07/16 23:20:35
+@@ -429,9 +429,14 @@
+  *
+  * The run-queue lock locks the parts that actually access
+  * and change the run-queues, and have to be interrupt-safe.
++ *
++ * The release_lock is a special-purpose lock for preventing
++ * races when a process wants to wait until another process
++ * is release()'d before proceeding (eg. cleanup_module()).
+  */
+ spinlock_t runqueue_lock = SPIN_LOCK_UNLOCKED;  /* second */
+ rwlock_t tasklist_lock = RW_LOCK_UNLOCKED;	/* third */
++rwlock_t release_lock = RW_LOCK_UNLOCKED;
+ 
+ /*
+  * Wake up a process. Put it on the run-queue if it's not
+@@ -1098,6 +1103,29 @@
+ 	SLEEP_ON_TAIL
+ 
+ 	return timeout;
++}
++
++void sleep_on_release(struct task_struct *p)
++{
++	struct release_queue wait;
++	struct task_struct *tsk;
++
++	write_lock(&release_lock);
++	read_lock(&tasklist_lock);
++	for_each_task(tsk)
++		if (p == tsk) goto found_task;
++	read_unlock(&tasklist_lock);
++	write_unlock(&release_lock);
++	return;
++
++found_task:
++	read_unlock(&tasklist_lock);
++	current->state = TASK_UNINTERRUPTIBLE;
++	wait.task = current;
++	wait.next = p->wait_release;
++	p->wait_release = &wait;
++	write_unlock(&release_lock);
++	schedule();
+ }
+ 
+ void scheduling_functions_end_here(void) { }
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

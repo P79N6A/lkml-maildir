@@ -1,0 +1,462 @@
+Date: Mon, 16 Oct 2000 00:08:54 +0200
+From: Andrea Arcangeli <>
+Subject: Re: mapping user space buffer to kernel address space
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/10/15/56
+
+On Sat, Oct 14, 2000 at 07:17:57PM -0700, Linus Torvalds wrote:
+> 
+> 
+> On Sat, 14 Oct 2000, Rogier Wolff wrote:
+> > > Note that it is usually MUCH better to do this the other way around:
+> > > having a kernel-side buffer, and mapping that into user space. I don't
+> > > understand why so many people always want to do it the wrong way around..
+> > 
+> > Provided this wasn't a retorical question, I'll answer it for you. 
+> > 
+> > It seems easier to people. Allocing megabytes of memory is "easy" from
+> > userspace, and there are all kinds of restrictions on the kernel side.
+> 
+> Yeah.
+> 
+> It's "easier".
+> 
+> Until you want to actually _map_ the thing.
+> 
+> At which point it turns a hell of a lot harder.
+Just as proof it's lot harder: the mechanism implemented in 2.4.0-test10-pre3
+in map_user_kiobuf to pin the userspace pages always been buggy and any driver
+that is using it (like rawio) will lead to memory corruption or errors right
+now. I started looking into this after I got reports of 2.2.18pre15aa1 getting
+-EFAULT errors using Oracle with rawio.
+The basic problem is that map_user_kiobuf tries to map those pages calling an
+handle_mm_fault on their virtual addresses and it's thinking that when
+handle_mm_fault returns 1 the page is mapped.  That's wrong.  handle_mm_fault
+may have generated a readonly mapping and it may want to giveup waiting a new
+wrprotection fault to happen as soon as we return from the current page fault
+handler. Or the pte may be changed under us while we slept and so
+handle_mm_faults givups only to see if the fault happens again or not
+(not because it finished its work).
+	In short the fact handle_mm_fault returns 1 doesn't mean the page
+	is currently mapped.
+Furthmore in 2.4.x SMP (this couldn't happen in 2.2.x SMP at least) the page
+can also go away from under us even assuming handle_mm_fault did its work right
+by luck. And reading the code it knows the pagetable lock was necessary but
+in case the race happened it returns -EFAULT and that's buggy.
+		spin_lock(&mm->page_table_lock);
+		map = follow_page(ptr);
+		if (!map) {
+			spin_unlock(&mm->page_table_lock);
+			dprintk (KERN_ERR "Missing page in map_user_kiobuf\n");
+			goto out_unlock;
+		}
+It should try again until it succeeds in pinning the page in memory instead (or
+as worse return -EAGAIN after many tries).
+I'm also not convinced that only increasing the page count in the critical
+section in map_user_kiobuf is enough because swap_out doesn't care about the
+page count (in 2.2.x rawio it's taking the page lock). The page count is
+significant as a "pin" only for the page cache and not for anonymous or shm
+memory for example. swap_out can mess with anonymous memory with a page
+count > 1 for example. To avoid VM activities on the page we should grab the
+lock atomically in the critical section protected by the pagetable lock. So I
+think map_user_kiovec is buggy in not getting the user page lock atomically
+while taking the page pinned in memory. I left the lock/unlock_kiovec
+operations only for everything that doesn't deal with userspace pages (for
+example skb or more in general kernel memory not visible to userspace or mapped
+as reserved). (they're not necessary while pinning userspace memory)
+And since we must lock down the page to pin it in map_user_kiobuf then we get
+the same swapin_readahead deadlock that is now fixed in the 2.2.x rawio patch.
+Really that deadlock is a side effect of a silly thing that swapin_readahead
+was doing all the time (infact such deadlock doesn't happen with the readahead
+of the pagecache but only of the swapcache): swapin_readahead is wasting time
+on locked swap cache pages while doing readahead (while it should only startup
+the I/O on the not yet present ones). This is potentially hurting also swapin
+performance because we end waiting on the wrong page (potentially waiting many
+times more than necessary).
+Assume the user is doing rawio to write to disk.  We'll generate a _read_
+swapin fault in memory and the page will remain in swap cache because it's not
+been changed and the pte is read only.
+1)	swapin page 0
+2)	swapin completes and page is mapped so we pin it down setting PG_locked
+	while we hold the pagetable lock
+3)	swapin page 1
+4)	swapin_readaround(page 1) does a lookup_swap_cache(page 0)
+	that hangs in find_lock_page(page 0) because we recursed on the
+	PG_locked that we set in point 2)
+5)	task unkillable in D state
+I also noticed shm_swap is buggy because it adds shm pages in the swap cache
+without the big kernel lock acquired (I added a FIXME in the patch, the fix
+is trivial).
+The patch fixes also some silly 2.4.x specific bug (missing wakeup and wrong
+place for wait_on_page).
+Patch is against 2.4.0-test10-pre3 and I checked the rawio regression test
+works correctly as with 2.2.15pre18aa1 with the patch applied (it run for one
+hour without showing any trouble). Then I backed out the patch and I run the
+testsuite again on a clean 2.4.0-test10-pre3 and as I expected it reported
+memory corruption while reading from disk after a few minutes exactly as it was
+happening in 2.2.18pre2aa2:
+root@laser:/home/andrea > ./rawio-test 
+Opening /dev/raw1
+Allocating 50MB of memory
+Reading from /dev/raw1
+Setting data
+Writing data to /dev/raw1
+Checking written data
+Invalidating data
+Checking invalidated data
+Reading from /dev/raw1
+Checking read data
+Writing data to /dev/raw1
+Checking written data
+Invalidating data
+Checking invalidated data
+Reading from /dev/raw1
+Checking read data
+Writing data to /dev/raw1
+Checking written data
+Invalidating data
+Checking invalidated data
+Reading from /dev/raw1
+Checking read data
+Writing data to /dev/raw1
+Checking written data
+Invalidating data
+Checking invalidated data
+Reading from /dev/raw1
+Checking read data
+Writing data to /dev/raw1
+Checking written data
+Invalidating data
+Checking invalidated data
+Reading from /dev/raw1
+Checking read data
+Writing data to /dev/raw1
+Checking written data
+Invalidating data
+Checking invalidated data
+Reading from /dev/raw1
+Checking read data
+Writing data to /dev/raw1
+Checking written data
+Invalidating data
+Checking invalidated data
+Reading from /dev/raw1
+Checking read data
+NOT MATCH (read Z) 472000
+^^^^^^^^^^^^^^^^^^^^^^^^ memory corruption
+Binary files 2.4.0-test10-pre3/ID and rawio-1/ID differ
+diff -urN 2.4.0-test10-pre3/drivers/char/raw.c rawio-1/drivers/char/raw.c
+--- 2.4.0-test10-pre3/drivers/char/raw.c	Thu Oct 12 03:04:42 2000
++++ rawio-1/drivers/char/raw.c	Sun Oct 15 17:00:07 2000
+@@ -310,11 +310,6 @@
+ 		err = map_user_kiobuf(rw, iobuf, (unsigned long) buf, iosize);
+ 		if (err)
+ 			break;
+-#if 0
+-		err = lock_kiovec(1, &iobuf, 1);
+-		if (err) 
+-			break;
+-#endif
+ 	
+ 		for (i=0; i < blocks; i++) 
+ 			b[i] = blocknr++;
+diff -urN 2.4.0-test10-pre3/fs/buffer.c rawio-1/fs/buffer.c
+--- 2.4.0-test10-pre3/fs/buffer.c	Sat Oct 14 19:00:17 2000
++++ rawio-1/fs/buffer.c	Sun Oct 15 16:32:22 2000
+@@ -1923,6 +1923,7 @@
+ 	}
+ 	
+ 	spin_unlock(&unused_list_lock);
++	wake_up(&buffer_wait);
+ 
+ 	return iosize;
+ }
+@@ -2061,6 +2062,7 @@
+ 		__put_unused_buffer_head(bh[i]);
+ 	}
+ 	spin_unlock(&unused_list_lock);
++	wake_up(&buffer_wait);
+ 	goto finished;
+ }
+ 
+diff -urN 2.4.0-test10-pre3/include/linux/mm.h rawio-1/include/linux/mm.h
+--- 2.4.0-test10-pre3/include/linux/mm.h	Sun Oct 15 17:49:26 2000
++++ rawio-1/include/linux/mm.h	Sun Oct 15 17:51:11 2000
+@@ -408,7 +408,7 @@
+ extern void mem_init(void);
+ extern void show_mem(void);
+ extern void si_meminfo(struct sysinfo * val);
+-extern void swapin_readahead(swp_entry_t);
++extern void swapin_readaround(swp_entry_t);
+ 
+ /* mmap.c */
+ extern void merge_segments(struct mm_struct *, unsigned long, unsigned long);
+diff -urN 2.4.0-test10-pre3/include/linux/pagemap.h rawio-1/include/linux/pagemap.h
+--- 2.4.0-test10-pre3/include/linux/pagemap.h	Sun Oct 15 17:38:48 2000
++++ rawio-1/include/linux/pagemap.h	Sun Oct 15 17:49:28 2000
+@@ -77,6 +77,11 @@
+ #define find_lock_page(mapping, index) \
+ 		__find_lock_page(mapping, index, page_hash(mapping, index))
+ 
++extern int __check_page(struct address_space * mapping, unsigned long index,
++			struct page **hash);
++#define check_page(mapping, index) \
++		__check_page(mapping, index, page_hash(mapping, index))
++
+ extern void __add_page_to_hash_queue(struct page * page, struct page **p);
+ 
+ extern void add_to_page_cache(struct page * page, struct address_space *mapping, unsigned long index);
+diff -urN 2.4.0-test10-pre3/ipc/shm.c rawio-1/ipc/shm.c
+--- 2.4.0-test10-pre3/ipc/shm.c	Thu Oct 12 03:04:50 2000
++++ rawio-1/ipc/shm.c	Sun Oct 15 17:51:15 2000
+@@ -1414,7 +1414,7 @@
+ 			page = lookup_swap_cache(entry);
+ 			if (!page) {
+ 				lock_kernel();
+-				swapin_readahead(entry);
++				swapin_readaround(entry);
+ 				page = read_swap_cache(entry);
+ 				unlock_kernel();
+ 				if (!page)
+diff -urN 2.4.0-test10-pre3/mm/filemap.c rawio-1/mm/filemap.c
+--- 2.4.0-test10-pre3/mm/filemap.c	Sat Oct 14 19:00:18 2000
++++ rawio-1/mm/filemap.c	Sun Oct 15 17:47:41 2000
+@@ -254,10 +254,23 @@
+ 	 * up kswapd.
+ 	 */
+ 	age_page_up(page);
++
++	/* Oh, I feel bad with this horror. */
+ 	if (inactive_shortage() > inactive_target / 2 && free_shortage())
+ 			wakeup_kswapd(0);
+ not_found:
+ 	return page;
++}
++
++int __check_page(struct address_space * mapping, unsigned long index, struct page ** hash)
++{
++	struct page * page;
++
++	spin_lock(&pagecache_lock);
++	page = __find_page_nolock(mapping, index, *hash);
++	spin_unlock(&pagecache_lock);
++
++	return page != NULL;
+ }
+ 
+ /*
+diff -urN 2.4.0-test10-pre3/mm/memory.c rawio-1/mm/memory.c
+--- 2.4.0-test10-pre3/mm/memory.c	Thu Oct 12 03:04:50 2000
++++ rawio-1/mm/memory.c	Sun Oct 15 17:51:20 2000
+@@ -385,7 +385,7 @@
+ /*
+  * Do a quick page-table lookup for a single page. 
+  */
+-static struct page * follow_page(unsigned long address) 
++static struct page * follow_page(unsigned long address, int write)
+ {
+ 	pgd_t *pgd;
+ 	pmd_t *pmd;
+@@ -395,7 +395,8 @@
+ 	if (pmd) {
+ 		pte_t * pte = pte_offset(pmd, address);
+ 		if (pte && pte_present(*pte))
+-			return pte_page(*pte);
++			if (!write || pte_write(*pte))
++				return pte_page(*pte);
+ 	}
+ 	
+ 	return NULL;
+@@ -427,8 +428,12 @@
+ 	struct mm_struct *	mm;
+ 	struct vm_area_struct *	vma = 0;
+ 	struct page *		map;
++	int			doublepage = 0;
++	int			repeat = 0;
+ 	int			i;
+-	int			datain = (rw == READ);
++	int			write = (rw == READ); /* if we read from disk
++							 it means we write
++							 to memory */
+ 	
+ 	/* Make sure the iobuf is not already mapped somewhere. */
+ 	if (iobuf->nr_pages)
+@@ -443,10 +448,11 @@
+ 	if (err)
+ 		return err;
+ 
++ repeat:
+ 	down(&mm->mmap_sem);
+ 
+ 	err = -EFAULT;
+-	iobuf->locked = 0;
++	iobuf->locked = 1;
+ 	iobuf->offset = va & ~PAGE_MASK;
+ 	iobuf->length = len;
+ 	
+@@ -457,8 +463,9 @@
+ 	 */
+ 	while (ptr < end) {
+ 		if (!vma || ptr >= vma->vm_end) {
+-			vma = find_vma(current->mm, ptr);
+-			if (!vma) 
++		refind:
++			vma = find_vma(mm, ptr);
++			if (!vma)
+ 				goto out_unlock;
+ 			if (vma->vm_start > ptr) {
+ 				if (!(vma->vm_flags & VM_GROWSDOWN))
+@@ -466,25 +473,35 @@
+ 				if (expand_stack(vma, ptr))
+ 					goto out_unlock;
+ 			}
+-			if (((datain) && (!(vma->vm_flags & VM_WRITE))) ||
+-					(!(vma->vm_flags & VM_READ))) {
+-				err = -EACCES;
+-				goto out_unlock;
++			err = -EACCES;
++			if (write) {
++				if (!(vma->vm_flags & VM_WRITE))
++					goto out_unlock;
++			} else {
++				if (!(vma->vm_flags & VM_READ))
++					goto out_unlock;
+ 			}
++			err = -EFAULT;
+ 		}
+-		if (handle_mm_fault(current->mm, vma, ptr, datain) <= 0) 
+-			goto out_unlock;
+ 		spin_lock(&mm->page_table_lock);
+-		map = follow_page(ptr);
+-		if (!map) {
++		if (!(map = follow_page(ptr, write))) {
++			char * user_ptr = (char *) ptr;
++			char c;
+ 			spin_unlock(&mm->page_table_lock);
+-			dprintk (KERN_ERR "Missing page in map_user_kiobuf\n");
+-			goto out_unlock;
++			up(&mm->mmap_sem);
++			if (get_user(c, user_ptr))
++				goto out;
++			if (write && put_user(c, user_ptr))
++				goto out;
++			down(&mm->mmap_sem);
++			goto refind;
+ 		}
+ 		map = get_page_map(map);
+-		if (map)
++		if (map) {
++			if (TryLockPage(map))
++				goto retry;
+ 			atomic_inc(&map->count);
+-		else
++		} else
+ 			printk (KERN_INFO "Mapped page missing [%d]\n", i);
+ 		spin_unlock(&mm->page_table_lock);
+ 		iobuf->maplist[i] = map;
+@@ -499,9 +516,39 @@
+ 
+  out_unlock:
+ 	up(&mm->mmap_sem);
++ out:
+ 	unmap_kiobuf(iobuf);
+ 	dprintk ("map_user_kiobuf: end %d\n", err);
+ 	return err;
++
++ retry:
++
++	/* 
++	 * Undo the locking so far, wait on the page we got to, and try again.
++	 */
++	unmap_kiobuf(iobuf);
++	up(&mm->mmap_sem);
++
++	/* 
++	 * Did the release also unlock the page we got stuck on?
++	 */
++	if (!PageLocked(map)) {
++		/* If so, we may well have the page mapped twice in the
++		 * IO address range.  Bad news.  Of course, it _might_
++		 * just be a coincidence, but if it happens more than
++		 * once, chances are we have a double-mapped page. */
++		if (++doublepage >= 3) {
++			return -EINVAL;
++		}
++	}
++	
++	/*
++	 * Try again...
++	 */
++	wait_on_page(map);
++	if (++repeat < 16)
++		goto repeat;
++	return -EAGAIN;
+ }
+ 
+ 
+@@ -594,9 +641,9 @@
+ 		if (++doublepage >= 3) 
+ 			return -EINVAL;
+ 		
++	} else
+ 		/* Try again...  */
+ 		wait_on_page(page);
+-	}
+ 	
+ 	if (++repeat < 16)
+ 		goto repeat;
+@@ -1027,11 +1074,12 @@
+  * because it doesn't cost us any seek time.  We also make sure to queue
+  * the 'original' request together with the readahead ones...  
+  */
+-void swapin_readahead(swp_entry_t entry)
++void swapin_readaround(swp_entry_t entry)
+ {
+ 	int i, num;
+ 	struct page *new_page;
+ 	unsigned long offset;
++	swp_entry_t readaround_entry;
+ 
+ 	/*
+ 	 * Get the number of handles we should do readahead io to. Also,
+@@ -1046,8 +1094,17 @@
+ 				swap_free(SWP_ENTRY(SWP_TYPE(entry), offset++));
+ 			break;
+ 		}
+-		/* Ok, do the async read-ahead now */
+-		new_page = read_swap_cache_async(SWP_ENTRY(SWP_TYPE(entry), offset), 0);
++		readaround_entry = SWP_ENTRY(SWP_TYPE(entry), offset);
++		new_page = NULL;
++		/*
++		 * Nobody can insert a page in the swap_cache without
++		 * holding the big kernel lock. FIXME: swap_shm will SMP
++		 * race because it runs add_to_swap_cache without the big
++		 * kernel lock held.
++		 */
++		if (!check_page(&swapper_space, readaround_entry.val))
++			/* Ok, do the async read-ahead now */
++			new_page = read_swap_cache_async(readaround_entry, 0);
+ 		if (new_page != NULL)
+ 			page_cache_release(new_page);
+ 		swap_free(SWP_ENTRY(SWP_TYPE(entry), offset));
+@@ -1064,7 +1121,7 @@
+ 
+ 	if (!page) {
+ 		lock_kernel();
+-		swapin_readahead(entry);
++		swapin_readaround(entry);
+ 		page = read_swap_cache(entry);
+ 		unlock_kernel();
+ 		if (!page)
+The patch is also here:
+	
+ftp://ftp.us.kernel.org/pub/linux/kernel/people/andrea/patches/v2.4/2.4.0-test10-pre3/rawio-1
+Andrea
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+Please read the FAQ at 
+http://www.tux.org/lkml/

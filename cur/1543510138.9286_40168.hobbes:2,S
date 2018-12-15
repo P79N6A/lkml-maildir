@@ -1,0 +1,272 @@
+Date: Tue, 21 Sep 1999 20:32:32 +0200 (CEST)
+From: Urban Widmark <>
+Subject: [patch] smbfs in 2.3.18(ac#)
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/9/21/144
+
+Hello ac-maintainer, smbfs maintainer, list
+This is my attempt at getting smbfs to work with 2.3.x.
+This patch:
+* adds a 'get_cached_page' with inspiration from 2.2 mm/filemap.c
+* changes the locking for inode->readpage/writepage
+* tries to use macros instead of setting PG_ values
+* smb_write_one_page is now of type writepage_t
+* debug messages don't printk non-null terminated strings
+  (it oops'ed me ...)
+This should apply cleanly to any 2.3.18 (+ac#).
+I have tested this on a few machines (plain 2.3.18, ac5, ac7). Me and at
+least one more person have been unable to crash it so maybe it is fit for
+a development kernel. Oh, not only does it not crash, it shows files and
+allows reading & writing. :)
+Still, someone who understands these things called page cache, memory
+management should perhaps have a look ...
+Questions:
+       SetPageUptodate(page);
+I added a set PG_uptodate after having written the page. To me that seemed
+logical, but maybe that flag is always already set when it is time to
+write something? Or shouldn't be set?
+include/linux/mm.h disagrees with me (when read it's uptodate) and I'd
+like to know why I'm wrong.
+How do I check that the #locked and allocated pages does not increase
+without ever decreasing? It would be nice to test that.
+/Urban, not sure which maintainer to send this to ... sending it to both
+        to let them fight it out :)
+diff -ur linux.orig/fs/smbfs/cache.c linux/fs/smbfs/cache.c
+--- linux.orig/fs/smbfs/cache.c	Mon Mar  8 00:25:23 1999
++++ linux/fs/smbfs/cache.c	Sun Sep 19 21:43:14 1999
+@@ -14,12 +14,67 @@
+ #include <linux/mm.h>
+ #include <linux/dirent.h>
+ #include <linux/smb_fs.h>
++#include <linux/pagemap.h>
+ 
+ #include <asm/page.h>
+ 
+ #define SMBFS_PARANOIA 1
+ /* #define SMBFS_DEBUG_VERBOSE 1 */
+ 
++#ifdef SMBFS_DEBUG_VERBOSE
++/*
++ * Print a cache_dirent->name, max 80 chars
++ * You can't just printk non-null terminated strings ...
++ */
++printk_name(const char *name, int len)
++{
++	char buf[81];
++
++	if(len > 80)
++		len = 80;
++	strncpy(buf, name, len);
++	buf[len] = 0;
++	printk(buf);
++}
++#endif
++
++/*
++ * Get a page for this inode, if new is set then we want to allocate
++ * the page if it isn't in memory. As I understand it the rest of the
++ * smb-cache code assumes we return a locked page.
++ */
++unsigned long
++get_cached_page(struct inode * inode, unsigned long offset, int new)
++{
++	struct page * page;
++	struct page ** hash;
++	unsigned long new_page;
++
++ again:
++	hash = page_hash(inode, offset);
++	page = __find_lock_page(inode, offset, hash);
++	if(!page && new) {
++		/* not in cache, alloc a new page */
++		new_page = page_cache_alloc();
++		if (!new_page)
++			return 0;
++		clear_page(new_page);	/* smb code assumes pages are zeroed */
++		page = page_cache_entry(new_page);
++		if (add_to_page_cache_unique(page, inode, offset, hash)) {
++			/* Hmm, a page has materialized in the
++                           cache. Fine. Go back and get that page
++                           instead ... throwing away this one first. */
++			put_cached_page((unsigned long) page);
++			goto again;
++		}
++	}
++	if(!page)
++		return 0;
++	if(!PageLocked(page))
++		printk(KERN_ERR "smbfs/cache.c: page isn't locked! This could be fun ...\n");
++	return page_address(page);
++}
++
+ static inline struct inode * 
+ get_cache_inode(struct cache_head *cachep)
+ {
+@@ -38,8 +93,8 @@
+ 	struct cache_head * cachep;
+ 
+ #ifdef SMBFS_DEBUG_VERBOSE
+-printk("smb_get_dircache: finding cache for %s/%s\n",
+-dentry->d_parent->d_name.name, dentry->d_name.name);
++	printk("smb_get_dircache: finding cache for %s/%s\n",
++	       dentry->d_parent->d_name.name, dentry->d_name.name);
+ #endif
+ 	cachep = (struct cache_head *) get_cached_page(inode, 0, 1);
+ 	if (!cachep)
+@@ -140,8 +195,10 @@
+ 	unsigned int needed = len + sizeof(struct cache_entry);
+ 
+ #ifdef SMBFS_DEBUG_VERBOSE
+-printk("smb_add_to_cache: cache inode %p, status %d, adding %s at %ld\n",
+-inode, cachep->status, entry->name, fpos);
++printk("smb_add_to_cache: cache inode %p, status %d, adding ", 
++       inode, cachep->status);
++printk_name(entry->name, entry->len);
++printk(" at %ld\n", fpos);
+ #endif
+ 	/*
+ 	 * Don't do anything if we've had an error ...
+@@ -169,8 +226,10 @@
+ 		block->cb_data.table[nent].ino = entry->ino;
+ 		cachep->entries++;
+ #ifdef SMBFS_DEBUG_VERBOSE
+-printk("smb_add_to_cache: added entry %s, len=%d, pos=%ld, entries=%d\n",
+-entry->name, len, fpos, cachep->entries);
++printk("smb_add_to_cache: added entry ");
++printk_name(entry->name, entry->len);
++printk(", len=%d, pos=%ld, entries=%d\n",
++len, fpos, cachep->entries);
+ #endif
+ 		return;
+ 	}
+@@ -231,7 +290,7 @@
+ 		nent = pos - next_pos;
+ 		next_pos += index->num_entries;
+ 		if (pos >= next_pos)
+-			continue; 
++			continue;
+ 		/*
+ 		 * The entry is in this block. Note: we return
+ 		 * then name as a reference with _no_ null byte.
+@@ -242,8 +301,9 @@
+ 		offset = block->cb_data.table[nent].offset;
+ 		entry->name = &block->cb_data.names[offset];
+ #ifdef SMBFS_DEBUG_VERBOSE
+-printk("smb_find_in_cache: found %s, len=%d, pos=%ld\n",
+-entry->name, entry->len, pos);
++printk("smb_find_in_cache: found ");
++printk_name(entry->name, entry->len);
++printk(", len=%d, pos=%ld\n", entry->len, pos);
+ #endif
+ 		break;
+ 	}
+@@ -312,4 +372,3 @@
+ 	dir->u.smbfs_i.cache_valid &= ~SMB_F_CACHEVALID;
+ 	dir->u.smbfs_i.oldmtime = 0;
+ }
+-
+diff -ur linux.orig/fs/smbfs/file.c linux/fs/smbfs/file.c
+--- linux.orig/fs/smbfs/file.c	Sun Jun 27 19:10:41 1999
++++ linux/fs/smbfs/file.c	Mon Sep 20 20:30:28 1999
+@@ -32,13 +32,6 @@
+ 	return a < b ? a : b;
+ }
+ 
+-static inline void
+-smb_unlock_page(struct page *page)
+-{
+-	clear_bit(PG_locked, &page->flags);
+-	wake_up(&page->wait);
+-}
+-
+ static int
+ smb_fsync(struct file *file, struct dentry * dentry)
+ {
+@@ -61,7 +54,9 @@
+ 	int count = PAGE_SIZE;
+ 	int result;
+ 
+-	clear_bit(PG_error, &page->flags);
++	/* We can't replace this with ClearPageError. why? is it a problem? 
++	   fs/buffer.c:brw_page does the same. */
++	/* clear_bit(PG_error, &page->flags); */
+ 
+ #ifdef SMBFS_DEBUG_VERBOSE
+ printk("smb_readpage_sync: file %s/%s, count=%d@%ld, rsize=%d\n",
+@@ -94,11 +89,11 @@
+ 	} while (count);
+ 
+ 	memset(buffer, 0, count);
+-	set_bit(PG_uptodate, &page->flags);
++	SetPageUptodate(page);
+ 	result = 0;
+ 
+ io_error:
+-	smb_unlock_page(page);
++	UnlockPage(page);
+ 	return result;
+ }
+ 
+@@ -110,13 +105,13 @@
+ 
+ 	pr_debug("SMB: smb_readpage %08lx\n", page_address(page));
+ #ifdef SMBFS_PARANOIA
+-	if (test_bit(PG_locked, &page->flags))
+-		printk("smb_readpage: page already locked!\n");
++	if (!PageLocked(page))
++		printk("smb_readpage: page not already locked!\n");
+ #endif
+-	set_bit(PG_locked, &page->flags);
+-	atomic_inc(&page->count);
++
++	get_page(page);
+ 	error = smb_readpage_sync(dentry, page);
+-	free_page(page_address(page));
++	put_page(page);
+ 	return error;
+ }
+ 
+@@ -169,6 +164,8 @@
+ /*
+  * Write a page to the server. This will be used for NFS swapping only
+  * (for now), and we currently do this synchronously only.
++ *
++ * We are called with the page locked and the caller unlocks.
+  */
+ static int
+ smb_writepage(struct file *file, struct page *page)
+@@ -177,14 +174,13 @@
+ 	int 	result;
+ 
+ #ifdef SMBFS_PARANOIA
+-	if (test_bit(PG_locked, &page->flags))
+-		printk("smb_writepage: page already locked!\n");
++	if (!PageLocked(page))
++		printk("smb_writepage: page not already locked!\n");
+ #endif
+-	set_bit(PG_locked, &page->flags);
+-	atomic_inc(&page->count);
++	get_page(page);
+ 	result = smb_writepage_sync(dentry, page, 0, PAGE_SIZE);
+-	smb_unlock_page(page);
+-	free_page(page_address(page));
++	SetPageUptodate(page);
++	put_page(page);
+ 	return result;
+ }
+ 
+@@ -266,9 +262,9 @@
+  * If the writer ends up delaying the write, the writer needs to
+  * increment the page use counts until he is done with the page.
+  */
+-static long smb_write_one_page(struct file *file, struct page *page, unsigned long offset, unsigned long bytes, const char * buf)
++static int smb_write_one_page(struct file *file, struct page *page, unsigned long offset, unsigned long bytes, const char * buf)
+ {
+-	long status;
++	int status;
+ 
+ 	bytes -= copy_from_user((u8*)page_address(page) + offset, buf, bytes);
+ 	status = -EFAULT;

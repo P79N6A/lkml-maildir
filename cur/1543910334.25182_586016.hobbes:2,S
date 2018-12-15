@@ -1,0 +1,110 @@
+Date: Sun, 19 Aug 2007 14:53:53 +0800
+From: Fengguang Wu <>
+Subject: [PATCH 4/6] writeback: introduce writeback_control.more_io to indicate more io
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2007/8/19/15
+
+After making dirty a 100M file, the normal behavior is to
+start the writeback for all data after 30s delays. But
+sometimes the following happens instead:
+	- after 30s:    ~4M
+	- after 5s:     ~4M
+	- after 5s:     all remaining 92M
+Some analyze shows that the internal io dispatch queues goes like this:
+		s_io            s_more_io
+		-------------------------
+	1)	100M,1K         0
+	2)	1K              96M
+	3)	0               96M
+1) initial state with a 100M file and a 1K file
+2) 4M written, nr_to_write <= 0, so write more
+3) 1K written, nr_to_write > 0, no more writes(BUG)
+nr_to_write > 0 in (3) fools the upper layer to think that data have all been
+written out. The big dirty file is actually still sitting in s_more_io. We
+cannot simply splice s_more_io back to s_io as soon as s_io becomes empty, and
+let the loop in generic_sync_sb_inodes() continue: this may starve newly
+expired inodes in s_dirty.  It is also not an option to draw inodes from both
+s_more_io and s_dirty, an let the loop go on: this might lead to live locks,
+and might also starve other superblocks in sync time(well kupdate may still
+starve some superblocks, that's another bug).
+We have to return when a full scan of s_io completes. So nr_to_write > 0 does
+not necessarily mean that "all data are written". This patch introduces a flag
+writeback_control.more_io to indicate this situation. With it the big dirty file
+no longer has to wait for the next kupdate invocation 5s later.
+Cc: David Chinner <dgc@sgi.com>
+Cc: Ken Chen <kenchen@google.com>
+Cc: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Fengguang Wu <wfg@mail.ustc.edu.cn>
+---
+ fs/fs-writeback.c         |    2 ++
+ include/linux/writeback.h |    1 +
+ mm/page-writeback.c       |    9 ++++++---
+ 3 files changed, 9 insertions(+), 3 deletions(-)
+--- linux-2.6.23-rc2-mm2.orig/fs/fs-writeback.c
++++ linux-2.6.23-rc2-mm2/fs/fs-writeback.c
+@@ -472,6 +472,8 @@ sync_sb_inodes(struct super_block *sb, s
+ 		if (wbc->nr_to_write <= 0)
+ 			break;
+ 	}
++	if (!list_empty(&sb->s_more_io))
++		wbc->more_io = 1;
+ 
+ 	return;		/* Leave any unwritten inodes on s_io */
+ }
+--- linux-2.6.23-rc2-mm2.orig/include/linux/writeback.h
++++ linux-2.6.23-rc2-mm2/include/linux/writeback.h
+@@ -61,6 +61,7 @@ struct writeback_control {
+ 	unsigned for_reclaim:1;		/* Invoked from the page allocator */
+ 	unsigned for_writepages:1;	/* This is a writepages() call */
+ 	unsigned range_cyclic:1;	/* range_start is cyclic */
++	unsigned more_io:1;		/* more io to be dispatched */
+ 
+ 	void *fs_private;		/* For use by ->writepages() */
+ };
+--- linux-2.6.23-rc2-mm2.orig/mm/page-writeback.c
++++ linux-2.6.23-rc2-mm2/mm/page-writeback.c
+@@ -382,6 +382,7 @@ static void background_writeout(unsigned
+ 			global_page_state(NR_UNSTABLE_NFS) < background_thresh
+ 				&& min_pages <= 0)
+ 			break;
++		wbc.more_io = 0;
+ 		wbc.encountered_congestion = 0;
+ 		wbc.nr_to_write = MAX_WRITEBACK_PAGES;
+ 		wbc.pages_skipped = 0;
+@@ -389,8 +390,9 @@ static void background_writeout(unsigned
+ 		min_pages -= MAX_WRITEBACK_PAGES - wbc.nr_to_write;
+ 		if (wbc.nr_to_write > 0 || wbc.pages_skipped > 0) {
+ 			/* Wrote less than expected */
+-			congestion_wait(WRITE, HZ/10);
+-			if (!wbc.encountered_congestion)
++			if (wbc.encountered_congestion || wbc.more_io)
++				congestion_wait(WRITE, HZ/10);
++			else
+ 				break;
+ 		}
+ 	}
+@@ -455,11 +457,12 @@ static void wb_kupdate(unsigned long arg
+ 			global_page_state(NR_UNSTABLE_NFS) +
+ 			(inodes_stat.nr_inodes - inodes_stat.nr_unused);
+ 	while (nr_to_write > 0) {
++		wbc.more_io = 0;
+ 		wbc.encountered_congestion = 0;
+ 		wbc.nr_to_write = MAX_WRITEBACK_PAGES;
+ 		writeback_inodes(&wbc);
+ 		if (wbc.nr_to_write > 0) {
+-			if (wbc.encountered_congestion)
++			if (wbc.encountered_congestion || wbc.more_io)
+ 				congestion_wait(WRITE, HZ/10);
+ 			else
+ 				break;	/* All the old data is written */
+-- 
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+More majordomo info at  
+http://vger.kernel.org/majordomo-info.html
+Please read the FAQ at  
+http://www.tux.org/lkml/

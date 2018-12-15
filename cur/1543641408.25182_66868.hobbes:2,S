@@ -1,0 +1,142 @@
+Date: Wed, 28 Aug 2002 15:44:57 -0600
+From: "David Stevens" <>
+Subject: [PATCH] anycast support for IPv6, linux-2.5.31
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2002/8/28/248
+
+      Below is a patch relative to the mainline 2.5.31 code for an
+implementation of anycast support for IPv6. This code was submitted and accepted
+in the USAGI tree last Fall. Below is a high-level description of the
+implementation:
+1) The API
+      Although the RFC's liken anycasting to ordinary unicasting, I think
+it's more appropriate to tie it closely to particular applications, so I've
+chosen an API similar to multicasting. So, rather than having a permanent
+anycast address associated with the machine, particular applications
+that use anycasting can join or leave "anycast groups," and the machine will
+recognize the anycast addresses as its own when one or more applications have
+joined the group.
+      So, for example, someone using anycasting for DNS high availability
+can add a join to the anycast group in the server and as long as the DNS server
+is running, the machine will answer to that anycast address. But the machine
+will not respond to anycasts when the service that's using it isn't available,
+so a broken server application that has exited won't deny that service if
+there are other working members of the anycast group on other hosts.
+      I don't know if that's controversial or not-- the RFC's are written
+more from the external context, but seem to imply a model along the lines of
+using "ifconfig" to add anycast addresses. I think that model doesn't fit the
+best uses of anycasting, but I'd like to hear your thoughts on it.
+      The application interface for joining and leaving anycast groups is 2
+new setsockopt() calls: IPV6_JOIN_ANYCAST and IPV6_LEAVE_ANYCAST. The arguments
+are the same as the corresponding multicast operations. The kernel keeps a
+reference count of members; when that goes to zero, the anycast address is not
+recognized as a local address. While nonzero, the host listens on the solicited
+node for that address, sends advertisements in response to solicitations (with
+override=0) and delivers packets sent to the anycast address to upper layers.
+      There's also an in-kernel interface described below, which is used by
+IPv6 mobility, for example.
+2) Security Model
+      RFC 2373 states:
+"
+o An anycast address must not be assigned to an IPv6 host, that is, it may be
+  assigned to an IPv6 router only."
+      This patch violates this in 1 special case, and I'll explain why.
+a) The restriction on host use of anycast is to avoid carrying individual host
+      routes for anycast addresses spread out among multiple physical
+      networks. I think the initial application sets are exactly things that
+      won't be on off-the-shelf routers (high availabily servers (DNS, http,
+      etc) and mobile IPv6) and the particular cases don't have the problem of
+      requiring host routes or participation in the routing system. They use
+      anycast addresses with a prefix common to a unicast address on the
+      system, so ordinary routing gets you to the right network, anyway, and
+      there's no external penalty on the routing system for using those types
+      of anycast addresses. For that reason, I allow anycast addresses that
+      match an existing unicast prefix even on hosts.
+      Finally (for security considerations), I had to choose whether anycast
+should require root privilege or not. Multicasting does not, but it'd obviously
+be a spoofing issue if an application joined an "anycast" that was actually the
+unicast address of another machine on that network. On the other hand, it's
+handy for non-root users to be able to make use of anycasting where that use
+doesn't pose any security risks.
+      The code below allows non-root users to join anycast groups that have
+matching prefixes (don't require special-route propagation) with existing
+unicast addresses,  and require root (really "CAP_NET_ADMIN") and a router for
+off-link anycasts (disallowed completely on hosts). I think that should be
+extended to require CAP_NET_ADMIN for any anycasts (even on-link ones) that are
+not well-known anycasts (to avoid the spoofing of on-link unicast addresses).
+4) The Implementation
+      The code maintains a list of anycast addresses that are in use for
+a given interface. The code is a modifed version of the existing multicast
+code, with some things cleaned up, and operations on the anycast list instead
+of the multicast list. Because the anycast address list is separate from the
+ordinary address list, anycast addresses in general won't be selected as a
+source address, or available for inappropriate uses. Protocols (like ICMP ECHO)
+that respond by swapping the source and destination address have a separate
+check for anycasts and set the source to zero in that case-- allows IPv6 to
+choose the outbound source address.
+      The code has the setsockopt() interface for joining and leaving anycast
+groups, but does not yet have changes needed for UDP and TCP to work with them.
+TCP is problematic, because the PCB lookup mechanism relies on the destination
+address which must change-- it should be disallowed initially. UDP may work
+with an INADDR_ANY-bound listener, but I haven't made changes to support it
+yet. It will probably use the anycast address as the source, so it'll need a
+modification similar to what I've done with ICMP, but should be straightforward.
+Ultimately, I think we want to allow binding to anycast addresses as well.
+      Our immediate application is mobile IPv6, so this patch doesn't include
+any of the upper-layer changes that may be needed for general application
+support.
+      For in-kernel use, applications (like mobile IPv6) can call join and
+drop functions for anycast addresses, and a function that checks if a device
+is in an anycast group (if dev == 0, checks if any device is in that group).
+      They are (similar to multicast functions):
+int ipv6_dev_ac_inc(struct net_device *dev, struct in6_addr *addr)
+      - add "addr" as an anycast address on "dev"
+int ipv6_dev_ac_dec(struct net_device *dev, struct in6_addr *addr)
+      - remove "addr" as an anycast address on "dev"
+these use reference counts, so only the first call to "inc" for a particular
+address will add a new address, and only when all references are removed via
+"dec" will the address be removed as a local address.
+      The function:
+int ipv6_chk_acast_addr(struct net_device *dev, struct in6_addr *addr)
+returns true if "addr" is an anycast address on "dev", false otherwise. If
+"dev" is 0, it searches all devices for "addr".
+      Those 3 functions provide the in-kernel interface.
+4) Things of Note
+      I think we want the ip6_addr_type() to check *only* the well-known
+anycasts, since it seems inappropriate to me that that function should be
+searching linked lists of anycast addresses. It would also need a "dev"
+argument it doesn't have now, since anycast addresses, like unicast and
+multicast addresses, in this implementation are associated with particular
+devices. Use of those address on other devices should not return type ANYCAST,
+but should for the device that has the anycast address. So, in most cases,
+ipv6_chk_acast_addr() and not ipv6_addr_type() will be more appropriate.
+      ipv6_addr_type(), with modifications included for reserved anycast
+addresses, will still be useful for cases where the address is known to
+*always* be an anycast (for example, disallowing reserved anycasts through
+"ifconfig" being set as an ordinary address), but for the lower-level code,
+it'll usually need a per-device check. So, I recommend we keep both, and use
+ipv6_chk_acast_addr() to answer if it is a configured anycast address, use
+ipv6_addr_type() to answer if the address is reserved for anycast (whether
+configured or not).
+      That's what this code does.
+5) Testing
+      I wrote programs to join and leave anycast groups and I checked through
+the /proc/net interface (file "anycast6") the presence of the groups. I've
+used network sniffers to watch the neighbor discovery sequence and verify the
+override bit is cleared, and I've tested with multiple hosts in the anycast
+group talking to an unmodifed host that pings the anycast address. I also
+verified that the existing code handles "override=0" correctly (it does).
+      In addition, our mobile IPv6 team has used the code to test the use of
+anycasting for Dynamic Home Agent address discovery, with several different
+topologies and configurations.
+      We've done tests with uniprocessor and SMP kernels on multiprocessor
+machines.
+6) TODO
+      I think the next steps are to flesh out the UDP part so ordinary
+user-level applications can make full use of anycasting.
+                              +-DLS
+(See attached file: anycast-2.5.31.patch)
+[unhandled content-type:application/octet-stream]

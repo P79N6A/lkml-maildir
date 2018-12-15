@@ -1,0 +1,181 @@
+Date: Sun, 11 Mar 2001 16:04:12 +0100 (CET)
+From: Ingo Molnar <>
+Subject: [patch] nmi-watchdog-2.4.2-A2
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2001/3/11/43
+
+On Sun, 11 Mar 2001, Andrew Morton wrote:
+> Sorry, this doesn't look right. Are you sure you booted with
+> `nmi_watchdog=1'? It was turned off by default in -ac18.
+of course i did ...
+> Two things:
+>
+> - CPU A could be doing the SYSRQ printing, while
+>   CPU B is spinning on a lock which CPU A holds. The
+>   NMI watchdog will then whack CPU B.  So touch_nmi_watchdog()
+>   needs to touch *all* CPUs.  (kbd_controller_lock, for example).
+yep, agreed.
+> - We need to touch the NMI more than once during the
+>   SYSRQ-T output - five seconds isn't enough.
+>
+>   The correctest way is, I think, to touch_nmi() in
+>   rs285_console_write(), lp_console_write() and
+>   serial_console_write().
+nope:
+>   We _could_ just touch it in show_state(), but that means
+>   we still get whacked if we do a lot of printk()s with interrupts
+>   disabled from some random place in the kernel.
+exactly, and that is a feature. We want to find all those places, because
+disabling IRQs for too long can cause problems in unrelated kernel code.
+SysRq-T is a special case so touch_nmi() is justified in that and only
+that case. The NMI watchdog is something that gives security, and we want
+to be very conservative disabling its effect.
+[i've attached nmi-watchdog-2.4.2-A2 (against -ac18) which adds your fix
+to clear all alert counters in touch_nmi_watchdog().]
+	Ingo
+--- linux/kernel/sched.c.orig	Sun Mar 11 11:49:00 2001
++++ linux/kernel/sched.c	Sun Mar 11 11:51:37 2001
+@@ -1183,8 +1183,14 @@
+ 	printk("  task                 PC        stack   pid father child younger older\n");
+ #endif
+ 	read_lock(&tasklist_lock);
+-	for_each_task(p)
++	for_each_task(p) {
++		/*
++		 * reset the NMI-timeout, listing all files on a slow
++		 * console might take alot of time:
++		 */
++		touch_nmi_watchdog();
+ 		show_task(p);
++	}
+ 	read_unlock(&tasklist_lock);
+ }
+ 
+--- linux/include/linux/irq.h.orig	Sun Mar 11 11:20:21 2001
++++ linux/include/linux/irq.h	Sun Mar 11 12:02:23 2001
+@@ -57,18 +57,16 @@
+ #include <asm/hw_irq.h> /* the arch dependent stuff */
+ 
+ /**
+- * nmi_watchdog_disable - disable NMI watchdog checking.
++ * touch_nmi_watchdog - restart NMI watchdog timeout.
+  * 
+- * If the architecture supports the NMI watchdog, nmi_watchdog_disable() may be used
+- * to temporarily disable it.  Use nmi_watchdog_enable() later on.  It is implemented
+- * via an up/down counter, so you must keep the calls balanced.
++ * If the architecture supports the NMI watchdog, touch_nmi_watchdog()
++ * may be used to reset the timeout - for code which intentionally
++ * disables interrupts for a long time. This call is stateless.
+  */
+ #ifdef ARCH_HAS_NMI_WATCHDOG
+-extern void nmi_watchdog_disable(void);
+-extern void nmi_watchdog_enable(void);
++extern void touch_nmi_watchdog(void);
+ #else
+-#define nmi_watchdog_disable() do{} while(0)
+-#define nmi_watchdog_enable() do{} while(0)
++# define touch_nmi_watchdog() do { } while(0)
+ #endif
+ 
+ extern int handle_IRQ_event(unsigned int, struct pt_regs *, struct irqaction *);
+--- linux/drivers/char/sysrq.c.orig	Sun Mar 11 11:30:46 2001
++++ linux/drivers/char/sysrq.c	Sun Mar 11 11:49:19 2001
+@@ -70,11 +70,6 @@
+ 	if (!key)
+ 		return;
+ 
+-	/*
+-	 * Interrupts are disabled, and serial consoles are slow. So
+-	 * Let's suspend the NMI watchdog.
+-	 */
+-	nmi_watchdog_disable();
+ 	console_loglevel = 7;
+ 	printk(KERN_INFO "SysRq: ");
+ 	switch (key) {
+@@ -158,7 +153,6 @@
+ 		/* Don't use 'A' as it's handled specially on the Sparc */
+ 	}
+ 
+-	nmi_watchdog_enable();
+ 	console_loglevel = orig_log_level;
+ }
+ 
+--- linux/arch/i386/kernel/nmi.c.orig	Sun Mar 11 11:24:34 2001
++++ linux/arch/i386/kernel/nmi.c	Sun Mar 11 17:57:41 2001
+@@ -226,37 +226,40 @@
+ }
+ 
+ static spinlock_t nmi_print_lock = SPIN_LOCK_UNLOCKED;
+-static atomic_t nmi_watchdog_disabled = ATOMIC_INIT(0);
+ 
+-void nmi_watchdog_disable(void)
+-{
+-	atomic_inc(&nmi_watchdog_disabled);
+-}
++/*
++ * the best way to detect wether a CPU has a 'hard lockup' problem
++ * is to check it's local APIC timer IRQ counts. If they are not
++ * changing then that CPU has some problem.
++ *
++ * as these watchdog NMI IRQs are generated on every CPU, we only
++ * have to check the current processor.
++ *
++ * since NMIs dont listen to _any_ locks, we have to be extremely
++ * careful not to rely on unsafe variables. The printk might lock
++ * up though, so we have to break up any console locks first ...
++ * [when there will be more tty-related locks, break them up
++ *  here too!]
++ */
++
++static unsigned int
++	last_irq_sums [NR_CPUS],
++	alert_counter [NR_CPUS];
+ 
+-void nmi_watchdog_enable(void)
++void touch_nmi_watchdog (void)
+ {
+-	atomic_dec(&nmi_watchdog_disabled);
+-}
++	int i;
+ 
+-void nmi_watchdog_tick (struct pt_regs * regs)
+-{
+ 	/*
+-	 * the best way to detect wether a CPU has a 'hard lockup' problem
+-	 * is to check it's local APIC timer IRQ counts. If they are not
+-	 * changing then that CPU has some problem.
+-	 *
+-	 * as these watchdog NMI IRQs are broadcasted to every CPU, here
+-	 * we only have to check the current processor.
+-	 *
+-	 * since NMIs dont listen to _any_ locks, we have to be extremely
+-	 * careful not to rely on unsafe variables. The printk might lock
+-	 * up though, so we have to break up any console locks first ...
+-	 * [when there will be more tty-related locks, break them up
+-	 *  here too!]
++	 * Just reset the alert counters, (other CPUs might be
++	 * spinning on locks we hold):
+ 	 */
++	for (i = 0; i < smp_num_cpus; i++)
++		alert_counter[i] = 0;
++}
+ 
+-	static unsigned int last_irq_sums [NR_CPUS],
+-				alert_counter [NR_CPUS];
++void nmi_watchdog_tick (struct pt_regs * regs)
++{
+ 
+ 	/*
+ 	 * Since current-> is always on the stack, and we always switch
+@@ -266,7 +269,7 @@
+ 
+ 	sum = apic_timer_irqs[cpu];
+ 
+-	if (last_irq_sums[cpu] == sum && atomic_read(&nmi_watchdog_disabled) == 0) {
++	if (last_irq_sums[cpu] == sum) {
+ 		/*
+ 		 * Ayiee, looks like this CPU is stuck ...
+ 		 * wait a few IRQs (5 seconds) before doing the oops ...

@@ -1,0 +1,361 @@
+Date: Sat, 31 Jul 1999 03:43:04 +0200
+From: Artur Skawina <>
+Subject: Re: sched_yield() on "SCHED_FIFO"
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/7/30/128
+
+NIIBE Yutaka wrote:
+> Kuniyasu SUZAKI writes:
+>  > The supposed action of my program depended on the Round Robin
+>  > scheduling on 1 CPU. The program produced two processes and they would
+>  > be executed alternately, because it yielded each other on 1 CPU.  The
+>  > main problem is one process monopolied a CPU even if it executed
+>  > sched_yield().
+>         if (current->policy == SCHED_OTHER)         <---------- This line.
+>                 current->policy |= SCHED_YIELD;
+> Without this conditional (set SCHED_YIELD flag regardless of policy),
+> I guess it works fine.
+That line is there to prevent SCHED_OTHER processes from running when
+a RT process yield()s, and simply removing it is wrong.
+Now, the problem is real -- sched_yield() doesn't yield to _another_
+_realtime_ thread (with equal priority).
+With my recent goodness() change, the fix for this was a two-liner.
+(removing the check in sched_yield() and making prev_goodness return
+ rt_priority makes everything magically work).
+But the problem isn't really that RT processes don't yield() -- the
+problem is that _normal_ processes don't yield. IOW sched_yield()
+doesn't do what you might think it does, even for SCHED_OTHER
+processes...
+It goes like this: a process sched_yield()s, is moved to the back of the
+runqueue, the SCHED_YIELD flag is set, it calls schedule(), where that
+flag is cleared after making the initial goodness calculation for the
+already running process be 0 (the lowest for a normal process). Then the
+scheduler goes over all processes in the runqueue and compares their
+goodness() value to the one it's already got. The yielding process is
+still on the queue... Now guess which process's goodness is often
+highest... Or, you could just run the program which came with the initial
+message in this thread, after removing the RT scheduling, on a UP box.
+The comment above prev_goodness() says "subtle". Well, "subtle" isn't
+exactly the word that comes to mind after looking at the sched_yield
+path...
+This behavior certainly makes sched_idle() look good in dumb benchmarks,
+but in real life when a thread yield()s, it expects to give up cputime
+to other runnable threads, not waste some time in the scheduler and
+continue immediately from there.
+The attached patch:
+o makes sched_idle() work correctly for RT processes. If there is
+  another RT process with equal priority, the other is selected, just
+  like you might expect.
+o makes sched_idle() ignore the currently running SCHED_OTHER process
+  when there are other SCHED_OTHER processes ready to run. Again just
+  like one might expect.
+With this patch in place, the context.c output looks like:
+[on UP (if machine is idle also when using other scheduling policies)]
+Context swicth time 28 us from 198 to 199
+Context swicth time 6 us from 199 to 198
+Context swicth time 3 us from 198 to 199
+Context swicth time 3 us from 199 to 198
+Context swicth time 3 us from 198 to 199
+Context swicth time 3 us from 199 to 198
+Context swicth time 2 us from 198 to 199
+Context swicth time 3 us from 199 to 198
+Context swicth time 3 us from 198 to 199
+The above changes should be relatively safe, at least on UP.
+The patch also contains the experimental SCHED_IDLE support. This one
+is WIP (for example there are known races; i'll look at which are
+harmless, and which not, and fix them, later). However these changes
+are contained -- unless you set a tasks policy to SCHED_IDLE they
+don't change behavior. In this version only root can select this
+policy (to prevent normal users from shooting themselves in the foot
+by starting idle tasks in the foreground when the cpu is busy :) [you
+can use a suid wrapper if you have to], and of course because it's
+just a dirty hack for now).
+[and yes, sched_idle() does the right thing for idle processes too]
+[patch vs stock 2.3.12, should work with 2.2 too, after fixing the
+ few obvious rejects.
+ You could also safely ignore all changes to files other than
+ sched.[ch] and leave out (SCHED|PF)_IDLE additions if you don't
+ want to experiment with that (the setscheduler/sys_sched_getparam
+ changes are needed even then)]
+diff -urNp --exclude-from /usr/src/lkdontdiff /img/linux-2.3.12/arch/i386/kernel/entry.S linux-2.3.12as/arch/i386/kernel/entry.S
+--- /img/linux-2.3.12/arch/i386/kernel/entry.S	Thu Jul 22 21:47:28 1999
++++ linux-2.3.12as/arch/i386/kernel/entry.S	Fri Jul 30 16:10:51 1999
+@@ -172,7 +172,7 @@ ENTRY(system_call)
+ 	GET_CURRENT(%ebx)
+ 	cmpl $(NR_syscalls),%eax
+ 	jae badsys
+-	testb $0x20,flags(%ebx)		# PF_TRACESYS
++	testb $0x28,flags(%ebx)		# PF_TRACESYS|PF_IDLE
+ 	jne tracesys
+ 	call *SYMBOL_NAME(sys_call_table)(,%eax,4)
+ 	movl %eax,EAX(%esp)		# save the return value
+diff -urNp --exclude-from /usr/src/lkdontdiff /img/linux-2.3.12/arch/i386/kernel/ptrace.c linux-2.3.12as/arch/i386/kernel/ptrace.c
+--- /img/linux-2.3.12/arch/i386/kernel/ptrace.c	Thu Jul 22 21:47:28 1999
++++ linux-2.3.12as/arch/i386/kernel/ptrace.c	Fri Jul 30 16:10:51 1999
+@@ -461,9 +461,17 @@ out:
+ 
+ asmlinkage void syscall_trace(void)
+ {
++	if (current->flags & PF_IDLE) {
++		if (current->policy==SCHED_IDLE)      /* idle process entering kernel.*/
++			current->policy = SCHED_OTHER;/* be good. */
++		else                                  /* idle process returning from syscall. */
++			current->policy = SCHED_IDLE; /* bad process. very bad process. */
++	}
++
+ 	if ((current->flags & (PF_PTRACED|PF_TRACESYS))
+ 			!= (PF_PTRACED|PF_TRACESYS))
+ 		return;
++
+ 	current->exit_code = SIGTRAP;
+ 	current->state = TASK_STOPPED;
+ 	notify_parent(current, SIGCHLD);
+diff -urNp --exclude-from /usr/src/lkdontdiff /img/linux-2.3.12/include/linux/sched.h linux-2.3.12as/include/linux/sched.h
+--- /img/linux-2.3.12/include/linux/sched.h	Fri Jul 30 20:55:51 1999
++++ linux-2.3.12as/include/linux/sched.h	Fri Jul 30 19:28:19 1999
+@@ -89,6 +89,7 @@ extern int last_pid;
+ #define SCHED_OTHER		0
+ #define SCHED_FIFO		1
+ #define SCHED_RR		2
++#define SCHED_IDLE		4
+ 
+ /*
+  * This is an additional bit set when we want to
+@@ -291,7 +292,8 @@ struct task_struct {
+ 
+ 	wait_queue_head_t wait_chldexit;	/* for wait4() */
+ 	struct semaphore *vfork_sem;		/* for vfork() */
+-	unsigned long policy, rt_priority;
++	unsigned long policy;
++	long rt_priority;
+ 	unsigned long it_real_value, it_prof_value, it_virt_value;
+ 	unsigned long it_real_incr, it_prof_incr, it_virt_incr;
+ 	struct timer_list real_timer;
+@@ -344,6 +346,7 @@ struct task_struct {
+ 					/* Not implemented yet, only for 486*/
+ #define PF_STARTING	0x00000002	/* being created */
+ #define PF_EXITING	0x00000004	/* getting shut down */
++#define PF_IDLE		0x00000008	/* set for a SCHED_IDLE process */
+ #define PF_PTRACED	0x00000010	/* set if ptrace (0) has been called */
+ #define PF_TRACESYS	0x00000020	/* tracing system calls */
+ #define PF_FORKNOEXEC	0x00000040	/* forked but didn't exec */
+diff -urNp --exclude-from /usr/src/lkdontdiff /img/linux-2.3.12/kernel/sched.c linux-2.3.12as/kernel/sched.c
+--- /img/linux-2.3.12/kernel/sched.c	Thu Jul 29 16:10:43 1999
++++ linux-2.3.12as/kernel/sched.c	Sat Jul 31 00:04:22 1999
+@@ -15,6 +15,8 @@
+  *				Copyright (C) 1998  Andrea Arcangeli
+  *  1998-12-28  Implemented better SMP scheduling by Ingo Molnar
+  *  1999-03-10	Improved NTP compatibility by Ulrich Windl
++ *  1999-07-29  SCHED_IDLE support by Artur Skawina
++ *  1999-07-30  Fixed sched_yield() by Artur Skawina
+  */
+ 
+ /*
+@@ -156,17 +158,20 @@ void scheduling_functions_start_here(voi
+  *	 +1000: realtime process, select this.
+  */
+ 
++#define GOODNESS_MIN    (-1000)  /* goodness value of the real idle task(s) */
++#define GOODNESS_MAX    1000     /* max 'normal' goodness; RT processes have more */
++
+ static inline int goodness(struct task_struct * p, int this_cpu, struct mm_struct *this_mm)
+ {
+ 	int weight;
+ 
+ 	/*
+-	 * Realtime process, select the first one on the
+-	 * runqueue (taking priorities within processes
+-	 * into account).
++	 * Realtime or idle process, select the first one on the
++	 * runqueue (taking priorities within processes into
++	 * account).
+ 	 */
+ 	if (p->policy != SCHED_OTHER) {
+-		weight = 1000 + p->rt_priority;
++		weight = p->rt_priority;
+ 		goto out;
+ 	}
+ 
+@@ -209,8 +214,15 @@ out:
+ static inline int prev_goodness(struct task_struct * p, int this_cpu, struct mm_struct *this_mm)
+ {
+ 	if (p->policy & SCHED_YIELD) {
++		/* This process wants to give others a chance to run;
++		 * for SCHED_OTHER processes return 0 (note this also
++		 * causes counter recalculation if this process wins).
++		 * for FIFO, RR, and IDLE processes return their
++		 * priority - if there's another process with the same
++		 * (or higher priority) this one won't be selected.
++		 */
+ 		p->policy &= ~SCHED_YIELD;
+-		return 0;
++		return p->rt_priority;
+ 	}
+ 	return goodness(p, this_cpu, this_mm);
+ }
+@@ -678,8 +690,8 @@ handle_bh_back:
+ 
+ 	spin_lock_irq(&runqueue_lock);
+ 
+-	/* move an exhausted RR process to be last.. */
+-	if (prev->policy == SCHED_RR)
++	/* move an exhausted RR or idle process to be last.. */
++	if (prev->policy & (SCHED_RR|SCHED_IDLE))
+ 		goto move_rr_last;
+ move_rr_back:
+ 
+@@ -704,11 +716,8 @@ repeat_schedule:
+ 	 * Default process to select..
+ 	 */
+ 	next = idle_task(this_cpu);
+-	c = -1000;
+-	if (prev->state == TASK_RUNNING)
+-		goto still_running;
+-still_running_back:
+-
++	c = GOODNESS_MIN;
++	
+ 	tmp = runqueue_head.next;
+ 	while (tmp != &runqueue_head) {
+ 		p = list_entry(tmp, struct task_struct, run_list);
+@@ -720,8 +729,12 @@ still_running_back:
+ 		tmp = tmp->next;
+ 	}
+ 
++	if (prev->state == TASK_RUNNING)
++		goto still_running;
++still_running_back:
++
+ 	/* Do we need to re-calculate counters? */
+-	if (!c)
++	if (c==0)
+ 		goto recalculate;
+ 	/*
+ 	 * from this point on nothing can prevent us from
+@@ -821,8 +834,11 @@ recalculate:
+ 	goto repeat_schedule;
+ 
+ still_running:
+-	c = prev_goodness(prev, this_cpu, prev->active_mm);
+-	next = prev;
++	{
++		int g = prev_goodness(prev, this_cpu, prev->active_mm);
++		if (g>c)
++			c = g, next = prev;
++	}
+ 	goto still_running_back;
+ 
+ handle_bh:
+@@ -1715,13 +1731,13 @@ static int setscheduler(pid_t pid, int p
+ 	else {
+ 		retval = -EINVAL;
+ 		if (policy != SCHED_FIFO && policy != SCHED_RR &&
+-				policy != SCHED_OTHER)
++				policy != SCHED_OTHER && policy != SCHED_IDLE)
+ 			goto out_unlock;
+ 	}
+ 	
+ 	/*
+-	 * Valid priorities for SCHED_FIFO and SCHED_RR are 1..99, valid
+-	 * priority for SCHED_OTHER is 0.
++	 * Valid priorities for SCHED_FIFO, SCHED_RR and SCHED_IDLE
++	 * are 1..99, valid priority for SCHED_OTHER is 0.
+ 	 */
+ 	retval = -EINVAL;
+ 	if (lp.sched_priority < 0 || lp.sched_priority > 99)
+@@ -1730,7 +1746,7 @@ static int setscheduler(pid_t pid, int p
+ 		goto out_unlock;
+ 
+ 	retval = -EPERM;
+-	if ((policy == SCHED_FIFO || policy == SCHED_RR) && 
++	if ((policy == SCHED_FIFO || policy == SCHED_RR || policy == SCHED_IDLE) && 
+ 	    !capable(CAP_SYS_NICE))
+ 		goto out_unlock;
+ 	if ((current->euid != p->euid) && (current->euid != p->uid) &&
+@@ -1738,8 +1754,22 @@ static int setscheduler(pid_t pid, int p
+ 		goto out_unlock;
+ 
+ 	retval = 0;
+-	p->policy = policy;
++	/* prevent changing policy of an already idle process to SCHED_IDLE */
++	if ( (policy!=SCHED_IDLE) || !(p->flags&PF_IDLE) )
++		p->policy = policy;
+ 	p->rt_priority = lp.sched_priority;
++	switch ( policy ) /* move rt_priority into proper range, update flags */
++	{
++	case SCHED_IDLE:	p->rt_priority  += GOODNESS_MIN;
++				p->flags        |= PF_IDLE;
++				break;
++	case SCHED_RR:
++	case SCHED_FIFO:	p->rt_priority  += GOODNESS_MAX;
++	default:
++	/*case SCHED_OTHER:*/
++				p->flags        &= ~PF_IDLE;
++	}
++	
+ 	if (task_on_runqueue(p))
+ 		move_first_runqueue(p);
+ 
+@@ -1780,7 +1810,10 @@ asmlinkage int sys_sched_getscheduler(pi
+ 	if (!p)
+ 		goto out_unlock;
+ 			
+-	retval = p->policy;
++	if (p->flags & PF_IDLE)
++		retval = SCHED_IDLE;
++	else
++		retval = p->policy;
+ 
+ out_unlock:
+ 	read_unlock(&tasklist_lock);
+@@ -1805,6 +1838,12 @@ asmlinkage int sys_sched_getparam(pid_t 
+ 	if (!p)
+ 		goto out_unlock;
+ 	lp.sched_priority = p->rt_priority;
++	switch ( p->policy )
++	{
++	default: /* case SCHED_OTHER: */  if ( !(p->flags&PF_IDLE) ) break;
++	case SCHED_IDLE:                  lp.sched_priority -= GOODNESS_MIN; break;
++	case SCHED_RR: case SCHED_FIFO:   lp.sched_priority -= GOODNESS_MAX; break;
++	}
+ 	read_unlock(&tasklist_lock);
+ 
+ 	/*
+@@ -1823,8 +1862,7 @@ out_unlock:
+ asmlinkage int sys_sched_yield(void)
+ {
+ 	spin_lock_irq(&runqueue_lock);
+-	if (current->policy == SCHED_OTHER)
+-		current->policy |= SCHED_YIELD;
++	current->policy |= SCHED_YIELD;
+ 	current->need_resched = 1;
+ 	move_last_runqueue(current);
+ 	spin_unlock_irq(&runqueue_lock);
+@@ -1838,6 +1876,7 @@ asmlinkage int sys_sched_get_priority_ma
+ 	switch (policy) {
+ 	case SCHED_FIFO:
+ 	case SCHED_RR:
++	case SCHED_IDLE:
+ 		ret = 99;
+ 		break;
+ 	case SCHED_OTHER:
+@@ -1854,6 +1893,7 @@ asmlinkage int sys_sched_get_priority_mi
+ 	switch (policy) {
+ 	case SCHED_FIFO:
+ 	case SCHED_RR:
++	case SCHED_IDLE:
+ 		ret = 1;
+ 		break;
+ 	case SCHED_OTHER:
+@@ -1886,7 +1926,7 @@ asmlinkage int sys_nanosleep(struct time
+ 
+ 
+ 	if (t.tv_sec == 0 && t.tv_nsec <= 2000000L &&
+-	    current->policy != SCHED_OTHER)
++	    (current->policy & (SCHED_FIFO|SCHED_RR)))
+ 	{
+ 		/*
+ 		 * Short delay requests up to 2 ms will be handled with

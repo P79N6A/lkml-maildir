@@ -1,0 +1,251 @@
+Date: Wed, 05 Dec 2001 17:54:44 -0800
+From: "S. Parker" <>
+Subject: [PATCH] VM system in 2.4.16 doesn't try hard enough for user  memory...
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2001/12/5/296
+
+Hi,
+I'm interested in comments and feedback on this patch.
+Attached below is "memstride.c", a simple program to exercise a process which
+wishes to grow to the largest size of available VM the system can handle,
+scribble in it all.  Actually, scribble in it all several times.
+Under at least 2.4.14 -> 2.4.16, the VM system *always* over-commits to
+memstride, even on an otherwise idle system, and ends up killing it.
+This is wrong.  It should be possible for memstride to be told when
+it has over-stepped the size of the system's total VM resources, by
+having sbrk() return -1 (out of memory).
+Also attached is my proposed fix for this problem.  It has the following
+changes:
+1.  Do a better job estimating how much VM is available
+         vm_enough_memory() was changed to take the sum of all free RAM
+         and all free swap, subtract up to 1/8th of physical RAM (but not
+         more than 16MB) as a reserve for system buffers to prevent deadlock,
+         and compare this to the request.  If the VM request is <= the
+         available free stuff, then we're set.
+2.  Be willing to sleep for memory chunks larger than 8 pages.
+         __alloc_pages had an uncommented piece of code, that I couldn't
+         see any reason to have.  It doesn't matter how big the piece of
+         memory is--if we're low, and it's a sleepable request, we should
+         sleep.  Now it does.  (Can anyone explain to me why this coded was
+         added originally??)
+The combination of these two changes makes it so that memstride passes.
+Although memstride is a contrived example, it was contrived to parallel
+behavior that was seen in many situations, with many different real
+processes in normal use.  This fix allows those uncontrived programs
+to run reliably.
+#include <stdlib.h>
+#include <sys/time.h>
+#include <sys/user.h>
+#include <sys/resource.h>
+#include <unistd.h>
+scan_mem(int *base, int size)
+{
+	int sum = 0;
+	while (size > 0) {
+		sum += *base++;
+		size -= sizeof (int);
+	}
+}
+usage_report(struct rusage *prev_ru, int npages)
+{
+	struct rusage ru;
+	float fltim;
+	float ofltim;
+	int newline = 0;
+	getrusage(RUSAGE_SELF, &ru);
+	fltim = ru.ru_utime.tv_sec;
+	fltim += ((float)ru.ru_utime.tv_usec)/1.0e06;
+	ofltim = prev_ru->ru_utime.tv_sec;
+	ofltim += ((float)prev_ru->ru_utime.tv_usec)/1.0e06;
+	printf("user %.2f", fltim - ofltim);
+	fltim = ru.ru_stime.tv_sec;
+	fltim += ((float)ru.ru_stime.tv_usec)/1.0e06;
+	ofltim = prev_ru->ru_stime.tv_sec;
+	ofltim += ((float)prev_ru->ru_stime.tv_usec)/1.0e06;
+	printf(" sys %.2f", fltim - ofltim);
+	printf(" reclaims: %d faults %d swaps: %d in/out %d/%d csw %d/%d\n",
+	    ru.ru_minflt - prev_ru->ru_minflt,
+	    ru.ru_majflt - prev_ru->ru_majflt,
+	    ru.ru_nswap - prev_ru->ru_nswap,
+	    ru.ru_inblock - prev_ru->ru_inblock,
+	    ru.ru_oublock - prev_ru->ru_oublock,
+	    ru.ru_nvcsw - prev_ru->ru_nvcsw,
+	    ru.ru_nivcsw - prev_ru->ru_nivcsw);
+	if (npages == 0)
+		return; /* should not happen */
+	if (ru.ru_minflt - prev_ru->ru_minflt > 0) {
+		printf("minor flts/pg: %d ",
+		    (ru.ru_minflt - prev_ru->ru_minflt)/npages);
+		newline++;
+	}
+	if (ru.ru_majflt - prev_ru->ru_majflt > 0) {
+		printf("major flts/pg: %d ",
+		    (ru.ru_majflt - prev_ru->ru_majflt)/npages);
+		newline++;
+	}
+	if (newline) {
+		printf("\n");
+	}
+}
+#define SZ2PG(x)	((x + PAGE_SIZE - 1)/PAGE_SIZE)
+main(int argc, char *argv[])
+{
+	int size = 512;
+	int tot_size = 0;
+	int loops = 0;
+	int *p;
+	int *base = sbrk(1);
+	int max_size;
+	struct rusage ru;
+	if (argc > 1) {
+		max_size = atoi(argv[1]);
+		printf("Stop growing after crossing %d bytes\n", max_size);
+	} else {
+		max_size = 2000000000;
+	}
+	while ((p = sbrk(size)) != (int *)-1) {
+		printf("Touching %d newly allocated bytes.  Size: %d pages/%d "
+		    "bytes\n", size, SZ2PG(tot_size), tot_size);
+		memset(p, loops, size);
+		tot_size += size;
+		scan_mem(base, tot_size);
+		size <<= 1;
+		loops++;
+		if (tot_size + size > max_size)
+			break;
+	}
+	printf("Begin doing smaller chunks to finish the job...\n");
+	while (size > 4096) {
+		size >>= 1;
+		p = sbrk(size);
+		if (p == (int *)-1)
+			continue;
+		printf("Touching %d newly allocated bytes.  Size: %d pages/%d "
+		    "bytes\n", size, SZ2PG(tot_size), tot_size);
+		tot_size += size;
+	}
+	printf("Finished growing memory.  %d pages\n", SZ2PG(tot_size));
+	memset(&ru, 0, sizeof (ru));
+	usage_report(&ru, SZ2PG(tot_size));
+	getrusage(RUSAGE_SELF, &ru);
+	printf("Now scan memory... total size: %d pages/%d. bytes\n", SZ2PG(tot_size), tot_size);
+	for (loops = 5; loops > 0; loops--) {
+		scan_mem(base, tot_size);
+		/*usage_report(&ru, SZ2PG(tot_size));*/
+		/*getrusage(RUSAGE_SELF, &ru);*/
+		printf("%d scans remaining...\n", loops);
+	}
+	printf("Overall usage:  (%d pages in this run)\n", SZ2PG(tot_size));
+	memset(&ru, 0, sizeof (ru));
+	usage_report(&ru, SZ2PG(tot_size));
+}
+diff -r -c generic-2.4.16/mm/mmap.c vm-lapdog/mm/mmap.c
+*** generic-2.4.16/mm/mmap.c	Sun Nov  4 10:17:20 2001
+--- vm-lapdog/mm/mmap.c	Sun Dec  2 22:10:46 2001
+***************
+*** 62,93 ****
+  	 */
+  
+  	unsigned long free;
+  	
+          /* Sometimes we want to use more memory than we have. */
+  	if (sysctl_overcommit_memory)
+  	    return 1;
+  
+- 	/* The page cache contains buffer pages these days.. */
+- 	free = atomic_read(&page_cache_size);
+- 	free += nr_free_pages();
+- 	free += nr_swap_pages;
+- 	/*
+- 	 * This double-counts: the nrpages are both in the page-cache
+- 	 * and in the swapper space. At the same time, this compensates
+- 	 * for the swap-space over-allocation (ie "nr_swap_pages" being
+- 	 * too small.
+- 	 */
+- 	free += swapper_space.nrpages;
+  	/*
+! 	 * The code below doesn't account for free space in the inode
+! 	 * and dentry slab cache, slab cache fragmentation, inodes and
+! 	 * dentries which will become freeable under VM load, etc.
+! 	 * Lets just hope all these (complex) factors balance out...
+  	 */
+! 	free += (dentry_stat.nr_unused * sizeof(struct dentry)) >> PAGE_SHIFT;
+! 	free += (inodes_stat.nr_unused * sizeof(struct inode)) >> PAGE_SHIFT;
+  
+  	return free > pages;
+  }
+--- 62,98 ----
+  	 */
+  
+  	unsigned long free;
++ 	unsigned long free_pages;
+  	
+          /* Sometimes we want to use more memory than we have. */
+  	if (sysctl_overcommit_memory)
+  	    return 1;
+  
+  	/*
+! 	 * Um... how about a better algorithm yet.
+! 	 * Start with the theoretical maximum--size of RAM + size of swap.
+! 	 * Reduce the RAM by 1/8, up to a maximum of MAX_OS_RESERVED_MEM
+! 	 * (16MB) to allow for the OS to have *some* work to get stuff
+! 	 * done with.
+  	 */
+! #define	MAX_OS_RESERVED_MEM	4096 /* in pages */
+! 	free_pages = nr_free_pages();
+! 	if (free_pages < (max_mapnr >> 3)) { /* free_pages < 1/8 physical */
+! 		free = nr_swap_pages + swapper_space.nrpages; /* take swap free */
+! 		/*
+! 		 * Now compensate for the RAM short-fall...
+! 		 */
+! 		if (free > ((max_mapnr >> 3) - free_pages)) { /* swap > RAM shortfall */
+! 			free -= (max_mapnr >> 3) - free_pages;
+! 		} else {
+! 			free = 0;
+! 		}
+! 	} else {
+! 		free = free_pages - (max_mapnr >> 3);
+! 		if (free > MAX_OS_RESERVED_MEM)
+! 			free = MAX_OS_RESERVED_MEM;
+! 		free += nr_swap_pages + swapper_space.nrpages;
+! 	}
+  
+  	return free > pages;
+  }
+diff -r -c generic-2.4.16/mm/page_alloc.c vm-lapdog/mm/page_alloc.c
+*** generic-2.4.16/mm/page_alloc.c	Mon Nov 19 16:35:40 2001
+--- vm-lapdog/mm/page_alloc.c	Sun Dec  2 18:50:29 2001
+***************
+*** 389,397 ****
+  		}
+  	}
+  
+! 	/* Don't let big-order allocations loop */
+! 	if (order > 3)
+! 		return NULL;
+  
+  	/* Yield for kswapd, and try again */
+  	current->policy |= SCHED_YIELD;
+--- 389,405 ----
+  		}
+  	}
+  
+! 	/*
+! 	 * So this is a sleep-able request for memory--we're presuming
+! 	 * that vm_enough_memory() hasn't indicated more available VM
+! 	 * than we actually have, or this process could end up looping
+! 	 * here.  On the other hand, that's far less detrimental than
+! 	 * killing processes!
+! 	 *
+! 	 * More ideal would be if vm_enough_memory() decreased the
+! 	 * available memory counts, but allowed *that* request to
+! 	 * claim those pages as if they were free.
+! 	 */
+  
+  	/* Yield for kswapd, and try again */
+  	current->policy |= SCHED_YIELD;
+Cheers,
+	~sparker

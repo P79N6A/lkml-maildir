@@ -1,0 +1,452 @@
+Date: Sun, 14 Mar 1999 20:02:40 +0100 (CET)
+From: Andrea Arcangeli <>
+Subject: [patch] /proc race fixes [Re: sleeping while holding a rwspinlock?]
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/3/14/58
+
+On Sun, 14 Mar 1999, Tigran Aivazian wrote:
+>I understand that the answer is No. (first from the Schimmel's book and
+>then from Andi's email).
+>
+>Well, it turns out that for read_maps() it does not really matter as it
+>tries to get a GFP_KERNEL page *before* getting the lock so we never sleep
+>holding a lock.
+>
+>Therefore, I shall redo my previous fs/proc/array.c 
+>"tasklist_lock FIXMEs fixed" patch with one major
+>difference - this time I *know* exactly what I am doing :)
+I think to have just fixed _safely_ all races of array.c at 2.2.0 time.
+They all are in my arca-tree patches from ages. I don't know if Linus
+wants to add them to the stock kernel.
+Here it is my longstanding patch that I am using all the time under any
+kind of load in SMP without _one_ problem.
+The patch will apply without rejects to 2.2.3:
+Index: array.c
+===================================================================
+RCS file: /var/cvs/linux/fs/proc/array.c,v
+retrieving revision 1.1.1.6
+diff -u -r1.1.1.6 array.c
+--- array.c	1999/03/09 01:31:56	1.1.1.6
++++ linux/fs/proc/array.c	1999/03/14 18:54:56
+@@ -386,21 +387,57 @@
+ 	return sprintf(buffer, "%s\n", saved_command_line);
+ }
+ 
+-static unsigned long get_phys_addr(struct task_struct * p, unsigned long ptr)
++/*
++ * Caller must release_mm the mm_struct later.
++ * You don't get any access to init_mm.
++ */
++static struct mm_struct * grab_mm(int pid)
++{
++	struct mm_struct * mm;
++	struct task_struct * tsk;
++
++	if (current->pid == pid)
++		return current->mm;
++
++	mm = NULL;
++	read_lock(&tasklist_lock);
++	tsk = find_task_by_pid(pid);
++	/*
++	 * NOTE: this doesn't race because we are protected by the
++	 * big kernel lock. -arca
++	 */
++	if (tsk && tsk->mm && tsk->mm != &init_mm)
++		mmget(mm = tsk->mm);
++	read_unlock(&tasklist_lock);
++	if (mm)
++		down(&mm->mmap_sem);
++	return mm;
++}
++
++static void release_mm(struct mm_struct *mm)
+ {
++	if (current->mm != mm)
++	{
++		up(&mm->mmap_sem);
++		mmput(mm);
++	}
++}
++
++static unsigned long get_phys_addr(struct mm_struct *mm, unsigned long ptr)
++{
+ 	pgd_t *page_dir;
+ 	pmd_t *page_middle;
+ 	pte_t pte;
+ 
+-	if (!p || !p->mm || ptr >= TASK_SIZE)
++	if (ptr >= TASK_SIZE)
+ 		return 0;
+ 	/* Check for NULL pgd .. shouldn't happen! */
+-	if (!p->mm->pgd) {
+-		printk("get_phys_addr: pid %d has NULL pgd!\n", p->pid);
++	if (!mm->pgd) {
++		printk(KERN_DEBUG "missing pgd for mm %p\n", mm);
+ 		return 0;
+ 	}
+ 
+-	page_dir = pgd_offset(p->mm,ptr);
++	page_dir = pgd_offset(mm,ptr);
+ 	if (pgd_none(*page_dir))
+ 		return 0;
+ 	if (pgd_bad(*page_dir)) {
+@@ -422,7 +459,7 @@
+ 	return pte_page(pte) + (ptr & ~PAGE_MASK);
+ }
+ 
+-static int get_array(struct task_struct *p, unsigned long start, unsigned long end, char * buffer)
++static int get_array(struct mm_struct *mm, unsigned long start, unsigned long end, char * buffer)
+ {
+ 	unsigned long addr;
+ 	int size = 0, result = 0;
+@@ -431,7 +468,7 @@
+ 	if (start >= end)
+ 		return result;
+ 	for (;;) {
+-		addr = get_phys_addr(p, start);
++		addr = get_phys_addr(mm, start);
+ 		if (!addr)
+ 			return result;
+ 		do {
+@@ -453,27 +490,28 @@
+ 
+ static int get_env(int pid, char * buffer)
+ {
+-	struct task_struct *p;
+-	
+-	read_lock(&tasklist_lock);
+-	p = find_task_by_pid(pid);
+-	read_unlock(&tasklist_lock);	/* FIXME!! This should be done after the last use */
++	struct mm_struct *mm;
++	int res = 0;
+ 
+-	if (!p || !p->mm)
+-		return 0;
+-	return get_array(p, p->mm->env_start, p->mm->env_end, buffer);
++	mm = grab_mm(pid);
++	if (mm) {
++		res = get_array(mm, mm->env_start, mm->env_end, buffer);
++		release_mm(mm);
++	}
++	return res;
+ }
+ 
+ static int get_arg(int pid, char * buffer)
+ {
+-	struct task_struct *p;
++	struct mm_struct *mm;
++	int res = 0;
+ 
+-	read_lock(&tasklist_lock);
+-	p = find_task_by_pid(pid);
+-	read_unlock(&tasklist_lock);	/* FIXME!! This should be done after the last use */
+-	if (!p || !p->mm)
+-		return 0;
+-	return get_array(p, p->mm->arg_start, p->mm->arg_end, buffer);
++	mm = grab_mm(pid);
++	if (mm) {
++		res = get_array(mm, mm->arg_start, mm->arg_end, buffer);
++		release_mm(mm);
++	}
++	return res;
+ }
+ 
+ /*
+@@ -722,12 +719,10 @@
+ 	return buffer;
+ }
+ 
+-static inline char * task_mem(struct task_struct *p, char *buffer)
++static inline char * task_mem(struct mm_struct * mm, char *buffer)
+ {
+-	struct mm_struct * mm = p->mm;
+-
+-	if (mm && mm != &init_mm) {
+-		struct vm_area_struct * vma = mm->mmap;
++	if (mm) {
++		struct vm_area_struct * vma;
+ 		unsigned long data = 0, stack = 0;
+ 		unsigned long exec = 0, lib = 0;
+ 
+@@ -817,47 +812,96 @@
+ 			    cap_t(p->cap_effective));
+ }
+ 
++static struct task_struct *grab_task(int pid, struct mm_struct ** mm)
++{
++	struct task_struct *tsk = current;
++	
++	if (current->pid == pid)
++	{
++		*mm = current->mm;
++		return current;
++	}
+ 
++	*mm = NULL;
++	read_lock(&tasklist_lock);
++	tsk = find_task_by_pid(pid);
++	if (tsk)
++	{
++		struct mm_struct * __mm;
++		struct page * page = mem_map + MAP_NR(tsk);
++		atomic_inc(&page->count);
++		/*
++		 * NOTE: this doesn't race because we are protected
++		 * by the big kernel lock. -arca
++		 */
++		__mm = tsk->mm;
++		if (__mm && __mm != &init_mm)
++		{
++			mmget(__mm);
++			*mm = __mm;
++		}
++	}
++	read_unlock(&tasklist_lock);
++	if (*mm)
++		down(&(*mm)->mmap_sem);
++
++	return tsk;
++}
++
++static void release_task(struct task_struct *tsk, struct mm_struct * mm)
++{
++	if (current != tsk)
++	{
++		if (mm)
++		{
++			up(&mm->mmap_sem);
++			mmput(mm);
++		}
++		free_pages((unsigned long) tsk, 1);
++	}
++}
++
+ static int get_status(int pid, char * buffer)
+ {
+ 	char * orig = buffer;
+ 	struct task_struct *tsk;
+-
+-	read_lock(&tasklist_lock);
+-	tsk = find_task_by_pid(pid);
+-	read_unlock(&tasklist_lock);	/* FIXME!! This should be done after the last use */
++	struct mm_struct * mm;
++	
++	tsk = grab_task(pid, &mm);
+ 	if (!tsk)
+ 		return 0;
+ 	buffer = task_name(tsk, buffer);
+ 	buffer = task_state(tsk, buffer);
+-	buffer = task_mem(tsk, buffer);
++	buffer = task_mem(mm, buffer);
+ 	buffer = task_sig(tsk, buffer);
+ 	buffer = task_cap(tsk, buffer);
++	release_task(tsk, mm);
+ 	return buffer - orig;
+ }
+ 
+ static int get_stat(int pid, char * buffer)
+ {
+ 	struct task_struct *tsk;
++	struct mm_struct * mm;
+ 	unsigned long vsize, eip, esp, wchan;
+ 	long priority, nice;
+ 	int tty_pgrp;
+ 	sigset_t sigign, sigcatch;
+ 	char state;
++	int res;
+ 
+-	read_lock(&tasklist_lock);
+-	tsk = find_task_by_pid(pid);
+-	read_unlock(&tasklist_lock);	/* FIXME!! This should be done after the last use */
++	tsk = grab_task(pid, &mm);
+ 	if (!tsk)
+ 		return 0;
+ 	state = *get_task_state(tsk);
+ 	vsize = eip = esp = 0;
+-	if (tsk->mm && tsk->mm != &init_mm) {
+-		struct vm_area_struct *vma = tsk->mm->mmap;
+-		while (vma) {
++	if (mm) {
++		struct vm_area_struct *vma;
++
++		for (vma = mm->mmap; vma; vma = vma->vm_next) {
+ 			vsize += vma->vm_end - vma->vm_start;
+-			vma = vma->vm_next;
+ 		}
++		
+ 		eip = KSTK_EIP(tsk);
+ 		esp = KSTK_ESP(tsk);
+ 	}
+@@ -878,7 +922,7 @@
+ 	nice = tsk->priority;
+ 	nice = 20 - (nice * 20 + DEF_PRIORITY / 2) / DEF_PRIORITY;
+ 
+-	return sprintf(buffer,"%d (%s) %c %d %d %d %d %d %lu %lu \
++	res = sprintf(buffer,"%d (%s) %c %d %d %d %d %d %lu %lu \
+ %lu %lu %lu %lu %lu %ld %ld %ld %ld %ld %ld %lu %lu %ld %lu %lu %lu %lu %lu \
+ %lu %lu %lu %lu %lu %lu %lu %lu %d\n",
+ 		pid,
+@@ -904,11 +948,11 @@
+ 		tsk->it_real_value,
+ 		tsk->start_time,
+ 		vsize,
+-		tsk->mm ? tsk->mm->rss : 0, /* you might want to shift this left 3 */
++		mm ? mm->rss : 0, /* you might want to shift this left 3 */
+ 		tsk->rlim ? tsk->rlim[RLIMIT_RSS].rlim_cur : 0,
+-		tsk->mm ? tsk->mm->start_code : 0,
+-		tsk->mm ? tsk->mm->end_code : 0,
+-		tsk->mm ? tsk->mm->start_stack : 0,
++		mm ? mm->start_code : 0,
++		mm ? mm->end_code : 0,
++		mm ? mm->start_stack : 0,
+ 		esp,
+ 		eip,
+ 		/* The signal information here is obsolete.
+@@ -923,6 +967,9 @@
+ 		tsk->nswap,
+ 		tsk->cnswap,
+ 		tsk->exit_signal);
++
++	release_task(tsk, mm);
++	return res;
+ }
+ 		
+ static inline void statm_pte_range(pmd_t * pmd, unsigned long address, unsigned long size,
+@@ -1000,19 +1047,15 @@
+ 
+ static int get_statm(int pid, char * buffer)
+ {
+-	struct task_struct *tsk;
+ 	int size=0, resident=0, share=0, trs=0, lrs=0, drs=0, dt=0;
++	struct mm_struct *mm;
+ 
+-	read_lock(&tasklist_lock);
+-	tsk = find_task_by_pid(pid);
+-	read_unlock(&tasklist_lock);	/* FIXME!! This should be done after the last use */
+-	if (!tsk)
+-		return 0;
+-	if (tsk->mm && tsk->mm != &init_mm) {
+-		struct vm_area_struct * vma = tsk->mm->mmap;
++	mm = grab_mm(pid);
++	if (mm) {
++		struct vm_area_struct * vma = mm->mmap;
+ 
+ 		while (vma) {
+-			pgd_t *pgd = pgd_offset(tsk->mm, vma->vm_start);
++			pgd_t *pgd = pgd_offset(mm, vma->vm_start);
+ 			int pages = 0, shared = 0, dirty = 0, total = 0;
+ 
+ 			statm_pgd_range(pgd, vma->vm_start, vma->vm_end, &pages, &shared, &dirty, &total);
+@@ -1030,6 +1073,7 @@
+ 				drs += pages;
+ 			vma = vma->vm_next;
+ 		}
++		release_mm(mm);
+ 	}
+ 	return sprintf(buffer,"%d %d %d %d %d %d %d\n",
+ 		       size, resident, share, trs, lrs, drs, dt);
+@@ -1067,16 +1111,15 @@
+ 
+ #define MAPS_LINE_MAX	MAPS_LINE_MAX8
+ 
+-
+ static ssize_t read_maps (int pid, struct file * file, char * buf,
+ 			  size_t count, loff_t *ppos)
+ {
+-	struct task_struct *p;
++	struct task_struct * p;
++	struct mm_struct * mm;
+ 	struct vm_area_struct * map, * next;
+ 	char * destptr = buf, * buffer;
+ 	loff_t lineno;
+ 	ssize_t column, i;
+-	int volatile_task;
+ 	long retval;
+ 
+ 	/*
+@@ -1088,24 +1131,19 @@
+ 		goto out;
+ 
+ 	retval = -EINVAL;
+-	read_lock(&tasklist_lock);
+-	p = find_task_by_pid(pid);
+-	read_unlock(&tasklist_lock);	/* FIXME!! This should be done after the last use */
++	p = grab_task(pid, &mm);
+ 	if (!p)
+ 		goto freepage_out;
+ 
+-	if (!p->mm || p->mm == &init_mm || count == 0)
++	if (!mm || count == 0)
+ 		goto getlen_out;
+ 
+-	/* Check whether the mmaps could change if we sleep */
+-	volatile_task = (p != current || atomic_read(&p->mm->count) > 1);
+-
+ 	/* decode f_pos */
+ 	lineno = *ppos >> MAPS_LINE_SHIFT;
+ 	column = *ppos & (MAPS_LINE_LENGTH-1);
+ 
+ 	/* quickly go to line lineno */
+-	for (map = p->mm->mmap, i = 0; map && (i < lineno); map = map->vm_next, i++)
++	for (map = mm->mmap, i = 0; map && (i < lineno); map = map->vm_next, i++)
+ 		continue;
+ 
+ 	for ( ; map ; map = next ) {
+@@ -1176,18 +1214,13 @@
+ 		/* done? */
+ 		if (count == 0)
+ 			break;
+-
+-		/* By writing to user space, we might have slept.
+-		 * Stop the loop, to avoid a race condition.
+-		 */
+-		if (volatile_task)
+-			break;
+ 	}
+ 
+ 	/* encode f_pos */
+ 	*ppos = (lineno << MAPS_LINE_SHIFT) + column;
+ 
+ getlen_out:
++	release_task(p, mm);
+ 	retval = destptr - buf;
+ 
+ freepage_out:
+@@ -1199,15 +1232,12 @@
+ #ifdef __SMP__
+ static int get_pidcpu(int pid, char * buffer)
+ {
+-	struct task_struct * tsk = current ;
++	struct task_struct * tsk;
++	struct mm_struct * mm;
+ 	int i, len;
+ 
+-	read_lock(&tasklist_lock);
+-	if (pid != tsk->pid)
+-		tsk = find_task_by_pid(pid);
+-	read_unlock(&tasklist_lock);	/* FIXME!! This should be done after the last use */
+-
+-	if (tsk == NULL)
++	tsk = grab_task(pid, &mm);
++	if (!tsk)
+ 		return 0;
+ 
+ 	len = sprintf(buffer,
+@@ -1221,6 +1251,7 @@
+ 			tsk->per_cpu_utime[cpu_logical_map(i)],
+ 			tsk->per_cpu_stime[cpu_logical_map(i)]);
+ 
++	release_task(tsk, mm);
+ 	return len;
+ }
+ #endif
+Andrea Arcangeli
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

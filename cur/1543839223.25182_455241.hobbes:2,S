@@ -1,0 +1,1003 @@
+Date: Fri, 18 Aug 2006 14:27:43 +0100
+From: "Catalin Marinas" <>
+Subject: Re: [PATCH 2.6.18-rc4 00/10] Kernel memory leak detector 0.9
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2006/8/18/160
+
+On 18/08/06, Michal Piotrowski <michal.k.k.piotrowski@gmail.com> wrote:
+> Something doesn't work. It appears while udev start.
+Could you try the attached patch? It has some improvements from the
+yesterday's one and also prints extra information when that error
+happens.
+Thanks.
+-- 
+Catalin
+diff --git a/mm/memleak.c b/mm/memleak.c
+index 514280f..ffa4bdd 100644
+--- a/mm/memleak.c
++++ b/mm/memleak.c
+@@ -16,6 +16,18 @@
+  * You should have received a copy of the GNU General Public License
+  * along with this program; if not, write to the Free Software
+  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
++ *
++ *
++ * Notes on locking: kmemleak needs to allocate/free memory for its
++ * own data structures - the memleak_pointer and the pointer and
++ * aliases radix trees. The memleak_free hook can be called from
++ * mm/slab.c with the list_lock held (i.e. when releasing of off-slab
++ * management structures) and it will ackquire the memleak_lock. To
++ * avoid deadlocks caused by locking dependency, the list_lock must
++ * not be acquired while memleak_lock is held. This is ensured by not
++ * allocating any memory while memleak_lock is held. The radix trees
++ * have to be preloaded before acquiring the lock so that the
++ * insertion won't allocate memory.
+  */
+ 
+ /* #define DEBUG */
+@@ -37,6 +49,7 @@ #include <linux/seq_file.h>
+ #include <linux/vmalloc.h>
+ #include <linux/mutex.h>
+ #include <linux/cpumask.h>
++#include <linux/spinlock.h>
+ 
+ #include <asm/bitops.h>
+ #include <asm/sections.h>
+@@ -128,6 +141,7 @@ static inline int color_black(const stru
+ 
+ /* Tree storing the pointer aliases indexed by size */
+ static RADIX_TREE(alias_tree, GFP_ATOMIC);
++static DEFINE_RWLOCK(alias_tree_lock);
+ /* Tree storing all the possible pointers, indexed by the pointer value */
+ static RADIX_TREE(pointer_tree, GFP_ATOMIC);
+ /* The list of all allocated pointers */
+@@ -136,8 +150,8 @@ static LIST_HEAD(pointer_list);
+ static LIST_HEAD(gray_list);
+ 
+ static struct kmem_cache *pointer_cache;
+-/* Used to avoid recursive call via the kmalloc/kfree functions */
+-static spinlock_t memleak_lock = SPIN_LOCK_UNLOCKED;
++/* The main lock for protecting the pointer lists and radix trees */
++static DEFINE_SPINLOCK(memleak_lock);
+ static cpumask_t memleak_cpu_mask = CPU_MASK_NONE;
+ static DEFINE_MUTEX(memleak_mutex);
+ static atomic_t memleak_initialized = ATOMIC_INIT(0);
+@@ -171,7 +185,7 @@ static inline void dump_symbol_name(unsi
+ }
+ #endif
+ 
+-#ifdef DEBUG
++#if 1
+ static inline void dump_pointer_internals(struct memleak_pointer *pointer)
+ {
+ 	struct memleak_alias *alias;
+@@ -181,9 +195,12 @@ static inline void dump_pointer_internal
+ 	printk(KERN_NOTICE "  ref_count = %d\n", pointer->ref_count);
+ 	printk(KERN_NOTICE "  count = %d\n", pointer->count);
+ 	printk(KERN_NOTICE "  aliases:\n");
+-	if (pointer->alias_list)
+-		hlist_for_each_entry(alias, elem, pointer->alias_list, node)
++	if (pointer->alias_list) {
++		rcu_read_lock();
++		hlist_for_each_entry_rcu(alias, elem, pointer->alias_list, node)
+ 			printk(KERN_NOTICE "    0x%lx\n", alias->offset);
++		rcu_read_unlock();
++	}
+ }
+ #else
+ static inline void dump_pointer_internals(struct memleak_pointer *pointer)
+@@ -213,45 +230,81 @@ static int insert_alias(unsigned long ty
+ {
+ 	int ret = 0;
+ 	struct hlist_head *alias_list;
++	struct hlist_node *elem;
+ 	struct memleak_alias *alias;
++	unsigned long flags;
++	unsigned int cpu_id;
+ 
+-	if (type_id == 0 || offset == 0 || offset >= ml_sizeof(type_id)) {
+-		ret = -EINVAL;
+-		goto out;
+-	}
++	if (type_id == 0 || offset == 0 || offset >= ml_sizeof(type_id))
++		return -EINVAL;
++
++	/* no recursive re-entrance on the same CPU. We do not track
++	 * the alias tree allocations */
++	local_irq_save(flags);
++	cpu_id = get_cpu();
++	if (cpu_test_and_set(cpu_id, memleak_cpu_mask))
++		BUG();
+ 
+ 	offset &= ~(BYTES_PER_WORD - 1);
+ 
++	read_lock(&alias_tree_lock);
+ 	alias_list = radix_tree_lookup(&alias_tree, type_id);
+-	if (alias_list) {
+-		struct hlist_node *elem;
++	read_unlock(&alias_tree_lock);
+ 
+-		hlist_for_each_entry(alias, elem, alias_list, node) {
+-			if (alias->offset == offset) {
+-				ret = -EEXIST;
+-				goto out;
+-			}
+-		}
+-	} else {
++	if (!alias_list) {
++		/* no alias list for this type id. Allocate list_head
++		 * and preload the radix tree */
+ 		alias_list = kmalloc(sizeof(*alias_list), GFP_ATOMIC);
+ 		if (!alias_list)
+-			panic("kmemleak: cannot allocate initial memory\n");
++			panic("kmemleak: cannot allocate alias_list\n");
+ 		INIT_HLIST_HEAD(alias_list);
+ 
+-		ret = radix_tree_insert(&alias_tree, type_id, alias_list);
++		ret = radix_tree_preload(GFP_ATOMIC);
+ 		if (ret)
++			panic("kmemleak: cannot preload the aliases radix tree: %d\n", ret);
++
++		write_lock(&alias_tree_lock);
++		ret = radix_tree_insert(&alias_tree, type_id, alias_list);
++		write_unlock(&alias_tree_lock);
++
++		radix_tree_preload_end();
++
++		if (ret == -EEXIST) {
++			/* allocated in the meantime on a different CPU */
++			read_lock(&alias_tree_lock);
++			alias_list = radix_tree_lookup(&alias_tree, type_id);
++			read_unlock(&alias_tree_lock);
++		} else if (ret)
+ 			panic("kmemleak: cannot insert into the aliases radix tree: %d\n", ret);
+ 	}
+ 
++	BUG_ON(!alias_list);
++
++	rcu_read_lock();
++	hlist_for_each_entry_rcu(alias, elem, alias_list, node) {
++		if (alias->offset == offset) {
++			rcu_read_unlock();
++			ret = -EEXIST;
++			goto out;
++		}
++	}
++	rcu_read_unlock();
++
+ 	alias = kmalloc(sizeof(*alias), GFP_ATOMIC);
+ 	if (!alias)
+ 		panic("kmemleak: cannot allocate initial memory\n");
+ 	INIT_HLIST_NODE(&alias->node);
+ 	alias->offset = offset;
+ 
+-	hlist_add_head(&alias->node, alias_list);
++	write_lock(&alias_tree_lock);
++	hlist_add_head_rcu(&alias->node, alias_list);
++	write_unlock(&alias_tree_lock);
+ 
+  out:
++	cpu_clear(cpu_id, memleak_cpu_mask);
++	put_cpu_no_resched();
++	local_irq_restore(flags);
++
+ 	return ret;
+ }
+ 
+@@ -261,18 +314,12 @@ void memleak_insert_aliases(struct memle
+ {
+ 	struct memleak_offset *ml_off;
+ 	int i = 0;
++#ifdef CONFIG_DEBUG_MEMLEAK_SECONDARY_ALIASES
+ 	unsigned long flags;
+-	unsigned int cpu_id;
++#endif
+ 
+ 	pr_debug("%s(0x%p, 0x%p)\n", __FUNCTION__, ml_off_start, ml_off_end);
+ 
+-	spin_lock_irqsave(&memleak_lock, flags);
+-
+-	/* do not track the kmemleak allocated pointers */
+-	cpu_id = smp_processor_id();
+-	if (cpu_test_and_set(cpu_id, memleak_cpu_mask))
+-		BUG();
+-
+ 	/* primary aliases - container_of(member) */
+ 	for (ml_off = ml_off_start; ml_off < ml_off_end; ml_off++)
+ 		if (!insert_alias(ml_off->type_id, ml_off->offset))
+@@ -286,124 +333,213 @@ #ifdef CONFIG_DEBUG_MEMLEAK_SECONDARY_AL
+ 		struct memleak_alias *alias;
+ 		struct hlist_node *elem;
+ 
++		/* with imprecise type identification, it the member
++		 * id is the same as the outer structure id, just
++		 * ignore as any potential aliases are already in the
++		 * tree */
++		if (ml_off->member_type_id == ml_off->type_id)
++			continue;
++
++		read_lock_irqsave(&alias_tree_lock, flags);
+ 		alias_list = radix_tree_lookup(&alias_tree, ml_off->member_type_id);
++		read_unlock_irqrestore(&alias_tree_lock, flags);
+ 		if (!alias_list)
+ 			continue;
+ 
+-		hlist_for_each_entry(alias, elem, alias_list, node)
++		rcu_read_lock();
++		hlist_for_each_entry_rcu(alias, elem, alias_list, node)
+ 			if (!insert_alias(ml_off->type_id, ml_off->offset + alias->offset))
+ 				i++;
++		rcu_read_unlock();
+ 	}
+ 	pr_debug("kmemleak: found %d alias(es)\n", i);
+ #endif
+-
+-	cpu_clear(cpu_id, memleak_cpu_mask);
+-	spin_unlock_irqrestore(&memleak_lock, flags);
+ }
+ EXPORT_SYMBOL_GPL(memleak_insert_aliases);
+ 
++/* called with memleak_lock held and interrupts disabled */
+ static inline struct memleak_pointer *get_cached_pointer(unsigned long ptr)
+ {
++	BUG_ON(!irqs_disabled());
++	BUG_ON(!spin_is_locked(&memleak_lock));
++
+ 	if (!last_pointer || ptr != last_pointer->pointer)
+ 		last_pointer = radix_tree_lookup(&pointer_tree, ptr);
+ 	return last_pointer;
+ }
+ 
+-static void create_pointer_aliases(struct memleak_pointer *pointer)
++/* no need for atomic operations since memleak_lock is held and
++ * interrupts disabled */
++static inline void get_pointer(struct memleak_pointer *pointer)
+ {
+-	struct memleak_alias *alias;
+-	struct hlist_node *elem;
+-	unsigned long ptr = pointer->pointer;
+-	int err;
++	BUG_ON(!irqs_disabled());
++	BUG_ON(!spin_is_locked(&memleak_lock));
+ 
+-	BUG_ON(pointer->flags & POINTER_ALIASES);
++	pointer->use_count++;
++}
+ 
+-	if (pointer->offset) {
+-		err = radix_tree_insert(&pointer_tree, ptr + pointer->offset, pointer);
+-		if (err) {
+-			dump_stack();
+-			panic("kmemleak: cannot insert offset into the pointer radix tree: %d\n", err);
+-		}
+-	}
++/* called with memleak_lock held for pointer_list modification and
++ * memleak_cpu_mask set to avoid entering memleak_free (and deadlock)
++ */
++static void __put_pointer(struct memleak_pointer *pointer)
++{
++	struct hlist_node *elem, *tmp;
++	struct memleak_scan_area *area;
+ 
+-	pointer->alias_list = radix_tree_lookup(&alias_tree, pointer->type_id);
+-	if (pointer->alias_list) {
+-		hlist_for_each_entry(alias, elem, pointer->alias_list, node) {
+-			err = radix_tree_insert(&pointer_tree, ptr
+-						+ pointer->offset + alias->offset,
+-						pointer);
+-			if (err) {
+-				dump_stack();
+-				panic("kmemleak: cannot insert alias into the pointer radix tree: %d\n", err);
+-			}
+-		}
++	BUG_ON(!irqs_disabled());
++	BUG_ON(!spin_is_locked(&memleak_lock));
++
++	if (--pointer->use_count > 0)
++		return;
++
++	/* free the scanning areas */
++	hlist_for_each_entry_safe(area, elem, tmp, &pointer->area_list, node) {
++		hlist_del(elem);
++		kfree(area);
+ 	}
+ 
+-	pointer->flags |= POINTER_ALIASES;
++	list_del(&pointer->pointer_list);
++	kmem_cache_free(pointer_cache, pointer);
++
++	BUG_ON(!irqs_disabled());
++	BUG_ON(!spin_is_locked(&memleak_lock));
++}
++
++static void put_pointer(struct memleak_pointer *pointer)
++{
++	unsigned long flags;
++	unsigned int cpu_id;
++
++	/* no recursive re-entrance on the same CPU */
++	local_irq_save(flags);
++	cpu_id = get_cpu();
++	if (cpu_test_and_set(cpu_id, memleak_cpu_mask))
++		BUG();
++
++	spin_lock(&memleak_lock);
++	__put_pointer(pointer);
++	spin_unlock(&memleak_lock);
++
++	cpu_clear(cpu_id, memleak_cpu_mask);
++	put_cpu_no_resched();
++	local_irq_restore(flags);
+ }
+ 
++/* called with memleak_lock held and interrupts disabled */
+ static void delete_pointer_aliases(struct memleak_pointer *pointer)
+ {
+ 	struct memleak_alias *alias;
+ 	struct hlist_node *elem;
+-	unsigned long ptr = pointer->pointer;
++
++	BUG_ON(!irqs_disabled());
++	BUG_ON(!spin_is_locked(&memleak_lock));
+ 
+ 	BUG_ON(!(pointer->flags & POINTER_ALIASES));
+ 
+ 	if (pointer->offset)
+-		radix_tree_delete(&pointer_tree, ptr + pointer->offset);
++		radix_tree_delete(&pointer_tree, pointer->pointer
++				  + pointer->offset);
+ 
+ 	if (pointer->alias_list) {
+-		hlist_for_each_entry(alias, elem, pointer->alias_list, node)
+-			radix_tree_delete(&pointer_tree,
+-					  ptr + pointer->offset + alias->offset);
++		rcu_read_lock();
++		hlist_for_each_entry_rcu(alias, elem, pointer->alias_list, node)
++			radix_tree_delete(&pointer_tree, pointer->pointer
++					  + pointer->offset + alias->offset);
++		rcu_read_unlock();
+ 		pointer->alias_list = NULL;
+ 	}
+ 
+ 	pointer->flags &= ~POINTER_ALIASES;
++
++	BUG_ON(!irqs_disabled());
++	BUG_ON(!spin_is_locked(&memleak_lock));
+ }
+ 
+-/* no need for atomic operations since memleak_lock is held anyway */
+-static inline void get_pointer(struct memleak_pointer *pointer)
++/* called with memleak_lock held but may be released */
++static inline int insert_pointer_alias(struct memleak_pointer *pointer,
++				       unsigned long alias)
+ {
+-	pointer->use_count++;
++	int ret = 0;
++
++	BUG_ON(!irqs_disabled());
++	BUG_ON(!spin_is_locked(&memleak_lock));
++
++	spin_unlock(&memleak_lock);
++	ret = radix_tree_preload(GFP_ATOMIC);
++	spin_lock(&memleak_lock);
++	if (ret) {
++		printk(KERN_WARNING "kmemleak: cannot preload the pointer radix tree: %d\n", ret);
++		goto out;
++	}
++
++	ret = radix_tree_insert(&pointer_tree, alias, pointer);
++	if (ret) {
++		dump_stack();
++		panic("kmemleak: cannot insert alias into the pointer radix tree: %d\n", ret);
++	}
++
++	radix_tree_preload_end();
++
++	BUG_ON(!irqs_disabled());
++	BUG_ON(!spin_is_locked(&memleak_lock));
++
++ out:
++	return ret;
+ }
+ 
+-/* called with memleak_lock held for pointer_list modification and
+- * memleak_cpu_mask set to avoid entering memleak_free (and deadlock)
++/* called with memleak_lock held but it may be released in
++ * insert_pointer_alias(). The pointer structure is guaranteed not to
++ * be freed before this function returns (get/put_pointer)
+  */
+-static void __put_pointer(struct memleak_pointer *pointer)
++static inline void create_pointer_aliases(struct memleak_pointer *pointer)
+ {
+-	struct hlist_node *elem, *tmp;
+-	struct memleak_scan_area *area;
++	struct memleak_alias *alias;
++	struct hlist_node *elem;
++	int err = 0;
+ 
+-	if (--pointer->use_count > 0)
+-		return;
++	BUG_ON(!irqs_disabled());
++	BUG_ON(!spin_is_locked(&memleak_lock));
+ 
+-	/* free the scanning areas */
+-	hlist_for_each_entry_safe(area, elem, tmp, &pointer->area_list, node) {
+-		hlist_del(elem);
+-		kfree(area);
++	BUG_ON(pointer->flags & POINTER_ALIASES);
++
++	get_pointer(pointer);
++
++	if (pointer->offset) {
++		err = insert_pointer_alias(pointer, pointer->pointer
++					   + pointer->offset);
++		if (err)
++			goto out;
+ 	}
+ 
+-	list_del(&pointer->pointer_list);
+-	kmem_cache_free(pointer_cache, pointer);
+-}
++	read_lock(&alias_tree_lock);
++	pointer->alias_list = radix_tree_lookup(&alias_tree, pointer->type_id);
++	read_unlock(&alias_tree_lock);
+ 
+-static void put_pointer(struct memleak_pointer *pointer)
+-{
+-	unsigned long flags;
+-	unsigned int cpu_id;
++	if (pointer->alias_list) {
++		rcu_read_lock();
++		hlist_for_each_entry_rcu(alias, elem, pointer->alias_list, node) {
++			err = insert_pointer_alias(pointer, pointer->pointer
++						   + pointer->offset + alias->offset);
++			if (err) {
++				rcu_read_unlock();
++				goto out;
++			}
++		}
++		rcu_read_unlock();
++	}
+ 
+-	spin_lock_irqsave(&memleak_lock, flags);
+-	cpu_id = smp_processor_id();
+-	if (cpu_test_and_set(cpu_id, memleak_cpu_mask))
+-		BUG();
++ out:
++	pointer->flags |= POINTER_ALIASES;
++
++	/* check whether the memory block might have been freed during
++	 * the unlocked periods or an error occured */
++	if (err || !(pointer->flags & POINTER_ALLOCATED))
++		delete_pointer_aliases(pointer);
+ 
+ 	__put_pointer(pointer);
+ 
+-	cpu_clear(cpu_id, memleak_cpu_mask);
+-	spin_unlock_irqrestore(&memleak_lock, flags);
++	BUG_ON(!irqs_disabled());
++	BUG_ON(!spin_is_locked(&memleak_lock));
+ }
+ 
+ /* Insert a pointer and its aliases into the pointer radix tree */
+@@ -416,12 +552,12 @@ #ifdef CONFIG_FRAME_POINTER
+ 	void *frame;
+ #endif
+ 
++	BUG_ON(!irqs_disabled());
++
+ 	pointer = kmem_cache_alloc(pointer_cache, SLAB_ATOMIC);
+ 	if (!pointer)
+ 		panic("kmemleak: cannot allocate a memleak_pointer structure\n");
+ 
+-	last_pointer = pointer;
+-
+ 	INIT_LIST_HEAD(&pointer->pointer_list);
+ 	INIT_LIST_HEAD(&pointer->gray_list);
+ 	INIT_HLIST_HEAD(&pointer->area_list);
+@@ -455,6 +591,16 @@ #else
+ 	pointer->trace[0] = (unsigned long)__builtin_return_address(0);
+ #endif
+ 
++	/* allocate here to avoid acquiring the list_lock in mm/slab.c
++	 * while memleak_lock is held */
++	err = radix_tree_preload(GFP_ATOMIC);
++	if (err) {
++		dump_stack();
++		panic("kmemleak: cannot preload the pointer radix tree: %d\n", err);
++	}
++
++	spin_lock(&memleak_lock);
++
+ 	err = radix_tree_insert(&pointer_tree, ptr, pointer);
+ 	if (err) {
+ 		dump_stack();
+@@ -469,6 +615,12 @@ #endif
+ 
+ 	list_add_tail(&pointer->pointer_list, &pointer_list);
+ 	get_pointer(pointer);
++	last_pointer = pointer;
++
++	spin_unlock(&memleak_lock);
++	radix_tree_preload_end();
++
++	BUG_ON(!irqs_disabled());
+ }
+ 
+ /* Remove a pointer and its aliases from the pointer radix tree */
+@@ -476,11 +628,15 @@ static inline void delete_pointer(unsign
+ {
+ 	struct memleak_pointer *pointer;
+ 
++	BUG_ON(!irqs_disabled());
++
++	spin_lock(&memleak_lock);
++
+ 	pointer = radix_tree_delete(&pointer_tree, ptr);
+ 	if (!pointer) {
+ 		dump_stack();
+ 		printk(KERN_WARNING "kmemleak: freeing unknown pointer value 0x%08lx\n", ptr);
+-		return;
++		goto out;
+ 	}
+ 	if (pointer->pointer != ptr) {
+ 		dump_stack();
+@@ -490,6 +646,7 @@ static inline void delete_pointer(unsign
+ 
+ 	BUG_ON(!(pointer->flags & POINTER_ALLOCATED));
+ 
++	/* deleting the cached pointer */
+ 	if (last_pointer && ptr == last_pointer->pointer)
+ 		last_pointer = NULL;
+ 
+@@ -506,6 +663,11 @@ #endif
+ 	pointer->flags &= ~POINTER_ALLOCATED;
+ 	pointer->pointer = 0;
+ 	__put_pointer(pointer);
++
++ out:
++	spin_unlock(&memleak_lock);
++
++	BUG_ON(!irqs_disabled());
+ }
+ 
+ /* Re-create the pointer aliases according to the new size/offset
+@@ -515,6 +677,10 @@ static inline void unpad_pointer(unsigne
+ {
+ 	struct memleak_pointer *pointer;
+ 
++	BUG_ON(!irqs_disabled());
++
++	spin_lock(&memleak_lock);
++
+ 	pointer = get_cached_pointer(ptr);
+ 	if (!pointer) {
+ 		dump_stack();
+@@ -532,13 +698,18 @@ static inline void unpad_pointer(unsigne
+ 	}
+ 
+ 	if (offset == pointer->offset && size == pointer->size)
+-		return;
++		goto out;
+ 
+ 	if (pointer->flags & POINTER_ALIASES)
+ 		delete_pointer_aliases(pointer);
+ 
+ 	pointer->offset = offset;
+ 	pointer->size = size;
++
++ out:
++	spin_unlock(&memleak_lock);
++
++	BUG_ON(!irqs_disabled());
+ }
+ 
+ /* Make a pointer permanently gray (false positive) */
+@@ -546,6 +717,10 @@ static inline void make_gray_pointer(uns
+ {
+ 	struct memleak_pointer *pointer;
+ 
++	BUG_ON(!irqs_disabled());
++
++	spin_lock(&memleak_lock);
++
+ 	pointer = get_cached_pointer(ptr);
+ 	if (!pointer) {
+ 		dump_stack();
+@@ -558,6 +733,10 @@ static inline void make_gray_pointer(uns
+ 	}
+ 
+ 	pointer->ref_count = 0;
++
++	spin_unlock(&memleak_lock);
++
++	BUG_ON(!irqs_disabled());
+ }
+ 
+ /* Mark the pointer as black */
+@@ -565,6 +744,10 @@ static inline void make_black_pointer(un
+ {
+ 	struct memleak_pointer *pointer;
+ 
++	BUG_ON(!irqs_disabled());
++
++	spin_lock(&memleak_lock);
++
+ 	pointer = get_cached_pointer(ptr);
+ 	if (!pointer) {
+ 		dump_stack();
+@@ -577,6 +760,10 @@ static inline void make_black_pointer(un
+ 	}
+ 
+ 	pointer->ref_count = -1;
++
++	spin_unlock(&memleak_lock);
++
++	BUG_ON(!irqs_disabled());
+ }
+ 
+ /* Add a scanning area to the pointer */
+@@ -585,6 +772,18 @@ static inline void add_scan_area(unsigne
+ 	struct memleak_pointer *pointer;
+ 	struct memleak_scan_area *area;
+ 
++	BUG_ON(!irqs_disabled());
++
++	area = kmalloc(sizeof(*area), GFP_ATOMIC);
++	if (!area)
++		panic("kmemleak: cannot allocate a scan area\n");
++
++	INIT_HLIST_NODE(&area->node);
++	area->offset = offset;
++	area->length = length;
++
++	spin_lock(&memleak_lock);
++
+ 	pointer = get_cached_pointer(ptr);
+ 	if (!pointer) {
+ 		dump_stack();
+@@ -601,15 +800,11 @@ static inline void add_scan_area(unsigne
+ 		panic("kmemleak: scan area larger than block 0x%08lx\n", ptr);
+ 	}
+ 
+-	area = kmalloc(sizeof(*area), GFP_ATOMIC);
+-	if (!area)
+-		panic("kmemleak: cannot allocate a scan area\n");
++	hlist_add_head(&area->node, &pointer->area_list);
+ 
+-	INIT_HLIST_NODE(&area->node);
+-	area->offset = offset;
+-	area->length = length;
++	spin_unlock(&memleak_lock);
+ 
+-	hlist_add_head(&area->node, &pointer->area_list);
++	BUG_ON(!irqs_disabled());
+ }
+ 
+ /* Re-create the pointer aliases according to the new type id */
+@@ -617,6 +812,10 @@ static inline void change_type_id(unsign
+ {
+ 	struct memleak_pointer *pointer;
+ 
++	BUG_ON(!irqs_disabled());
++
++	spin_lock(&memleak_lock);
++
+ 	pointer = get_cached_pointer(ptr);
+ 	if (!pointer) {
+ 		dump_stack();
+@@ -634,12 +833,17 @@ static inline void change_type_id(unsign
+ 	}
+ 
+ 	if (!type_id || type_id == pointer->type_id)
+-		return;
++		goto out;
+ 
+ 	if (pointer->flags & POINTER_ALIASES)
+ 		delete_pointer_aliases(pointer);
+ 
+ 	pointer->type_id = type_id;
++
++ out:
++	spin_unlock(&memleak_lock);
++
++	BUG_ON(!irqs_disabled());
+ }
+ 
+ /* Allocation function hook */
+@@ -671,21 +875,20 @@ void memleak_alloc(const void *ptr, size
+ 
+ 		BUG_ON(cpu_id != 0);
+ 
+-		if (preinit_pos >= PREINIT_POINTERS)
+-			panic("kmemleak: preinit pointers buffer overflow\n");
+-		pointer = &preinit_pointers[preinit_pos++];
++		if (preinit_pos < PREINIT_POINTERS) {
++			pointer = &preinit_pointers[preinit_pos];
+ 
+-		pointer->type = MEMLEAK_ALLOC;
+-		pointer->pointer = ptr;
+-		pointer->size = size;
+-		pointer->ref_count = ref_count;
++			pointer->type = MEMLEAK_ALLOC;
++			pointer->pointer = ptr;
++			pointer->size = size;
++			pointer->ref_count = ref_count;
++		}
++		preinit_pos++;
+ 
+ 		goto unmask;
+ 	}
+ 
+-	spin_lock(&memleak_lock);
+ 	create_pointer((unsigned long)ptr, size, ref_count);
+-	spin_unlock(&memleak_lock);
+ 
+  unmask:
+ 	cpu_clear(cpu_id, memleak_cpu_mask);
+@@ -718,19 +921,18 @@ void memleak_free(const void *ptr)
+ 
+ 		BUG_ON(cpu_id != 0);
+ 
+-		if (preinit_pos >= PREINIT_POINTERS)
+-			panic("kmemleak: preinit pointers buffer overflow\n");
+-		pointer = &preinit_pointers[preinit_pos++];
++		if (preinit_pos < PREINIT_POINTERS) {
++			pointer = &preinit_pointers[preinit_pos];
+ 
+-		pointer->type = MEMLEAK_FREE;
+-		pointer->pointer = ptr;
++			pointer->type = MEMLEAK_FREE;
++			pointer->pointer = ptr;
++		}
++		preinit_pos++;
+ 
+ 		goto unmask;
+ 	}
+ 
+-	spin_lock(&memleak_lock);
+ 	delete_pointer((unsigned long)ptr);
+-	spin_unlock(&memleak_lock);
+ 
+  unmask:
+ 	cpu_clear(cpu_id, memleak_cpu_mask);
+@@ -764,21 +966,20 @@ void memleak_padding(const void *ptr, un
+ 
+ 		BUG_ON(cpu_id != 0);
+ 
+-		if (preinit_pos >= PREINIT_POINTERS)
+-			panic("kmemleak: preinit pointers buffer overflow\n");
+-		pointer = &preinit_pointers[preinit_pos++];
++		if (preinit_pos < PREINIT_POINTERS) {
++			pointer = &preinit_pointers[preinit_pos];
+ 
+-		pointer->type = MEMLEAK_PADDING;
+-		pointer->pointer = ptr;
+-		pointer->offset = offset;
+-		pointer->size = size;
++			pointer->type = MEMLEAK_PADDING;
++			pointer->pointer = ptr;
++			pointer->offset = offset;
++			pointer->size = size;
++		}
++		preinit_pos++;
+ 
+ 		goto unmask;
+ 	}
+ 
+-	spin_lock(&memleak_lock);
+ 	unpad_pointer((unsigned long)ptr, offset, size);
+-	spin_unlock(&memleak_lock);
+ 
+  unmask:
+ 	cpu_clear(cpu_id, memleak_cpu_mask);
+@@ -811,19 +1012,18 @@ void memleak_not_leak(const void *ptr)
+ 
+ 		BUG_ON(cpu_id != 0);
+ 
+-		if (preinit_pos >= PREINIT_POINTERS)
+-			panic("kmemleak: preinit pointers buffer overflow\n");
+-		pointer = &preinit_pointers[preinit_pos++];
++		if (preinit_pos < PREINIT_POINTERS) {
++			pointer = &preinit_pointers[preinit_pos];
+ 
+-		pointer->type = MEMLEAK_NOT_LEAK;
+-		pointer->pointer = ptr;
++			pointer->type = MEMLEAK_NOT_LEAK;
++			pointer->pointer = ptr;
++		}
++		preinit_pos++;
+ 
+ 		goto unmask;
+ 	}
+ 
+-	spin_lock(&memleak_lock);
+ 	make_gray_pointer((unsigned long)ptr);
+-	spin_unlock(&memleak_lock);
+ 
+  unmask:
+ 	cpu_clear(cpu_id, memleak_cpu_mask);
+@@ -856,19 +1056,18 @@ void memleak_ignore(const void *ptr)
+ 
+ 		BUG_ON(cpu_id != 0);
+ 
+-		if (preinit_pos >= PREINIT_POINTERS)
+-			panic("kmemleak: preinit pointers buffer overflow\n");
+-		pointer = &preinit_pointers[preinit_pos++];
++		if (preinit_pos < PREINIT_POINTERS) {
++			pointer = &preinit_pointers[preinit_pos];
+ 
+-		pointer->type = MEMLEAK_IGNORE;
+-		pointer->pointer = ptr;
++			pointer->type = MEMLEAK_IGNORE;
++			pointer->pointer = ptr;
++		}
++		preinit_pos++;
+ 
+ 		goto unmask;
+ 	}
+ 
+-	spin_lock(&memleak_lock);
+ 	make_black_pointer((unsigned long)ptr);
+-	spin_unlock(&memleak_lock);
+ 
+  unmask:
+ 	cpu_clear(cpu_id, memleak_cpu_mask);
+@@ -901,21 +1100,20 @@ void memleak_scan_area(const void *ptr, 
+ 
+ 		BUG_ON(cpu_id != 0);
+ 
+-		if (preinit_pos >= PREINIT_POINTERS)
+-			panic("kmemleak: preinit pointers buffer overflow\n");
+-		pointer = &preinit_pointers[preinit_pos++];
++		if (preinit_pos < PREINIT_POINTERS) {
++			pointer = &preinit_pointers[preinit_pos];
+ 
+-		pointer->type = MEMLEAK_SCAN_AREA;
+-		pointer->pointer = ptr;
+-		pointer->offset = offset;
+-		pointer->size = length;
++			pointer->type = MEMLEAK_SCAN_AREA;
++			pointer->pointer = ptr;
++			pointer->offset = offset;
++			pointer->size = length;
++		}
++		preinit_pos++;
+ 
+ 		goto unmask;
+ 	}
+ 
+-	spin_lock(&memleak_lock);
+ 	add_scan_area((unsigned long)ptr, offset, length);
+-	spin_unlock(&memleak_lock);
+ 
+  unmask:
+ 	cpu_clear(cpu_id, memleak_cpu_mask);
+@@ -948,20 +1146,19 @@ void memleak_typeid_raw(const void *ptr,
+ 
+ 		BUG_ON(cpu_id != 0);
+ 
+-		if (preinit_pos >= PREINIT_POINTERS)
+-			panic("kmemleak: preinit pointers buffer overflow\n");
+-		pointer = &preinit_pointers[preinit_pos++];
++		if (preinit_pos < PREINIT_POINTERS) {
++			pointer = &preinit_pointers[preinit_pos];
+ 
+-		pointer->type = MEMLEAK_TYPEID;
+-		pointer->pointer = ptr;
+-		pointer->type_id = type_id;
++			pointer->type = MEMLEAK_TYPEID;
++			pointer->pointer = ptr;
++			pointer->type_id = type_id;
++		}
++		preinit_pos++;
+ 
+ 		goto unmask;
+ 	}
+ 
+-	spin_lock(&memleak_lock);
+ 	change_type_id((unsigned long)ptr, type_id);
+-	spin_unlock(&memleak_lock);
+ 
+  unmask:
+ 	cpu_clear(cpu_id, memleak_cpu_mask);
+@@ -973,7 +1170,7 @@ EXPORT_SYMBOL(memleak_typeid_raw);
+ 
+ /* Scan a block of memory (exclusive range) for pointers and move
+  * those found to the gray list. This function is called with
+- * memleak_lock held
++ * memleak_lock held and interrupts disabled
+  */
+ static void __scan_block(void *_start, void *_end)
+ {
+@@ -982,6 +1179,9 @@ static void __scan_block(void *_start, v
+ 						      BYTES_PER_WORD);
+ 	unsigned long *end = _end;
+ 
++	BUG_ON(!irqs_disabled());
++	BUG_ON(!spin_is_locked(&memleak_lock));
++
+ 	for (ptr = start; ptr < end; ptr++) {
+ 		struct memleak_pointer *pointer =
+ 			radix_tree_lookup(&pointer_tree,
+@@ -998,6 +1198,9 @@ static void __scan_block(void *_start, v
+ 			list_add_tail_rcu(&pointer->gray_list, &gray_list);
+ 		}
+ 	}
++
++	BUG_ON(!irqs_disabled());
++	BUG_ON(!spin_is_locked(&memleak_lock));
+ }
+ 
+ static void scan_block(void *start, void *end)
+@@ -1027,7 +1230,7 @@ static inline void scan_pointer(struct m
+ 	spin_lock_irqsave(&memleak_lock, flags);
+ 
+ 	/* freed pointer */
+-	if (!pointer->pointer)
++	if (!pointer->flags & POINTER_ALLOCATED)
+ 		goto out;
+ 
+ 	if (hlist_empty(&pointer->area_list))
+@@ -1056,14 +1259,21 @@ #endif
+ 	unsigned int cpu_id;
+ 
+ 	/* initialize pointers (make them white) and build the initial
+-	 * gray list. Note that create_pointer_aliases might allocate
+-	 * memory */
+-	spin_lock_irqsave(&memleak_lock, flags);
+-	cpu_id = smp_processor_id();
++	 * gray list. memleak_cpu_mask is set as we don't track the
++	 * kmemleak allocations */
++	local_irq_save(flags);
++	cpu_id = get_cpu();
+ 	if (cpu_test_and_set(cpu_id, memleak_cpu_mask))
+ 		BUG();
+ 
+-	list_for_each_entry(pointer, &pointer_list, pointer_list) {
++	/* use the _rcu variant since pointer_list can change */
++	rcu_read_lock();
++	/* memleak_lock needed to ensure that the pointer structure is
++	 * not freed on a different CPU (create_pointer_aliases may
++	 * release the lock) */
++	spin_lock(&memleak_lock);
++
++	list_for_each_entry_rcu(pointer, &pointer_list, pointer_list) {
+ 		/* lazy insertion of the pointer aliases into the radix tree */
+ 		if ((pointer->flags & POINTER_ALLOCATED)
+ 		    && !(pointer->flags & POINTER_ALIASES))
+@@ -1071,13 +1281,19 @@ #endif
+ 
+ 		pointer->count = 0;
+ 		if (color_gray(pointer)) {
++			/* the pointer will be put back once it is
++			 * scanned via the gray_list */
+ 			get_pointer(pointer);
+ 			list_add_tail(&pointer->gray_list, &gray_list);
+ 		}
+ 	}
+ 
++	spin_unlock(&memleak_lock);
++	rcu_read_unlock();
++
+ 	cpu_clear(cpu_id, memleak_cpu_mask);
+-	spin_unlock_irqrestore(&memleak_lock, flags);
++	put_cpu_no_resched();
++	local_irq_restore(flags);
+ 
+ 	/* data/bss scanning */
+ 	scan_block(_sdata, _edata);
+@@ -1262,6 +1478,10 @@ void __init memleak_init(void)
+ 
+ 	atomic_set(&memleak_initialized, 1);
+ 
++	if (preinit_pos >= PREINIT_POINTERS)
++		panic("kmemleak: preinit pointers buffer overflow: %d\n",
++		      preinit_pos);
++
+ 	/* execute the buffered memleak actions */
+ 	pr_debug("kmemleak: %d preinit actions\n", preinit_pos);
+ 	for (i = 0; i < preinit_pos; i++) {

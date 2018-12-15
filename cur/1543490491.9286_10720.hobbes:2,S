@@ -1,0 +1,118 @@
+Date: Sun, 21 Mar 1999 02:53:02 -0500 (EST)
+From: Alexander Viro <>
+Subject: [PATCH] Bad races in sysvfs (fs and icache corruption)
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/3/21/9
+
+	Linus, Krzysztof - we have several holes is sysvfs, some of them
+exploitable (patch is in the end of posting). Details:
+1) sysv_link() doesn't increase i_count. Result: dcache corruption
+(dangling ->d_inode).
+	Fix: do it ;-)
+2)  sysv_put_inode() tries to do ->delete_inode() job.
+Scenario:
+link("a","b");
+fd1=open("a",O_RDWR);
+fd2=open("b",O_RDWR);
+unlink("a");
+unlink("b");
+/* Now i_nlink is 0 */
+close(fd1);
+/*
+ * iput() is called. sysv_put_inode() sees that i_nlink is 0 and does its
+ * thing. I.e. truncates the file and marks the on-disk inode free.
+ * The rest is left as an exercise for readers.
+ */
+	Fix: separate put_inode() and delete_inode(), indeed.
+3) Race: sysv_free_inode() (called by sysv_put_inode()) marks on-disk
+inode free and only after that calls clear_inode(). Suppose the inode was
+in I_LOCKED state at the moment of last iput() (and had i_nlink==0).
+clear_inode() does wait_on_inode(), so it will block. sysv_write_inode()
+that was called back when the inode was moved to I_LOCKED state might
+block before writing to disk (on bread()). There we go: somebody ask
+sysvfs to create a new inode. It gives back the same inumber. And *new*
+in-core inode. Fine, we fill the inode, mark it dirty, find that block
+with on-disk inode is already in core, fill the thing and request writing
+it on the disk. The thing that requested sync_one() on original inode
+wakes up. Fills the on-disk inode. And writes it back to disk. On-disk
+inode is trashed.
+	Fix: call clear_inode() *before* marking the on-disk inode free.
+Patch (against 2.2.3 - pre-4 doesn't touch files in question) follows:
+diff -urN linux-2.2.3/fs/sysv/ialloc.c linux-bird.sysv-fix/fs/sysv/ialloc.c
+--- linux-2.2.3/fs/sysv/ialloc.c	Fri Nov 13 18:02:04 1998
++++ linux-bird.sysv-fix/fs/sysv/ialloc.c	Sun Mar 21 02:52:04 1999
+@@ -86,6 +86,7 @@
+ 		return;
+ 	}
+ 	raw_inode = (struct sysv_inode *) bh->b_data + ((ino-1) & sb->sv_inodes_per_block_1);
++	clear_inode(inode);
+ 	lock_super(sb);
+ 	if (*sb->sv_sb_fic_count < sb->sv_fic_size)
+ 		*sv_sb_fic_inode(sb,(*sb->sv_sb_fic_count)++) = ino;
+@@ -97,7 +98,6 @@
+ 	mark_buffer_dirty(bh, 1);
+ 	unlock_super(sb);
+ 	brelse(bh);
+-	clear_inode(inode);
+ }
+ 
+ struct inode * sysv_new_inode(const struct inode * dir)
+diff -urN linux-2.2.3/fs/sysv/inode.c linux-bird.sysv-fix/fs/sysv/inode.c
+--- linux-2.2.3/fs/sysv/inode.c	Thu Dec 31 20:06:00 1998
++++ linux-bird.sysv-fix/fs/sysv/inode.c	Sun Mar 21 02:52:39 1999
+@@ -55,10 +55,8 @@
+ }
+ #endif
+ 
+-void sysv_put_inode(struct inode *inode)
++static void sysv_delete_inode(struct inode *inode)
+ {
+-	if (inode->i_nlink)
+-		return;
+ 	inode->i_size = 0;
+ 	sysv_truncate(inode);
+ 	sysv_free_inode(inode);
+@@ -68,8 +66,8 @@
+ static struct super_operations sysv_sops = {
+ 	sysv_read_inode,
+ 	sysv_write_inode,
+-	sysv_put_inode,
+-	NULL,			/* delete_inode */
++	NULL,			/* nothing special on put_inode() */
++	sysv_delete_inode,
+ 	sysv_notify_change,
+ 	sysv_put_super,
+ 	sysv_write_super,
+diff -urN linux-2.2.3/fs/sysv/namei.c linux-bird.sysv-fix/fs/sysv/namei.c
+--- linux-2.2.3/fs/sysv/namei.c	Thu Dec 31 20:06:01 1998
++++ linux-bird.sysv-fix/fs/sysv/namei.c	Sun Mar 21 02:46:33 1999
+@@ -576,6 +576,7 @@
+ 	oldinode->i_nlink++;
+ 	oldinode->i_ctime = CURRENT_TIME;
+ 	mark_inode_dirty(oldinode);
++	inode->i_count++;
+         d_instantiate(dentry, oldinode);
+ 	return 0;
+ }
+diff -urN linux-2.2.3/include/sysv_fs.h linux-bird.sysv-fix/include/sysv_fs.h
+--- linux-2.2.3/include/sysv_fs.h	Thu Dec 31 20:06:06 1998
++++ linux-bird.sysv-fix/include/sysv_fs.h	Sun Mar 21 02:53:51 1999
+@@ -398,7 +398,6 @@
+ extern void sysv_read_inode(struct inode *);
+ extern int sysv_notify_change(struct dentry *, struct iattr *);
+ extern void sysv_write_inode(struct inode *);
+-extern void sysv_put_inode(struct inode *);
+ extern int sysv_statfs(struct super_block *, struct statfs *, int);
+ extern int sysv_sync_inode(struct inode *);
+ extern int sysv_sync_file(struct file *, struct dentry *);
+	Please, apply it. Holes are trivially exploitable.
+							Cheers,
+								Al
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

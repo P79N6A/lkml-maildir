@@ -1,0 +1,183 @@
+Date: Fri, 30 Apr 1999 20:14:45 +0200 (CEST)
+From: Andrea Arcangeli <>
+Subject: [patch] better dynamic buffer-hash-table
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/4/30/82
+
+I seen that in 2.2.7 the number of the free areas list is been elarged
+from 6 to 10. Maybe the only reason to do that is not been the
+dynamic-buffer hash code inserted in 2.2.7.
+Anyway I wrote a (I think better) dynamic hash-table code that also don't
+play with GFP at all.
+My patch below will apply correctly against 2.2.7:
+Index: include/linux/fs.h
+===================================================================
+RCS file: /var/cvs/linux/include/linux/fs.h,v
+retrieving revision 1.1.2.30
+diff -u -r1.1.2.30 fs.h
+--- linux/include/linux/fs.h	1999/04/28 21:07:22	1.1.2.30
++++ linux/include/linux/fs.h	1999/04/30 17:10:26
+@@ -170,6 +170,7 @@
+ extern void update_atime (struct inode *inode);
+ #define UPDATE_ATIME(inode) update_atime (inode)
+ 
++extern unsigned long buffer_hash_init(unsigned long, unsigned long);
+ extern void buffer_init(unsigned long);
+ extern void inode_init(void);
+ extern void file_table_init(void);
+Index: init//main.c
+===================================================================
+RCS file: /var/cvs/linux/init/main.c,v
+retrieving revision 1.1.2.11
+diff -u -r1.1.2.11 main.c
+--- linux/init/main.c	1999/04/30 00:42:42	1.1.2.11
++++ linux/init/main.c	1999/04/30 17:10:48
+@@ -1151,6 +1151,7 @@
+ 		memset(prof_buffer, 0, prof_len * sizeof(unsigned int));
+ 	}
+ 
++	memory_start = buffer_hash_init(memory_start, memory_end);
+ 	memory_start = kmem_cache_init(memory_start, memory_end);
+ 	sti();
+ 	calibrate_delay();
+Index: mm/page_alloc.c
+===================================================================
+RCS file: /var/cvs/linux/mm/page_alloc.c,v
+retrieving revision 1.1.2.36
+diff -u -r1.1.2.36 page_alloc.c
+--- linux/mm/page_alloc.c	1999/04/28 21:07:23	1.1.2.36
++++ linux/mm/page_alloc.c	1999/04/30 17:09:53
+@@ -38,7 +38,7 @@
+    for the ring buffers */
+ #define NR_MEM_LISTS 12
+ #else
+-#define NR_MEM_LISTS 10
++#define NR_MEM_LISTS 6
+ #endif
+ 
+ /* The start of this MUST match the start of "struct page" */
+Index: fs/buffer.c
+===================================================================
+RCS file: /var/cvs/linux/fs/buffer.c,v
+retrieving revision 1.1.2.88
+diff -u -r1.1.2.88 buffer.c
+--- linux/fs/buffer.c	1999/04/29 18:54:03	1.1.2.88
++++ linux/fs/buffer.c	1999/04/30 18:09:17
+@@ -1546,37 +1546,81 @@
+ /* ===================== Init ======================= */
+ 
+ /*
+- * allocate the hash table and init the free list
+- * Use gfp() for the hash table to decrease TLB misses, use
+- * SLAB cache for buffer heads.
++ * Alloc the ram for the hashtable without having to play with the
++ * free area list of the VM. -Andrea
+  */
+-void __init buffer_init(unsigned long memory_size)
++unsigned long __init buffer_hash_init(unsigned long start, unsigned long end)
+ {
+-	int order;
+-	unsigned int nr_hash;
++	unsigned long mem_size, max_nr_buffers, nr_hash, hash_size;
++
++#define	BUF_MEAN_BUFFERS_PER_BUCKET	8
++
++	/*
++	 * My heuristic is to have a mean distribution of 8 buffer chained
++	 * in every hash bucket (supposing all buffers are BLOCK_SIZE wide).
++	 * You can change the distribution simply changing the define
++	 * above. Consider that not all the mem_size RAM can be used for
++	 * buffers (here we are in the early stage of the kernrel boot),
++	 * so using a mean distribution of 1 (supposing to have a perfect
++	 * hash-function) would be waste of ram. Also consider that
++	 * the hash_size will be power-of-two enlarged. -Andrea
++	 */
++	mem_size = end - start;
++	max_nr_buffers = mem_size >> BLOCK_SIZE_BITS;
++
++	nr_hash = max_nr_buffers/BUF_MEAN_BUFFERS_PER_BUCKET;
++
++	/*
++	 * Now we want nr_hash to be a power of 2 so we'll be allowed
++	 * to do a faster logic AND in the hash function. If it's not a
++	 * power of 2 I enlarge it to the nearest power of 2.
++	 * To do that I invented a funny algorithm. Seems also to work ;),
++	 * but if you know of something of better let me know ;). -Andrea
++	 */
++	if (nr_hash & (nr_hash-1))
++	{
++		nr_hash <<= 1;
++		do
++			nr_hash &= nr_hash-1;
++		while (nr_hash & (nr_hash-1));
++	}
+ 
+-	/* we need to guess at the right sort of size for a buffer cache.
+-	   the heuristic from working with large databases and getting
+-	   fsync times (ext2) manageable, is the following */
+-
+-	memory_size >>= 20;
+-	for (order = 5; (1UL << order) < memory_size; order++);
+-
+-	/* try to allocate something until we get it or we're asking
+-           for something that is really too small */
+-
+-	do {
+-		nr_hash = (1UL << order) * PAGE_SIZE /
+-		    sizeof(struct buffer_head *);
+-		hash_table = (struct buffer_head **)
+-		    __get_free_pages(GFP_ATOMIC, order);
+-	} while (hash_table == NULL && --order > 4);
+-	
+-	if (!hash_table)
+-		panic("Failed to allocate buffer hash table\n");
+-	memset(hash_table, 0, nr_hash * sizeof(struct buffer_head *));
+-	bh_hash_mask = nr_hash-1;
++ try_again:
++	hash_size = nr_hash * sizeof(struct buffer_head *);
++	if (!hash_size)
++		panic("hash table zero-sized");
+ 
++	if (start+hash_size >= end)
++	{
++		/*
++		 * Strange, something gone wrong, so try to decrease the
++		 * power order of the hash table. I think this can never
++		 * happens but better to be paranoid and verbose enough.
++		 * -Andrea
++		 */
++		printk("buffer hashtable too big %lu decresing to %lu\n",
++		       hash_size, hash_size >> 1);
++		nr_hash >>= 1;
++		goto try_again;
++	}
++
++	hash_table = (struct buffer_head **) start;
++	memset(hash_table, 0, hash_size);
++	bh_hash_mask = nr_hash - 1;
++	printk("buffer hashtable: buckets = %lu, size = %lu bytes\n",
++	       nr_hash, hash_size);
++	/*
++	 * Supposing there is no buggy code around us, we can safely avoid to
++	 * page align. -Andrea
++	 */
++	return start + hash_size;
++}
++
++/*
++ * Allocate the buffer-slab head and init the free list.
++ */
++void __init buffer_init(unsigned long memory_size)
++{
+ 	bh_cachep = kmem_cache_create("buffer_head",
+ 				      sizeof(struct buffer_head),
+ 				      __alignof__(struct buffer_head),
+Andrea Arcangeli
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

@@ -1,0 +1,180 @@
+Date: Sat, 5 Jun 1999 16:03:57 +0200
+From: Jamie Lokier <>
+Subject: [PATCH] speedup for directory tree traversals
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/6/5/24
+
+Dear Linus,
+  Here's a patch that speeds up programs that recurse over directory
+  trees, by removing redundant I/O and reducing inode cache flushing.
+  Only subdirectory inodes get read, usually a very small subset of the
+  ones we read now.
+  The trick is to avoid reading inodes when opening a non-directory with
+  O_DIRECTORY set.  It's similar to the effect of the BSD's
+  `dirent->d_type' field.  Using that, you can see when you can skip
+  stat()ing an entry.
+  But this is better because it doesn't need a new API.  Simply try to
+  open each entry using opendir().  Glibc's opendir() always sets
+  O_DIRECTORY, and opendir() is specified to refuse to open
+  non-directories.
+  For this use it's also more effective than d_type.  Conceivably, some
+  filesystem would know if a directory entry is a subdirectory or not,
+  but that's all.  So it would set d_type to DT_UNKNOWN in the
+  non-directory case, which the application must assume _might_ be a
+  directory...
+  Implementation: When looking up the last component of a path with
+  O_DIRECTORY explicitly requested, set some flags in the dentry passed to
+  lookup.  This is safe and keeps the VFS interface the same.  On seeing
+  the flags, fs-specific lookup() may choose to return -ENOTDIR for
+  non-directory lookups.  +Quirks for symlinks.
+  I've implemented the fs-specifics for msdos and ext2.  vfat is hairier
+  and I thought it'd tread on Alex Viro's toes.  Unfortunately the
+  FILETYPE feature of ext2 is not widely deployed (I'm a bit
+  disappointed), but it does work and gives a significant speedup with
+  some directory structures.  I haven't measured traversing a large
+  filesystem because I don't have one handy.
+have a nice day,
+-- Jamie
+diff -u linux-2.2.9/fs/ext2/namei.c.diropt linux-2.2/fs/ext2/namei.c
+--- linux-2.2.9/fs/ext2/namei.c.diropt	Wed May 12 00:17:11 1999
++++ linux-2.2.9/fs/ext2/namei.c	Sat Jun  5 15:13:34 1999
+@@ -168,6 +168,7 @@
+ 
+ struct dentry *ext2_lookup(struct inode * dir, struct dentry *dentry)
+ {
++	unsigned long ino;
+ 	struct inode * inode;
+ 	struct ext2_dir_entry_2 * de;
+ 	struct buffer_head * bh;
+@@ -178,10 +179,19 @@
+ 	bh = ext2_find_entry (dir, dentry->d_name.name, dentry->d_name.len, &de);
+ 	inode = NULL;
+ 	if (bh) {
+-		unsigned long ino = le32_to_cpu(de->inode);
++		/* Optimise away iget() when we want a directory. */
++		if ((dentry->d_flags & DCACHE_LOOKUP_DIR)
++		    && de->file_type != EXT2_FT_DIR
++		    && de->file_type != EXT2_FT_UNKNOWN
++		    && (de->file_type != EXT2_FT_SYMLINK
++			|| !(dentry->d_flags & DCACHE_LOOKUP_SYMLINK))) {
++			brelse (bh);
++			return ERR_PTR(-ENOTDIR);
++		}
++
++		ino = le32_to_cpu(de->inode);
+ 		brelse (bh);
+ 		inode = iget(dir->i_sb, ino);
+-
+ 		if (!inode)
+ 			return ERR_PTR(-EACCES);
+ 	}
+diff -u linux-2.2.9/fs/msdos/namei.c.diropt linux-2.2/fs/msdos/namei.c
+--- linux-2.2.9/fs/msdos/namei.c.diropt	Wed Apr 28 22:41:44 1999
++++ linux-2.2.9/fs/msdos/namei.c	Sat Jun  5 15:08:45 1999
+@@ -269,8 +269,16 @@
+ 		goto add;
+ 	if (res < 0)
+ 		goto out;
+-	if (bh)
++	if (bh) {
++		/* Optimise away iget() when we want a directory. */
++		if ((dentry->d_flags & DCACHE_LOOKUP_DIR)
++		    && !((de->attr & ATTR_DIR) && !IS_FREE(de->name))) {
++			fat_brelse(sb, bh);
++			res = -ENOTDIR;
++			goto out;		
++		}
+ 		fat_brelse(sb, bh);
++	}
+ 
+ 	/* try to get the inode */
+ 	res = -EACCES;
+diff -u linux-2.2.9/fs/namei.c.diropt linux-2.2/fs/namei.c
+--- linux-2.2.9/fs/namei.c.diropt	Wed May 12 00:17:11 1999
++++ linux-2.2.9/fs/namei.c	Sat Jun  5 12:35:19 1999
+@@ -251,6 +251,20 @@
+ 		struct dentry * dentry = d_alloc(parent, name);
+ 		result = ERR_PTR(-ENOMEM);
+ 		if (dentry) {
++			/*
++			 * Try not to read non-directory inodes for the final
++			 * component of an explicit O_DIRECTORY lookup.  Don't
++			 * do this optimisation for intermediate components --
++			 * those lookups tend to repeat so it's faster to cache
++			 * the result than repeatedly call lookup().
++			 */
++			if ((flags & (LOOKUP_O_DIRECTORY | LOOKUP_CONTINUE))
++			    == LOOKUP_O_DIRECTORY) {
++				dentry->d_flags |= DCACHE_LOOKUP_DIR;
++				if (flags & LOOKUP_FOLLOW)
++					dentry->d_flags |= DCACHE_LOOKUP_SYMLINK;
++			}
++
+ 			result = dir->i_op->lookup(dir, dentry);
+ 			if (result)
+ 				dput(dentry);
+@@ -324,7 +338,8 @@
+ 		goto return_base;
+ 
+ 	inode = base->d_inode;
+-	lookup_flags &= LOOKUP_FOLLOW | LOOKUP_DIRECTORY | LOOKUP_SLASHOK;
++	lookup_flags &= (LOOKUP_FOLLOW | LOOKUP_DIRECTORY | LOOKUP_SLASHOK
++			 | LOOKUP_O_DIRECTORY);
+ 
+ 	/* At this point we know we have a real path component. */
+ 	for(;;) {
+@@ -628,7 +643,7 @@
+ 		retval &= ~LOOKUP_FOLLOW;
+ 	
+ 	if (f & O_DIRECTORY)
+-		retval |= LOOKUP_DIRECTORY;
++		retval |= LOOKUP_DIRECTORY | LOOKUP_O_DIRECTORY;
+ 	
+ 	return retval;
+ }
+diff -u linux-2.2.9/include/linux/dcache.h.diropt linux-2.2/include/linux/dcache.h
+--- linux-2.2.9/include/linux/dcache.h.diropt	Wed May 12 00:17:13 1999
++++ linux-2.2.9/include/linux/dcache.h	Wed May 12 00:17:13 1999
+@@ -100,6 +100,15 @@
+ 					 * renamed" and has to be
+ 					 * deleted on the last dput()
+ 					 */
++#define DCACHE_LOOKUP_DIR     0x0004	/* during fs lookup(): "if you find a
++					 * non-directory, you may return
++					 * -ENOTDIR instead of reading the
++					 * inode" (ignored at other times)
++					 */
++#define DCACHE_LOOKUP_SYMLINK 0x0008	/* modifies above: "if you find a
++					 * non-directory that is also not a
++					 * symbolic link..."
++					 */
+ 
+ /*
+  * d_drop() unhashes the entry from the parent
+diff -u linux-2.2.9/include/linux/fs.h.diropt linux-2.2/include/linux/fs.h
+--- linux-2.2.9/include/linux/fs.h.diropt	Tue May 18 11:11:33 1999
++++ linux-2.2.9/include/linux/fs.h	Tue May 18 11:11:33 1999
+@@ -815,12 +815,14 @@
+  *  - follow links at the end
+  *  - require a directory
+  *  - ending slashes ok even for nonexistent files
+- *  - internal "there are more path compnents" flag
++ *  - internal "there are more path components" flag
++ *  - internal "use different cache strategy for explicit O_DIRECTORY" flag
+  */
+ #define LOOKUP_FOLLOW		(1)
+ #define LOOKUP_DIRECTORY	(2)
+ #define LOOKUP_SLASHOK		(4)
+ #define LOOKUP_CONTINUE		(8)
++#define LOOKUP_O_DIRECTORY	(16)
+ 
+ extern struct dentry * lookup_dentry(const char *, struct dentry *, unsigned int);
+ extern struct dentry * __namei(const char *, unsigned int);
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

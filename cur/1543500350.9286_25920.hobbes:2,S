@@ -1,0 +1,261 @@
+Date: Thu, 24 Jun 1999 12:48:51 +0100 (GMT)
+From: Matthew Kirkwood <>
+Subject: Re: RFC: BSD system call revoke?
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/6/24/48
+
+On Thu, 24 Jun 1999, Bernd Kaindl wrote:
+> One thing I miss in the patch i found is what Chris pointed out:
+> > 1) It is not sufficient to just close the file descriptor. Some
+> > potentially sensitive devices (and all files) may by mmap()'ed into
+> > virtual memory. I think the solution was vmtruncate()
+> 
+> Question one: Is this the last version of the revoke patch?
+Not quite.  I've attached something newer, which does have
+(tested but unverified) code to yank away the file mapping,
+and should be OK.
+Things it needs:
+ * Someone to verify that vmtruncate(inode, 0) works and is
+   the right thing to do
+ * Investigation of how to handle the CLONE_FILES case.
+I don't think that the approach for finding files to revoke
+really fits in with the "lock_kernel?  What's that?" approach
+of 2.3, though.
+Al's per-superblock inode hashes could make this a fair bit
+easier, though.
+Matthew.
+diff -ruN linux-2.1.80-pre4-clean/Makefile linux/Makefile
+--- linux-2.1.80-pre4-clean/Makefile	Sat Jan 17 13:59:44 1998
++++ linux/Makefile	Sat Jan 17 15:56:21 1998
+@@ -11,7 +11,7 @@
+ #
+ # NOTE! SMP is experimental. See the file Documentation/SMP.txt
+ #
+-SMP = 1
++# SMP = 1
+ #
+ # SMP profiling options
+ # SMP_PROF = 1
+diff -ruN linux-2.1.80-pre4-clean/arch/i386/kernel/entry.S linux/arch/i386/kernel/entry.S
+--- linux-2.1.80-pre4-clean/arch/i386/kernel/entry.S	Sat Jan 10 19:57:29 1998
++++ linux/arch/i386/kernel/entry.S	Sat Jan 17 15:20:07 1998
+@@ -532,7 +532,8 @@
+ 	.long SYMBOL_NAME(sys_rt_sigsuspend)
+ 	.long SYMBOL_NAME(sys_pread)		/* 180 */
+ 	.long SYMBOL_NAME(sys_pwrite)
++	.long SYMBOL_NAME(sys_rescind)
+ 	
+-	.rept NR_syscalls-181
++	.rept NR_syscalls-182
+ 		.long SYMBOL_NAME(sys_ni_syscall)
+ 	.endr
+diff -ruN linux-2.1.80-pre4-clean/drivers/char/tty_io.c linux/drivers/char/tty_io.c
+--- linux-2.1.80-pre4-clean/drivers/char/tty_io.c	Thu Jan  1 00:40:08 1998
++++ linux/drivers/char/tty_io.c	Sat Jan 17 13:56:12 1998
+@@ -1121,10 +1121,10 @@
+ 			redirect = NULL;
+ 	}
+ 
++	filp->private_data = 0;
+ 	/* check whether both sides are closing ... */
+ 	if (!tty_closing || (o_tty && !o_tty_closing))
+ 		return;
+-	filp->private_data = 0;
+ 	
+ #ifdef TTY_DEBUG_HANGUP
+ 	printk("freeing tty structure...");
+diff -ruN linux-2.1.80-pre4-clean/fs/Makefile linux/fs/Makefile
+--- linux-2.1.80-pre4-clean/fs/Makefile	Sun Jan  4 18:40:16 1998
++++ linux/fs/Makefile	Sat Jan 17 13:56:12 1998
+@@ -13,7 +13,7 @@
+ O_OBJS    = open.o read_write.o devices.o file_table.o buffer.o \
+ 		super.o  block_dev.o stat.o exec.o pipe.o namei.o fcntl.o \
+ 		ioctl.o readdir.o select.o fifo.o locks.o filesystems.o \
+-		inode.o dcache.o attr.o bad_inode.o $(BINFMTS) 
++		inode.o dcache.o attr.o bad_inode.o revoke.o $(BINFMTS) 
+ 
+ MOD_LIST_NAME := FS_MODULES
+ ALL_SUB_DIRS = coda minix ext2 fat msdos vfat proc isofs nfs umsdos ntfs \
+diff -ruN linux-2.1.80-pre4-clean/fs/revoke.c linux/fs/revoke.c
+--- linux-2.1.80-pre4-clean/fs/revoke.c	Thu Jan  1 01:00:00 1970
++++ linux/fs/revoke.c	Sat Jan 17 16:09:35 1998
+@@ -0,0 +1,152 @@
++/*
++ *  linux/fs/revoke.c
++ *
++ *  Copyright (C) 1997  Matthew Kirkwood <weejock@ferret.lmh.ox.ac.uk>
++ *  Copyright (C) 1997  Chris Evans <chris@ferret.lmh.ox.ac.uk>
++ *
++ */
++
++#include <linux/kernel.h>
++#include <linux/linkage.h>
++#include <linux/sched.h>
++#include <linux/errno.h>
++#include <linux/smp_lock.h>
++#include <linux/fs.h>
++#include <linux/malloc.h>
++#include <linux/mm.h>
++
++#include <linux/stat.h>
++#include <linux/rescind.h>
++
++static int ret_ebadf(void)
++{
++	return -EBADF;
++}
++
++/* BSD man page mandates read() performs thus. Pity certain BSDs don't
++ * adhere to this.
++ */
++
++static ssize_t ret_no_bytes(struct file* filp, char* buf, size_t len, loff_t* off)
++{
++	return 0;
++}
++
++static int revoked_release(struct inode * inode, struct file * filp)
++{
++	filp->f_op = NULL;
++	return 0;
++}
++
++static struct file_operations revokedf_ops = {
++	ret_ebadf,		/* llseek */
++	ret_no_bytes,		/* read */
++	ret_ebadf,		/* write */
++	ret_ebadf,		/* readdir */
++	ret_ebadf,		/* poll */
++	ret_ebadf,		/* ioctl */
++	ret_ebadf,		/* mmap */
++	ret_ebadf,		/* open */
++	revoked_release,	/* release */
++	ret_ebadf,		/* fsync */
++	ret_ebadf,		/* fasync */
++	ret_ebadf,		/* check_media_change */
++	ret_ebadf,		/* revalidate */
++	ret_ebadf,		/* lock */
++};
++
++
++static void do_revoke(struct inode * inode, struct file * filp, int who, int what)
++{
++/* Do we do this one? */
++	if((filp->f_owner.uid == inode->i_uid) || (filp->f_owner.euid == inode->i_uid))
++		if(~(who & RESCIND_WHO_ME))
++			return;
++	else
++		if(~(who & RESCIND_WHO_NOTME))
++			return;
++
++/* So do it then... */
++	down(&inode->i_sem);
++
++	if(what & RESCIND_WHAT_FD) {
++		if(filp->f_op->release)
++			(*filp->f_op->release)(inode, filp);	/* Close the file */
++
++		filp->f_op = &revokedf_ops;	/* The file_ops to do what we want... */
++	}
++
++/* Right. Did someone mmap() the fd while they held it open?
++ * Better sort this out. Does your OS get it right :-)
++ * Hint: See some of the *BSD. We discovered problems..
++ */
++	if(what & RESCIND_WHAT_MMAP)
++		vmtruncate(inode, 0);
++
++	up(&inode->i_sem);
++
++	return;
++}
++
++asmlinkage int sys_rescind(char * path, int who, int what, int type)
++{
++int error = 0;
++struct dentry * dentry;
++struct inode * inode;
++kdev_t dev;
++unsigned long inum;
++
++struct file * filp;
++
++	lock_kernel();
++	dentry = namei(path);
++
++	error = PTR_ERR(dentry);
++	if(IS_ERR(dentry))
++		goto out;
++
++	inode = dentry->d_inode;
++
++/* Check if owner or superuser */
++	if( (inode->i_uid != current->fsuid)
++	 && (inode->i_uid != current->euid)
++	 && !suser()) {
++		error = -EPERM;
++		goto dput_out;
++	}
++
++/* See if we want to do this... */
++	if((inode->i_mode & (S_IFBLK | S_IFCHR)) && (~(type & RESCIND_TYPE_DEV)))
++		return -EINVAL;
++
++	if((inode->i_mode & S_IFREG) && (~(type & RESCIND_TYPE_FILE)))
++		return -EINVAL;
++
++/*
++ * Now, trawl the file table and see if we can revoke anything.
++ *
++ * Should I canonify the name, or is it OK to rely on the dev
++ * and inode values?
++ */
++	dev = inode->i_dev;
++	inum = inode->i_ino;
++
++	filp = inuse_filps;
++	while(filp) {
++		if(!filp->f_dentry)
++			continue;
++
++		inode = filp->f_dentry->d_inode;
++		if((inode->i_dev == dev) && (inode->i_ino == inum)) {
++			do_revoke(inode, filp, who, what);
++		}
++
++		filp = filp->f_next;
++	}
++
++dput_out:
++	dput(dentry);
++out:
++	unlock_kernel();
++	return error;
++}
+diff -ruN linux-2.1.80-pre4-clean/include/linux/rescind.h linux/include/linux/rescind.h
+--- linux-2.1.80-pre4-clean/include/linux/rescind.h	Thu Jan  1 01:00:00 1970
++++ linux/include/linux/rescind.h	Sat Jan 17 15:45:20 1998
+@@ -0,0 +1,20 @@
++#ifndef _LINUX_RESCIND_H
++#define _LINUX_RESCIND_H
++
++/* int rescind(char * path, int who, int what, int flags); */
++
++#define	RESCIND_WHO_ME		0x0001
++#define	RESCIND_WHO_NOTME	0x0002
++#define	RESCIND_WHO_ALL		(RESCIND_WHO_ME | RESCIND_WHO_NOTME)
++
++#define	RESCIND_WHAT_FD		0x0001
++#define	RESCIND_WHAT_MMAP	0x0002
++#define	RESCIND_WHAT_ALL	(RESCIND_WHAT_FD | RESCIND_WHAT_MMAP)
++
++#define	RESCIND_TYPE_DEV	0x0100
++#define	RESCIND_TYPE_FILE	0x0200
++#define RESCIND_TYPE_ALL	(RESCIND_TYPE_DEV | RESCIND_TYPE_FILE)
++
++/* BSD revoke is rescind(path, RESCIND_WHO_ALL, RESCIND_WHAT_FD, RESCIND_TYPE_DEV) */
++
++#endif /* _LINUX_RESCIND_H */

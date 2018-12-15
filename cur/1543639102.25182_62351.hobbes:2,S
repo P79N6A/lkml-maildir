@@ -1,0 +1,291 @@
+Date: Wed, 7 Aug 2002 20:10:40 +0200 (CEST)
+From: Ingo Molnar <>
+Subject: [patch] tls-2.5.30-A1
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2002/8/7/191
+
+the attached patch (against BK-curr + Luca Barbieri's two TLS patches)  
+does two things:
+ - it implements a second TLS entry for Wine's purposes.
+Alexandre suggested that Wine would need two TLS entries, one for glibc
+(in %gs), and one for the Win32 API (in %fs). The constant selector is
+also a speedup for switches to/from 16-bit mode.
+i left the possibility open to add even more TLS entries, but i find it
+very unlikely to happen. So the code does not iterate over an array of TLS
+descriptors, for performance reasons. This can be changed anytime without
+affecting the userspace interface.
+ - the patch adds the get_thread_area() system-call.
+the get_thread_area() call is needed by debuggers, to be able to read the
+TLS settings of a threaded application, without having to assume anything
+about what was loaded. The get_thread_area() call does not expose any
+segmentation details - it returns the TLS info in the same format as
+passed to the set_thread_area() call.
+i've also attached tls.c which shows off both extensions. These extensions
+are source and binary-compatible with any potential TLS code.
+	Ingo
+--- linux/arch/i386/kernel/process.c.orig	Wed Aug  7 19:16:45 2002
++++ linux/arch/i386/kernel/process.c	Wed Aug  7 19:40:27 2002
+@@ -839,6 +839,7 @@
+ asmlinkage int sys_set_thread_area(unsigned long base, unsigned long flags)
+ {
+ 	struct thread_struct *t = &current->thread;
++	struct desc_struct *desc;
+ 	int writable = 0;
+ 	int cpu;
+ 
+@@ -848,21 +849,62 @@
+ 
+ 	if (flags & TLS_FLAG_WRITABLE)
+ 		writable = 1;
++	desc = &t->tls_desc1;
++	if (flags & TLS_FLAG_ENTRY2)
++		desc = &t->tls_desc2;
+ 
+ 	/*
+ 	 * We must not get preempted while modifying the TLS.
+ 	 */
+ 	cpu = get_cpu();
+ 
+-        t->tls_desc.a = ((base & 0x0000ffff) << 16) | 0xffff;
++        desc->a = ((base & 0x0000ffff) << 16) | 0xffff;
+ 
+-        t->tls_desc.b = (base & 0xff000000) | ((base & 0x00ff0000) >> 16) |
++        desc->b = (base & 0xff000000) | ((base & 0x00ff0000) >> 16) |
+ 				0xf0000 | (writable << 9) | (1 << 15) |
+ 					(1 << 22) | (1 << 23) | 0x7000;
+ 
+ 	load_TLS_desc(t, cpu);
+ 	put_cpu();
+ 
+-	return TLS_ENTRY*8 + 3;
++	if (flags & TLS_FLAG_ENTRY2)
++		return TLS_ENTRY2*8 + 3;
++	else
++		return TLS_ENTRY1*8 + 3;
++}
++
++/*
++ * Get the current Thread-Local Storage area:
++ */
++
++#define GET_BASE(desc) \
++(	(((desc).a >> 16) & 0x0000ffff) | \
++	(((desc).b << 16) & 0x00ff0000) | \
++	( (desc).b        & 0xff000000)	)
++
++#define GET_WRITABLE(desc) \
++	(((desc).b >> 9)  & 0x00000001)
++
++asmlinkage int sys_get_thread_area(unsigned long *ubase, unsigned long *uflags,
++					unsigned long flags)
++{
++	struct thread_struct *thread = &current->thread;
++	unsigned long base, flg;
++
++	if (flags & ~TLS_FLAGS_MASK)
++		return -EINVAL;
++
++	if (flags & TLS_FLAG_ENTRY2) {
++		base = GET_BASE(thread->tls_desc2);
++		flg = GET_WRITABLE(thread->tls_desc2) | TLS_FLAG_ENTRY2;
++	} else {
++		base = GET_BASE(thread->tls_desc1);
++		flg = GET_WRITABLE(thread->tls_desc1) | TLS_FLAG_ENTRY1;
++	}
++	if (copy_to_user(ubase, &base, sizeof(base)))
++		return -EFAULT;
++	if (copy_to_user(uflags, &flg, sizeof(flg)))
++		return -EFAULT;
++	return 0;
+ }
+ 
+--- linux/arch/i386/kernel/entry.S.orig	Wed Aug  7 19:18:33 2002
++++ linux/arch/i386/kernel/entry.S	Wed Aug  7 19:18:21 2002
+@@ -753,6 +753,7 @@
+ 	.long sys_sched_setaffinity
+ 	.long sys_sched_getaffinity
+ 	.long sys_set_thread_area
++	.long sys_get_thread_area
+ 
+ 	.rept NR_syscalls-(.-sys_call_table)/4
+ 		.long sys_ni_syscall
+--- linux/include/asm-i386/processor.h.orig	Wed Aug  7 19:22:57 2002
++++ linux/include/asm-i386/processor.h	Wed Aug  7 19:27:01 2002
+@@ -376,8 +376,8 @@
+ 	unsigned long		v86flags, v86mask, v86mode, saved_esp0;
+ /* IO permissions */
+ 	unsigned long	*ts_io_bitmap;
+-/* TLS cached descriptor */
+-	struct desc_struct tls_desc;
++/* TLS cached descriptors */
++	struct desc_struct tls_desc1, tls_desc2;
+ };
+ 
+ #define INIT_THREAD  {						\
+--- linux/include/asm-i386/unistd.h.orig	Wed Aug  7 19:18:45 2002
++++ linux/include/asm-i386/unistd.h	Wed Aug  7 19:18:58 2002
+@@ -248,6 +248,7 @@
+ #define __NR_sched_setaffinity	241
+ #define __NR_sched_getaffinity	242
+ #define __NR_set_thread_area	243
++#define __NR_get_thread_area	244
+ 
+ /* user-visible error numbers are in the range -1 - -124: see <asm-i386/errno.h> */
+ 
+--- linux/include/asm-i386/desc.h.orig	Wed Aug  7 19:20:57 2002
++++ linux/include/asm-i386/desc.h	Wed Aug  7 19:51:13 2002
+@@ -12,7 +12,7 @@
+  *   3 - kernel data segment
+  *   4 - user code segment		<==== new cacheline
+  *   5 - user data segment
+- *   6 - Thread-Local Storage (TLS) segment
++ *   6 - Thread-Local Storage (TLS) segment #1
+  *   7 - LDT
+  *   8 - APM BIOS support		<==== new cacheline
+  *   9 - APM BIOS support
+@@ -23,12 +23,13 @@
+  *  14 - PNPBIOS support
+  *  15 - PNPBIOS support
+  *  16 - PNPBIOS support		<==== new cacheline
+- *  17 - not used
++ *  17 - TLS segment #2
+  *  18 - not used
+  *  19 - not used
+  */
+ #define TSS_ENTRY 1
+-#define TLS_ENTRY 6
++#define TLS_ENTRY1 6
++#define TLS_ENTRY2 17
+ #define LDT_ENTRY 7
+ /*
+  * The interrupt descriptor table has room for 256 idt's,
+@@ -86,13 +87,16 @@
+ 	_set_tssldt_desc(&cpu_gdt_table[cpu][LDT_ENTRY], (int)addr, ((size << 3)-1), 0x82);
+ }
+ 
+-#define TLS_FLAGS_MASK			0x00000001
++#define TLS_FLAGS_MASK			0x00000003
+ 
+ #define TLS_FLAG_WRITABLE		0x00000001
++#define TLS_FLAG_ENTRY1			0x00000000
++#define TLS_FLAG_ENTRY2			0x00000002
+ 
+ static inline void load_TLS_desc(struct thread_struct *t, unsigned int cpu)
+ {
+-	cpu_gdt_table[cpu][TLS_ENTRY] = t->tls_desc;
++	cpu_gdt_table[cpu][TLS_ENTRY1] = t->tls_desc1;
++	cpu_gdt_table[cpu][TLS_ENTRY2] = t->tls_desc2;
+ }
+ 
+ static inline void clear_LDT(void)#include <asm/ldt.h>
+#include <stdio.h>
+#include <linux/unistd.h>
+#include <signal.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <pthread.h>
+#include <asm/sigcontext.h>
+/*
+ * TLS functionality testing utility.
+ */
+#define TLS_FLAGS_MASK                  0x00000003
+#define TLS_FLAG_WRITABLE               0x00000001
+#define TLS_FLAG_ENTRY2                 0x00000002
+#define __NR_set_thread_area 243
+_syscall2(int, set_thread_area, unsigned int, base, unsigned int, flags)
+#define __NR_get_thread_area 244
+_syscall3(int, get_thread_area, unsigned int *, ubase, unsigned int *, uflags, unsigned int, flags)
+static inline void initseg (int seg)
+{
+	asm ("mov %w0,%%fs" : : "r" (seg));
+}
+static inline unsigned char __readseg (unsigned offset)
+{
+	unsigned char res;
+	asm ("fs; movb (%1),%%al" : "=a" (res) : "r" (offset));
+	return res;
+}
+static inline void __writeseg (unsigned offset, unsigned char b)
+{
+	asm ("fs; movb %b1,(%0)" : : "r" (offset), "r" (b));
+}
+static void readseg (void *dst, const void *src)
+{
+	*(char *)dst = __readseg((unsigned int)src);
+}
+static void writeseg (void *dst, unsigned char value)
+{
+	__writeseg((unsigned int)dst, value);
+}
+unsigned char pre_data		[4096] = { [ 0 ... 4095 ] = 33 };
+unsigned char data		[4096] = { [ 0 ... 4095 ] = 44 };
+unsigned char post_data		[4096] = { [ 0 ... 4095 ] = 55 };
+int main (void)
+{
+	unsigned int base, flags;
+	int seg, ret;
+	unsigned char result;
+	data[0] = 123;
+	data[4096] = 210;
+	base = 0;
+	printf("\ndoing set_thread_area(0x%08x, writable):\n", base);
+	seg = set_thread_area(base, TLS_FLAG_WRITABLE);
+	printf("====> got GDT selector: 0x%x", seg);
+	if (seg != 51) {
+		printf(" ERROR: incorrect selector!\n");
+		exit(-1);
+	} else
+		printf(" --- TEST PASSED.\n");
+	initseg(seg);
+	printf("\nreading first byte of [0x%08x] TLS:\n", base);
+	readseg (&result, &data);
+	if (result == 123)
+		printf("====> %d --- TEST PASSED.\n\n", result);
+	else
+		printf("====> %d --- TEST FAILURE!\n\n", result);
+	base = (unsigned int)&data;
+	printf("doing set_thread_area(0x%08x, writable, entry2):\n", base);
+	seg = set_thread_area(base, TLS_FLAG_WRITABLE | TLS_FLAG_ENTRY2);
+	initseg(seg);
+	printf("====> got GDT selector: 0x%x", seg);
+	if (seg != 0x8b) {
+		printf(" ERROR: incorrect selector!\n");
+		exit(-1);
+	} else
+		printf(" --- TEST PASSED.\n");
+	printf("context-switching once ...\n");
+	sleep(1);
+	printf("\nreading first byte of 4K [0x%08x] TLS:\n", base);
+	readseg (&result, 0);
+	if (result == 123)
+		printf("====> %d --- TEST PASSED.\n\n", result);
+	else
+		printf("====> %d --- TEST FAILURE!\n\n", result);
+	printf("reading last byte of 4097 byte [0x%08x] TLS:\n", base);
+	readseg (&result, (void *)4096);
+	if (result == 210)
+		printf("====> %d --- TEST PASSED.\n\n", result);
+	else
+		printf("====> %d --- TEST FAILURE!\n\n", result);
+	printf("writing last byte of 4097 byte [0x%08x] TLS:\n", base);
+	writeseg ((void *)4096, 234);
+	readseg (&result, (void *)4096);
+	if (result == 234)
+		printf("====> %d --- TEST PASSED.\n", result);
+	else
+		printf("====> %d --- TEST FAILURE!.\n", result);
+	printf("\nreading byte outside of the TLS (should not coredump)...\n\n");
+	readseg (&result, (void *)4097);
+	printf("result: %d.\n", result);
+	printf("doing get_thread_area(0x%08x, writable, entry2):\n", base);
+	base = flags = 1234;
+	ret = get_thread_area(&base, &flags, TLS_FLAG_WRITABLE | TLS_FLAG_ENTRY2);
+	if (!ret)
+		printf("====> [%08x, %d] %d --- TEST PASSED.\n", base, flags, ret);
+	else
+		printf("====> [%08x, %d] %d --- TEST FAILURE!.\n", base, flags, ret);
+	return 0;
+}

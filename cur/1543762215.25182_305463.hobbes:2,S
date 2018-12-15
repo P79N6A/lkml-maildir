@@ -1,0 +1,171 @@
+Date: Wed, 23 Mar 2005 12:54:55 -0500
+From: Linh Dang <>
+Subject: [PATCH] Hack to get dvd-burning at 8x (instead of 3x) with ide-cd (2.6.11)
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2005/3/23/180
+
+Hi,
+I'd like to receive  comments/guide-lines about a hack I made to the
+2.6.11 kernel to improve DVD-burning speed (using growisofs.)
+The basic idea is the 16-pages pipe between mkisofs and growisofs is
+too small for DVD burning (typical 4GB of data.)
+In the hack, pipe_new will simply check for, if privileges permitted,
+the enviroment variable
+PIPE_MAX_ORDER to see if a (much) longer pipe is requested.
+This hack enable me to burn DVD at 8X (instead of 3X) on my old
+P3-450MHz (with growisofs and mkisofs running at SCHED_FIFO.)
+-- 
+Linh Dang
+--- linux-2.6.11/include/linux/pipe_fs_i.h	        2005/03/17 15:39:38
++++ linux-2.6.11-vpipe/include/linux/pipe_fs_i.h	2005/03/23 17:27:12
+@@ -21,7 +21,6 @@ struct pipe_buf_operations {
+ struct pipe_inode_info {
+ 	wait_queue_head_t wait;
+ 	unsigned int nrbufs, curbuf;
+-	struct pipe_buffer bufs[PIPE_BUFFERS];
+ 	struct page *tmp_page;
+ 	unsigned int start;
+ 	unsigned int readers;
+@@ -31,6 +30,8 @@ struct pipe_inode_info {
+ 	unsigned int w_counter;
+ 	struct fasync_struct *fasync_readers;
+ 	struct fasync_struct *fasync_writers;
++        unsigned max_nr_buffers;
++	struct pipe_buffer bufs[0];
+ };
+ 
+ /* Differs from PIPE_BUF in that PIPE_SIZE is the length of the actual--- linux-2.6.11/fs/pipe.c	        2005/03/17 15:30:32
++++ linux-2.6.11-vpipe/fs/pipe.c	2005/03/23 17:16:46
+@@ -160,7 +160,7 @@ pipe_readv(struct file *filp, const stru
+ 			if (!buf->len) {
+ 				buf->ops = NULL;
+ 				ops->release(info, buf);
+-				curbuf = (curbuf + 1) & (PIPE_BUFFERS-1);
++				curbuf = (curbuf + 1) & (info->max_nr_buffers - 1);
+ 				info->curbuf = curbuf;
+ 				info->nrbufs = --bufs;
+ 				do_wakeup = 1;
+@@ -243,7 +243,7 @@ pipe_writev(struct file *filp, const str
+ 
+ 	/* We try to merge small writes */
+ 	if (info->nrbufs && total_len < PAGE_SIZE) {
+-		int lastbuf = (info->curbuf + info->nrbufs - 1) & (PIPE_BUFFERS-1);
++		int lastbuf = (info->curbuf + info->nrbufs - 1) & (info->max_nr_buffers-1);
+ 		struct pipe_buffer *buf = info->bufs + lastbuf;
+ 		struct pipe_buf_operations *ops = buf->ops;
+ 		int offset = buf->offset + buf->len;
+@@ -270,9 +270,9 @@ pipe_writev(struct file *filp, const str
+ 			break;
+ 		}
+ 		bufs = info->nrbufs;
+-		if (bufs < PIPE_BUFFERS) {
++		if (bufs < info->max_nr_buffers) {
+ 			ssize_t chars;
+-			int newbuf = (info->curbuf + bufs) & (PIPE_BUFFERS-1);
++			int newbuf = (info->curbuf + bufs) & (info->max_nr_buffers-1);
+ 			struct pipe_buffer *buf = info->bufs + newbuf;
+ 			struct page *page = info->tmp_page;
+ 			int error;
+@@ -315,7 +315,7 @@ pipe_writev(struct file *filp, const str
+ 			if (!total_len)
+ 				break;
+ 		}
+-		if (bufs < PIPE_BUFFERS)
++		if (bufs < info->max_nr_buffers)
+ 			continue;
+ 		if (filp->f_flags & O_NONBLOCK) {
+ 			if (!ret) ret = -EAGAIN;
+@@ -382,7 +382,7 @@ pipe_ioctl(struct inode *pino, struct fi
+ 			nrbufs = info->nrbufs;
+ 			while (--nrbufs >= 0) {
+ 				count += info->bufs[buf].len;
+-				buf = (buf+1) & (PIPE_BUFFERS-1);
++				buf = (buf+1) & (info->max_nr_buffers-1);
+ 			}
+ 			up(PIPE_SEM(*inode));
+ 			return put_user(count, (int __user *)arg);
+@@ -412,7 +412,7 @@ pipe_poll(struct file *filp, poll_table 
+ 	}
+ 
+ 	if (filp->f_mode & FMODE_WRITE) {
+-		mask |= (nrbufs < PIPE_BUFFERS) ? POLLOUT | POLLWRNORM : 0;
++		mask |= (nrbufs < info->max_nr_buffers) ? POLLOUT | POLLWRNORM : 0;
+ 		if (!PIPE_READERS(*inode))
+ 			mask |= POLLERR;
+ 	}
+@@ -641,7 +641,7 @@ void free_pipe_info(struct inode *inode)
+ 	struct pipe_inode_info *info = inode->i_pipe;
+ 
+ 	inode->i_pipe = NULL;
+-	for (i = 0; i < PIPE_BUFFERS; i++) {
++	for (i = 0; i < info->max_nr_buffers; i++) {
+ 		struct pipe_buffer *buf = info->bufs + i;
+ 		if (buf->ops)
+ 			buf->ops->release(info, buf);
+@@ -653,13 +653,59 @@ void free_pipe_info(struct inode *inode)
+ 
+ struct inode* pipe_new(struct inode* inode)
+ {
++#define ENV "PIPE_MAX_ORDER="
+ 	struct pipe_inode_info *info;
++        struct mm_struct       *mm = current ? get_task_mm(current) : NULL;
++
++
++        char*                   env            = NULL;
++        unsigned                env_len        = 0;
++        unsigned                max_nr_buffers = PIPE_BUFFERS;
++
++        if (unlikely(capable(CAP_SYS_RESOURCE))) {
++                if (mm) {
++                        env_len = mm->env_end - mm->env_start;
++                        env     = kmalloc(env_len, GFP_KERNEL);
++                        access_process_vm(current, mm->env_start, env, env_len, 0);
++                        mmput(mm);
++                }
++
++                if (env) {
++                        const char* env_end = env + env_len;
++                        char*       p       = env;
++                        char*       dummy;
++
++
++                        while (p < env_end && strncmp(p, ENV, sizeof(ENV)))
++                                p = memscan(p, '\0', env_end - p) + 1;
++
++                        if (p < env_end && strncmp(p, ENV, sizeof(ENV)) == 0) {
++                                unsigned  pipe_nr_buffers_order =
++                                        simple_strtoul(strchr(p, '='), &dummy, 10);
++
++                                if (pipe_nr_buffers_order < 4)
++                                        pipe_nr_buffers_order = 4;
++
++                                if (pipe_nr_buffers_order > 16)
++                                        pipe_nr_buffers_order = 16;
++
++                                max_nr_buffers = 1 << pipe_nr_buffers_order;
++                        }
++
++                        kfree(env);
++                }
++        }
++
++
++	info = kcalloc(1, sizeof(struct pipe_inode_info) +
++                       sizeof(struct pipe_buffer) * max_nr_buffers,
++                                       GFP_KERNEL);
+ 
+-	info = kmalloc(sizeof(struct pipe_inode_info), GFP_KERNEL);
+ 	if (!info)
+-		goto fail_page;
+-	memset(info, 0, sizeof(*info));
+-	inode->i_pipe = info;
++                goto fail_page;
++
++        info->max_nr_buffers = max_nr_buffers;
++	inode->i_pipe        = info;
+ 
+ 	init_waitqueue_head(PIPE_WAIT(*inode));
+ 	PIPE_RCOUNTER(*inode) = PIPE_WCOUNTER(*inode) = 1;

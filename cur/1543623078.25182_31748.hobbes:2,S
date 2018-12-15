@@ -1,0 +1,206 @@
+Date: Sat, 2 Mar 2002 00:41:58 +0100 (CET)
+From: Urban Widmark <>
+Subject: [PATCH] smbfs codepage fixes for 2.4.18
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2002/3/1/236
+
+Ok, I think I've got something regarding the 2.4.18 oopses. (oopsen?)
+There are two errors in the changes to smbfs in 2.4.18-rc3 (and 2.5.5)
+1. SMB_MAXNAMELEN (max length of a single path component) was used where
+   SMB_MAXPATHLEN (max total path length) should have been used.
+2. The charset conversion routine was modified to return errors as
+   negative values but not all callers was changed to handle this. When an 
+   "illegal" character was hit the length of the string was set to 
+   0xffffffff and when computing the hash value it read outside the kernel 
+   memory.
+Attached is a patch vs 2.4.18 that fixes these issues for me. Please test
+and let me know.
+If I select a codepage/charset combination that doesn't match I now get a
+somewhat cryptic message instead of an oops (just a temporary thing).
+    "smbfs: filename charset conversion failed"
+The file is then hidden, which is bad. Conversion errors should map to '?'
+as they used to or do some translation into ":####" strings. I'll do
+something about that.
+Some comments on what some of you have been doing:
+The smbfs remote codepage can never be utf8 since there are no smb servers
+that talk utf8. It can be one of the dos codepages, it can be blank or
+with additional patches it can be a 2 byte little endian unicode format.
+Furthermore, the local charset must be one that matches the chars used in
+the remote set. Otherwise you get conversion errors. A few known good
+combinations are:
+cp850 <-> iso8859-1
+cp866 <-> koi8-r
+cp932 <-> euc-jp
+(the right is the local = linux side)
+See also the smb.conf manpage.
+But even with these it seems to be possible to create chars that do not
+match, and I think it is caused by windows trying to map unicode to a
+codepage and not finding a matching char to use.
+Local utf8 always matches the remote and is preferred if your system is
+setup to handle it.
+I would explain the reported
+    smb_proc_readdir_long: name=<directory> result=-2, rcls=1, err=2
+as a name conversion problem. If the conversion failed one way it used to
+be truncated and would then fail when sent back to the server. The error
+is ERRDOS - ERRbadfile (File not found).
+Check the config and the nls maps used.
+/Urban
+diff -urN -X exclude linux-2.4.18-orig/fs/smbfs/cache.c linux-2.4.18-smbfs/fs/smbfs/cache.c
+--- linux-2.4.18-orig/fs/smbfs/cache.c	Sat Jan 12 16:55:58 2002
++++ linux-2.4.18-smbfs/fs/smbfs/cache.c	Fri Mar  1 21:46:36 2002
+@@ -84,7 +84,7 @@
+ 	struct list_head *next;
+ 
+ 	if (d_validate(dent, parent)) {
+-		if (dent->d_name.len <= SMB_MAXPATHLEN &&
++		if (dent->d_name.len <= SMB_MAXNAMELEN &&
+ 		    (unsigned long)dent->d_fsdata == fpos) {
+ 			if (!dent->d_inode) {
+ 				dput(dent);
+diff -urN -X exclude linux-2.4.18-orig/fs/smbfs/proc.c linux-2.4.18-smbfs/fs/smbfs/proc.c
+--- linux-2.4.18-orig/fs/smbfs/proc.c	Fri Mar  1 20:23:38 2002
++++ linux-2.4.18-smbfs/fs/smbfs/proc.c	Sat Mar  2 00:04:22 2002
+@@ -119,11 +119,6 @@
+ 	int n;
+ 	wchar_t ch;
+ 
+-	if (!nls_from || !nls_to) {
+-		PARANOIA("nls_from=%p, nls_to=%p\n", nls_from, nls_to);
+-		return convert_memcpy(output, olen, input, ilen, NULL, NULL);
+-	}
+-
+ 	while (ilen > 0) {
+ 		/* convert by changing to unicode and back to the new cp */
+ 		n = nls_from->char2uni((unsigned char *)input, ilen, &ch);
+@@ -141,6 +136,10 @@
+ 		len += n;
+ 	}
+ 	return len;
++
++	/* FIXME: these error returns will simply make the files disappear
++	   if there is a codepage error. uni_xlate? Or treat different errors
++	   differently? */
+ fail:
+ 	return n;
+ }
+@@ -226,8 +225,8 @@
+ 	if (maxlen < 2)
+ 		return -ENAMETOOLONG;
+ 
+-	if (maxlen > SMB_MAXNAMELEN + 1)
+-		maxlen = SMB_MAXNAMELEN + 1;
++	if (maxlen > SMB_MAXPATHLEN + 1)
++		maxlen = SMB_MAXPATHLEN + 1;
+ 
+ 	if (entry == NULL)
+ 		goto test_name_and_out;
+@@ -1579,12 +1578,16 @@
+ 	}
+ #endif
+ 
+-	qname->len = server->convert(server->name_buf, SMB_MAXNAMELEN,
+-				     qname->name, len,
+-				     server->remote_nls, server->local_nls);
+-	qname->name = server->name_buf;
++	qname->len = 0;
++	len = server->convert(server->name_buf, SMB_MAXNAMELEN,
++			    qname->name, len,
++			    server->remote_nls, server->local_nls);
++	if (len > 0) {
++		qname->len = len;
++		qname->name = server->name_buf;
++		DEBUG1("len=%d, name=%.*s\n",qname->len,qname->len,qname->name);
++	}
+ 
+-	DEBUG1("len=%d, name=%.*s\n", qname->len, qname->len, qname->name);
+ 	return p + 22;
+ }
+ 
+@@ -1700,6 +1703,10 @@
+ 		for (i = 0; i < count; i++) {
+ 			p = smb_decode_short_dirent(server, p, 
+ 						    &qname, &fattr);
++			if (qname.len == 0) {
++				printk(KERN_ERR "smbfs: filename charset conversion failed\n");
++				continue;
++			}
+ 
+ 			if (entries_seen == 2 && qname.name[0] == '.') {
+ 				if (qname.len == 1)
+@@ -1737,6 +1744,7 @@
+ {
+ 	char *result;
+ 	unsigned int len = 0;
++	int n;
+ 	__u16 date, time;
+ 
+ 	/*
+@@ -1812,10 +1820,14 @@
+ 	}
+ #endif
+ 
+-	qname->len = server->convert(server->name_buf, SMB_MAXNAMELEN,
+-				     qname->name, len,
+-				     server->remote_nls, server->local_nls);
+-	qname->name = server->name_buf;
++	qname->len = 0;
++	n = server->convert(server->name_buf, SMB_MAXNAMELEN,
++			    qname->name, len,
++			    server->remote_nls, server->local_nls);
++	if (n > 0) {
++		qname->len = n;
++		qname->name = server->name_buf;
++	}
+ 
+ out:
+ 	return result;
+@@ -1881,7 +1893,7 @@
+ 	 */
+ 	mask = param + 12;
+ 
+-	mask_len = smb_encode_path(server, mask, SMB_MAXNAMELEN+1, dir, &star);
++	mask_len = smb_encode_path(server, mask, SMB_MAXPATHLEN+1, dir, &star);
+ 	if (mask_len < 0) {
+ 		result = mask_len;
+ 		goto unlock_return;
+@@ -2030,6 +2042,10 @@
+ 
+ 			p = smb_decode_long_dirent(server, p, info_level,
+ 						   &qname, &fattr);
++			if (qname.len == 0) {
++				printk(KERN_ERR "smbfs: filename charset conversion failed\n");
++				continue;
++			}
+ 
+ 			/* ignore . and .. from the server */
+ 			if (entries_seen == 2 && qname.name[0] == '.') {
+@@ -2088,7 +2104,7 @@
+ 	int mask_len, result;
+ 
+ retry:
+-	mask_len = smb_encode_path(server, mask, SMB_MAXNAMELEN+1, dentry, NULL);
++	mask_len = smb_encode_path(server, mask, SMB_MAXPATHLEN+1, dentry, NULL);
+ 	if (mask_len < 0) {
+ 		result = mask_len;
+ 		goto out;
+@@ -2214,7 +2230,7 @@
+       retry:
+ 	WSET(param, 0, 1);	/* Info level SMB_INFO_STANDARD */
+ 	DSET(param, 2, 0);
+-	result = smb_encode_path(server, param+6, SMB_MAXNAMELEN+1, dir, NULL);
++	result = smb_encode_path(server, param+6, SMB_MAXPATHLEN+1, dir, NULL);
+ 	if (result < 0)
+ 		goto out;
+ 	p = param + 6 + result;
+@@ -2464,7 +2480,7 @@
+       retry:
+ 	WSET(param, 0, 1);	/* Info level SMB_INFO_STANDARD */
+ 	DSET(param, 2, 0);
+-	result = smb_encode_path(server, param+6, SMB_MAXNAMELEN+1, dir, NULL);
++	result = smb_encode_path(server, param+6, SMB_MAXPATHLEN+1, dir, NULL);
+ 	if (result < 0)
+ 		goto out;
+ 	p = param + 6 + result;

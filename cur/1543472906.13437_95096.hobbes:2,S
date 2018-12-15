@@ -1,0 +1,250 @@
+Date: Wed, 23 Dec 1998 20:24:33 +0100 (CET)
+From: Andrea Arcangeli <>
+Subject: if my new update_shared_mappings() races, vmtruncate is just racing , too
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1998/12/23/118
+
+It seems to me that vmtruncate is playing with the pte/pgd of other
+processes without hoding any mmap_semaphore.
+I guess the reason this is safe is that lock_kernel protect us from
+another CPU that would play with pte/pgd at the same time. It seems safe
+also in practice, I tried to reproduce a race with ftruncate and
+threading, but with no success (as expected ;). 
+I need to do the _same_ thing vmtruncate is doing in
+update_shared_mappings(). So now I don' t hold any additional mmap_sem
+before to change the pte of the other processes.
+Now I held also the inode->i_sem seamphore in some more place. I think
+that it's safe to hold the inode->i_sem semaphore before playing with the
+vm_shared list.
+Here a new patch:
+Index: fs/locks.c
+===================================================================
+RCS file: /var/cvs/linux/fs/locks.c,v
+retrieving revision 1.1.1.1.2.2
+diff -u -r1.1.1.1.2.2 locks.c
+--- locks.c	1998/12/17 14:43:55	1.1.1.1.2.2
++++ linux/fs/locks.c	1998/12/23 16:52:13
+@@ -402,12 +402,18 @@
+ 	if (IS_MANDLOCK(inode) &&
+ 	    (inode->i_mode & (S_ISGID | S_IXGRP)) == S_ISGID &&
+ 	    inode->i_mmap) {
++		struct semaphore * s = &inode->i_sem;
+ 		struct vm_area_struct *vma = inode->i_mmap;
+ 		error = -EAGAIN;
++		down(s);
+ 		do {
+ 			if (vma->vm_flags & VM_MAYSHARE)
++			{
++				up(s);
+ 				goto out_putf;
++			}
+ 		} while ((vma = vma->vm_next_share) != NULL);
++		up(s);
+ 	}
+ 
+ 	error = -EINVAL;
+Index: kernel/fork.c
+===================================================================
+RCS file: /var/cvs/linux/kernel/fork.c,v
+retrieving revision 1.1.1.1.2.4
+diff -u -r1.1.1.1.2.4 fork.c
+--- fork.c	1998/12/17 14:44:42	1.1.1.1.2.4
++++ fork.c	1998/12/23 16:47:41
+@@ -209,16 +209,19 @@
+ 		tmp->vm_next = NULL;
+ 		file = tmp->vm_file;
+ 		if (file) {
++			struct semaphore * s = &file->f_dentry->d_inode->i_sem;
+ 			file->f_count++;
+ 			if (tmp->vm_flags & VM_DENYWRITE)
+ 				file->f_dentry->d_inode->i_writecount--;
+-      
++
++			down(s);
+ 			/* insert tmp into the share list, just after mpnt */
+ 			if((tmp->vm_next_share = mpnt->vm_next_share) != NULL)
+ 				mpnt->vm_next_share->vm_pprev_share =
+ 					&tmp->vm_next_share;
+ 			mpnt->vm_next_share = tmp;
+ 			tmp->vm_pprev_share = &mpnt->vm_next_share;
++			up(s);
+ 		}
+ 
+ 		/* Copy the pages, but defer checking for errors */
+Index: mm/filemap.c
+===================================================================
+RCS file: /var/cvs/linux/mm/filemap.c,v
+retrieving revision 1.1.1.1.2.26
+diff -u -r1.1.1.1.2.26 filemap.c
+--- filemap.c	1998/12/23 14:39:48	1.1.1.1.2.26
++++ filemap.c	1998/12/23 17:48:16
+@@ -5,6 +5,10 @@
+  */
+ 
+ /*
++ * update_shared_mappings(), Copyright (C) 1998  Andrea Arcangeli
++ */
++
++/*
+  * This file handles the generic file mmap semantics used by
+  * most "normal" filesystems (but you don't /have/ to use this:
+  * the NFS filesystem used to do this differently, for example)
+@@ -1151,6 +1155,74 @@
+ 	return mk_pte(page,vma->vm_page_prot);
+ }
+ 
++static void update_one_shared_mapping(struct vm_area_struct *shared,
++				      unsigned long address, pte_t orig_pte)
++{
++	pgd_t *pgd;
++	pmd_t *pmd;
++	pte_t *pte;
++
++	pgd = pgd_offset(shared->vm_mm, address);
++	if (pgd_none(*pgd))
++		goto out;
++	if (pgd_bad(*pgd)) {
++		printk(KERN_ERR "update_shared_mappings: bad pgd (%08lx)\n",
++		       pgd_val(*pgd));
++		pgd_clear(pgd);
++		goto out;
++	}
++
++	pmd = pmd_offset(pgd, address);
++	if (pmd_none(*pmd))
++		goto out;
++	if (pmd_bad(*pmd))
++	{
++		printk(KERN_ERR "update_shared_mappings: bad pmd (%08lx)\n",
++		       pmd_val(*pmd));
++		pmd_clear(pmd);
++		goto out;
++	}
++
++	pte = pte_offset(pmd, address);
++
++	if (pte_val(pte_mkclean(pte_mkyoung(*pte))) !=
++	    pte_val(pte_mkclean(pte_mkyoung(orig_pte))))
++		goto out;
++
++	flush_page_to_ram(page(pte));
++	flush_cache_page(shared, address);
++	set_pte(pte, pte_mkclean(*pte));
++	flush_tlb_page(shared, address);
++
++ out:
++}
++
++static void update_shared_mappings(struct vm_area_struct *this,
++				   unsigned long address,
++				   pte_t orig_pte)
++{
++	if (this->vm_flags & VM_SHARED)
++	{
++		struct file * filp = this->vm_file;
++		if (filp)
++		{
++			struct inode * inode = filp->f_dentry->d_inode;
++			struct semaphore * s = &inode->i_sem;
++			struct vm_area_struct * shared;
++
++			down(s);
++			for (shared = inode->i_mmap; shared;
++			     shared = shared->vm_next_share)
++			{
++				if (shared->vm_mm == this->vm_mm)
++					continue;
++				update_one_shared_mapping(shared, address,
++							  orig_pte);
++			}
++			up(s);
++		}
++	}
++}
+ 
+ static inline int filemap_sync_pte(pte_t * ptep, struct vm_area_struct *vma,
+ 	unsigned long address, unsigned int flags)
+@@ -1170,6 +1242,7 @@
+ 		flush_tlb_page(vma, address);
+ 		page = pte_page(pte);
+ 		atomic_inc(&mem_map[MAP_NR(page)].count);
++		update_shared_mappings(vma, address, pte);
+ 	} else {
+ 		if (pte_none(pte))
+ 			return 0;
+Index: mm/mmap.c
+===================================================================
+RCS file: /var/cvs/linux/mm/mmap.c,v
+retrieving revision 1.1.1.1.2.10
+diff -u -r1.1.1.1.2.10 mmap.c
+--- mmap.c	1998/12/17 14:44:43	1.1.1.1.2.10
++++ mmap.c	1998/12/23 16:49:10
+@@ -76,11 +76,16 @@
+ 	struct file * file = vma->vm_file;
+ 
+ 	if (file) {
++		struct semaphore * sem = &file->f_dentry->d_inode->i_sem;
++		struct file * file = vma->vm_file;
++
++		down(sem);
+ 		if (vma->vm_flags & VM_DENYWRITE)
+ 			file->f_dentry->d_inode->i_writecount++;
+ 		if(vma->vm_next_share)
+ 			vma->vm_next_share->vm_pprev_share = vma->vm_pprev_share;
+ 		*vma->vm_pprev_share = vma->vm_next_share;
++		up(sem);
+ 	}
+ }
+ 
+@@ -514,9 +519,6 @@
+ 		free = free->vm_next;
+ 		freed = 1;
+ 
+-		mm->map_count--;
+-		remove_shared_vm_struct(mpnt);
+-
+ 		st = addr < mpnt->vm_start ? mpnt->vm_start : addr;
+ 		end = addr+len;
+ 		end = end > mpnt->vm_end ? mpnt->vm_end : end;
+@@ -525,6 +527,9 @@
+ 		if (mpnt->vm_ops && mpnt->vm_ops->unmap)
+ 			mpnt->vm_ops->unmap(mpnt, st, size);
+ 
++		mm->map_count--;
++		remove_shared_vm_struct(mpnt);
++
+ 		flush_cache_range(mm, st, end);
+ 		zap_page_range(mm, st, size);
+ 		flush_tlb_range(mm, st, end);
+@@ -616,14 +621,18 @@
+ 	file = vmp->vm_file;
+ 	if (file) {
+ 		struct inode * inode = file->f_dentry->d_inode;
++		struct semaphore * sem = &inode->i_sem;
++
+ 		if (vmp->vm_flags & VM_DENYWRITE)
+ 			inode->i_writecount--;
+       
++		down(sem);
+ 		/* insert vmp into inode's share list */
+ 		if((vmp->vm_next_share = inode->i_mmap) != NULL)
+ 			inode->i_mmap->vm_pprev_share = &vmp->vm_next_share;
+ 		inode->i_mmap = vmp;
+ 		vmp->vm_pprev_share = &inode->i_mmap;
++		up(sem);
+ 	}
+ }
+ 
+Seems to work fine here...
+I also don' t understand the reason for which we increase the ->count of
+the page when we sync it...
+Comments?
+Andrea Arcangeli
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

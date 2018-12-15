@@ -1,0 +1,242 @@
+Date: Thu, 30 Dec 1999 15:20:05 -0500
+From: Keith Adams <>
+Subject: [PATCH] siginfo, kernel 2.3.35
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/12/30/117
+
+The siginfo patch below applies cleanly to 2.3.35. It causes SIGSEGV to
+properly report siginfo fields on i386. This is necessary to an application
+I'm working on, which does user-level paging by trapping SIGSEGV. This is
+a fairly standard UNIX technique, that is impossible on Linux without this
+patch.
+As a nice side effect, this patch satisfies the two XXX comments in
+kernel/signal.c about queueing p to one signal for non-realtime signals, and
+cleans up dequeue_signal slightly.
+Thanks,
+Keith Adams
+--
+diff -ur -x Makefile -x .depend -x .hdepend -x *.o -x *.a -x *.o.flags linux/arch/i386/mm/fault.c linux-2.3.34/arch/i386/mm/fault.c
+--- linux/arch/i386/mm/fault.c	Tue Dec 28 17:27:44 1999
++++ linux-2.3.34/arch/i386/mm/fault.c	Mon Dec 27 20:29:26 1999
+@@ -123,6 +123,7 @@
+ 	unsigned long page;
+ 	unsigned long fixup;
+ 	int write;
++	int sinfo_code = SEGV_MAPERR;
+ 
+ 	/* get the address */
+ 	__asm__("movl %%cr2,%0":"=r" (address));
+@@ -164,6 +165,7 @@
+  */
+ good_area:
+ 	write = 0;
++	sinfo_code = SEGV_ACCERR;
+ 	switch (error_code & 3) {
+ 		default:	/* 3: write, present */
+ #ifdef TEST_VERIFY_AREA
+@@ -216,10 +218,15 @@
+ 
+ 	/* User mode accesses just cause a SIGSEGV */
+ 	if (error_code & 4) {
++		siginfo_t info;
++
++		info.si_signo = SIGSEGV;
++		info.si_code = sinfo_code;
++		info.si_addr = (void *) address;
+ 		tsk->thread.cr2 = address;
+ 		tsk->thread.error_code = error_code;
+ 		tsk->thread.trap_no = 14;
+-		force_sig(SIGSEGV, tsk);
++		force_sig_info(SIGSEGV, &info, tsk);
+ 		return;
+ 	}
+ 
+diff -ur -x Makefile -x .depend -x .hdepend -x *.o -x *.a -x *.o.flags linux/kernel/signal.c linux-2.3.34/kernel/signal.c
+--- linux/kernel/signal.c	Tue Dec 28 17:17:59 1999
++++ linux-2.3.34/kernel/signal.c	Tue Dec 28 13:43:02 1999
+@@ -130,55 +130,43 @@
+ 	if (sig) {
+ 		int reset = 1;
+ 
++		/* Unconditionally look for a queued signal. The usual
++		 * case is that the queue is empty anyway.  */
+ 		/* Collect the siginfo appropriate to this signal.  */
+-		if (sig < SIGRTMIN) {
+-			/* XXX: As an extension, support queueing exactly
+-			   one non-rt signal if SA_SIGINFO is set, so that
+-			   we can get more detailed information about the
+-			   cause of the signal.  */
+-			/* Deciding not to init these couple of fields is
+-			   more expensive that just initializing them.  */
++		struct signal_queue *q, **pp;
++		pp = &current->sigqueue;
++		q = current->sigqueue;
++
++		/* Find the one we're interested in ... */
++		for ( ; q ; pp = &q->next, q = q->next)
++			if (q->info.si_signo == sig)
++				break;
++		if (q) {
++			if ((*pp = q->next) == NULL)
++				current->sigqueue_tail = pp;
++			*info = q->info;	/* bitwise copy */
++			kmem_cache_free(signal_queue_cachep,q);
++			atomic_dec(&nr_queued_signals);
++
++			/* then see if this signal is still pending. */
++			q = *pp;
++			while (q) {
++				if (q->info.si_signo == sig) {
++					reset = 0;
++					break;
++				}
++				q = q->next;
++			}
++		} else {
++			/* Ok, it wasn't in the queue.  It must have
++			   been sent either by a non-rt mechanism and
++			   we ran out of queue space.  So zero out the
++			   info.  */
+ 			info->si_signo = sig;
+ 			info->si_errno = 0;
+ 			info->si_code = 0;
+ 			info->si_pid = 0;
+ 			info->si_uid = 0;
+-		} else {
+-			struct signal_queue *q, **pp;
+-			pp = &current->sigqueue;
+-			q = current->sigqueue;
+-
+-			/* Find the one we're interested in ... */
+-			for ( ; q ; pp = &q->next, q = q->next)
+-				if (q->info.si_signo == sig)
+-					break;
+-			if (q) {
+-				if ((*pp = q->next) == NULL)
+-					current->sigqueue_tail = pp;
+-				*info = q->info;
+-				kmem_cache_free(signal_queue_cachep,q);
+-				atomic_dec(&nr_queued_signals);
+-				
+-				/* then see if this signal is still pending. */
+-				q = *pp;
+-				while (q) {
+-					if (q->info.si_signo == sig) {
+-						reset = 0;
+-						break;
+-					}
+-					q = q->next;
+-				}
+-			} else {
+-				/* Ok, it wasn't in the queue.  It must have
+-				   been sent either by a non-rt mechanism and
+-				   we ran out of queue space.  So zero out the
+-				   info.  */
+-				info->si_signo = sig;
+-				info->si_errno = 0;
+-				info->si_code = 0;
+-				info->si_pid = 0;
+-				info->si_uid = 0;
+-			}
+ 		}
+ 
+ 		if (reset)
+@@ -252,6 +240,7 @@
+ {
+ 	unsigned long flags;
+ 	int ret;
++	struct signal_queue *q = 0;
+ 
+ #if DEBUG_SIG
+ printk("SIG queue (%s:%d): %d ", t->comm, t->pid, sig);
+@@ -304,36 +293,33 @@
+ 	if (ignored_signal(sig, t))
+ 		goto out;
+ 
+-	if (sig < SIGRTMIN) {
+-		/* Non-real-time signals are not queued.  */
+-		/* XXX: As an extension, support queueing exactly one
+-		   non-rt signal if SA_SIGINFO is set, so that we can
+-		   get more detailed information about the cause of
+-		   the signal.  */
+-		if (sigismember(&t->signal, sig))
++	/* Support queueing exactly one
++	   non-rt signal if SA_SIGINFO is set, so that we can
++	   get more detailed information about the cause of
++	   the signal.  */
++	if (sig < SIGRTMIN && sigismember(&t->signal, sig))
+ 			goto out;
+-	} else {
+-		/* Real-time signals must be queued if sent by sigqueue, or
+-		   some other real-time mechanism.  It is implementation
+-		   defined whether kill() does so.  We attempt to do so, on
+-		   the principle of least surprise, but since kill is not
+-		   allowed to fail with EAGAIN when low on memory we just
+-		   make sure at least one signal gets delivered and don't
+-		   pass on the info struct.  */
+-
+-		struct signal_queue *q = 0;
+-
+-		if (atomic_read(&nr_queued_signals) < max_queued_signals) {
+-			q = (struct signal_queue *)
+-			    kmem_cache_alloc(signal_queue_cachep, GFP_ATOMIC);
+-		}
+-		
+-		if (q) {
+-			atomic_inc(&nr_queued_signals);
+-			q->next = NULL;
+-			*t->sigqueue_tail = q;
+-			t->sigqueue_tail = &q->next;
+-			switch ((unsigned long) info) {
++
++	/* Real-time signals must be queued if sent by sigqueue, or
++	   some other real-time mechanism.  It is implementation
++	   defined whether kill() does so.  We attempt to do so, on
++	   the principle of least surprise, but since kill is not
++	   allowed to fail with EAGAIN when low on memory we just
++	   make sure at least one signal gets delivered and don't
++	   pass on the info struct.  */
++
++
++	if (atomic_read(&nr_queued_signals) < max_queued_signals) {
++		q = (struct signal_queue *)
++			kmem_cache_alloc(signal_queue_cachep, GFP_ATOMIC);
++	}
++
++	if (q) {
++		atomic_inc(&nr_queued_signals);
++		q->next = NULL;
++		*t->sigqueue_tail = q;
++		t->sigqueue_tail = &q->next;
++		switch ((unsigned long) info) {
+ 			case 0:
+ 				q->info.si_signo = sig;
+ 				q->info.si_errno = 0;
+@@ -349,14 +335,13 @@
+ 				q->info.si_uid = 0;
+ 				break;
+ 			default:
+-				q->info = *info;
++				q->info = *info;	/* bitwise copy */
+ 				break;
+-			}
+-		} else {
+-			/* Queue overflow, we have to abort. */
+-			ret = -EAGAIN;
+-			goto out;
+ 		}
++	} else {
++		/* Queue overflow, we have to abort. */
++		ret = -EAGAIN;
++		goto out;
+ 	}
+ 
+ 	sigaddset(&t->signal, sig);
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

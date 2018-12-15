@@ -1,0 +1,207 @@
+Date: Thu, 18 Feb 1999 13:47:19 -0500
+From: James Bottomley <>
+Subject: SMP patch to get pre-2.2.2-4 to boot on NCR 3416
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/2/18/93
+
+The NCR 3416 (eagle) is a pure EISA (mpc type 2) box.  It uses an external 
+82489DX for the local APIC (even for dual pentium machines)and it has a 
+strange type 0x1 IO-APIC.  The changes occur in 4 parts:
+1) detect the 82489 and handle it correctly (PICLK divisors don't work).
+2) use the ELCR for level/edge interrupts on the EISA box.  I've made this 
+happen only on type 2 boards to be conservative, but I believe it should 
+happen whenever the system sees it has an EISA bus.
+3) set up pin 0 as ExtINT for type 2 boards (this has to be done because pin2 
+isn't connected to the timer).
+4) detect the unusual IO-APIC.  It doesn't seem to work correctly in logical 
+routing mode, so switch it to physical.
+These changes are probably sufficient to get some i486-SMP boards running as 
+well, although I haven't tested this.
+I'd like to see these changes go into the 2.2 kernel, but since they change 
+the handling of MPC default type 2 boards, I need people with these boards to 
+test the changes.  The assumption I used was that type 2 boards never worked, 
+so if anyone has one of these currently working, I'll need to refine the 
+checks.
+James Bottomley
+NCR Columbia
+As usual, NCR Corp will not warranty, support or endorse these changes.
+--- linux/arch/i386/kernel/smp.c.orig	Thu Feb 18 11:59:29 1999
++++ linux/arch/i386/kernel/smp.c	Thu Feb 18 12:37:50 1999
+@@ -94,6 +94,8 @@
+ static void cache_APIC_registers (void);
+ static void stop_this_cpu (void);
+ 
++static unsigned int external_82489DX = 0; /* set if external local apic */
++
+ static int smp_b_stepping = 0;				/* Set if we find a B stepping CPU			*/
+ 
+ static int max_cpus = -1;				/* Setup configured maximum number of CPUs to activate	*/
+@@ -1225,7 +1227,6 @@
+ 		printk(KERN_INFO "SMP mode deactivated, forcing use of dummy APIC emulation.\n");
+ 	}
+ 
+-#ifdef SMP_DEBUG
+ 	{
+ 		int reg;
+ 
+@@ -1237,6 +1238,17 @@
+ 		 */
+ 
+ 		reg = apic_read(APIC_VERSION);
++		/* James.Bottomley@ColumbiaSC.ncr.com:
++		 *
++		 * Support the NCR3416.  However this should also work
++		 * for almost all 486 SMP systems. */
++		external_82489DX = ((reg & 0xf0) == 0);
++
++		if(external_82489DX) {
++			printk("Local APIC is external 82489DX\n");
++		}
++
++#ifdef SMP_DEBUG
+ 		SMP_PRINTK(("Getting VERSION: %x\n", reg));
+ 
+ 		apic_write(APIC_VERSION, 0);
+@@ -1260,8 +1272,8 @@
+ 
+ 		reg = apic_read(APIC_LVT1);
+ 		SMP_PRINTK(("Getting LVT1: %x\n", reg));
+-	}
+ #endif
++	}
+ 
+ 	enable_local_APIC();
+ 
+@@ -1866,14 +1878,19 @@
+ 	apic_write(APIC_LVTT , lvtt1_value);
+ 
+ 	/*
+-	 * Divide PICLK by 16
+-	 */
++	 * Divide PICLK by 16; 
++	 *
++	 * James.Bottomley@ColumbiaSC.ncr.com: this won't work for
++	 * external local APIC, so adjust the APIC_DIVISOR accordingly */
+ 	tmp_value = apic_read(APIC_TDCR);
+ 	apic_write(APIC_TDCR , (tmp_value & ~APIC_TDR_DIV_1 )
+ 				 | APIC_TDR_DIV_16);
+ 
+ 	tmp_value = apic_read(APIC_TMICT);
+-	apic_write(APIC_TMICT, clocks/APIC_DIVISOR);
++	if(!external_82489DX) {
++		clocks /= APIC_DIVISOR;
++	}
++	apic_write(APIC_TMICT, clocks);
+ }
+ 
+ void __init wait_8254_wraparound(void)
+@@ -1958,7 +1975,10 @@
+ 	 * underflown to be exact, as the timer counts down ;)
+ 	 */
+ 
+-	calibration_result = (tt1-tt2)*APIC_DIVISOR/LOOPS;
++	calibration_result = (tt1-tt2)/LOOPS;
++	if(!external_82489DX) {
++		calibration_result *= APIC_DIVISOR;
++	}
+ 
+ 	SMP_PRINTK(("\n..... %ld CPU clocks in 1 timer chip tick.",
+ 			 (unsigned long)(t2-t1)/LOOPS));
+--- linux/arch/i386/kernel/io_apic.c.orig	Thu Feb 18 11:59:29 1999
++++ linux/arch/i386/kernel/io_apic.c	Thu Feb 18 12:00:10 1999
+@@ -332,10 +332,11 @@
+  * It's part of the EISA specification, but maybe it should only be
+  * used if the interrupt is actually marked as EISA?
+  *
+- * Oh, well. Don't do it until somebody tells us what the right thing
+- * to do is..
++ * James.Bottomley@Columbiasc.ncr.com:
++ * The correct thing to do is to use this *if* the mpc type identifies
++ * the BUS as EISA.  This code *only* works for mpc default types.
+  */
+-#undef USE_ELCR_TRIGGER_LEVEL
++#define USE_ELCR_TRIGGER_LEVEL
+ #ifdef USE_ELCR_TRIGGER_LEVEL
+ 
+ /*
+@@ -344,8 +345,15 @@
+ static int __init EISA_ELCR(unsigned int irq)
+ {
+ 	if (irq < 16) {
+-		unsigned int port = 0x4d0 + (irq >> 3);
+-		return (inb(port) >> (irq & 7)) & 1;
++		unsigned int port;
++
++		switch(mpc_default_type) {
++		case 2:
++			port = 0x4d0 + (irq >> 3);
++			return (inb(port) >> (irq & 7)) & 1;
++		default:
++			return 0;
++		}
+ 	}
+ 	printk("Broken MPtable reports ISA irq %d\n", irq);
+ 	return 0;
+@@ -577,7 +585,14 @@
+ {
+ 	struct IO_APIC_route_entry entry;
+ 	int pin, idx, bus, irq, first_notcon = 1;
++	struct IO_APIC_reg_01 reg_01;
++	int ioapic_physical_only;
+ 
++	/* James.Bottomley@ColumbiaSC.ncr.com: support for ancient
++	 * IO-APIC in NCR3416.  This doesn't route IRQs properly in
++	 * logical mode */
++	*(int *)&reg_01 = io_apic_read(1);
++	ioapic_physical_only = (reg_01.version == 1);
+ 	printk("init IO_APIC IRQs\n");
+ 
+ 	for (pin = 0; pin < nr_ioapic_registers; pin++) {
+@@ -588,9 +603,15 @@
+ 		memset(&entry,0,sizeof(entry));
+ 
+ 		entry.delivery_mode = dest_LowestPrio;
+-		entry.dest_mode = 1;			/* logical delivery */
++		if(ioapic_physical_only) {
++			entry.dest_mode = 0; 		/* physical mode */
++			entry.dest.physical.physical_dest = 0;
++		}
++		else {
++			entry.dest_mode = 1;		/* logical delivery */
++			entry.dest.logical.logical_dest = 0;/* but no route */
++		}
+ 		entry.mask = 0;				/* enable IRQ */
+-		entry.dest.logical.logical_dest = 0;	/* but no route */
+ 
+ 		idx = find_irq_entry(pin,mp_INT);
+ 		if (idx == -1) {
+@@ -702,10 +723,17 @@
+ 		printk(".......       [IO-APIC cannot route PCI PIRQ 0-3]\n");
+ 
+ 	printk(".......     : IO APIC version: %04X\n", reg_01.version);
+-	if (	(reg_01.version != 0x10) && /* oldest IO-APICs */
++	if(reg_01.version == 1) {
++		/* ancient EISA eagle IO-APIC; doesn't support
++		 * logical delivery mode correctly
++		 */
++		printk(".......     : NCR 3416 IO-APIC; physical delivery only mode\n");
++	}	
++	else if (	(reg_01.version != 0x10) && /* oldest IO-APICs */
+ 		(reg_01.version != 0x11) && /* Pentium/Pro IO-APICs */
+ 		(reg_01.version != 0x13)    /* Xeon IO-APICs */
+ 	)
++	
+ 		UNEXPECTED_IO_APIC();
+ 	if (reg_01.__reserved_1 || reg_01.__reserved_2)
+ 		UNEXPECTED_IO_APIC();
+@@ -929,6 +957,7 @@
+ 	switch (mpc_default_type)
+ 	{
+ 		case 2:
++			mp_irqs[0].mpc_irqtype = mp_ExtINT;
+ 			break;
+ 		default:
+ 		/*

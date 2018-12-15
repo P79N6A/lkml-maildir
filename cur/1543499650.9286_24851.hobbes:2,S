@@ -1,0 +1,837 @@
+Date: Fri, 18 Jun 1999 20:55:29 -0400 (EDT)
+From: Alexander Viro <>
+Subject: [PATCH] Removing lock_kernel() from mlock(), mlockall(), munlock(), munlockall(), mprotect(), mremap().
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/6/18/275
+
+	Attached patch does (OK, tries to do) the following:
+a) ->f_count became atomic_t. fput() still needs the big lock being held,
+but changes of ->f_count outside of big lock are kosher now. Moreover,
+fput() is OK if we have two pointers on hands (and thus know that f_count
+will be at least 2).
+b) ->i_writecount became atomic too. We still depend on the fact that
+do_mmap(), get_write_access() and prepare_binfmt() are called with big
+lock, but the rest is SMP-safe now.
+c) new field added to struct inode: ->i_shared_lock. It's a spinlock and
+access to ->i_mmap and the shared areas ring is protected by grabbing it. 
+We still depend on the fact that do_mmap() and fcntl_setlk() are called
+with big lock.
+d) shm_open() and shm_close() grab (and release) the big lock.
+That makes insert_vm_struct() and merge_segments() SMP-safe. Since
+->f_count manipulations are safe too we can remove the lock_kernel() from
+many places - see subject ;-)
+Folks, give it a look, please. The patch is against 2.3.7-pre9 and I think
+that it doesn't open any new races ;-) I would be very grateful if VM
+folks would look at it.
+							Cheers,
+								Al
+diff -urN linux-2.3.7-pre9/arch/sparc/mm/srmmu.c linux-bird.f_count/arch/sparc/mm/srmmu.c
+--- linux-2.3.7-pre9/arch/sparc/mm/srmmu.c	Thu May 13 07:01:45 1999
++++ linux-bird.f_count/arch/sparc/mm/srmmu.c	Fri Jun 18 20:26:39 1999
+@@ -2076,6 +2076,7 @@
+ 			goto done;
+ 		inode = file->f_dentry->d_inode;
+ 		offset = (address & PAGE_MASK) - vma->vm_start;
++		spin_lock(&inode->i_shared_lock);
+ 		vmaring = inode->i_mmap; 
+ 		do {
+ 			/* Do not mistake ourselves as another mapping. */
+@@ -2109,6 +2110,7 @@
+ 				}
+ 			}
+ 		} while ((vmaring = vmaring->vm_next_share) != NULL);
++		spin_unlock(&inode->i_shared_lock);
+ 
+ 		if(alias_found && ((pte_val(pte) & SRMMU_CACHE) != 0)) {
+ 			pgdp = srmmu_pgd_offset(vma->vm_mm, address);
+diff -urN linux-2.3.7-pre9/arch/sparc/mm/sun4c.c linux-bird.f_count/arch/sparc/mm/sun4c.c
+--- linux-2.3.7-pre9/arch/sparc/mm/sun4c.c	Thu May 13 07:01:45 1999
++++ linux-bird.f_count/arch/sparc/mm/sun4c.c	Fri Jun 18 20:26:39 1999
+@@ -2682,8 +2682,10 @@
+ 		inode = dentry->d_inode;
+ 	if(inode) {
+ 		unsigned long offset = (address & PAGE_MASK) - vma->vm_start;
+-		struct vm_area_struct *vmaring = inode->i_mmap; 
++		struct vm_area_struct *vmaring;
+ 		int alias_found = 0;
++		spin_lock(&inode->i_shared_lock);
++		vmaring = inode->i_mmap; 
+ 		do {
+ 			unsigned long vaddr = vmaring->vm_start + offset;
+ 			unsigned long start;
+@@ -2712,6 +2714,7 @@
+ 				}
+ 			}
+ 		} while ((vmaring = vmaring->vm_next_share) != NULL);
++		spin_unlock(&inode->i_shared_lock);
+ 
+ 		if(alias_found && !(pte_val(pte) & _SUN4C_PAGE_NOCACHE)) {
+ 			pgdp = sun4c_pgd_offset(vma->vm_mm, address);
+diff -urN linux-2.3.7-pre9/arch/sparc64/kernel/sys_sparc32.c linux-bird.f_count/arch/sparc64/kernel/sys_sparc32.c
+--- linux-2.3.7-pre9/arch/sparc64/kernel/sys_sparc32.c	Thu Jun 10 07:24:03 1999
++++ linux-bird.f_count/arch/sparc64/kernel/sys_sparc32.c	Fri Jun 18 20:26:39 1999
+@@ -2335,7 +2335,7 @@
+ 			break;
+ 		}
+ 		/* Bump the usage count and install the file. */
+-		fp[i]->f_count++;
++		atomic_inc(&fp[i]->f_count);
+ 		current->files->fd[new_fd] = fp[i];
+ 	}
+ 
+diff -urN linux-2.3.7-pre9/drivers/char/sysrq.c linux-bird.f_count/drivers/char/sysrq.c
+--- linux-2.3.7-pre9/drivers/char/sysrq.c	Thu May 13 07:01:58 1999
++++ linux-bird.f_count/drivers/char/sysrq.c	Fri Jun 18 20:26:39 1999
+@@ -155,7 +155,8 @@
+ 	struct file *file;
+ 
+ 	for (file = inuse_filps; file; file = file->f_next)
+-		if (file->f_dentry && file->f_count && S_ISREG(file->f_dentry->d_inode->i_mode))
++		if (file->f_dentry && atomic_read(&file->f_count)
++				&& S_ISREG(file->f_dentry->d_inode->i_mode))
+ 			file->f_mode &= ~2;
+ }
+ 
+diff -urN linux-2.3.7-pre9/drivers/char/tpqic02.c linux-bird.f_count/drivers/char/tpqic02.c
+--- linux-2.3.7-pre9/drivers/char/tpqic02.c	Thu May 13 07:49:32 1999
++++ linux-bird.f_count/drivers/char/tpqic02.c	Fri Jun 18 20:26:39 1999
+@@ -2216,7 +2216,7 @@
+     }
+     
+ 	/* Only one at a time from here on... */
+-    if (filp->f_count>1) 	/* filp->f_count==1 for the first open() */
++    if (atomic_read(&filp->f_count)>1) 	/* filp->f_count==1 for the first open() */
+     {
+ 	return -EBUSY;
+     }
+diff -urN linux-2.3.7-pre9/drivers/scsi/st.c linux-bird.f_count/drivers/scsi/st.c
+--- linux-2.3.7-pre9/drivers/scsi/st.c	Sat May 29 18:04:08 1999
++++ linux-bird.f_count/drivers/scsi/st.c	Fri Jun 18 20:26:39 1999
+@@ -890,7 +890,7 @@
+     kdev_t devt = inode->i_rdev;
+     int dev;
+ 
+-    if (filp->f_count > 1)
++    if (atomic_read(&filp->f_count) > 1)
+ 	return 0;
+ 
+     dev = TAPE_NR(devt);
+diff -urN linux-2.3.7-pre9/drivers/sgi/char/usema.c linux-bird.f_count/drivers/sgi/char/usema.c
+--- linux-2.3.7-pre9/drivers/sgi/char/usema.c	Mon May 17 07:34:12 1999
++++ linux-bird.f_count/drivers/sgi/char/usema.c	Fri Jun 18 20:26:39 1999
+@@ -50,8 +50,8 @@
+ 	if (newfd < 0)
+ 		return newfd;
+ 	
++	atomic_inc(&usema->filp->f_count);
+ 	current->files->fd [newfd] = usema->filp;
+-	usema->filp->f_count++;
+ 	/* Is that it? */
+ 	printk("UIOCATTACHSEMA: new usema fd is %d", newfd);
+ 	return newfd;
+diff -urN linux-2.3.7-pre9/fs/exec.c linux-bird.f_count/fs/exec.c
+--- linux-2.3.7-pre9/fs/exec.c	Wed Jun  2 22:39:43 1999
++++ linux-bird.f_count/fs/exec.c	Fri Jun 18 20:26:39 1999
+@@ -563,7 +563,8 @@
+ 	if ((retval = permission(inode, MAY_EXEC)) != 0)
+ 		return retval;
+ 	/* better not execute files which are being written to */
+-	if (inode->i_writecount > 0)
++	/* WARNING. Read comments in fs/namei.c::get_write_access() */
++	if (atomic_read(&inode->i_writecount) > 0)
+ 		return -ETXTBSY;
+ 
+ 	bprm->e_uid = current->euid;
+diff -urN linux-2.3.7-pre9/fs/file_table.c linux-bird.f_count/fs/file_table.c
+--- linux-2.3.7-pre9/fs/file_table.c	Wed Jun  2 22:39:43 1999
++++ linux-bird.f_count/fs/file_table.c	Fri Jun 18 20:26:39 1999
+@@ -80,7 +80,7 @@
+ 		nr_free_files--;
+ 	new_one:
+ 		memset(f, 0, sizeof(*f));
+-		f->f_count = 1;
++		atomic_set(&f->f_count,1);
+ 		f->f_version = ++event;
+ 		f->f_uid = current->fsuid;
+ 		f->f_gid = current->fsgid;
+@@ -120,7 +120,7 @@
+ {
+ 	memset(filp, 0, sizeof(*filp));
+ 	filp->f_mode   = mode;
+-	filp->f_count  = 1;
++	atomic_set(&filp->f_count, 1);
+ 	filp->f_dentry = dentry;
+ 	filp->f_uid    = current->fsuid;
+ 	filp->f_gid    = current->fsgid;
+@@ -133,21 +133,21 @@
+ 
+ void fput(struct file *file)
+ {
+-	int count = file->f_count-1;
+-
+-	if (!count) {
++	/* We still need big lock here */
++	if (atomic_dec_and_test(&file->f_count)) {
++		atomic_inc(&file->f_count);
+ 		locks_remove_flock(file);
+ 		__fput(file);
+-		file->f_count = 0;
++		atomic_set(&file->f_count, 0);
+ 		remove_filp(file);
+ 		insert_file_free(file);
+-	} else
+-		file->f_count = count;
++	}
+ }
+ 
+ void put_filp(struct file *file)
+ {
+-	if(--file->f_count == 0) {
++	if(atomic_dec_and_test(&file->f_count)) {
++		/* XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX */
+ 		remove_filp(file);
+ 		insert_file_free(file);
+ 	}
+diff -urN linux-2.3.7-pre9/fs/hpfs/mmap.c linux-bird.f_count/fs/hpfs/mmap.c
+--- linux-2.3.7-pre9/fs/hpfs/mmap.c	Fri May 14 23:54:27 1999
++++ linux-bird.f_count/fs/hpfs/mmap.c	Fri Jun 18 20:26:39 1999
+@@ -119,9 +119,9 @@
+ 		mark_inode_dirty(inode);
+ 	}*/
+ 
+-	vma->vm_file = file;
+ 	/*inode->i_count++;*/
+-	file->f_count++;
++	atomic_inc(&file->f_count);
++	vma->vm_file = file;
+ 	vma->vm_ops = &hpfs_file_mmap;
+ 	/*printk("end mmap\n");*/
+ 	return 0;
+diff -urN linux-2.3.7-pre9/fs/inode.c linux-bird.f_count/fs/inode.c
+--- linux-2.3.7-pre9/fs/inode.c	Fri Jun 18 20:26:09 1999
++++ linux-bird.f_count/fs/inode.c	Fri Jun 18 20:26:39 1999
+@@ -130,6 +130,7 @@
+ 	INIT_LIST_HEAD(&inode->i_hash);
+ 	INIT_LIST_HEAD(&inode->i_dentry);
+ 	sema_init(&inode->i_sem, 1);
++	spin_lock_init(&inode->i_shared_lock);
+ }
+ 
+ static inline void write_inode(struct inode *inode)
+@@ -521,7 +522,7 @@
+ 	inode->i_sock = 0;
+ 	inode->i_op = NULL;
+ 	inode->i_nlink = 1;
+-	inode->i_writecount = 0;
++	atomic_set(&inode->i_writecount, 0);
+ 	inode->i_size = 0;
+ 	inode->i_generation = 0;
+ 	memset(&inode->i_dquot, 0, sizeof(inode->i_dquot));
+diff -urN linux-2.3.7-pre9/fs/locks.c linux-bird.f_count/fs/locks.c
+--- linux-2.3.7-pre9/fs/locks.c	Thu May 13 07:51:11 1999
++++ linux-bird.f_count/fs/locks.c	Fri Jun 18 20:26:39 1999
+@@ -400,16 +400,23 @@
+ 
+ 	/* Don't allow mandatory locks on files that may be memory mapped
+ 	 * and shared.
++	 *
++	 * Since do_mmap() is protected by big lock we are safe here, but as
++	 * soon as it will go we will have a bunch of interesting stuff to
++	 * care of.
+ 	 */
+ 	if (IS_MANDLOCK(inode) &&
+ 	    (inode->i_mode & (S_ISGID | S_IXGRP)) == S_ISGID &&
+ 	    inode->i_mmap) {
+-		struct vm_area_struct *vma = inode->i_mmap;
++		struct vm_area_struct *vma;
+ 		error = -EAGAIN;
++		spin_lock(&inode->i_shared_lock);
++		vma = inode->i_mmap;
+ 		do {
+ 			if (vma->vm_flags & VM_MAYSHARE)
+-				goto out_putf;
++				goto out_putf_unlock;
+ 		} while ((vma = vma->vm_next_share) != NULL);
++		spin_unlock(&inode->i_shared_lock);
+ 	}
+ 
+ 	error = -EINVAL;
+@@ -461,6 +468,9 @@
+ 	fput(filp);
+ out:
+ 	return error;
++out_putf_unlock:
++	spin_unlock(&inode->i_shared_lock);
++	goto out_putf;
+ }
+ 
+ /*
+diff -urN linux-2.3.7-pre9/fs/namei.c linux-bird.f_count/fs/namei.c
+--- linux-2.3.7-pre9/fs/namei.c	Mon May 17 07:34:31 1999
++++ linux-bird.f_count/fs/namei.c	Fri Jun 18 20:26:39 1999
+@@ -171,18 +171,22 @@
+  * 0: no writers, no VM_DENYWRITE mappings
+  * < 0: (-i_writecount) vm_area_structs with VM_DENYWRITE set exist
+  * > 0: (i_writecount) users are writing to the file.
++ *
++ * WARNING: as soon as we will move get_write_access(), do_mmap() or
++ * prepare_binfmt() out of the big lock we will need a spinlock protecting
++ * the checks in all 3. For the time being it is not needed.
+  */
+ int get_write_access(struct inode * inode)
+ {
+-	if (inode->i_writecount < 0)
++	if (atomic_read(&inode->i_writecount) < 0)
+ 		return -ETXTBSY;
+-	inode->i_writecount++;
++	atomic_inc(&inode->i_writecount);
+ 	return 0;
+ }
+ 
+ void put_write_access(struct inode * inode)
+ {
+-	inode->i_writecount--;
++	atomic_dec(&inode->i_writecount);
+ }
+ 
+ /*
+diff -urN linux-2.3.7-pre9/fs/nfs/write.c linux-bird.f_count/fs/nfs/write.c
+--- linux-2.3.7-pre9/fs/nfs/write.c	Fri Jun 18 20:26:10 1999
++++ linux-bird.f_count/fs/nfs/write.c	Fri Jun 18 20:26:39 1999
+@@ -302,6 +302,7 @@
+ 		goto out_req;
+ 
+ 	/* Put the task on inode's writeback request list. */
++	atomic_inc(&file->f_count);
+ 	wreq->wb_file = file;
+ 	wreq->wb_pid    = current->pid;
+ 	wreq->wb_page   = page;
+@@ -464,7 +465,6 @@
+ 	 * The IO completion will then free the page and the dentry.
+ 	 */
+ 	get_page(page);
+-	file->f_count++;
+ 
+ 	/* Schedule request */
+ 	synchronous = schedule_write_request(req, synchronous);
+diff -urN linux-2.3.7-pre9/fs/nfsd/vfs.c linux-bird.f_count/fs/nfsd/vfs.c
+--- linux-2.3.7-pre9/fs/nfsd/vfs.c	Mon May 17 07:34:43 1999
++++ linux-bird.f_count/fs/nfsd/vfs.c	Fri Jun 18 20:26:39 1999
+@@ -342,7 +342,7 @@
+ 
+ 	memset(filp, 0, sizeof(*filp));
+ 	filp->f_op    = inode->i_op->default_file_ops;
+-	filp->f_count = 1;
++	atomic_set(&filp->f_count, 1);
+ 	filp->f_flags = wflag? O_WRONLY : O_RDONLY;
+ 	filp->f_mode  = wflag? FMODE_WRITE : FMODE_READ;
+ 	filp->f_dentry = dentry;
+@@ -360,7 +360,7 @@
+ 			/* I nearly added put_filp() call here, but this filp
+ 			 * is really on callers stack frame. -DaveM
+ 			 */
+-			filp->f_count--;
++			atomic_dec(&filp->f_count);
+ 		}
+ 	}
+ out_nfserr:
+@@ -585,7 +585,7 @@
+ 		 * nice and simple solution (IMHO), and it seems to
+ 		 * work:-)
+ 		 */
+-		if (EX_WGATHER(exp) && (inode->i_writecount > 1
++		if (EX_WGATHER(exp) && (atomic_read(&inode->i_writecount) > 1
+ 		 || (last_ino == inode->i_ino && last_dev == inode->i_dev))) {
+ #if 0
+ 			interruptible_sleep_on_timeout(&inode->i_wait, 10 * HZ / 1000);
+diff -urN linux-2.3.7-pre9/fs/open.c linux-bird.f_count/fs/open.c
+--- linux-2.3.7-pre9/fs/open.c	Sat May 29 18:04:33 1999
++++ linux-bird.f_count/fs/open.c	Fri Jun 18 20:26:39 1999
+@@ -790,7 +790,7 @@
+ 	int retval;
+ 	struct dentry *dentry = filp->f_dentry;
+ 
+-	if (filp->f_count == 0) {
++	if (atomic_read(&filp->f_count) == 0) {
+ 		printk("VFS: Close: file count is 0\n");
+ 		return 0;
+ 	}
+diff -urN linux-2.3.7-pre9/fs/select.c linux-bird.f_count/fs/select.c
+--- linux-2.3.7-pre9/fs/select.c	Sat May 29 18:04:33 1999
++++ linux-bird.f_count/fs/select.c	Fri Jun 18 20:26:39 1999
+@@ -65,8 +65,8 @@
+ 			struct poll_table_entry * entry;
+ ok_table:
+ 		 	entry = p->entry + p->nr;
++		 	atomic_inc(&filp->f_count);
+ 		 	entry->filp = filp;
+-		 	filp->f_count++;
+ 			entry->wait_address = wait_address;
+ 			init_waitqueue_entry(&entry->wait, current);
+ 			add_wait_queue(wait_address,&entry->wait);
+diff -urN linux-2.3.7-pre9/include/linux/file.h linux-bird.f_count/include/linux/file.h
+--- linux-2.3.7-pre9/include/linux/file.h	Wed Jun  9 08:04:09 1999
++++ linux-bird.f_count/include/linux/file.h	Fri Jun 18 20:26:39 1999
+@@ -32,12 +32,13 @@
+ 	return file;
+ }
+ 
++/* Still needs a protection against modifications of current->files->fd[] */
+ extern inline struct file * fget(unsigned int fd)
+ {
+ 	struct file * file = fcheck(fd);
+ 
+ 	if (file)
+-		file->f_count++;
++		atomic_inc(&file->f_count);
+ 	return file;
+ }
+ 
+diff -urN linux-2.3.7-pre9/include/linux/fs.h linux-bird.f_count/include/linux/fs.h
+--- linux-2.3.7-pre9/include/linux/fs.h	Fri Jun 18 20:26:11 1999
++++ linux-bird.f_count/include/linux/fs.h	Fri Jun 18 20:26:39 1999
+@@ -345,6 +345,7 @@
+ 	struct file_lock	*i_flock;
+ 	struct vm_area_struct	*i_mmap;
+ 	struct page		*i_pages;
++	spinlock_t		i_shared_lock;
+ 	struct dquot		*i_dquot[MAXQUOTAS];
+ 	struct pipe_inode_info	*i_pipe;
+ 
+@@ -353,7 +354,7 @@
+ 	unsigned int		i_flags;
+ 	unsigned char		i_sock;
+ 
+-	int			i_writecount;
++	atomic_t		i_writecount;
+ 	unsigned int		i_attr_flags;
+ 	__u32			i_generation;
+ 	union {
+@@ -404,7 +405,8 @@
+ 	struct file_operations	*f_op;
+ 	mode_t			f_mode;
+ 	loff_t			f_pos;
+-	unsigned int 		f_count, f_flags;
++	atomic_t 		f_count;
++	unsigned int		f_flags;
+ 	unsigned long 		f_reada, f_ramax, f_raend, f_ralen, f_rawin;
+ 	struct fown_struct	f_owner;
+ 	unsigned int		f_uid, f_gid;
+diff -urN linux-2.3.7-pre9/ipc/shm.c linux-bird.f_count/ipc/shm.c
+--- linux-2.3.7-pre9/ipc/shm.c	Fri Jun 18 20:26:12 1999
++++ linux-bird.f_count/ipc/shm.c	Fri Jun 18 20:26:39 1999
+@@ -547,6 +547,7 @@
+ 	unsigned int id;
+ 	struct shmid_kernel *shp;
+ 
++	lock_kernel();
+ 	id = SWP_OFFSET(shmd->vm_pte) & SHM_ID_MASK;
+ 	shp = shm_segs[id];
+ 	if (shp == IPC_UNUSED) {
+@@ -557,6 +558,7 @@
+ 	shp->u.shm_nattch++;
+ 	shp->u.shm_atime = CURRENT_TIME;
+ 	shp->u.shm_lpid = current->pid;
++	unlock_kernel();
+ }
+ 
+ /*
+@@ -570,6 +572,7 @@
+ 	struct shmid_kernel *shp;
+ 	int id;
+ 
++	lock_kernel();
+ 	/* remove from the list of attaches of the shm segment */
+ 	id = SWP_OFFSET(shmd->vm_pte) & SHM_ID_MASK;
+ 	shp = shm_segs[id];
+@@ -578,6 +581,7 @@
+ 	shp->u.shm_dtime = CURRENT_TIME;
+ 	if (--shp->u.shm_nattch <= 0 && shp->u.shm_perm.mode & SHM_DEST)
+ 		killseg (id);
++	unlock_kernel();
+ }
+ 
+ /*
+diff -urN linux-2.3.7-pre9/kernel/acct.c linux-bird.f_count/kernel/acct.c
+--- linux-2.3.7-pre9/kernel/acct.c	Fri Jun 18 20:26:12 1999
++++ linux-bird.f_count/kernel/acct.c	Fri Jun 18 20:26:39 1999
+@@ -276,7 +276,7 @@
+ 	 */
+ 	if (!file)
+ 		return 0;
+-	file->f_count++;
++	atomic_inc(&file->f_count);
+ 	if (!check_free_space(file)) {
+ 		fput(file);
+ 		return 0;
+diff -urN linux-2.3.7-pre9/kernel/fork.c linux-bird.f_count/kernel/fork.c
+--- linux-2.3.7-pre9/kernel/fork.c	Sat May 29 18:05:43 1999
++++ linux-bird.f_count/kernel/fork.c	Fri Jun 18 20:26:39 1999
+@@ -243,22 +243,28 @@
+ 		if (!tmp)
+ 			goto fail_nomem;
+ 		*tmp = *mpnt;
++		/*
++		 * Accurate here. We need to be sure that nothing will
++		 * alter mpnt->vm_file before we increment f_count.
++		 */
+ 		tmp->vm_flags &= ~VM_LOCKED;
+ 		tmp->vm_mm = mm;
+ 		mm->map_count++;
+ 		tmp->vm_next = NULL;
+ 		file = tmp->vm_file;
+ 		if (file) {
+-			file->f_count++;
++			atomic_inc(&file->f_count);
+ 			if (tmp->vm_flags & VM_DENYWRITE)
+-				file->f_dentry->d_inode->i_writecount--;
++				atomic_dec(&file->f_dentry->d_inode->i_writecount);
+       
++			spin_lock(&file->f_dentry->d_inode->i_shared_lock);
+ 			/* insert tmp into the share list, just after mpnt */
+ 			if((tmp->vm_next_share = mpnt->vm_next_share) != NULL)
+ 				mpnt->vm_next_share->vm_pprev_share =
+ 					&tmp->vm_next_share;
+ 			mpnt->vm_next_share = tmp;
+ 			tmp->vm_pprev_share = &mpnt->vm_next_share;
++			spin_unlock(&file->f_dentry->d_inode->i_shared_lock);
+ 		}
+ 
+ 		/* Copy the pages, but defer checking for errors */
+@@ -483,9 +489,9 @@
+ 	old_fds = oldf->fd;
+ 	for (; i != 0; i--) {
+ 		struct file *f = *old_fds++;
+-		*new_fds = f;
+ 		if (f)
+-			f->f_count++;
++			atomic_inc(&f->f_count);
++		*new_fds = f;
+ 		new_fds++;
+ 	}
+ 	/* This is long word aligned thus could use a optimized version */ 
+diff -urN linux-2.3.7-pre9/mm/filemap.c linux-bird.f_count/mm/filemap.c
+--- linux-2.3.7-pre9/mm/filemap.c	Fri Jun 18 20:26:12 1999
++++ linux-bird.f_count/mm/filemap.c	Fri Jun 18 20:26:39 1999
+@@ -1482,7 +1482,7 @@
+ 	 * If a task terminates while we're swapping the page, the vma and
+ 	 * and file could be released ... increment the count to be safe.
+ 	 */
+-	file->f_count++;
++	atomic_inc(&file->f_count);
+ 
+ 	/* 
+ 	 * If this is a swapping operation rather than msync(), then
+diff -urN linux-2.3.7-pre9/mm/memory.c linux-bird.f_count/mm/memory.c
+--- linux-2.3.7-pre9/mm/memory.c	Fri Jun 18 20:26:12 1999
++++ linux-bird.f_count/mm/memory.c	Fri Jun 18 20:26:39 1999
+@@ -723,8 +723,9 @@
+ 	struct vm_area_struct * mpnt;
+ 
+ 	truncate_inode_pages(inode, offset);
++	spin_lock(&inode->i_lock_shared);
+ 	if (!inode->i_mmap)
+-		return;
++		goto out_unlock;
+ 	mpnt = inode->i_mmap;
+ 	do {
+ 		struct mm_struct *mm = mpnt->vm_mm;
+@@ -755,6 +756,8 @@
+ 		zap_page_range(mm, start, len);
+ 		flush_tlb_range(mm, start, end);
+ 	} while ((mpnt = mpnt->vm_next_share) != NULL);
++out_unlock:
++	spin_unlock(&inode->i_lock_shared);
+ }
+ 
+ 
+diff -urN linux-2.3.7-pre9/mm/mlock.c linux-bird.f_count/mm/mlock.c
+--- linux-2.3.7-pre9/mm/mlock.c	Mon May 17 07:35:39 1999
++++ linux-bird.f_count/mm/mlock.c	Fri Jun 18 20:26:39 1999
+@@ -31,7 +31,7 @@
+ 	vma->vm_offset += vma->vm_start - n->vm_start;
+ 	n->vm_flags = newflags;
+ 	if (n->vm_file)
+-		n->vm_file->f_count++;
++		atomic_inc(&n->vm_file->f_count);
+ 	if (n->vm_ops && n->vm_ops->open)
+ 		n->vm_ops->open(n);
+ 	insert_vm_struct(current->mm, n);
+@@ -52,7 +52,7 @@
+ 	n->vm_offset += n->vm_start - vma->vm_start;
+ 	n->vm_flags = newflags;
+ 	if (n->vm_file)
+-		n->vm_file->f_count++;
++		atomic_inc(&n->vm_file->f_count);
+ 	if (n->vm_ops && n->vm_ops->open)
+ 		n->vm_ops->open(n);
+ 	insert_vm_struct(current->mm, n);
+@@ -82,7 +82,7 @@
+ 	right->vm_offset += right->vm_start - left->vm_start;
+ 	vma->vm_flags = newflags;
+ 	if (vma->vm_file)
+-		vma->vm_file->f_count += 2;
++		atomic_add(&vma->vm_file->f_count, 2);
+ 
+ 	if (vma->vm_ops && vma->vm_ops->open) {
+ 		vma->vm_ops->open(left);
+@@ -179,7 +179,6 @@
+ 	int error = -ENOMEM;
+ 
+ 	down(&current->mm->mmap_sem);
+-	lock_kernel();
+ 	len = (len + (start & ~PAGE_MASK) + ~PAGE_MASK) & PAGE_MASK;
+ 	start &= PAGE_MASK;
+ 
+@@ -200,7 +199,6 @@
+ 
+ 	error = do_mlock(start, len, 1);
+ out:
+-	unlock_kernel();
+ 	up(&current->mm->mmap_sem);
+ 	return error;
+ }
+@@ -210,11 +208,9 @@
+ 	int ret;
+ 
+ 	down(&current->mm->mmap_sem);
+-	lock_kernel();
+ 	len = (len + (start & ~PAGE_MASK) + ~PAGE_MASK) & PAGE_MASK;
+ 	start &= PAGE_MASK;
+ 	ret = do_mlock(start, len, 0);
+-	unlock_kernel();
+ 	up(&current->mm->mmap_sem);
+ 	return ret;
+ }
+@@ -254,7 +250,6 @@
+ 	int ret = -EINVAL;
+ 
+ 	down(&current->mm->mmap_sem);
+-	lock_kernel();
+ 	if (!flags || (flags & ~(MCL_CURRENT | MCL_FUTURE)))
+ 		goto out;
+ 
+@@ -272,7 +267,6 @@
+ 
+ 	ret = do_mlockall(flags);
+ out:
+-	unlock_kernel();
+ 	up(&current->mm->mmap_sem);
+ 	return ret;
+ }
+@@ -282,9 +276,7 @@
+ 	int ret;
+ 
+ 	down(&current->mm->mmap_sem);
+-	lock_kernel();
+ 	ret = do_mlockall(0);
+-	unlock_kernel();
+ 	up(&current->mm->mmap_sem);
+ 	return ret;
+ }
+diff -urN linux-2.3.7-pre9/mm/mmap.c linux-bird.f_count/mm/mmap.c
+--- linux-2.3.7-pre9/mm/mmap.c	Fri Jun 18 20:26:12 1999
++++ linux-bird.f_count/mm/mmap.c	Fri Jun 18 20:26:40 1999
+@@ -77,10 +77,12 @@
+ 
+ 	if (file) {
+ 		if (vma->vm_flags & VM_DENYWRITE)
+-			file->f_dentry->d_inode->i_writecount++;
++			atomic_inc(&file->f_dentry->d_inode->i_writecount);
++		spin_lock(file->f_dentry->d_inode->i_shared_lock);
+ 		if(vma->vm_next_share)
+ 			vma->vm_next_share->vm_pprev_share = vma->vm_pprev_share;
+ 		*vma->vm_pprev_share = vma->vm_next_share;
++		spin_unlock(file->f_dentry->d_inode->i_shared_lock);
+ 	}
+ }
+ 
+@@ -294,7 +296,12 @@
+ 	if (file) {
+ 		int correct_wcount = 0;
+ 		if (vma->vm_flags & VM_DENYWRITE) {
+-			if (file->f_dentry->d_inode->i_writecount > 0) {
++			/*
++			 * WARNING: when we will take it out of the big lock
++			 * we will need a spinlock here. See comments in
++			 * fs/namei.c::get_write_access()
++			 */
++			if (atomic_read(&file->f_dentry->d_inode->i_writecount) > 0) {
+ 				error = -ETXTBSY;
+ 				goto free_vma;
+ 			}
+@@ -303,17 +310,17 @@
+ 			 * might). In any case, this takes care of any
+ 			 * race that this might cause.
+ 			 */
+-			file->f_dentry->d_inode->i_writecount--;
++			atomic_dec(&file->f_dentry->d_inode->i_writecount);
+ 			correct_wcount = 1;
+ 		}
+ 		error = file->f_op->mmap(file, vma);
+ 		/* Fix up the count if necessary, then check for an error */
+ 		if (correct_wcount)
+-			file->f_dentry->d_inode->i_writecount++;
++			atomic_inc(&file->f_dentry->d_inode->i_writecount);
+ 		if (error)
+ 			goto unmap_and_free_vma;
++		atomic_inc(&file->f_count);
+ 		vma->vm_file = file;
+-		file->f_count++;
+ 	}
+ 
+ 	/*
+@@ -547,7 +554,7 @@
+ 		mpnt->vm_file = area->vm_file;
+ 		mpnt->vm_pte = area->vm_pte;
+ 		if (mpnt->vm_file)
+-			mpnt->vm_file->f_count++;
++			atomic_inc(&mpnt->vm_file->f_count);
+ 		if (mpnt->vm_ops && mpnt->vm_ops->open)
+ 			mpnt->vm_ops->open(mpnt);
+ 		area->vm_end = addr;	/* Truncate area */
+@@ -875,13 +882,14 @@
+ 	if (file) {
+ 		struct inode * inode = file->f_dentry->d_inode;
+ 		if (vmp->vm_flags & VM_DENYWRITE)
+-			inode->i_writecount--;
+-      
++			atomic_dec(&inode->i_writecount);
++      		spin_lock(&inode->i_shared_lock);
+ 		/* insert vmp into inode's share list */
+ 		if((vmp->vm_next_share = inode->i_mmap) != NULL)
+ 			inode->i_mmap->vm_pprev_share = &vmp->vm_next_share;
+ 		inode->i_mmap = vmp;
+ 		vmp->vm_pprev_share = &inode->i_mmap;
++      		spin_unlock(&inode->i_shared_lock);
+ 	}
+ }
+ 
+@@ -948,7 +956,7 @@
+ 		mm->map_count--;
+ 		remove_shared_vm_struct(mpnt);
+ 		if (mpnt->vm_file)
+-			fput(mpnt->vm_file);
++			fput(mpnt->vm_file);	/* This one is safe */
+ 		kmem_cache_free(vm_area_cachep, mpnt);
+ 		mpnt = prev;
+ 	}
+diff -urN linux-2.3.7-pre9/mm/mprotect.c linux-bird.f_count/mm/mprotect.c
+--- linux-2.3.7-pre9/mm/mprotect.c	Thu May 13 07:03:30 1999
++++ linux-bird.f_count/mm/mprotect.c	Fri Jun 18 20:26:40 1999
+@@ -103,7 +103,7 @@
+ 	n->vm_flags = newflags;
+ 	n->vm_page_prot = prot;
+ 	if (n->vm_file)
+-		n->vm_file->f_count++;
++		atomic_inc(&n->vm_file->f_count);
+ 	if (n->vm_ops && n->vm_ops->open)
+ 		n->vm_ops->open(n);
+ 	insert_vm_struct(current->mm, n);
+@@ -126,7 +126,7 @@
+ 	n->vm_flags = newflags;
+ 	n->vm_page_prot = prot;
+ 	if (n->vm_file)
+-		n->vm_file->f_count++;
++		atomic_inc(&n->vm_file->f_count);
+ 	if (n->vm_ops && n->vm_ops->open)
+ 		n->vm_ops->open(n);
+ 	insert_vm_struct(current->mm, n);
+@@ -158,7 +158,7 @@
+ 	vma->vm_flags = newflags;
+ 	vma->vm_page_prot = prot;
+ 	if (vma->vm_file)
+-		vma->vm_file->f_count += 2;
++		atomic_add(&vma->vm_file->f_count);
+ 	if (vma->vm_ops && vma->vm_ops->open) {
+ 		vma->vm_ops->open(left);
+ 		vma->vm_ops->open(right);
+@@ -212,7 +212,6 @@
+ 		return 0;
+ 
+ 	down(&current->mm->mmap_sem);
+-	lock_kernel();
+ 
+ 	vma = find_vma(current->mm, start);
+ 	error = -EFAULT;
+@@ -249,7 +248,6 @@
+ 	}
+ 	merge_segments(current->mm, start, end);
+ out:
+-	unlock_kernel();
+ 	up(&current->mm->mmap_sem);
+ 	return error;
+ }
+diff -urN linux-2.3.7-pre9/mm/mremap.c linux-bird.f_count/mm/mremap.c
+--- linux-2.3.7-pre9/mm/mremap.c	Wed Jun  9 08:04:28 1999
++++ linux-bird.f_count/mm/mremap.c	Fri Jun 18 20:26:40 1999
+@@ -134,14 +134,12 @@
+ 			new_vma->vm_start = new_addr;
+ 			new_vma->vm_end = new_addr+new_len;
+ 			new_vma->vm_offset = vma->vm_offset + (addr - vma->vm_start);
+-			lock_kernel();
+ 			if (new_vma->vm_file)
+-				new_vma->vm_file->f_count++;
++				atomic_inc(&new_vma->vm_file->f_count);
+ 			if (new_vma->vm_ops && new_vma->vm_ops->open)
+ 				new_vma->vm_ops->open(new_vma);
+ 			insert_vm_struct(current->mm, new_vma);
+ 			merge_segments(current->mm, new_vma->vm_start, new_vma->vm_end);
+-			unlock_kernel();
+ 			do_munmap(addr, old_len);
+ 			current->mm->total_vm += new_len >> PAGE_SHIFT;
+ 			if (new_vma->vm_flags & VM_LOCKED) {
+diff -urN linux-2.3.7-pre9/net/core/scm.c linux-bird.f_count/net/core/scm.c
+--- linux-2.3.7-pre9/net/core/scm.c	Thu May 13 07:03:32 1999
++++ linux-bird.f_count/net/core/scm.c	Fri Jun 18 20:26:40 1999
+@@ -232,7 +232,7 @@
+ 			break;
+ 		}
+ 		/* Bump the usage count and install the file. */
+-		fp[i]->f_count++;
++		atomic_inc(&fp[i]->f_count);
+ 		current->files->fd[new_fd] = fp[i];
+ 	}
+ 
+@@ -271,10 +271,9 @@
+ 
+ 	new_fpl = kmalloc(sizeof(*fpl), GFP_KERNEL);
+ 	if (new_fpl) {
+-		memcpy(new_fpl, fpl, sizeof(*fpl));
+-
+ 		for (i=fpl->count-1; i>=0; i--)
+-			fpl->fp[i]->f_count++;
++			atomic_inc(&fpl->fp[i]->f_count);
++		memcpy(new_fpl, fpl, sizeof(*fpl));
+ 	}
+ 	return new_fpl;
+ }
+diff -urN linux-2.3.7-pre9/net/sunrpc/xprt.c linux-bird.f_count/net/sunrpc/xprt.c
+--- linux-2.3.7-pre9/net/sunrpc/xprt.c	Wed Jun  9 08:04:49 1999
++++ linux-bird.f_count/net/sunrpc/xprt.c	Fri Jun 18 20:26:40 1999
+@@ -1455,8 +1455,8 @@
+ 
+ 	proto = (sock->type == SOCK_DGRAM)? IPPROTO_UDP : IPPROTO_TCP;
+ 	if ((xprt = xprt_setup(sock, proto, ap, to)) != NULL) {
++		atomic_inc(&file->f_count);
+ 		xprt->file = file;
+-		file->f_count++;
+ 	}
+ 
+ 	return xprt;
+diff -urN linux-2.3.7-pre9/net/unix/garbage.c linux-bird.f_count/net/unix/garbage.c
+--- linux-2.3.7-pre9/net/unix/garbage.c	Thu May 13 07:03:39 1999
++++ linux-bird.f_count/net/unix/garbage.c	Fri Jun 18 20:26:40 1999
+@@ -199,7 +199,8 @@
+ 		 *	in flight we are in use.
+ 		 */
+ 		if(s->socket && s->socket->file &&
+-		   s->socket->file->f_count > s->protinfo.af_unix.inflight)
++		   atomic_read(&s->socket->file->f_count) >
++				   s->protinfo.af_unix.inflight)
+ 			maybe_unmark_and_push(s);
+ 	}
+ 

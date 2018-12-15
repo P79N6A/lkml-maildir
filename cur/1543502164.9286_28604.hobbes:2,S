@@ -1,0 +1,1175 @@
+Date: Thu, 8 Jul 1999 20:03:18 +0200 (CEST)
+From: Andrea Arcangeli <>
+Subject: [patch] 2.2.10 buffer patch
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/7/8/67
+
+I propose this patch for inclusion into 2.2.11.
+o	fixed races in invalidate_buffers and set_blocksize. If such
+	functions sleep the `next' buffer could be refiled and we could
+	skip invalidating all buffers.
+o	ufs and minix truncate fixes. (minix now also use bforget, I
+	tested it and works fine)
+o	better wakeup of kflushd. Wake kflushd in advance to avoid
+	a task to stall if it doesn't write at a very high rate.
+	Also avoid start syncing buffers if there are tons of
+	free pages. If you have 1giga of ram free you don't
+	want to start flushing buffers to disk in sync mode
+	if you have only 200k of dirty buffers and 500kbyte of
+	total buffers memory.
+o	fixed flushtime jiffy wrap (flushtime == 0 is not a special case)
+o	__brelse shoudln't set_writetime refile and touch the buffer.
+o	create_buffers must stop waiting if there are enough unused
+	buffer in the unused_list.
+o	put a spinlock instead of the cli(). This should be not needed
+	(since in most of cases we call end_io from the end_request
+	callback that runs with the io_request_lock held, or from
+	a failed writeahead that runs with the big kernel lock held and
+	protect itself from irqs using cli()), but looks more robust
+	(it will be a noop in UP).
+o	create_buffers can't return 0 in the async request case.
+	Panic if that happens.
+o	rewrote a common flushing routine. Also sync_old_buffers
+	uses the loopback workaround.
+o	While syncing old buffers we mustn't check flushtime against
+	a dynamic jiffies since we must stop at some time flushing
+	buffers to syncing inodes and superblocks on the bhs.
+o	kupdate replaces completly update. It's a separate and alone
+	kernel daemon. It has no way to be killed and it won't be swapped
+	out. We need kupdate mainly if the machine goes OOM. Think if
+	update gets killed (and it's really easy to kill update
+	with some trashing proggy). At this point the admin may have not
+	a keyboard on the machine. It may stop logging in from the
+	network and he chooses to reboot the machine. Woops, update
+	is been killed and he will get some more fun at the next
+	fsck... kupdate will also save us some separate mm, ptes, vma,
+	tlb flushes etc... kupdate can also be stopped setting interval
+	to 0 via /proc or with sysctl(2).
+	To wakeup kupdate just send it a SIGCONT as root after setting
+	interval between 1 and 60*HZ (otherwise it will return to sleep :).
+	Note: no need to change the userspace configuration since
+	update will istant do_exit().
+o	some buffer cleanup. Also avoid removing and reinserting from
+	the hash table while refiling the buffer.
+o	unrelated: Alpha spin_trylock(lock) must return 1 in UP.
+This patch should be well tested (I tested heavily also the loopback and
+ramdisk device also in loopback over loopback). It seems ready for
+production. (btw the ramdisk still need some minor fixes but it's a
+separate issue)
+Index: linux/fs/buffer.c
+===================================================================
+RCS file: /var/cvs/linux/fs/buffer.c,v
+retrieving revision 1.1.1.17
+diff -u -r1.1.1.17 buffer.c
+--- linux/fs/buffer.c	1999/06/14 15:22:55	1.1.1.17
++++ linux/fs/buffer.c	1999/07/08 13:23:31
+@@ -74,6 +74,7 @@
+ 
+ static int nr_buffers = 0;
+ static int nr_buffers_type[NR_LIST] = {0,};
++static int size_buffers_type[NR_LIST] = {0,};
+ static int nr_buffer_heads = 0;
+ static int nr_unused_buffer_heads = 0;
+ static int nr_hashed_buffers = 0;
+@@ -100,7 +101,7 @@
+ 				each time we call refill */
+ 		int nref_dirt; /* Dirty buffer threshold for activating bdflush
+ 				  when trying to refill buffers. */
+-		int dummy1;    /* unused */
++		int interval; /* jiffies delay between kupdate flushes */
+ 		int age_buffer;  /* Time for normal buffer to age before 
+ 				    we flush it */
+ 		int age_super;  /* Time for superblock to age before we 
+@@ -109,21 +110,28 @@
+ 		int dummy3;    /* unused */
+ 	} b_un;
+ 	unsigned int data[N_PARAM];
+-} bdf_prm = {{40, 500, 64, 256, 15, 30*HZ, 5*HZ, 1884, 2}};
++} bdf_prm = {{40, 500, 64, 256, 5*HZ, 30*HZ, 5*HZ, 1884, 2}};
+ 
+ /* These are the min and max parameter values that we will allow to be assigned */
+ int bdflush_min[N_PARAM] = {  0,  10,    5,   25,  0,   1*HZ,   1*HZ, 1, 1};
+-int bdflush_max[N_PARAM] = {100,5000, 2000, 2000,100, 600*HZ, 600*HZ, 2047, 5};
++int bdflush_max[N_PARAM] = {100,5000, 2000, 2000,60*HZ, 600*HZ, 600*HZ, 2047, 5};
+ 
+ void wakeup_bdflush(int);
+ 
++#define	many_dirty_buffers()						    \
++	((size_buffers_type[BUF_DIRTY] >> PAGE_SHIFT) >			    \
++	 ((nr_free_pages+(buffermem>>PAGE_SHIFT))*bdf_prm.b_un.nfract/200))
++#define	too_many_dirty_buffers()					    \
++	((size_buffers_type[BUF_DIRTY] >> PAGE_SHIFT) >			    \
++	 ((nr_free_pages+(buffermem>>PAGE_SHIFT))*bdf_prm.b_un.nfract/100))
++
+ /*
+  * Rewrote the wait-routines to use the "new" wait-queue functionality,
+  * and getting rid of the cli-sti pairs. The wait-queue routines still
+  * need cli-sti, but now it's just a couple of 386 instructions or so.
+  *
+  * Note that the real wait_on_buffer() is an inline function that checks
+- * if 'b_wait' is set before calling this, so that the queues aren't set
++ * if the buffer is locked before calling this, so that the queues aren't set
+  * up unnecessarily.
+  */
+ void __wait_on_buffer(struct buffer_head * bh)
+@@ -219,7 +227,6 @@
+ 				continue;
+ 			bh->b_count++;
+ 			next->b_count++;
+-			bh->b_flushtime = 0;
+ 			ll_rw_block(WRITE, 1, &bh);
+ 			bh->b_count--;
+ 			next->b_count--;
+@@ -395,29 +402,35 @@
+ 	return err;
+ }
+ 
+-void invalidate_buffers(kdev_t dev)
++static inline void __remove_from_list(struct buffer_head * bh,
++				      struct buffer_head ** list_p)
+ {
+-	int i;
+-	int nlist;
+-	struct buffer_head * bh;
++	if (bh->b_next_free != bh)
++	{
++		bh->b_prev_free->b_next_free = bh->b_next_free;
++		bh->b_next_free->b_prev_free = bh->b_prev_free;
+ 
+-	for(nlist = 0; nlist < NR_LIST; nlist++) {
+-		bh = lru_list[nlist];
+-		for (i = nr_buffers_type[nlist]*2 ; --i > 0 ; bh = bh->b_next_free) {
+-			if (bh->b_dev != dev)
+-				continue;
+-			wait_on_buffer(bh);
+-			if (bh->b_dev != dev)
+-				continue;
+-			if (bh->b_count)
+-				continue;
+-			bh->b_flushtime = 0;
+-			clear_bit(BH_Protected, &bh->b_state);
+-			clear_bit(BH_Uptodate, &bh->b_state);
+-			clear_bit(BH_Dirty, &bh->b_state);
+-			clear_bit(BH_Req, &bh->b_state);
+-		}
++		if (*list_p == bh)
++			*list_p = bh->b_next_free;
++	} else
++		*list_p = NULL;
++
++	bh->b_next_free = bh->b_prev_free = NULL;
++}
++
++static inline void __insert_into_list(struct buffer_head * bh,
++				      struct buffer_head ** list_p)
++{
++	if (*list_p)
++		bh->b_prev_free = (*list_p)->b_prev_free;
++	else
++	{
++		bh->b_prev_free = bh;
++		*list_p = bh;
+ 	}
++	bh->b_next_free = *list_p;
++	(*list_p)->b_prev_free->b_next_free = bh;
++	(*list_p)->b_prev_free = bh;
+ }
+ 
+ #define _hashfn(dev,block) (((unsigned)(HASHDEV(dev)^block)) & bh_hash_mask)
+@@ -434,27 +447,39 @@
+ 		}
+ 		*pprev = next;
+ 		bh->b_pprev = NULL;
++		nr_hashed_buffers--;
+ 	}
+-	nr_hashed_buffers--;
+ }
+ 
++static inline void insert_into_hash_queue(struct buffer_head * bh)
++{
++	/* Put the buffer in new hash-queue if it has a device. */
++	struct buffer_head **bhp = &hash(bh->b_dev, bh->b_blocknr);
++	struct buffer_head *next = *bhp;
++
++	if (next)
++	{
++		bh->b_next = next;
++		next->b_pprev = &bh->b_next;
++	}
++	else
++		bh->b_next = NULL;
++	*bhp = bh;
++	bh->b_pprev = bhp;
++	nr_hashed_buffers++;
++}
++
+ static inline void remove_from_lru_list(struct buffer_head * bh)
+ {
+ 	if (!(bh->b_prev_free) || !(bh->b_next_free))
+ 		panic("VFS: LRU block list corrupted");
+ 	if (bh->b_dev == B_FREE)
+ 		panic("LRU list corrupted");
+-	bh->b_prev_free->b_next_free = bh->b_next_free;
+-	bh->b_next_free->b_prev_free = bh->b_prev_free;
+ 
+-	if (lru_list[bh->b_list] == bh)
+-		 lru_list[bh->b_list] = bh->b_next_free;
+-	if (lru_list[bh->b_list] == bh)
+-		 lru_list[bh->b_list] = NULL;
+-	bh->b_next_free = bh->b_prev_free = NULL;
++	__remove_from_list(bh, &lru_list[bh->b_list]);
+ }
+ 
+-static inline void remove_from_free_list(struct buffer_head * bh)
++static void remove_from_free_list(struct buffer_head * bh)
+ {
+ 	int isize = BUFSIZE_INDEX(bh->b_size);
+ 	if (!(bh->b_prev_free) || !(bh->b_next_free))
+@@ -463,88 +488,36 @@
+ 		panic("Free list corrupted");
+ 	if(!free_list[isize])
+ 		panic("Free list empty");
+-	if(bh->b_next_free == bh)
+-		 free_list[isize] = NULL;
+-	else {
+-		bh->b_prev_free->b_next_free = bh->b_next_free;
+-		bh->b_next_free->b_prev_free = bh->b_prev_free;
+-		if (free_list[isize] == bh)
+-			 free_list[isize] = bh->b_next_free;
+-	}
+-	bh->b_next_free = bh->b_prev_free = NULL;
++
++	__remove_from_list(bh, &free_list[isize]);
+ }
+ 
+ static void remove_from_queues(struct buffer_head * bh)
+ {
+-	if(bh->b_dev == B_FREE) {
+-		remove_from_free_list(bh); /* Free list entries should not be
+-					      in the hash queue */
+-		return;
+-	}
+ 	nr_buffers_type[bh->b_list]--;
+-	remove_from_hash_queue(bh);
++	size_buffers_type[bh->b_list] -= bh->b_size;
+ 	remove_from_lru_list(bh);
+ }
+ 
+-static inline void put_last_free(struct buffer_head * bh)
++static void put_last_free(struct buffer_head * bh)
+ {
+-	if (bh) {
+-		struct buffer_head **bhp = &free_list[BUFSIZE_INDEX(bh->b_size)];
+-
+-		bh->b_dev = B_FREE;  /* So it is obvious we are on the free list. */
++	struct buffer_head **bhp = &free_list[BUFSIZE_INDEX(bh->b_size)];
+ 
+-		/* Add to back of free list. */
+-		if(!*bhp) {
+-			*bhp = bh;
+-			bh->b_prev_free = bh;
+-		}
+-
+-		bh->b_next_free = *bhp;
+-		bh->b_prev_free = (*bhp)->b_prev_free;
+-		(*bhp)->b_prev_free->b_next_free = bh;
+-		(*bhp)->b_prev_free = bh;
+-	}
++	remove_from_queues(bh);
++	remove_from_hash_queue(bh);
++	bh->b_count = 0;
++	bh->b_state = 0;
++	bh->b_dev = B_FREE;  /* So it is obvious we are on the free list. */
++	__insert_into_list(bh, bhp);
+ }
+ 
+ static void insert_into_queues(struct buffer_head * bh)
+ {
+-	/* put at end of free list */
+-	if(bh->b_dev == B_FREE) {
+-		put_last_free(bh);
+-	} else {
+-		struct buffer_head **bhp = &lru_list[bh->b_list];
++	struct buffer_head **bhp = &lru_list[bh->b_list];
+ 
+-		if(!*bhp) {
+-			*bhp = bh;
+-			bh->b_prev_free = bh;
+-		}
+-
+-		if (bh->b_next_free)
+-			panic("VFS: buffer LRU pointers corrupted");
+-
+-		bh->b_next_free = *bhp;
+-		bh->b_prev_free = (*bhp)->b_prev_free;
+-		(*bhp)->b_prev_free->b_next_free = bh;
+-		(*bhp)->b_prev_free = bh;
+-
+-		nr_buffers_type[bh->b_list]++;
+-
+-		/* Put the buffer in new hash-queue if it has a device. */
+-		bh->b_next = NULL;
+-		bh->b_pprev = NULL;
+-		if (bh->b_dev) {
+-			struct buffer_head **bhp = &hash(bh->b_dev, bh->b_blocknr);
+-			struct buffer_head *next = *bhp;
+-
+-			if (next) {
+-				bh->b_next = next;
+-				next->b_pprev = &bh->b_next;
+-			}
+-			*bhp = bh;
+-			bh->b_pprev = bhp;
+-		}
+-		nr_hashed_buffers++;
+-	}
++	__insert_into_list(bh, bhp);
++	nr_buffers_type[bh->b_list]++;
++	size_buffers_type[bh->b_list] += bh->b_size;
+ }
+ 
+ struct buffer_head * find_buffer(kdev_t dev, int block, int size)
+@@ -600,11 +573,47 @@
+ 	return 0;
+ }
+ 
++void invalidate_buffers(kdev_t dev)
++{
++	int i, nlist, slept;
++	struct buffer_head * bh, * bhnext;
++
++ again:
++	slept = 0;
++	for(nlist = 0; nlist < NR_LIST; nlist++) {
++		bh = lru_list[nlist];
++		if (!bh)
++			continue;
++		for (i = nr_buffers_type[nlist] ; i > 0 ;
++		     bh = bhnext, i--)
++		{
++			bhnext = bh->b_next_free;
++			if (bh->b_dev != dev)
++				continue;
++			if (buffer_locked(bh))
++			{
++				slept = 1;
++				wait_on_buffer(bh);
++			}
++			if (bh->b_dev != dev)
++				goto panic_changed;
++			if (!bh->b_count)
++				put_last_free(bh);
++			if (slept)
++				goto again;
++		}
++	}
++	return;
++
++ panic_changed:
++	panic("invalidate_buffers: buffer changed under us");
++}
++
+ void set_blocksize(kdev_t dev, int size)
+ {
+ 	extern int *blksize_size[];
+-	int i, nlist;
+-	struct buffer_head * bh, *bhnext;
++	int i, nlist, slept;
++	struct buffer_head * bh, * bhnext;
+ 
+ 	if (!blksize_size[MAJOR(dev)])
+ 		return;
+@@ -625,29 +634,41 @@
+ 	/* We need to be quite careful how we do this - we are moving entries
+ 	 * around on the free list, and we can get in a loop if we are not careful.
+ 	 */
+-	for(nlist = 0; nlist < NR_LIST; nlist++) {
++ again:
++	slept = 0;
++ 	for(nlist = 0; nlist < NR_LIST; nlist++) {
+ 		bh = lru_list[nlist];
+-		for (i = nr_buffers_type[nlist]*2 ; --i > 0 ; bh = bhnext) {
+-			if(!bh)
+-				break;
+-
+-			bhnext = bh->b_next_free; 
+-			if (bh->b_dev != dev)
+-				 continue;
+-			if (bh->b_size == size)
++		if (!bh)
++			continue;
++		for (i = nr_buffers_type[nlist] ; i > 0 ;
++		     bh = bhnext, i--)
++		{
++			bhnext = bh->b_next_free;
++			if (bh->b_dev != dev || bh->b_size == size)
+ 				 continue;
+-			bhnext->b_count++;
+-			wait_on_buffer(bh);
+-			bhnext->b_count--;
+-			if (bh->b_dev == dev && bh->b_size != size) {
+-				clear_bit(BH_Dirty, &bh->b_state);
+-				clear_bit(BH_Uptodate, &bh->b_state);
+-				clear_bit(BH_Req, &bh->b_state);
+-				bh->b_flushtime = 0;
++			if (buffer_locked(bh))
++			{
++				slept = 1;
++				wait_on_buffer(bh);
+ 			}
+-			remove_from_hash_queue(bh);
++			if (bh->b_dev != dev || bh->b_size == size)
++				goto panic_changed;
++			if (!bh->b_count)
++				put_last_free(bh);
++			else
++				printk(KERN_ERR
++				       "set_blocksize: "
++				       "b_count %d, dev %s, block %lu!\n",
++				       bh->b_count, bdevname(bh->b_dev),
++				       bh->b_blocknr);
++			if (slept)
++				goto again;
+ 		}
+ 	}
++	return;
++
++ panic_changed:
++	panic("set_blocksize: buffer changed under us");
+ }
+ 
+ /*
+@@ -667,7 +688,6 @@
+ {
+ 	bh->b_count = 1;
+ 	bh->b_list = BUF_CLEAN;
+-	bh->b_flushtime = 0;
+ 	bh->b_dev = dev;
+ 	bh->b_blocknr = block;
+ 	bh->b_end_io = handler;
+@@ -696,11 +716,11 @@
+ 	int isize;
+ 
+ repeat:
+-	bh = get_hash_table(dev, block, size);
+-	if (bh) {
+-		if (!buffer_dirty(bh)) {
+-			bh->b_flushtime = 0;
+-		}
++	bh = find_buffer(dev, block, size);
++	if (bh)
++	{
++		bh->b_count++;
++		touch_buffer(bh);
+ 		return bh;
+ 	}
+ 
+@@ -717,6 +737,8 @@
+ 	init_buffer(bh, dev, block, end_buffer_io_sync, NULL);
+ 	bh->b_state=0;
+ 	insert_into_queues(bh);
++	insert_into_hash_queue(bh);
++	touch_buffer(bh);
+ 	return bh;
+ 
+ 	/*
+@@ -732,17 +754,12 @@
+ 
+ void set_writetime(struct buffer_head * buf, int flag)
+ {
+-	int newtime;
++	unsigned long newtime;
+ 
+-	if (buffer_dirty(buf)) {
+-		/* Move buffer to dirty list if jiffies is clear. */
+-		newtime = jiffies + (flag ? bdf_prm.b_un.age_super : 
+-				     bdf_prm.b_un.age_buffer);
+-		if(!buf->b_flushtime || buf->b_flushtime > newtime)
+-			 buf->b_flushtime = newtime;
+-	} else {
+-		buf->b_flushtime = 0;
+-	}
++	/* Move buffer to dirty list if jiffies is clear. */
++	newtime = jiffies + (flag ? bdf_prm.b_un.age_super : 
++			     bdf_prm.b_un.age_buffer);
++	buf->b_flushtime = newtime;
+ }
+ 
+ 
+@@ -777,13 +794,17 @@
+ 	if(dispose != buf->b_list) {
+ 		file_buffer(buf, dispose);
+ 		if(dispose == BUF_DIRTY) {
+-			int too_many = (nr_buffers * bdf_prm.b_un.nfract/100);
+-
+-			/* This buffer is dirty, maybe we need to start flushing.
+-			 * If too high a percentage of the buffers are dirty...
++			/* This buffer is dirty, maybe we need to start
++			 * flushing.
++			 * If too high a percentage of the cache is dirty...
+ 			 */
+-			if (nr_buffers_type[BUF_DIRTY] > too_many)
+-				wakeup_bdflush(1);
++			if (many_dirty_buffers())
++			{
++				int wait = 1;
++				if (!too_many_dirty_buffers())
++					wait = 0;
++				wakeup_bdflush(wait);
++			}
+ 
+ 			/* If this is a loop device, and
+ 			 * more than half of the buffers are dirty...
+@@ -801,11 +822,6 @@
+  */
+ void __brelse(struct buffer_head * buf)
+ {
+-	/* If dirty, mark the time this buffer should be written back. */
+-	set_writetime(buf, 0);
+-	refile_buffer(buf);
+-	touch_buffer(buf);
+-
+ 	if (buf->b_count) {
+ 		buf->b_count--;
+ 		return;
+@@ -825,9 +841,6 @@
+ 		__brelse(buf);
+ 		return;
+ 	}
+-	buf->b_count = 0;
+-	buf->b_state = 0;
+-	remove_from_queues(buf);
+ 	put_last_free(buf);
+ }
+ 
+@@ -1029,7 +1042,6 @@
+ static struct buffer_head * create_buffers(unsigned long page, 
+ 						unsigned long size, int async)
+ {
+-	struct wait_queue wait = { current, NULL };
+ 	struct buffer_head *bh, *head;
+ 	long offset;
+ 
+@@ -1090,12 +1102,8 @@
+ 	 * Set our state for sleeping, then check again for buffer heads.
+ 	 * This ensures we won't miss a wake_up from an interrupt.
+ 	 */
+-	add_wait_queue(&buffer_wait, &wait);
+-	current->state = TASK_UNINTERRUPTIBLE;
+-	if (!recover_reusable_buffer_heads())
+-		schedule();
+-	remove_wait_queue(&buffer_wait, &wait);
+-	current->state = TASK_RUNNING;
++	__wait_event(buffer_wait, recover_reusable_buffer_heads() ||
++		     nr_unused_buffer_heads >= MAX_BUF_PER_PAGE);
+ 	goto try_again;
+ }
+ 
+@@ -1142,6 +1150,8 @@
+ 	wake_up(&buffer_wait);
+ }
+ 
++spinlock_t buffer_io_async_lock = SPIN_LOCK_UNLOCKED;
++
+ static void end_buffer_io_async(struct buffer_head * bh, int uptodate)
+ {
+ 	unsigned long flags;
+@@ -1173,8 +1183,7 @@
+ 	 * only the _last_ buffer that decrements its count is the one
+ 	 * that free's the page..
+ 	 */
+-	save_flags(flags);
+-	cli();
++	spin_lock_irqsave(&buffer_io_async_lock, flags);
+ 	bh->b_count--;
+ 	tmp = bh;
+ 	do {
+@@ -1185,14 +1194,15 @@
+ 
+ 	/* OK, the async IO on this page is complete. */
+ 	free_async_buffers(bh);
+-	restore_flags(flags);
++	spin_unlock_irqrestore(&buffer_io_async_lock, flags);
++
+ 	clear_bit(PG_locked, &page->flags);
+ 	wake_up(&page->wait);
+ 	after_unlock_page(page);
+ 	return;
+ 
+ still_busy:
+-	restore_flags(flags);
++	spin_unlock_irqrestore(&buffer_io_async_lock, flags);
+ 	return;
+ 
+ not_locked:
+@@ -1224,12 +1234,8 @@
+ 	 * They are _not_ registered in page->buffers either!
+ 	 */
+ 	bh = create_buffers(page_address(page), size, 1);
+-	if (!bh) {
+-		/* WSH: exit here leaves page->count incremented */
+-		clear_bit(PG_locked, &page->flags);
+-		wake_up(&page->wait);
+-		return -ENOMEM;
+-	}
++	if (!bh)
++		goto panic_async_failed;
+ 	nr = 0;
+ 	next = bh;
+ 	do {
+@@ -1284,14 +1290,16 @@
+ 		clear_bit(PG_locked, &page->flags);
+ 		set_bit(PG_uptodate, &page->flags);
+ 		wake_up(&page->wait);
+-		save_flags(flags);
+-		cli();
++		spin_lock_irqsave(&buffer_io_async_lock, flags);
+ 		free_async_buffers(bh);
+-		restore_flags(flags);
++		spin_unlock_irqrestore(&buffer_io_async_lock, flags);
+ 		after_unlock_page(page);
+ 	}
+ 	++current->maj_flt;
+ 	return 0;
++
++ panic_async_failed:
++	panic("async create_buffers() failed!");
+ }
+ 
+ /*
+@@ -1430,12 +1438,17 @@
+ 		return 0;
+ 	} while (tmp != bh);
+ 
+-	tmp = bh;
+ 	do {
+ 		struct buffer_head * p = tmp;
+ 		tmp = tmp->b_this_page;
+ 		nr_buffers--;
+-		remove_from_queues(p);
++		if (p->b_dev != B_FREE)
++		{
++			remove_from_queues(p);
++			remove_from_hash_queue(p);
++		}
++		else
++			remove_from_free_list(p);
+ 		put_unused_buffer_head(p);
+ 	} while (tmp != bh);
+ 
+@@ -1553,99 +1566,92 @@
+  * response to dirty buffers.  Once this process is activated, we write back
+  * a limited number of buffers to the disks and then go back to sleep again.
+  */
+-static struct wait_queue * bdflush_wait = NULL;
+ static struct wait_queue * bdflush_done = NULL;
+-struct task_struct *bdflush_tsk = 0;
++static struct task_struct * bdflush_tsk = NULL;
+ 
+-void wakeup_bdflush(int wait)
++void wakeup_bdflush(int sleep)
+ {
+-	if (current == bdflush_tsk)
+-		return;
+-	wake_up(&bdflush_wait);
+-	if (wait) {
+-		run_task_queue(&tq_disk);
++	if (bdflush_tsk->state == TASK_INTERRUPTIBLE)
++		wake_up_process(bdflush_tsk);
++	if (sleep && current != bdflush_tsk)
+ 		sleep_on(&bdflush_done);
+-	}
+ }
+-
+ 
+-/* 
+- * Here we attempt to write back old buffers.  We also try to flush inodes 
+- * and supers as well, since this function is essentially "update", and 
+- * otherwise there would be no way of ensuring that these quantities ever 
+- * get written back.  Ideally, we would have a timestamp on the inodes
+- * and superblocks so that we could write back only the old ones as well
++/* To prevent deadlocks for a loop device:
++ * 1) Do non-blocking writes to loop (avoids deadlock with running
++ *	out of request blocks).
++ * 2) But do a blocking write if the only dirty buffers are loop buffers
++ *	(otherwise we go into an infinite busy-loop).
++ * 3) Quit writing loop blocks if a freelist went low (avoids deadlock
++ *	with running out of free buffers for loop's "real" device).
+  */
+-
+-static int sync_old_buffers(void)
++static void flush_dirty_buffers(int check_flushtime, unsigned long now)
+ {
+-	int i;
+-	int ndirty, nwritten;
+-	int nlist;
+-	int ncount;
++	int i, flushed = 0;
+ 	struct buffer_head * bh, *next;
+-
+-	sync_supers(0);
+-	sync_inodes(0);
++	struct task_struct * tsk = current;
++	int wrta_cmd = WRITEA;	/* non-blocking write for LOOP */
+ 
+-	ncount = 0;
+-#ifdef DEBUG
+-	for(nlist = 0; nlist < NR_LIST; nlist++)
+-#else
+-	for(nlist = BUF_LOCKED; nlist <= BUF_DIRTY; nlist++)
+-#endif
++ try_again:
++	bh = lru_list[BUF_DIRTY];
++	if (!bh)
++		return;
++	for (i = nr_buffers_type[BUF_DIRTY]; i > 0; bh = next, i--)
+ 	{
+-		ndirty = 0;
+-		nwritten = 0;
+-	repeat:
++		next = bh->b_next_free;
+ 
+-		bh = lru_list[nlist];
+-		if(bh) 
+-			 for (i = nr_buffers_type[nlist]; i-- > 0; bh = next) {
+-				 /* We may have stalled while waiting for I/O to complete. */
+-				 if(bh->b_list != nlist) goto repeat;
+-				 next = bh->b_next_free;
+-				 if(!lru_list[nlist]) {
+-					 printk("Dirty list empty %d\n", i);
+-					 break;
+-				 }
+-				 
+-				 /* Clean buffer on dirty list?  Refile it */
+-				 if (nlist == BUF_DIRTY && !buffer_dirty(bh) && !buffer_locked(bh)) {
+-					 refile_buffer(bh);
+-					 continue;
+-				 }
+-				  
+-				  /* Unlocked buffer on locked list?  Refile it */
+-				  if (nlist == BUF_LOCKED && !buffer_locked(bh)) {
+-					  refile_buffer(bh);
+-					  continue;
+-				  }
+-				 
+-				 if (buffer_locked(bh) || !buffer_dirty(bh))
+-					  continue;
+-				 ndirty++;
+-				 if(time_before(jiffies, bh->b_flushtime))
+-					continue;
+-				 nwritten++;
+-				 next->b_count++;
+-				 bh->b_count++;
+-				 bh->b_flushtime = 0;
+-#ifdef DEBUG
+-				 if(nlist != BUF_DIRTY) ncount++;
+-#endif
+-				 ll_rw_block(WRITE, 1, &bh);
+-				 bh->b_count--;
+-				 next->b_count--;
+-			 }
++		if (!buffer_dirty(bh))
++		{
++			refile_buffer(bh);
++			continue;
++		}
++		if (buffer_locked(bh))
++			continue;
++
++		/*
++		 * This is safe because we always put newer buffer
++		 * at the end of the lru dirty list. We _never_ roll the
++		 * dirty lru-list.
++		 */
++		if (check_flushtime && time_before(now, bh->b_flushtime))
++			return;
++
++		/* Should we write back buffers that are shared or
++		   not?? currently dirty buffers are not shared,
++		   so it does not matter */
++		next->b_count++;
++		bh->b_count++;
++		flushed++;
++		if (MAJOR(bh->b_dev) != LOOP_MAJOR)
++			ll_rw_block(WRITE, 1, &bh);
++		else
++		{
++			ll_rw_block(wrta_cmd,1, &bh);
++			wrta_cmd = WRITEA;
++			if (buffer_dirty(bh))
++				--flushed;
++		}
++		bh->b_count--;
++		if (tsk->need_resched)
++			schedule();
++		next->b_count--;
++
++		if (!nr_buffers_type[BUF_DIRTY])
++			return;
++		if (!check_flushtime && flushed >= bdf_prm.b_un.ndirty)
++			return;
++		if (next->b_list != BUF_DIRTY)
++			goto try_again;
++	}
++	/* If we didn't write anything, but there are still
++	 * dirty buffers, then make the next write to a
++	 * loop device to be a blocking write.
++	 * This lets us block--which we _must_ do! */
++	if (flushed == 0 && nr_buffers_type[BUF_DIRTY] > 0 &&
++	    wrta_cmd != WRITE) {
++		wrta_cmd = WRITE;
++		goto try_again;
+ 	}
+-	run_task_queue(&tq_disk);
+-#ifdef DEBUG
+-	if (ncount) printk("sync_old_buffers: %d dirty buffers not on dirty list\n", ncount);
+-	printk("Wrote %d/%d buffers\n", nwritten, ndirty);
+-#endif
+-	run_task_queue(&tq_disk);
+-	return 0;
+ }
+ 
+ 
+@@ -1663,8 +1669,10 @@
+ 		goto out;
+ 
+ 	if (func == 1) {
+-		 error = sync_old_buffers();
+-		 goto out;
++		unlock_kernel();
++		error = 0;
++		/* do_exit directly and let kupdate to do its work alone. */
++		do_exit(0);
+ 	}
+ 
+ 	/* Basically func 1 means read param 1, 2 means write param 1, etc */
+@@ -1698,34 +1706,19 @@
+  * the syscall above, but now we launch it ourselves internally with
+  * kernel_thread(...)  directly after the first thread in init/main.c */
+ 
+-/* To prevent deadlocks for a loop device:
+- * 1) Do non-blocking writes to loop (avoids deadlock with running
+- *	out of request blocks).
+- * 2) But do a blocking write if the only dirty buffers are loop buffers
+- *	(otherwise we go into an infinite busy-loop).
+- * 3) Quit writing loop blocks if a freelist went low (avoids deadlock
+- *	with running out of free buffers for loop's "real" device).
+-*/
+ int bdflush(void * unused) 
+ {
+-	int i;
+-	int ndirty;
+-	int nlist;
+-	int ncount;
+-	struct buffer_head * bh, *next;
+-	int major;
+-	int wrta_cmd = WRITEA;	/* non-blocking write for LOOP */
+-
+ 	/*
+ 	 *	We have a bare-bones task_struct, and really should fill
+ 	 *	in a few more things so "top" and /proc/2/{exe,root,cwd}
+ 	 *	display semi-sane things. Not real crucial though...  
+ 	 */
+ 
+-	current->session = 1;
+-	current->pgrp = 1;
+-	sprintf(current->comm, "kflushd");
+ 	bdflush_tsk = current;
++	bdflush_tsk->session = 1;
++	bdflush_tsk->pgrp = 1;
++	strcpy(bdflush_tsk->comm, "kflushd");
++	sigfillset(&bdflush_tsk->blocked);
+ 
+ 	/*
+ 	 *	As a kernel thread we want to tamper with system buffers
+@@ -1735,93 +1728,60 @@
+ 	lock_kernel();
+ 		 
+ 	for (;;) {
++		bdflush_tsk->state = TASK_INTERRUPTIBLE;
++		schedule();
+ #ifdef DEBUG
+-		printk("bdflush() activated...");
++		printk("bdflush() activated...\n");
+ #endif
+ 
+ 		CHECK_EMERGENCY_SYNC
+ 
+-		ncount = 0;
+-#ifdef DEBUG
+-		for(nlist = 0; nlist < NR_LIST; nlist++)
+-#else
+-		for(nlist = BUF_LOCKED; nlist <= BUF_DIRTY; nlist++)
+-#endif
+-		 {
+-			 ndirty = 0;
+-		 repeat:
+-
+-			 bh = lru_list[nlist];
+-			 if(bh) 
+-				  for (i = nr_buffers_type[nlist]; i-- > 0 && ndirty < bdf_prm.b_un.ndirty; 
+-				       bh = next) {
+-					  /* We may have stalled while waiting for I/O to complete. */
+-					  if(bh->b_list != nlist) goto repeat;
+-					  next = bh->b_next_free;
+-					  if(!lru_list[nlist]) {
+-						  printk("Dirty list empty %d\n", i);
+-						  break;
+-					  }
+-					  
+-					  /* Clean buffer on dirty list?  Refile it */
+-					  if (nlist == BUF_DIRTY && !buffer_dirty(bh)) {
+-						  refile_buffer(bh);
+-						  continue;
+-					  }
+-					  
+-					  /* Unlocked buffer on locked list?  Refile it */
+-					  if (nlist == BUF_LOCKED && !buffer_locked(bh)) {
+-						  refile_buffer(bh);
+-						  continue;
+-					  }
+-					  
+-					  if (buffer_locked(bh) || !buffer_dirty(bh))
+-						   continue;
+-					  major = MAJOR(bh->b_dev);
+-					  /* Should we write back buffers that are shared or not??
+-					     currently dirty buffers are not shared, so it does not matter */
+-					  next->b_count++;
+-					  bh->b_count++;
+-					  ndirty++;
+-					  bh->b_flushtime = 0;
+-					  if (major == LOOP_MAJOR) {
+-						  ll_rw_block(wrta_cmd,1, &bh);
+-						  wrta_cmd = WRITEA;
+-						  if (buffer_dirty(bh))
+-							  --ndirty;
+-					  }
+-					  else
+-					  ll_rw_block(WRITE, 1, &bh);
+-#ifdef DEBUG
+-					  if(nlist != BUF_DIRTY) ncount++;
+-#endif
+-					  bh->b_count--;
+-					  next->b_count--;
+-				  }
+-		 }
++		do {
++			flush_dirty_buffers(0, 0);
++			if (waitqueue_active(&bdflush_done))
++				wake_up(&bdflush_done);
++		} while (many_dirty_buffers());
++	}
++}
++
++/*
++ * This is the kernel update daemon. It was used to live in userspace
++ * but since it's need to run safely we want it unkillable by mistake.
++ * You don't need to change your userspace configuration since
++ * the userspace `update` will do_exit(0) at the first sys_bdflush().
++ */
++int kupdate(void * unused) 
++{
++	struct task_struct * tsk = current;
++	int interval;
++
++	tsk->session = 1;
++	tsk->pgrp = 1;
++	strcpy(tsk->comm, "kupdate");
++	sigfillset(&tsk->blocked);
++	/* sigcont will wakeup kupdate after setting interval to 0 */
++	sigdelset(&tsk->blocked, SIGCONT);
++
++	lock_kernel();
++
++	for (;;) {
++		interval = bdf_prm.b_un.interval;
++		if (interval)
++		{
++			tsk->state = TASK_INTERRUPTIBLE;
++			schedule_timeout(interval);
++		}
++		else
++		{
++			tsk->state = TASK_STOPPED;
++			schedule(); /* wait for SIGCONT */
++		}
+ #ifdef DEBUG
+-		if (ncount) printk("sys_bdflush: %d dirty buffers not on dirty list\n", ncount);
+-		printk("sleeping again.\n");
++		printk("kupdate() activated...\n");
+ #endif
+-		/* If we didn't write anything, but there are still
+-		 * dirty buffers, then make the next write to a
+-		 * loop device to be a blocking write.
+-		 * This lets us block--which we _must_ do! */
+-		if (ndirty == 0 && nr_buffers_type[BUF_DIRTY] > 0 && wrta_cmd != WRITE) {
+-			wrta_cmd = WRITE;
+-			continue;
+-		}
++		sync_supers(0);
++		sync_inodes(0);
++		flush_dirty_buffers(1, jiffies);
+ 		run_task_queue(&tq_disk);
+-		wake_up(&bdflush_done);
+-		
+-		/* If there are still a lot of dirty buffers around, skip the sleep
+-		   and flush some more */
+-		if(ndirty == 0 || nr_buffers_type[BUF_DIRTY] <= nr_buffers * bdf_prm.b_un.nfract/100) {
+-			spin_lock_irq(&current->sigmask_lock);
+-			flush_signals(current);
+-			spin_unlock_irq(&current->sigmask_lock);
+-
+-			interruptible_sleep_on(&bdflush_wait);
+-		}
+ 	}
+ }
+Index: linux/init/main.c
+===================================================================
+RCS file: /var/cvs/linux/init/main.c,v
+retrieving revision 1.1.1.14
+diff -u -r1.1.1.14 main.c
+--- linux/init/main.c	1999/06/14 15:30:02	1.1.1.14
++++ linux/init/main.c	1999/07/08 13:24:35
+@@ -67,6 +67,7 @@
+ 
+ static int init(void *);
+ extern int bdflush(void *);
++extern int kupdate(void *);
+ extern int kswapd(void *);
+ extern int kpiod(void *);
+ extern void kswapd_setup(void);
+@@ -1291,6 +1292,7 @@
+ 
+ 	/* Launch bdflush from here, instead of the old syscall way. */
+ 	kernel_thread(bdflush, NULL, CLONE_FS | CLONE_FILES | CLONE_SIGHAND);
++	kernel_thread(kupdate, NULL, CLONE_FS | CLONE_FILES | CLONE_SIGHAND);
+ 	/* Start the background pageout daemon. */
+ 	kswapd_setup();
+ 	kernel_thread(kpiod, NULL, CLONE_FS | CLONE_FILES | CLONE_SIGHAND);
+Index: linux/fs/minix/truncate.c
+diff -u linux/fs/minix/truncate.c:1.1.1.1 linux/fs/minix/truncate.c:1.1.1.1.4.4
+--- linux/fs/minix/truncate.c:1.1.1.1	Mon Jan 18 02:26:50 1999
++++ linux/fs/minix/truncate.c	Tue Jul  6 03:08:42 1999
+@@ -52,17 +52,18 @@
+ 			brelse(bh);
+ 			goto repeat;
+ 		}
+-		if ((bh && bh->b_count != 1) || tmp != *p) {
++		/*
++		 * Don't get confused: `tmp != *p' here is superflous.
++		 */
++		if ((bh && (bh->b_count != 1 || buffer_locked(bh))) ||
++		    tmp != *p) {
+ 			retry = 1;
+ 			brelse(bh);
+ 			continue;
+ 		}
+ 		*p = 0;
+ 		mark_inode_dirty(inode);
+-		if (bh) {
+-			mark_buffer_clean(bh);
+-			brelse(bh);
+-		}
++		bforget(bh);
+ 		minix_free_block(inode->i_sb,tmp);
+ 	}
+ 	return retry;
+@@ -103,14 +104,18 @@
+ 			brelse(bh);
+ 			goto repeat;
+ 		}
+-		if ((bh && bh->b_count != 1) || tmp != *ind) {
++		/*
++		 * Don't get confused: `tmp != *p' here is superflous.
++		 */
++		if ((bh && (bh->b_count != 1 || buffer_locked(bh))) ||
++		    tmp != *ind) {
+ 			retry = 1;
+ 			brelse(bh);
+ 			continue;
+ 		}
+ 		*ind = 0;
+ 		mark_buffer_dirty(ind_bh, 1);
+-		brelse(bh);
++		bforget(bh);
+ 		minix_free_block(inode->i_sb,tmp);
+ 	}
+ 	ind = (unsigned short *) ind_bh->b_data;
+@@ -189,8 +194,9 @@
+ 		retry |= V1_trunc_dindirect(inode, 7+512, inode->u.minix_i.u.i1_data + 8);
+ 		if (!retry)
+ 			break;
+-		current->counter = 0;
+-		schedule();
++		run_task_queue(&tq_disk);
++		current->policy |= SCHED_YIELD;
++		schedule ();
+ 	}
+ 	inode->i_mtime = inode->i_ctime = CURRENT_TIME;
+ 	mark_inode_dirty(inode);
+Index: linux/fs/ufs/truncate.c
+diff -u linux/fs/ufs/truncate.c:1.1.1.1 linux/fs/ufs/truncate.c:1.1.1.1.4.3
+--- linux/fs/ufs/truncate.c:1.1.1.1	Mon Jan 18 02:26:54 1999
++++ linux/fs/ufs/truncate.c	Tue Jul  6 02:41:08 1999
+@@ -452,10 +452,9 @@
+ 			break;
+ 		if (IS_SYNC(inode) && (inode->i_state & I_DIRTY))
+ 			ufs_sync_inode (inode);
+-		current->counter = 0;
++		run_task_queue(&tq_disk);
++		current->policy |= SCHED_YIELD;
+ 		schedule ();
+-
+-
+ 	}
+ 	offset = inode->i_size & uspi->s_fshift;
+ 	if (offset) {
+Index: linux/include/asm-alpha/spinlock.h
+diff -u linux/include/asm-alpha/spinlock.h:1.1.1.3 linux/include/asm-alpha/spinlock.h:1.1.1.1.4.4
+--- linux/include/asm-alpha/spinlock.h:1.1.1.3	Mon Jun 14 17:24:53 1999
++++ linux/include/asm-alpha/spinlock.h	Tue Jul  6 02:41:08 1999
+@@ -18,11 +18,11 @@
+   #define SPIN_LOCK_UNLOCKED (spinlock_t) { 0 }
+ #endif
+ 
+-#define spin_lock_init(lock)			((void) 0)
+-#define spin_lock(lock)				((void) 0)
+-#define spin_trylock(lock)			((void) 0)
+-#define spin_unlock_wait(lock)			((void) 0)
+-#define spin_unlock(lock)			((void) 0)
++#define spin_lock_init(lock)			do { } while(0)
++#define spin_lock(lock)				do { } while(0)
++#define spin_trylock(lock)			(1)
++#define spin_unlock_wait(lock)			do { } while(0)
++#define spin_unlock(lock)			do { } while(0)
+ #define spin_lock_irq(lock)			cli()
+ #define spin_unlock_irq(lock)			sti()
+ 
+Index: linux/include/linux/sysrq.h
+===================================================================
+RCS file: /var/cvs/linux/include/linux/sysrq.h,v
+retrieving revision 1.1.1.1
+diff -u -r1.1.1.1 sysrq.h
+--- linux/include/linux/sysrq.h	1999/01/18 01:27:12	1.1.1.1
++++ linux/include/linux/sysrq.h	1999/07/08 11:45:35
+@@ -32,7 +32,10 @@
+ #ifdef CONFIG_MAGIC_SYSRQ
+ #define CHECK_EMERGENCY_SYNC			\
+ 	if (emergency_sync_scheduled)		\
+-		do_emergency_sync();
++	{					\
++		do_emergency_sync();		\
++		continue;			\
++	}
+ #else
+ #define CHECK_EMERGENCY_SYNC
+ #endif
+Andrea
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

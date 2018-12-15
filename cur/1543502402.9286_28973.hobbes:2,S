@@ -1,0 +1,199 @@
+Date: Sun, 11 Jul 1999 13:45:43 +0200 (METDST)
+From: Richard Guenther <>
+Subject: Re: [RFC][PATCH] scripts with stdin replaced
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/7/11/23
+
+On Thu, 8 Jul 1999, Horst von Brand wrote:
+> Ralf Baechle <ralf@uni-koblenz.de> said:
+> > On Tue, Jul 06, 1999 at 08:44:23AM -0400, Horst von Brand wrote:
+> > > > Probably the only safe well-known interpreter is perl, and that runs
+> > > > setuid scripts itself already.
+> 
+> > > That is a kludge, and it won't work at all when capabilities are done right
+> > > in the filesystem.
+> 
+> > I don't see why Perl's mechanism for SUID scripts used on Linux couldn't
+> > be expanded to cover capabilites as well.  Except that that would make
+> > as small part of Perl the single point of failure in the security system.
+> 
+> I don't want to trust an all-capable Perl interpreter. Not on a system that
+> is important/critical enough to be secured by capabilitites. A clean
+> solution is given if the script carries capabilities, the kernel notes this
+> and invokes the interpreter with the capabilities the filesystem grants. In
+> this case it is useless to trick the interpreter.
+Ok, as suggested here is a patch to binfmt_misc that does pass
+/dev/fd/# as argument rather than the filename. It can not fully
+replace #! processing, as arguments after #!/bin/sh are not
+processed (but its mostly fine, only the debian-netscape script
+failes with an binfmt_misc entry with magic #!/bin/sh).
+Patching binfmt_script did not work, as /proc is not mounted
+at early boot, so every script failed (tested it) and I dont
+know where and if to add magic checks to binfmt_script to check
+for "early boot stage". Btw. one really wants to carefully choose
+which interpreters are allowed to be called with suid-scripts.
+I personally wont let bash do it.
+Comments? Richard.
+---
+Richard Guenther <richard.guenther@student.uni-tuebingen.de>
+PGP: 2E829319 - 2F 83 FC 93 E9 E4 19 E2 93 7A 32 42 45 37 23 57
+WWW: 
+http://www.anatom.uni-tuebingen.de/~richi/
+--- linux-2.2.0/fs/binfmt_misc.c.original	Fri Jul  2 17:40:37 1999
++++ linux-2.2.0/fs/binfmt_misc.c	Sat Jul 10 16:41:12 1999
+@@ -18,9 +18,14 @@
+ #include <linux/config.h>
+ #include <linux/module.h>
+ 
++#include <asm/current.h>
++#include <linux/sched.h>
+ #include <linux/kernel.h>
++#include <linux/smp_lock.h>
+ #include <linux/errno.h>
+ #include <linux/fs.h>
++#include <linux/file.h>
++#include <linux/mm.h>
+ #include <linux/malloc.h>
+ #include <linux/binfmts.h>
+ #include <linux/init.h>
+@@ -57,6 +62,7 @@
+ };
+ 
+ #define ENTRY_ENABLED 1		/* the old binfmt_entry.enabled */
++#define ENTRY_PASS_FD 7		/* pass /dev/fd/x as parameter (executable as open file) */
+ #define	ENTRY_MAGIC 8		/* not filename detection */
+ 
+ static int load_misc_binary(struct linux_binprm *bprm, struct pt_regs *regs);
+@@ -187,8 +193,12 @@
+ 	struct dentry * dentry;
+ 	char iname[128];
+ 	char *iname_addr = iname;
+-	int retval;
+-
++	int retval, flags;
++	char fdname[16];
++	char *fdname_addr = fdname;
++	int execfd, e_uid, e_gid;
++	kernel_cap_t cap_inheritable, cap_permitted, cap_effective;
++	
+ 	MOD_INC_USE_COUNT;
+ 	retval = -ENOEXEC;
+ 	if (!enabled)
+@@ -200,34 +210,65 @@
+ 	if (fmt) {
+ 		strncpy(iname, fmt->interpreter, 127);
+ 		iname[127] = '\0';
++		flags = fmt->flags;
+ 	}
+ 	read_unlock(&entries_lock);
+ 	if (!fmt)
+ 		goto _ret;
+ 
++	/* pass open fd as /dev/fd/x to interpreter preserving SUID of binary */
++	if (flags & ENTRY_PASS_FD) {
++		execfd = open_dentry(bprm->dentry, O_RDONLY);
++		if (execfd == -1)
++			goto _ret;
++		sprintf(fdname, "/dev/fd/%i", execfd);
++		e_uid = bprm->e_uid;
++		e_gid = bprm->e_gid;
++		cap_inheritable = bprm->cap_inheritable;
++	 	cap_permitted = bprm->cap_permitted;
++		cap_effective = bprm->cap_effective;
++	}
++
+ 	dput(bprm->dentry);
+ 	bprm->dentry = NULL;
+ 
+ 	/* Build args for interpreter */
+ 	remove_arg_zero(bprm);
+-	bprm->p = copy_strings(1, &bprm->filename, bprm->page, bprm->p, 2);
++	if (flags & ENTRY_PASS_FD) {
++		bprm->p = copy_strings(1, &fdname_addr, bprm->page, bprm->p, 2);
++	} else {
++		bprm->p = copy_strings(1, &bprm->filename, bprm->page, bprm->p, 2);
++	}
+ 	bprm->argc++;
+ 	bprm->p = copy_strings(1, &iname_addr, bprm->page, bprm->p, 2);
+ 	bprm->argc++;
+ 	retval = -E2BIG;
+ 	if (!bprm->p)
+-		goto _ret;
++		goto _out_close;
+ 	bprm->filename = iname;	/* for binfmt_script */
+ 
+ 	dentry = open_namei(iname, 0, 0);
+ 	retval = PTR_ERR(dentry);
+ 	if (IS_ERR(dentry))
+-		goto _ret;
++		goto _out_close;
+ 	bprm->dentry = dentry;
+ 
+ 	retval = prepare_binprm(bprm);
+-	if (retval >= 0)
++	if (retval >= 0) {
++		/* allow set-uid binaries for fd passing */
++		if (flags & ENTRY_PASS_FD) {
++			bprm->e_uid = e_uid;
++			bprm->e_gid = e_gid;
++			bprm->cap_inheritable = cap_inheritable;
++			bprm->cap_permitted = cap_permitted;
++			bprm->cap_effective = cap_effective;
++		}
+ 		retval = search_binary_handler(bprm, regs);
++	}
++
++_out_close:
++	if (flags & ENTRY_PASS_FD)
++		sys_close(execfd);
+ _ret:
+ 	MOD_DEC_USE_COUNT;
+ 	return retval;
+@@ -277,7 +318,7 @@
+ 
+ /*
+  * This registers a new binary format, it recognises the syntax
+- * ':name:type:offset:magic:mask:interpreter:'
++ * ':name:flags:offset:magic:mask:interpreter:'
+  * where the ':' is the IFS, that can be chosen with the first char
+  */
+ static int proc_write_register(struct file *file, const char *buffer,
+@@ -307,11 +348,25 @@
+ 
+ 	/* we can use bit 3 of type for ext/magic
+ 	   flag due to the nice encoding of E and M */
+-	if ((*sp & ~('E' | 'M')) || (sp[1] != del))
+-		err = -EINVAL;
+-	else
+-		e->flags = (*sp++ & (ENTRY_MAGIC | ENTRY_ENABLED));
+-	cnt -= 2; sp++;
++	e->flags = ENTRY_ENABLED;
++	while (*sp != del && err == 0) {
++		switch (*sp) {
++			case 'E':
++				e->flags &= ~ENTRY_MAGIC;
++				break;
++			case 'M':
++				e->flags |= ENTRY_MAGIC;
++				break;
++			case 'F':
++				e->flags |= ENTRY_PASS_FD;
++				break;
++			default:
++				err = -EINVAL;
++				break;
++		}
++		sp++; cnt--;
++	}
++	sp++; cnt--;
+ 
+ 	e->offset = 0;
+ 	while (cnt-- && isdigit(*sp))
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

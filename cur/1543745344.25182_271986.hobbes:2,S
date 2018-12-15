@@ -1,0 +1,159 @@
+Date: Thu, 18 Nov 2004 10:29:32 +0900
+From: Hidetoshi Seto <>
+Subject: Re: Futex queue_me/get_user ordering
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2004/11/17/346
+
+Jamie Lokier wrote:
+> Hidetoshi Seto wrote:
+> 
+>>I have to deeply apologize to all for my mistake.
+>>If my understanding is correct, this bug is "2.4 futex"(RHEL3) *SPECIFIC*!!
+>>I had swallow the story that 2.6 futex has the same problem...
+> 
+> Wrong, 2.6 has the same behaviour!
+> 
+>>So I realize that 2.6 futex never behave:
+>>
+>>>>     "returns 0 if the futex was not equal to the expected value, but
+>>>>      the process was woken by a FUTEX_WAKE call."
+>>
+>>Update of manpage is now unnecessary, I think.
+> 
+> It is necessary.
+> 
+>>First of all, I would appreciate if you could read my old post:
+>>"Kernel bug in futex_wait, cause application hang with NPTL"
+>>
+http://www.ussg.iu.edu/hypermail/linux/kernel/0409.0/2044.html
+> 
+>>If my understanding is correct, 2.6 futex does not get any spinlocks,
+>>but a semaphore:
+>>
+>> 286 static int futex_wake(unsigned long uaddr, int nr_wake)
+>>  :
+>> 294         down_read(&current->mm->mmap_sem);
+>>
+>> 477 static int futex_wait(unsigned long uaddr, int val, unsigned long time)
+>>  :
+>> 483         down_read(&current->mm->mmap_sem);
+> 
+>>This semaphore prevents a waiter which temporarily queued to check the val
+>>from being target of wakeup.
+> 
+> No, because it's a read-write semaphore, and we do "down_read" on it
+> which is a shared lock.  It does not prevent concurrent wake and wait
+> operations!
+Aha, yes. You are right.
+> [About 2.4 futex in RHEL3U2 which takes spinlocks instead]:
+> 
+>>However, this spinlocks fail to prevent topical waiters from wakeups.
+>>Because the spinlocks are released *before* unqueue_me(&q) (line 343 & 373).
+>>So this failure allows wake_Y to touch the queue while wait_A is in it.
+> 
+> This order is necessary, because it's not safe to call get_user()
+> while holding any spinlocks.  It is not a bug in RHEL.
+I think 2.4 is fixable. My original patch for 2.4 was:
+/*----- patch begin -----*/
+diff -Naur linux-2.4.21-EL3_org/kernel/futex.c linux-2.4.21-EL3/kernel/futex.c
+--- linux-2.4.21-EL3_org/kernel/futex.c	2004-08-25 19:47:35.418632860 +0900
++++ linux-2.4.21-EL3/kernel/futex.c	2004-08-25 19:48:32.505546224 +0900
+@@ -297,14 +297,20 @@
+  	spin_lock(&vcache_lock);
+  	spin_lock(&futex_lock);
++	ret = __unqueue_me(q);
++	spin_unlock(&futex_lock);
++	spin_unlock(&vcache_lock);
++	return ret;
++}
++
++static inline int __unqueue_me(struct futex_q *q)
++{
+  	if (!list_empty(&q->list)) {
+  		list_del(&q->list);
+  		__detach_vcache(&q->vcache);
+-		ret = 1;
++		return 1;
+  	}
+-	spin_unlock(&futex_lock);
+-	spin_unlock(&vcache_lock);
+-	return ret;
++	return 0;
+  }
+  static inline int futex_wait(unsigned long uaddr,
+@@ -333,13 +339,18 @@
+  	 * Page is pinned, but may no longer be in this address space.
+  	 * It cannot schedule, so we access it with the spinlock held.
+  	 */
+-	if (!access_ok(VERIFY_READ, uaddr, 4))
+-		goto out_fault;
++	if (!access_ok(VERIFY_READ, uaddr, 4)) {
++		__unqueue_me(&q);
++		unlock_futex_mm();
++		ret = -EFAULT;
++		goto out;
++	}
+  	kaddr = kmap_atomic(page, KM_USER0);
+  	curval = *(int*)(kaddr + offset);
+  	kunmap_atomic(kaddr, KM_USER0);
+  	if (curval != val) {
++		__unqueue_me(&q);
+  		unlock_futex_mm();
+  		ret = -EWOULDBLOCK;
+  		goto out;
+@@ -364,22 +375,18 @@
+  	 */
+  	if (time == 0) {
+  		ret = -ETIMEDOUT;
+-		goto out;
++		goto out_wait;
+  	}
+  	if (signal_pending(current))
+  		ret = -EINTR;
+-out:
++out_wait:
+  	/* Were we woken up anyway? */
+  	if (!unqueue_me(&q))
+  		ret = 0;
++out:
+  	put_page(q.page);
+  	return ret;
+-
+-out_fault:
+-	unlock_futex_mm();
+-	ret = -EFAULT;
+-	goto out;
+  }
+  long do_futex(unsigned long uaddr, int op, int val, unsigned long timeout,
+/*----- patch end -----*/
+This patch just reorder old codes in fault route:
+if(fault){
+   unlock(futex);
+   ret = -ERRVAR;
+   unqueue();
+   put_page();
+   return ret;
+}
+to new one:
+if(fault){
+   unqueue_in_lock();
+   unlock(futex);
+   ret = -ERRVAR;
+   put_page();
+   return ret;
+}
+It protects the temporarily queued thread from wakes, doesn't it?
+If this work, it could be said that we can fix 2.6 futex with a
+spinlock... but it will be slow, slow...
+Thanks,
+H.Seto
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+More majordomo info at  
+http://vger.kernel.org/majordomo-info.html
+Please read the FAQ at  
+http://www.tux.org/lkml/

@@ -1,0 +1,575 @@
+Date: Tue, 18 Nov 2003 16:31:43 +0100 (CET)
+From: Maciej Zenczykowski <>
+Subject: Re: Announce: ndiswrapper
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2003/11/18/78
+
+> > Speaking of io-trace has anyone actually done this?  I'm working on a 
+> 
+> It's actually not all that simple. Some CPUs do have direct inb/outb
+> instructions that are not syscalls. So you either have to single-step
+> all the program and look at it's execution path, or you'd run it as a
+> notmal user and handle the privilege penetration then luser starts
+> inb'ing:) A coworker of me has done that with a DOS driver, doing such
+> IO tracing for the dosemu it was running it.
+> 
+> Maybe he cares to explain it in detail...
+> 
+> MfG, JBG
+Well I have a working patch for linux x86 strace 4.5 (mostly needs 
+cleanup) which implements IO-trace for non-mmaped IO by causing protection 
+violations on IO instructions.  Normally you'd call ioperm/iopl to get at 
+the hardware this is intercepted, noted on the side and _not_ passed to 
+the kernel.  All IO accesses from now on cause SIGSEGV's - which I procede 
+to printf and emulate.
+I'm still not decided on whether this should be done entirely in 
+user-space (there are issues...) or partially or even mostly in kernel.
+I'm attaching a patch for strace 4.5 (from sourceforge), you'll need to 
+patch and then likely run aclocal and automake before configure and make.
+It currently only works for x86 linux non-string IO instructions for plain 
+non-segmented 32bit code (which is probably 99% of x86 IO not covered by 
+dosemu).  Attach/detach don't work (fully), so you'll want to strace -I a 
+program from the very beginning :)  I've run SVGATextMode through it and 
+it works, haven't tried it but the Xserver would likely work as well 
+(although that would probably require far more disk space in tmp then I 
+have :)).  If you're strace'ing IO which access the video card it is 
+probably smart to redirect stderr to a file to keep the kernel from 
+accessing the video card at the same time (locking during strace is 
+impossible).
+Any comments? Feedback and ideas are welcome...
+Cheers,
+MaZe.
+diff -urN strace-4.5/defs.h strace-4.5mz/defs.h
+--- strace-4.5/defs.h	2003-08-21 11:58:00.000000000 +0200
++++ strace-4.5mz/defs.h	2003-11-15 16:08:25.000000000 +0100
+@@ -284,6 +284,14 @@
+ 	int nclone_threads;	/* # of nchildren with CLONE_THREAD */
+ 	int nclone_detached;	/* # of nchildren with CLONE_DETACHED */
+ 	int nclone_waiting;	/* clone threads in wait4 (TCB_SUSPENDED) */
++#ifdef I386	
++	int ioscno;
++	int ioretval;
++	int iopl;
++	char cap_rawio;
++#define MAX_IOPERM 1024
++	unsigned char io_bitmap[MAX_IOPERM / 8 + 1];
++#endif
+ #endif
+ 				/* (1st arg of wait4()) */
+ 	long baddr;		/* `Breakpoint' address */
+@@ -395,7 +403,7 @@
+ extern struct tcb **tcbtab;
+ extern int qual_flags[];
+ extern int debug, followfork, followvfork;
+-extern int rflag, tflag, dtime, cflag, xflag, qflag;
++extern int rflag, tflag, dtime, cflag, ioflag, xflag, qflag;
+ extern int acolumn;
+ extern char *outfname;
+ extern unsigned int nprocs, tcbtabsize;
+@@ -456,6 +464,9 @@
+ extern void tprint_iov P((struct tcb *, int, long));
+ 
+ #ifdef LINUX
++#ifdef I386
++extern int internal_ioemu P((struct tcb *));
++#endif
+ extern int internal_clone P((struct tcb *));
+ #endif
+ extern int internal_fork P((struct tcb *));
+diff -urN strace-4.5/io_emu.c strace-4.5mz/io_emu.c
+--- strace-4.5/io_emu.c	1970-01-01 01:00:00.000000000 +0100
++++ strace-4.5mz/io_emu.c	2003-11-15 19:07:08.000000000 +0100
+@@ -0,0 +1,199 @@
++/*
++ * Copyright (c) 2003 Maciej Zenczykowski <maze@cela.pl>
++ * All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ * 3. The name of the author may not be used to endorse or promote products
++ *    derived from this software without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR
++ * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
++ * OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
++ * IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
++ * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
++ * NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
++ * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ *
++ *	$Id: io_emu.c,v 1.00 2003/10/15 17:36:37 maze Exp $
++ */
++
++#include "defs.h"
++
++#if defined(LINUX) && defined(I386)
++
++/*
++#include <stdlib.h>
++#include <string.h>
++#include <stdio.h>
++#include <errno.h>
++#include <unistd.h>
++#include <asm/unistd.h>
++#include <sys/ptrace.h>
++*/
++#include <linux/ptrace.h>
++/*
++#include <sys/types.h>
++#include <sys/resource.h>
++#include <sys/wait.h>
++#include <sys/io.h>
++*/
++
++typedef int bool;
++#define false ((bool)0)
++#define true  ((bool)1)
++
++typedef   signed char   int8;
++typedef   signed short  int16;
++typedef   signed int    int32;
++typedef unsigned char  uint8;
++typedef unsigned short uint16;
++typedef unsigned int   uint32;
++
++struct user_regs {
++  union {
++    struct { uint32 ebx,              ecx,              edx;              };
++    struct { uint16 bx,     xbx,      cx,     xcx,      dx,     xdx;      };
++    struct { uint8  bl, bh, xbl, xbh, cl, ch, xcl, xch, dl, dh, xdl, xdh; };
++  };
++  union {
++    struct { uint32 esi,              edi,              ebp;               };
++    struct { uint16 si,     xsi,      di,     xdi,      bp,     xbp;       };
++  };
++  union {
++    struct { uint32 eax;              };
++    struct { uint16 ax,     xax;      };
++    struct { uint8  al, ah, xal, xah; };
++  };
++  uint16 ds, xds, es, xes, fs, xfs, gs, xgs;
++  union {
++    struct { uint32 _eax,                 eip;     };
++    struct { uint16 _ax,      _xax,       ip, xip; }; 
++    struct { uint8  _al, _ah, _xal, _xah; };
++  };
++  uint16 cs, xcs;
++  union {
++    struct { uint32 eflags,        esp;     };
++    struct { uint16 flags, xflags, sp, xsp; };
++  };
++  uint16 ss, xss;
++};
++
++static inline void out_b (uint16 port, uint8  * v) { asm volatile ("outb\t%b0, %w1" : : "a" (*v), "Nd" (port)); };
++static inline void out_w (uint16 port, uint16 * v) { asm volatile ("outw\t%w0, %w1" : : "a" (*v), "Nd" (port)); };
++static inline void out_l (uint16 port, uint32 * v) { asm volatile ("outl\t%0, %w1"  : : "a" (*v), "Nd" (port)); };
++
++static inline void in_b  (uint16 port, uint8  * v) { asm volatile ("inb\t%w1, %b0"  : "=a" (*v) : "Nd" (port)); };
++static inline void in_w  (uint16 port, uint16 * v) { asm volatile ("inw\t%w1, %w0"  : "=a" (*v) : "Nd" (port)); };
++static inline void in_l  (uint16 port, uint32 * v) { asm volatile ("inl\t%w1, %0"   : "=a" (*v) : "Nd" (port)); };
++
++bool valid_port (struct tcb *tcp, uint16 port, int mask) {
++  if (tcp->iopl == 3) return true;
++  if ( ((*(uint16*)&tcp->io_bitmap[port >> 3]) >> (port & 7)) & mask ) return false;
++  return true;
++};
++#define valid8(P)  valid_port((P), 1)
++#define valid16(P) valid_port((P), 3)
++#define valid32(P) valid_port((P), 7)
++
++uint32 mask[] = { 0, 0xFF, 0xFFFF, 0xFFFFFF, 0xFFFFFFFF };
++
++static int emulate_io (struct tcb *tcp) {
++  struct user_regs regs;
++  ptrace(PTRACE_GETREGS, tcp->pid, 0, (int)&regs);
++  int seg = 0;
++  bool gr1 = 0, gr2 = 0, gr3 = 0, gr4 = 0;
++  bool op32 = 1, ad32 = 1; /* !!! ASSUMES 32BIT CODE !!! */
++  bool lock = 0, repne = 0, repe = 0;
++  int pp = 0;
++  uint8 insn, param;
++  
++loop:
++#define CODE8(P) ((uint8)(ptrace(PTRACE_PEEKTEXT, tcp->pid, (char*)(P), 0)))
++  insn = CODE8(regs.eip + pp); ++pp;
++  param = CODE8(regs.eip + pp);
++
++  switch (insn) {
++#define dprintf(...)
++    case 0x26: dprintf("ES: ");    if (gr1++) goto error; seg = ES; goto loop;
++    case 0x2E: dprintf("CS: ");    if (gr1++) goto error; seg = CS; goto loop;
++    case 0x36: dprintf("SS: ");    if (gr1++) goto error; seg = SS; goto loop;
++    case 0x3E: dprintf("DS: ");    if (gr1++) goto error; seg = DS; goto loop;
++    case 0x64: dprintf("FS: ");    if (gr1++) goto error; seg = FS; goto loop;
++    case 0x65: dprintf("GS: ");    if (gr1++) goto error; seg = GS; goto loop;
++    case 0x66: dprintf("(op32) "); if (gr2++) goto error; op32 ^= 1; goto loop;
++    case 0x67: dprintf("(ad32) "); if (gr3++) goto error; ad32 ^= 1; goto loop;
++    case 0xF0: dprintf("lock "  ); if (gr4++) goto error; lock  = 1; goto loop;
++    case 0xF2: dprintf("repne " ); if (gr4++) goto error; repne = 1; goto loop;
++    case 0xF3: dprintf("rep(e) "); if (gr4++) goto error; repe  = 1; goto loop;
++#undef dprintf
++
++    /* DISABLE/ENABLE INTERRUPTS - IGNORE! */
++    case 0xFA: if (gr1 || gr2 || gr3 || gr4) goto error; tprintf("cli"); goto ok;
++    case 0xFB: if (gr1 || gr2 || gr3 || gr4) goto error; tprintf("sti"); goto ok;
++
++    /* STRING I/O - UNIMPLEMENTED */
++    case 0x6C: if (gr1 || lock || repne) goto error; tprintf("insb"); goto error;
++    case 0x6D: if (gr1 || lock || repne) goto error; tprintf("insw/l"); goto error;
++    case 0x6E: if (       lock || repne) goto error; tprintf("outsb"); goto error;
++    case 0x6F: if (       lock || repne) goto error; tprintf("outsw/l"); goto error;
++
++#define simulate_in(szo, sza, port) \
++tprintf("in%c(0x%0*X) = ", "0bw3l"[szo], sza+sza, port); \
++if (!valid_port(tcp, port, (1 << szo) - 1 )) { tprintf("ERROR"); goto error; }; \
++if (szo == 1) in_b(port, &regs.al); \
++if (szo == 2) in_w(port, &regs.ax); \
++if (szo == 4) in_l(port, &regs.eax); \
++tprintf("0x%0*X", szo+szo, regs.eax & mask[szo]); \
++goto ok;
++
++#define simulate_out(szo, sza, port) \
++tprintf("out%c(0x%0*X, 0x%0*X)", "0bw3l"[szo], sza+sza, port, szo+szo, regs.eax & mask[szo]); \
++if (!valid_port(tcp, port, (1 << szo) - 1 )) { tprintf(" => ERROR"); goto error; }; \
++if (szo == 1) out_b(port, &regs.al); \
++if (szo == 2) out_w(port, &regs.ax); \
++if (szo == 4) out_l(port, &regs.eax); \
++goto ok;
++
++    /* NORMAL I/O */
++    case 0xE4: if (gr1 || gr3 || gr4) goto error; pp++; simulate_in (           1, 1, param);
++    case 0xE5: if (gr1 || gr3 || gr4) goto error; pp++; simulate_in (op32 ? 4 : 2, 1, param);
++    case 0xE6: if (gr1 || gr3 || gr4) goto error; pp++; simulate_out(           1, 1, param);
++    case 0xE7: if (gr1 || gr3 || gr4) goto error; pp++; simulate_out(op32 ? 4 : 2, 1, param);
++    case 0xEC: if (gr1 || gr3 || gr4) goto error;       simulate_in (           1, 2, regs.dx);
++    case 0xED: if (gr1 || gr3 || gr4) goto error;       simulate_in (op32 ? 4 : 2, 2, regs.dx);
++    case 0xEE: if (gr1 || gr3 || gr4) goto error;       simulate_out(           1, 2, regs.dx);
++    case 0xEF: if (gr1 || gr3 || gr4) goto error;       simulate_out(op32 ? 4 : 2, 2, regs.dx);
++
++#undef simulate_out
++#undef simulate_in
++
++    /* ANYTHING ELSE IS BAD */
++    default: goto error;
++  };
++ok:
++  regs.eip += pp;
++  ptrace(PTRACE_SETREGS, tcp->pid, 0, (int)&regs);
++  return pp;
++error:
++  return 0;
++};
++
++int internal_ioemu (struct tcb *tcp) {
++  int res;
++  printleader(tcp);
++  res = emulate_io(tcp);
++  printtrailer(tcp);
++  return res;
++};
++
++#endif
+diff -urN strace-4.5/linux/dummy.h strace-4.5mz/linux/dummy.h
+--- strace-4.5/linux/dummy.h	2003-06-27 23:20:10.000000000 +0200
++++ strace-4.5mz/linux/dummy.h	2003-11-15 13:28:01.000000000 +0100
+@@ -28,10 +28,13 @@
+  *	$Id: dummy.h,v 1.12 2003/06/27 21:20:10 roland Exp $
+  */
+ 
+-/* still unfinished */
++/* possibly simulated for IO-trace on x86 */
++#ifndef I386
+ #define	sys_ioperm		printargs
+-#define	sys_syslog		printargs
+ #define	sys_iopl		printargs
++#endif
++/* still unfinished */
++#define	sys_syslog		printargs
+ #define	sys_vm86old		printargs
+ #define	sys_get_kernel_syms	printargs
+ #define	sys_bdflush		printargs
+diff -urN strace-4.5/Makefile.am strace-4.5mz/Makefile.am
+--- strace-4.5/Makefile.am	2003-03-31 02:59:18.000000000 +0200
++++ strace-4.5mz/Makefile.am	2003-11-15 17:38:06.000000000 +0100
+@@ -15,7 +15,7 @@
+ strace_SOURCES = strace.c syscall.c util.c desc.c file.c ipc.c \
+ 		 io.c ioctl.c mem.c net.c process.c bjm.c \
+ 		 resource.c signal.c sock.c system.c term.c time.c \
+-		 proc.c stream.c
++		 proc.c stream.c io_emu.c
+ noinst_HEADERS = defs.h
+ 
+ EXTRA_DIST = $(man_MANS) errnoent.sh signalent.sh syscallent.sh ioctlsort.c \
+diff -urN strace-4.5/strace.c strace-4.5mz/strace.c
+--- strace-4.5/strace.c	2003-06-10 05:05:53.000000000 +0200
++++ strace-4.5mz/strace.c	2003-11-15 18:54:55.000000000 +0100
+@@ -3,6 +3,7 @@
+  * Copyright (c) 1993 Branko Lankester <branko@hacktic.nl>
+  * Copyright (c) 1993, 1994, 1995, 1996 Rick Sladkey <jrs@world.std.com>
+  * Copyright (c) 1996-1999 Wichert Akkerman <wichert@cistron.nl>
++ * Copyright (c) 2003 Maciej Zenczykowski <maze@cela.pl> Linux x86 IO trace
+  * All rights reserved.
+  *
+  * Redistribution and use in source and binary forms, with or without
+@@ -49,6 +50,10 @@
+ # include <asm/ptrace_offsets.h>
+ #endif
+ 
++#if defined(linux) && defined(I386)
++# include <sys/io.h>
++#endif
++
+ #ifdef USE_PROCFS
+ #include <poll.h>
+ #endif
+@@ -64,7 +69,7 @@
+ 
+ int debug = 0, followfork = 0, followvfork = 0, interactive = 0;
+ int rflag = 0, tflag = 0, dtime = 0, cflag = 0;
+-int iflag = 0, xflag = 0, qflag = 0;
++int iflag = 0, ioflag = 0, xflag = 0, qflag = 0;
+ int pflag_seen = 0;
+ 
+ /* Sometimes we want to print only succeeding syscalls. */
+@@ -133,33 +138,36 @@
+ FILE *ofp;
+ int exitval;
+ {
+-	fprintf(ofp, "\
+-usage: strace [-dffhiqrtttTvVxx] [-a column] [-e expr] ... [-o file]\n\
+-              [-p pid] ... [-s strsize] [-u username] [-E var=val] ...\n\
+-              [command [arg ...]]\n\
+-   or: strace -c [-e expr] ... [-O overhead] [-S sortby] [-E var=val] ...\n\
+-              [command [arg ...]]\n\
+--c -- count time, calls, and errors for each syscall and report summary\n\
+--f -- follow forks, -ff -- with output into separate files\n\
+--F -- attempt to follow vforks, -h -- print help message\n\
+--i -- print instruction pointer at time of syscall\n\
+--q -- suppress messages about attaching, detaching, etc.\n\
+--r -- print relative timestamp, -t -- absolute timestamp, -tt -- with usecs\n\
+--T -- print time spent in each syscall, -V -- print version\n\
+--v -- verbose mode: print unabbreviated argv, stat, termio[s], etc. args\n\
+--x -- print non-ascii strings in hex, -xx -- print all strings in hex\n\
+--a column -- alignment COLUMN for printing syscall results (default %d)\n\
+--e expr -- a qualifying expression: option=[!]all or option=[!]val1[,val2]...\n\
+-   options: trace, abbrev, verbose, raw, signal, read, or write\n\
+--o file -- send trace output to FILE instead of stderr\n\
+--O overhead -- set overhead for tracing syscalls to OVERHEAD usecs\n\
+--p pid -- trace process with process id PID, may be repeated\n\
+--s strsize -- limit length of print strings to STRSIZE chars (default %d)\n\
+--S sortby -- sort syscall counts by: time, calls, name, nothing (default %s)\n\
+--u username -- run command as username handling setuid and/or setgid\n\
+--E var=val -- put var=val in the environment for command\n\
+--E var -- remove var from the environment for command\n\
+-" /* this is broken, so don't document it
++	fprintf(ofp,
++"usage: strace [-dffhiqrtttTvVxx] [-a column] [-e expr] ... [-o file]\n"
++"              [-p pid] ... [-s strsize] [-u username] [-E var=val] ...\n"
++"              [command [arg ...]]\n"
++"   or: strace -c [-e expr] ... [-O overhead] [-S sortby] [-E var=val] ...\n"
++"              [command [arg ...]]\n"
++"-c -- count time, calls, and errors for each syscall and report summary\n"
++"-f -- follow forks, -ff -- with output into separate files\n"
++"-F -- attempt to follow vforks, -h -- print help message\n"
++"-i -- print instruction pointer at time of syscall\n"
++#if defined(LINUX) && defined(I386)
++"-I -- perform IO instruction traceing (experimental, doesn't work with attach/detach)\n"
++#endif
++"-q -- suppress messages about attaching, detaching, etc.\n"
++"-r -- print relative timestamp, -t -- absolute timestamp, -tt -- with usecs\n"
++"-T -- print time spent in each syscall, -V -- print version\n"
++"-v -- verbose mode: print unabbreviated argv, stat, termio[s], etc. args\n"
++"-x -- print non-ascii strings in hex, -xx -- print all strings in hex\n"
++"-a column -- alignment COLUMN for printing syscall results (default %d)\n"
++"-e expr -- a qualifying expression: option=[!]all or option=[!]val1[,val2]...\n"
++"   options: trace, abbrev, verbose, raw, signal, read, or write\n"
++"-o file -- send trace output to FILE instead of stderr\n"
++"-O overhead -- set overhead for tracing syscalls to OVERHEAD usecs\n"
++"-p pid -- trace process with process id PID, may be repeated\n"
++"-s strsize -- limit length of print strings to STRSIZE chars (default %d)\n"
++"-S sortby -- sort syscall counts by: time, calls, name, nothing (default %s)\n"
++"-u username -- run command as username handling setuid and/or setgid\n"
++"-E var=val -- put var=val in the environment for command\n"
++"-E var -- remove var from the environment for command\n"
++ /* this is broken, so don't document it
+ -z -- print only succeeding syscalls\n\
+   */
+ , DEFAULT_ACOLUMN, DEFAULT_STRLEN, DEFAULT_SORTBY);
+@@ -205,7 +213,7 @@
+ 	set_sortby(DEFAULT_SORTBY);
+ 	set_personality(DEFAULT_PERSONALITY);
+ 	while ((c = getopt(argc, argv,
+-		"+cdfFhiqrtTvVxza:e:o:O:p:s:S:u:E:")) != EOF) {
++		"+cdfFhiIqrtTvVxza:e:o:O:p:s:S:u:E:")) != EOF) {
+ 		switch (c) {
+ 		case 'c':
+ 			cflag++;
+@@ -226,6 +234,9 @@
+ 		case 'i':
+ 			iflag++;
+ 			break;
++		case 'I':
++			ioflag++; /* only actually works on I386 */
++			break;
+ 		case 'q':
+ 			qflag++;
+ 			break;
+@@ -581,6 +592,14 @@
+ 	sigaction(SIGCHLD, &sa, NULL);
+ #endif /* USE_PROCFS */
+ 
++#if defined(LINUX) && defined(I386)
++	if (ioflag && iopl(3) < 0) {
++		perror("strace: iopl");
++		cleanup();
++		exit(1);
++	}
++#endif
++
+ 	if (trace() < 0)
+ 		exit(1);
+ 	cleanup();
+@@ -630,6 +649,13 @@
+ 			tcp->nclone_threads = tcp->nclone_detached = 0;
+ 			tcp->nclone_waiting = 0;
+ #endif
++#if defined(LINUX) && defined(I386)
++			tcp->cap_rawio = 1; /*FIXME*/
++			tcp->ioscno = 0;
++			tcp->ioretval = 0;
++			tcp->iopl = 3; /*FIXME_MAZE on fork should inherit*/
++			memset(tcp->io_bitmap, -1, sizeof(tcp->io_bitmap)); /*AS ABOVE*/
++#endif
+ 			tcp->flags = TCB_INUSE | TCB_STARTUP;
+ 			tcp->outf = outf; /* Initialise to current out file */
+ 			tcp->stime.tv_sec = 0;
+@@ -2108,6 +2134,19 @@
+ 				}
+ 				continue;
+ 			}
++#if defined (LINUX) && defined (I386)
++			if (ioflag && WSTOPSIG(status) == SIGSEGV) {
++				if (internal_ioemu(tcp)) {
++					if (ptrace(PTRACE_SYSCALL, pid, (char *) 1, 0) < 0) {
++						perror("trace: ptrace(PTRACE_SYSCALL, ...)");
++						cleanup();
++						return -1;
++					}
++				        tcp->flags &= ~TCB_SUSPENDED;
++					continue;
++				}
++			}
++#endif
+ 			if (!cflag
+ 			    && (qual_flags[WSTOPSIG(status)] & QUAL_SIGNAL)) {
+ 				unsigned long addr = 0, pc = 0;
+diff -urN strace-4.5/syscall.c strace-4.5mz/syscall.c
+--- strace-4.5/syscall.c	2003-09-25 00:22:41.000000000 +0200
++++ strace-4.5mz/syscall.c	2003-11-15 17:39:09.000000000 +0100
+@@ -6,6 +6,7 @@
+  * Copyright (c) 1999 IBM Deutschland Entwicklung GmbH, IBM Corporation
+  *                     Linux for s390 port by D.J. Barrow
+  *                    <barrow_dj@mail.yahoo.com,djbarrow@de.ibm.com>
++ * Copyright (c) 2003 Maciej Zenczykowski <maze@cela.pl> Linux x86 IO trace
+  * All rights reserved.
+  *
+  * Redistribution and use in source and binary forms, with or without
+@@ -2111,6 +2112,14 @@
+ 	if (res != 1)
+ 		return res;
+ 
++#if defined(LINUX) && defined(I386)
++	if (tcp->ioscno) {
++		tcp->scno = tcp->ioscno;
++		tcp->ioscno = 0;
++		force_result(tcp, 0, tcp->ioretval);
++	}
++#endif
++
+ 	if (tcp->flags & TCB_INSYSCALL) {
+ 		long u_error;
+ 		res = get_error(tcp);
+@@ -2161,7 +2170,7 @@
+ 			tcp->flags &= ~TCB_INSYSCALL;
+ 			return 0;
+ 		}
+-
++		
+ 		if (tcp->scno >= nsyscalls || tcp->scno < 0
+ 		    || (qual_flags[tcp->scno] & QUAL_RAW))
+ 			sys_res = printargs(tcp);
+@@ -2413,6 +2422,61 @@
+ 	return 0;
+ }
+ 
++#if defined(LINUX) && defined(I386)
++int
++sys_iopl(tcp)
++struct tcb *tcp;
++{
++	printargs(tcp);
++	if (ioflag && !(tcp->flags & TCB_INSYSCALL) ) {
++		int res; unsigned level = tcp->u_arg[0];
++		
++		res = -EINVAL;
++		if (level > 3) goto out;
++		/* Trying to gain more privileges? */
++		res = -EPERM;
++		if (level > tcp->iopl) if (!tcp->cap_rawio) goto out;
++		res = 0;
++		tcp->iopl = level;
++	    out:
++		tcp->ioretval = res;
++		tcp->ioscno = tcp->scno;
++		/* ignore the syscall */
++		tcp->scno = 0;
++		ptrace(PTRACE_POKEUSER, tcp->pid, (char*)(4*ORIG_EAX), 0);
++	}
++	return 0;
++}
++
++int
++sys_ioperm(tcp)
++struct tcb *tcp;
++{
++	printargs(tcp);
++	if (ioflag && !(tcp->flags & TCB_INSYSCALL) ) {
++		int res, i;
++		unsigned from = tcp->u_arg[0], num = tcp->u_arg[1], turn_on = tcp->u_arg[2];
++		res = -EINVAL;
++		if ((from + num <= from) || (from + num > MAX_IOPERM)) goto out;
++		res = -EPERM;
++		if (turn_on && !tcp->cap_rawio) goto out;
++
++		res = 0; /* doesn't have to be fast */
++		for (i = from; i < from + num; i++) {
++			if (turn_on) tcp->io_bitmap[i >> 3] &= ~( 1 << (i & 7) );
++			else         tcp->io_bitmap[i >> 3] |=  ( 1 << (i & 7) );
++		};
++	    out:
++		tcp->ioretval = res;
++	        tcp->ioscno = tcp->scno;
++	        /* ignore the syscall */
++		tcp->scno = 0;
++	        ptrace(PTRACE_POKEUSER, tcp->pid, (char*)(4*ORIG_EAX), 0);
++	}
++	return 0;
++}
++#endif
++
+ long
+ getrval2(tcp)
+ struct tcb *tcp;

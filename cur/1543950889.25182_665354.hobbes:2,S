@@ -1,0 +1,318 @@
+Date: Sun, 9 Mar 2008 01:31:24 +0100
+From: "Dmitry Adamushko" <>
+Subject: Re: [PATCH] adjust root-domain->online span in response to hotplugevent
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2008/3/8/140
+
+On 08/03/2008, Gregory Haskins <ghaskins@novell.com> wrote:
+> >>> On Sat, Mar 8, 2008 at  3:41 AM, in message <20080308084118.GA24552@elte.hu>,
+>  Ingo Molnar <mingo@elte.hu> wrote:
+>
+>  > * Gregory Haskins <ghaskins@novell.com> wrote:
+>  >
+>  >>    Unfortunately, this patch will introduce its own set of bugs.
+>  >> However, your analysis was spot-on.  I think I see the problem now.
+>  >> It was introduced when I put a hack in to "fix" s2ram problems in -mm
+>  >> as a result of the new root-domain logic.  I think the following patch
+>  >> will fix both issues:
+>  >>
+>  >> (I verified that I could take a cpu offline/online, but I don't have
+>  >> an s2ram compatible machine handy.  Andrew, I believe you could
+>  >> reproduce the s2ram problem a few months ago when that issue popped
+>  >> up.  So if you could, please verify that s2ram also works with this
+>  >> patch applied, in addition to the hotplug problem.
+>  >
+>  > thanks Gregory, i've queued up your fix. If it passes all tests over the
+>  > day i'll send it to Linus in about 12 hours.
+>  >
+>
+>
+>
+> After thinking about it some more, I am not sure if I got this fix quite right. The first two hunks are technically fine and should ultimately go in.  The last hunk is questionable.
+>
+>  Ultimately, I believe the root cause of these reported issues is that cpu_online_map and rd->online can get out of sync.  I fear that while the current patch may fix the hotplug/s2ram case, it potentially breaks the disjoint cpuset topology change case.  I will run a few cpuset tests ASAP to confirm, though I may not have a chance until Monday.
+>
+>  What I probably need is to tie the code that sets/clears cpu_online_map to the root-domain rd->online map somehow.  However, a cursory cscope inspection has failed to reveal the location that this cpu_online_map manipulation occurs.  If anyone knows where cpu_online_map is actually updated, please let me know.
+I guess, it's in arch-specific code. e.g. for x86-64,
+down:
+kernel/cpu.c :: _cpu_down -> take_cpu_down() -> __cpu_disable() [
+arch/x86/kernel/smpboot_64.c ] -> cpu_clear(cpu, cpu_online_map)
+up:
+kernel/cpu.c :: _cpu_up() -> __cpu_up [ arch/x86/kernel/smpboot_64.c ]
+-> do_boot_cpu() -> start_secondary() [ runs on a to-be-online cpu ]
+-> cpu_set(smp_processor_id(), cpu_online_map)
+there are cpu-notification events available before a cpu gets removed
+from cpu_online_map or after it gets added, so I guess (a first guess.
+I'll also look at the code) they should be a sync. point.
+I have a small patch to record some events during the cpu_down/up. I
+have a trace but will already analyze it tomorrow.
+[ the patch is enclosed (err.. it also includes Gregory's fix... I
+just forgot to commit it previously :-/) ]
+e.g. it should print a message if a task is placed on the 'offline'
+cpu. Note, the 'cpu' is removed from the cpu_online_map before
+migrate_live_tasks() runs. So if any task remains on the offline cpu,
+it has been likely placed there already after migrate_live_tasks().
+>  Regards,
+>  -Greg
+>
+-- 
+Best regards,
+Dmitry Adamushko
+diff --git a/arch/x86/kernel/smpboot_64.c b/arch/x86/kernel/smpboot_64.c
+index 0880f2c..a8332c6 100644
+--- a/arch/x86/kernel/smpboot_64.c
++++ b/arch/x86/kernel/smpboot_64.c
+@@ -381,6 +381,8 @@ void __cpuinit start_secondary(void)
+ 
+ 	setup_secondary_clock();
+ 
++	printk("*** -> online cpu %i\n", smp_processor_id());
++
+ 	cpu_idle();
+ }
+ 
+@@ -1063,6 +1065,9 @@ int __cpu_disable(void)
+ 	spin_lock(&vector_lock);
+ 	/* It's now safe to remove this processor from the online map */
+ 	cpu_clear(cpu, cpu_online_map);
++
++	printk(KERN_ERR "*** <- down cpu %i\n", cpu);
++
+ 	spin_unlock(&vector_lock);
+ 	remove_cpu_from_maps();
+ 	fixup_irqs(cpu_online_map);
+diff --git a/kernel/cpu.c b/kernel/cpu.c
+index 2eff3f6..d374c27 100644
+--- a/kernel/cpu.c
++++ b/kernel/cpu.c
+@@ -198,6 +198,8 @@ static int take_cpu_down(void *_param)
+ 	return 0;
+ }
+ 
++extern void wake_up_watchdog(int cpu);
++
+ /* Requires cpu_add_remove_lock to be held */
+ static int _cpu_down(unsigned int cpu, int tasks_frozen)
+ {
+@@ -255,6 +257,8 @@ static int _cpu_down(unsigned int cpu, int tasks_frozen)
+ 	while (!idle_cpu(cpu))
+ 		yield();
+ 
++	wake_up_watchdog(cpu);
++
+ 	/* This actually kills the CPU. */
+ 	__cpu_die(cpu);
+ 
+diff --git a/kernel/sched.c b/kernel/sched.c
+index 52b9867..6087161 100644
+--- a/kernel/sched.c
++++ b/kernel/sched.c
+@@ -1787,7 +1787,7 @@ static int sched_balance_self(int cpu, int flag)
+  */
+ static int try_to_wake_up(struct task_struct *p, unsigned int state, int sync)
+ {
+-	int cpu, orig_cpu, this_cpu, success = 0;
++	int cpu = -1, orig_cpu, this_cpu, success = 0, offline = 0;
+ 	unsigned long flags;
+ 	long old_state;
+ 	struct rq *rq;
+@@ -1851,6 +1851,9 @@ out_activate:
+ 		schedstat_inc(p, se.nr_wakeups_local);
+ 	else
+ 		schedstat_inc(p, se.nr_wakeups_remote);
++
++	offline = cpu_is_offline(cpu);
++
+ 	update_rq_clock(rq);
+ 	activate_task(rq, p, 1);
+ 	check_preempt_curr(rq, p);
+@@ -1865,9 +1868,36 @@ out_running:
+ out:
+ 	task_rq_unlock(rq, &flags);
+ 
++	if (cpu != -1 && offline)
++		printk(KERN_ERR "!!! try_to_wake_up(%s) on offline cpu %i\n",
++			p->comm, cpu);
++
+ 	return success;
+ }
+ 
++extern struct task_struct * get_watchdog_task(int cpu);
++
++void wake_up_watchdog(int cpu)
++{
++	unsigned long flags;
++	struct rq *rq;
++	struct task_struct *p = get_watchdog_task(cpu);
++	int ret = 0;
++
++	rq = task_rq_lock(p, &flags);
++
++	if (p->state != TASK_RUNNING && !p->se.on_rq) {
++		ret = 1;
++		update_rq_clock(rq);
++		activate_task(rq, p, 1);
++		p->state = TASK_RUNNING;
++	}
++
++	task_rq_unlock(rq, &flags);
++
++	printk(KERN_ERR "watchdog(cpu: %i) -> wake up (%i)\n", cpu, ret);
++}
++
+ int wake_up_process(struct task_struct *p)
+ {
+ 	return try_to_wake_up(p, TASK_ALL, 0);
+@@ -5345,7 +5375,7 @@ EXPORT_SYMBOL_GPL(set_cpus_allowed);
+ static int __migrate_task(struct task_struct *p, int src_cpu, int dest_cpu)
+ {
+ 	struct rq *rq_dest, *rq_src;
+-	int ret = 0, on_rq;
++	int ret = 0, on_rq = -1;
+ 
+ 	if (unlikely(cpu_is_offline(dest_cpu)))
+ 		return ret;
+@@ -5373,6 +5403,11 @@ static int __migrate_task(struct task_struct *p, int src_cpu, int dest_cpu)
+ 	ret = 1;
+ out:
+ 	double_rq_unlock(rq_src, rq_dest);
++
++	if (cpu_is_offline(src_cpu))
++		printk("__migrate_task( %s, on_rq: %i ) from %i to %i -> %i\n",
++			p->comm, on_rq, src_cpu, dest_cpu, ret);
++
+ 	return ret;
+ }
+ 
+@@ -5802,6 +5837,8 @@ migration_call(struct notifier_block *nfb, unsigned long action, void *hcpu)
+ 	unsigned long flags;
+ 	struct rq *rq;
+ 
++	printk(KERN_ERR "-> migration_call(cpu: %i, action: %lu)\n", cpu, action);
++
+ 	switch (action) {
+ 
+ 	case CPU_UP_PREPARE:
+@@ -5813,23 +5850,25 @@ migration_call(struct notifier_block *nfb, unsigned long action, void *hcpu)
+ 		/* Must be high prio: stop_machine expects to yield to it. */
+ 		rq = task_rq_lock(p, &flags);
+ 		__setscheduler(rq, p, SCHED_FIFO, MAX_RT_PRIO-1);
++
++		/* Update our root-domain */
++		if (rq->rd) {
++			BUG_ON(!cpu_isset(cpu, rq->rd->span));
++			cpu_set(cpu, rq->rd->online);
++		}
++
+ 		task_rq_unlock(rq, &flags);
+ 		cpu_rq(cpu)->migration_thread = p;
++
++		printk(KERN_ERR "--> migration_call() : cpu(%i - %p) online\n",
++			cpu, rq->rd);
++
+ 		break;
+ 
+ 	case CPU_ONLINE:
+ 	case CPU_ONLINE_FROZEN:
+ 		/* Strictly unnecessary, as first user will wake it. */
+ 		wake_up_process(cpu_rq(cpu)->migration_thread);
+-
+-		/* Update our root-domain */
+-		rq = cpu_rq(cpu);
+-		spin_lock_irqsave(&rq->lock, flags);
+-		if (rq->rd) {
+-			BUG_ON(!cpu_isset(cpu, rq->rd->span));
+-			cpu_set(cpu, rq->rd->online);
+-		}
+-		spin_unlock_irqrestore(&rq->lock, flags);
+ 		break;
+ 
+ #ifdef CONFIG_HOTPLUG_CPU
+@@ -5890,9 +5929,14 @@ migration_call(struct notifier_block *nfb, unsigned long action, void *hcpu)
+ 			cpu_clear(cpu, rq->rd->online);
+ 		}
+ 		spin_unlock_irqrestore(&rq->lock, flags);
++
++		printk(KERN_ERR "--> migration_call() : cpu(%i - %p) offline\n",
++			cpu, rq->rd);
+ 		break;
+ #endif
+ 	}
++	printk(KERN_ERR "<- migration_call(cpu: %i, action: %lu)\n", cpu, action);
++
+ 	return NOTIFY_OK;
+ }
+ 
+@@ -6083,6 +6127,7 @@ static void rq_attach_root(struct rq *rq, struct root_domain *rd)
+ {
+ 	unsigned long flags;
+ 	const struct sched_class *class;
++	int clear = 0;
+ 
+ 	spin_lock_irqsave(&rq->lock, flags);
+ 
+@@ -6097,6 +6142,8 @@ static void rq_attach_root(struct rq *rq, struct root_domain *rd)
+ 		cpu_clear(rq->cpu, old_rd->span);
+ 		cpu_clear(rq->cpu, old_rd->online);
+ 
++		clear = 1;
++
+ 		if (atomic_dec_and_test(&old_rd->refcount))
+ 			kfree(old_rd);
+ 	}
+@@ -6105,8 +6152,6 @@ static void rq_attach_root(struct rq *rq, struct root_domain *rd)
+ 	rq->rd = rd;
+ 
+ 	cpu_set(rq->cpu, rd->span);
+-	if (cpu_isset(rq->cpu, cpu_online_map))
+-		cpu_set(rq->cpu, rd->online);
+ 
+ 	for (class = sched_class_highest; class; class = class->next) {
+ 		if (class->join_domain)
+@@ -6114,6 +6159,8 @@ static void rq_attach_root(struct rq *rq, struct root_domain *rd)
+ 	}
+ 
+ 	spin_unlock_irqrestore(&rq->lock, flags);
++
++	printk(KERN_ERR "* rq_attach_root(cpu: %i) -- clear (%i)\n", rq->cpu, clear);
+ }
+ 
+ static void init_rootdomain(struct root_domain *rd)
+diff --git a/kernel/softlockup.c b/kernel/softlockup.c
+index 01b6522..4f478c2 100644
+--- a/kernel/softlockup.c
++++ b/kernel/softlockup.c
+@@ -27,6 +27,11 @@ static DEFINE_PER_CPU(struct task_struct *, watchdog_task);
+ static int __read_mostly did_panic;
+ unsigned long __read_mostly softlockup_thresh = 60;
+ 
++struct task_struct * get_watchdog_task(int cpu)
++{
++	return per_cpu(watchdog_task, cpu);
++}
++
+ static int
+ softlock_panic(struct notifier_block *this, unsigned long event, void *ptr)
+ {
+@@ -250,6 +255,8 @@ cpu_callback(struct notifier_block *nfb, unsigned long action, void *hcpu)
+ 	int hotcpu = (unsigned long)hcpu;
+ 	struct task_struct *p;
+ 
++	printk(KERN_ERR "--> cpu_callback(cpu: %i, action: %lu)\n", hotcpu, action);
++
+ 	switch (action) {
+ 	case CPU_UP_PREPARE:
+ 	case CPU_UP_PREPARE_FROZEN:
+@@ -294,6 +301,9 @@ cpu_callback(struct notifier_block *nfb, unsigned long action, void *hcpu)
+ 		break;
+ #endif /* CONFIG_HOTPLUG_CPU */
+ 	}
++
++	printk(KERN_ERR "<-- cpu_callback(cpu: %i, action: %lu)\n", hotcpu, action);
++
+ 	return NOTIFY_OK;
+ }
+ 

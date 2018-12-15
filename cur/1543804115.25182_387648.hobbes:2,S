@@ -1,0 +1,164 @@
+Date: Wed, 18 Jan 2006 11:39:56 -0800 (PST)
+From: Davide Libenzi <>
+Subject: [patch] epoll_pwait ...
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2006/1/18/290
+
+The attached patch implements the epoll_pwait system call, that extend the 
+event wait mechanism with the same logic ppoll and pselect do. The 
+definition of epoll_pwait is:
+int epoll_pwait(int epfd, struct epoll_event *events, int maxevents,
+                 int timeout, const sigset_t *sigmask, size_t sigsetsize);
+The difference between the vanilla epoll_wait and epoll_pwait is that the 
+latter allows the caller to specify a signal mask to be set while waiting 
+for events. Hence epoll_pwait will wait until either one monitored event, 
+or an unmasked signal happen. If sigmask is NULL, the epoll_pwait system 
+call will act exactly like epoll_wait. For the POSIX definition of 
+pselect, information is available here:
+http://www.opengroup.org/onlinepubs/009695399/functions/select.html
+This patch goes over 2.6.15-mm4 and the epoll_pwait definition depends on 
+the TIF_RESTORE_SIGMASK bits.
+ChangeLog:
+o Make it conditional to TIF_RESTORE_SIGMASK definition to avoid breaking
+   archs that do not still support it
+o Changed the name to epoll_pwait
+o Changed the order of "sigmask" and "error" checks in the epoll_pwait
+   exit path
+Singed-off-by: Davide Libenzi <davidel@xmailserver.org>
+- Davide
+arch/i386/kernel/syscall_table.S |    1
+fs/eventpoll.c                   |   55 ++++++++++++++++++++++++++++++++++++---
+include/asm-i386/unistd.h        |    3 +-
+include/linux/syscalls.h         |    3 ++
+4 files changed, 58 insertions(+), 4 deletions(-)
+diff -Nru linux-2.6.15/arch/i386/kernel/syscall_table.S linux-2.6.15.mod/arch/i386/kernel/syscall_table.S
+--- linux-2.6.15/arch/i386/kernel/syscall_table.S	2006-01-18 11:05:35.000000000 -0800
++++ linux-2.6.15.mod/arch/i386/kernel/syscall_table.S	2006-01-18 11:06:42.000000000 -0800
+@@ -310,3 +310,4 @@
+ 	.long sys_pselect6
+ 	.long sys_ppoll
+ 	.long sys_unshare		/* 310 */
++	.long sys_epoll_pwait
+diff -Nru linux-2.6.15/fs/eventpoll.c linux-2.6.15.mod/fs/eventpoll.c
+--- linux-2.6.15/fs/eventpoll.c	2006-01-18 11:05:37.000000000 -0800
++++ linux-2.6.15.mod/fs/eventpoll.c	2006-01-18 11:31:12.000000000 -0800
+@@ -105,6 +105,8 @@
+ /* Maximum msec timeout value storeable in a long int */
+ #define EP_MAX_MSTIMEO min(1000ULL * MAX_SCHEDULE_TIMEOUT / HZ, (LONG_MAX - 999ULL) / HZ)
+ 
++#define EP_MAX_EVENTS (INT_MAX / sizeof(struct epoll_event))
++
+ 
+ struct epoll_filefd {
+ 	struct file *file;
+@@ -506,7 +508,7 @@
+  */
+ asmlinkage long sys_epoll_create(int size)
+ {
+-	int error, fd;
++	int error, fd = -1;
+ 	struct eventpoll *ep;
+ 	struct inode *inode;
+ 	struct file *file;
+@@ -649,7 +651,6 @@
+ 	return error;
+ }
+ 
+-#define MAX_EVENTS (INT_MAX / sizeof(struct epoll_event))
+ 
+ /*
+  * Implement the event wait interface for the eventpoll file. It is the kernel
+@@ -666,7 +667,7 @@
+ 		     current, epfd, events, maxevents, timeout));
+ 
+ 	/* The maximum number of event must be greater than zero */
+-	if (maxevents <= 0 || maxevents > MAX_EVENTS)
++	if (maxevents <= 0 || maxevents > EP_MAX_EVENTS)
+ 		return -EINVAL;
+ 
+ 	/* Verify that the area passed by the user is writeable */
+@@ -708,6 +709,54 @@
+ }
+ 
+ 
++#ifdef TIF_RESTORE_SIGMASK
++
++/*
++ * Implement the event wait interface for the eventpoll file. It is the kernel
++ * part of the user space epoll_pwait(2).
++ */
++asmlinkage long sys_epoll_pwait(int epfd, struct epoll_event __user *events,
++				int maxevents, int timeout, const sigset_t __user *sigmask,
++				size_t sigsetsize)
++{
++	int error;
++	sigset_t ksigmask, sigsaved;
++
++	/*
++	 * If the caller wants a certain signal mask to be set during the wait,
++	 * we apply it here.
++	 */
++	if (sigmask) {
++		if (sigsetsize != sizeof(sigset_t))
++			return -EINVAL;
++		if (copy_from_user(&ksigmask, sigmask, sizeof(ksigmask)))
++			return -EFAULT;
++		sigdelsetmask(&ksigmask, sigmask(SIGKILL) | sigmask(SIGSTOP));
++		sigprocmask(SIG_SETMASK, &ksigmask, &sigsaved);
++	}
++
++	error = sys_epoll_wait(epfd, events, maxevents, timeout);
++
++	/*
++	 * If we changed the signal mask, we need to restore the original one.
++	 * In case we've got a signal while waiting, we do not restore the signal
++	 * mask yet, and we allow do_signal() to deliver the signal on the way back
++	 * to userspace, before the signal mask is restored.
++	 */
++	if (sigmask) {
++		if (error == -EINTR) {
++			memcpy(&current->saved_sigmask, &sigsaved, sizeof(sigsaved));
++			set_thread_flag(TIF_RESTORE_SIGMASK);			
++		} else
++			sigprocmask(SIG_SETMASK, &sigsaved, NULL);
++	}
++
++	return error;
++}
++
++#endif /* #ifdef TIF_RESTORE_SIGMASK */
++
++
+ /*
+  * Creates the file descriptor to be used by the epoll interface.
+  */
+diff -Nru linux-2.6.15/include/asm-i386/unistd.h linux-2.6.15.mod/include/asm-i386/unistd.h
+--- linux-2.6.15/include/asm-i386/unistd.h	2006-01-18 11:05:38.000000000 -0800
++++ linux-2.6.15.mod/include/asm-i386/unistd.h	2006-01-18 11:06:56.000000000 -0800
+@@ -316,8 +316,9 @@
+ #define __NR_pselect6		308
+ #define __NR_ppoll		309
+ #define __NR_unshare		310
++#define __NR_epoll_pwait	311
+ 
+-#define NR_syscalls 311
++#define NR_syscalls 312
+ 
+ /*
+  * user-visible error numbers are in the range -1 - -128: see
+diff -Nru linux-2.6.15/include/linux/syscalls.h linux-2.6.15.mod/include/linux/syscalls.h
+--- linux-2.6.15/include/linux/syscalls.h	2006-01-18 11:05:38.000000000 -0800
++++ linux-2.6.15.mod/include/linux/syscalls.h	2006-01-18 11:07:11.000000000 -0800
+@@ -428,6 +428,9 @@
+ 				struct epoll_event __user *event);
+ asmlinkage long sys_epoll_wait(int epfd, struct epoll_event __user *events,
+ 				int maxevents, int timeout);
++asmlinkage long sys_epoll_pwait(int epfd, struct epoll_event __user *events,
++				int maxevents, int timeout, const sigset_t __user *sigmask,
++				size_t sigsetsize);
+ asmlinkage long sys_gethostname(char __user *name, int len);
+ asmlinkage long sys_sethostname(char __user *name, int len);
+ asmlinkage long sys_setdomainname(char __user *name, int len);

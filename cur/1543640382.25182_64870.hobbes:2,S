@@ -1,0 +1,663 @@
+Date: Sun, 18 Aug 2002 13:51:13 +0100 (BST)
+From: Ruth Ivimey-Cook <>
+Subject: RFC: patch to pdc202xx.c; help wanted please
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2002/8/18/104
+
+Folks,
+I've played a bit more with the patch for /proc/ide/pdc202xx, but am having 
+problems with getting correct 'hwif' values. If I boot with this change, it 
+starts up as expected until it dies in the BUG() I inserted in the tune 
+function, about line 606. 
+I am aware I'm very much a newbie here, and any pointers are gratefully 
+accepted.
+I've attached the patch (against 2.4.19) and the full file, if that's easier 
+reading.  
+Thanks
+Ruth
+-- 
+Ruth Ivimey-Cook
+Software engineer and technical writer.
+--- linux-2.4.19/drivers/ide/pdc202xx.c	Sat Aug  3 01:39:44 2002
++++ 2.4.19-ri1/linux/drivers/ide/pdc202xx.c	Fri Aug 16 18:47:00 2002
+@@ -49,14 +49,14 @@
+  *  Copyright (C) 1999-2002 Promise Technology, Inc.
+  *  Author: Frank Tiernan <frankt@promise.com>
+  *          PROMISE pdc202xx IDE Controller driver MAINTAINERS
+  *  Released under terms of General Public License
+  */
+  
+-#define VERSION	"1.20.0.7"
+-#define VERDATE "2002-05-23"
++#define VERSION	"1.20.0.7-ri1"
++#define VERDATE "2002-08-11"
+ #include <linux/config.h>
+ #include <linux/types.h>
+ #include <linux/kernel.h>
+ #include <linux/delay.h>
+ #include <linux/timer.h>
+ #include <linux/mm.h>
+@@ -70,12 +70,20 @@
+ 
+ #include <asm/io.h>
+ #include <asm/irq.h>
+ 
+ #include "ide_modes.h"
+ 
++/* maximum number of PDC PCI controllers (not drives!) this driver can accomodate */
++#define MAX_PDC_DEVS    8
++
++/* maximum number of interfaces (cables) on one PDC controller (normally this is 2, but
++ * there are 4-way PDC cards and I'm not sure whether they appear as 2x2 or 1x4
++ */
++#define MAX_CABLES      4
++
+ #define PDC202XX_DEBUG_DRIVE_INFO		0
+ #define PDC202XX_DECODE_REGISTER_INFO		0
+ 
+ #define DISPLAY_PDC202XX_TIMINGS
+ 
+ #ifndef SPLIT_BYTE
+@@ -83,121 +91,202 @@
+ #endif
+ 
+ #if defined(DISPLAY_PDC202XX_TIMINGS) && defined(CONFIG_PROC_FS)
+ #include <linux/stat.h>
+ #include <linux/proc_fs.h>
+ 
++static void pdc202xx_print_drive_array(void);
++static int pdc202xx_setup_drive_data(ide_hwif_t *hwif);
+ static int pdc202xx_get_info(char *, char **, off_t, int);
+ extern int (*pdc202xx_display_info)(char *, char **, off_t, int); /* ide-proc.c */
+ extern char *ide_media_verbose(ide_drive_t *);
+-static struct pci_dev *bmide_dev;
+-static struct hd_driveid *id[4];
+-static int speed_rate[4];
+ 
+-static char * pdc202xx_info (char *buf, struct pci_dev *dev)
++struct pdc_driveinfo {
++	int nr_cables;	/* actual number of interfaces (cables) on this controller */
++	int speed_rate[MAX_CABLES][MAX_DRIVES];
++	ide_hwif_t *hwif[MAX_CABLES];
++} pdc_devs[MAX_PDC_DEVS];
++static int nr_pdc_devs = 0;
++
++static int pdc202xx_get_max_cables(struct pci_dev *dev)
++{
++	return 2;	/* return max number of cables per interface */
++}
++
++static char *pdc202xx_get_drive_class(struct pci_dev *dev)
++{
++	char *str = NULL;
++	switch(dev->device) {
++		case PCI_DEVICE_ID_PROMISE_20276:
++		case PCI_DEVICE_ID_PROMISE_20275:
++			str = "MBUltra133";
++
++		case PCI_DEVICE_ID_PROMISE_20269:
++			str = "Ultra133 TX2";
++
++		case PCI_DEVICE_ID_PROMISE_20268:
++			str = "Ultra100 TX2";
++
++		case PCI_DEVICE_ID_PROMISE_20267:
++			str = "Ultra100";
++
++		case PCI_DEVICE_ID_PROMISE_20265:
++			str = "Ultra100 on M/B";
++
++		case PCI_DEVICE_ID_PROMISE_20262:
++			str = "Ultra66";
++
++		case PCI_DEVICE_ID_PROMISE_20246:
++			str = "Ultra33";
++
++		default:
++			str = "Ultra Series";
++	}
++	return str;
++}
++
++#define FORALL_DRIVES(interf)	{ int hd = 0, cable, drive; \
++				  for(cable = 0; cable < pdc_devs[interf].nr_cables; cable++) { \
++				  for(drive = 0; drive < MAX_DRIVES; drive++,hd++ )
++#define ENDFORALL_DRIVES	} }
++/*
++ * Return a buffer of formatted info about the PDC interface
++ * numbered in 'interf'.
++ */
++static int pdc202xx_info (char *buf, int interf)
+ {
++	struct pci_dev *dev	= pdc_devs[interf].hwif[0]->pci_dev;
+ 	char *p = buf;
+ 
+ 	u32 bibma  = pci_resource_start(dev, 4);
+ 	u32 reg60h = 0, reg64h = 0, reg68h = 0, reg6ch = 0;
+-	u16 reg50h = 0;
++	u16 reg50h = 0;				/* this is written but not read */
+ 	u16 word88 = 0;
+-	int udmasel[4] = {0,0,0,0}, piosel[4] = {0,0,0,0};
+-	int i = 0, hd = 0;
++	u8 c0, c1;
++	u8 sc11, sc1a, sc1b;
++	int udmasel[MAX_CABLES*MAX_DRIVES];
++	int piosel[MAX_CABLES*MAX_DRIVES];
++	int i = 0;
++
++        if (interf < 0 || interf >= MAX_PDC_DEVS) return 0;
+ 
+         /*
+-         * at that point bibma+0x2 et bibma+0xa are byte registers
++         * at that point bibma+0x2 and bibma+0xa are byte registers
+          * to investigate:
+          */
+-	u8 c0	= inb_p((unsigned short)bibma + 0x02);
+-	u8 c1	= inb_p((unsigned short)bibma + 0x0a);
++	c0	= inb_p((unsigned short)bibma + 0x02);
++	c1	= inb_p((unsigned short)bibma + 0x0a);
+ 
+-	u8 sc11	= inb_p((unsigned short)bibma + 0x11);
+-	u8 sc1a	= inb_p((unsigned short)bibma + 0x1a);
+-	u8 sc1b	= inb_p((unsigned short)bibma + 0x1b);
++	sc11	= inb_p((unsigned short)bibma + 0x11);
++	sc1a	= inb_p((unsigned short)bibma + 0x1a);
++	sc1b	= inb_p((unsigned short)bibma + 0x1b);
+ 	/* u8 sc1c	= inb_p((unsigned short)bibma + 0x1c); 
+-	u8 sc1d	= inb_p((unsigned short)bibma + 0x1d);
+-	u8 sc1e	= inb_p((unsigned short)bibma + 0x1e);
+-	u8 sc1f	= inb_p((unsigned short)bibma + 0x1f); */
++	 * u8 sc1d	= inb_p((unsigned short)bibma + 0x1d);
++	 * u8 sc1e	= inb_p((unsigned short)bibma + 0x1e);
++	 * u8 sc1f	= inb_p((unsigned short)bibma + 0x1f); */
+ 
+-	pci_read_config_word(dev, 0x50, &reg50h);
++	pci_read_config_word(dev, 0x50, &reg50h); /* this is unused */
+ 	pci_read_config_dword(dev, 0x60, &reg60h);
+ 	pci_read_config_dword(dev, 0x64, &reg64h);
+ 	pci_read_config_dword(dev, 0x68, &reg68h);
+ 	pci_read_config_dword(dev, 0x6c, &reg6ch);
+ 
+-	p+=sprintf(p, "\nPROMISE Ultra series driver Ver %s %s Adapter: ", VERSION, VERDATE);
+-	switch(dev->device) {
+-		case PCI_DEVICE_ID_PROMISE_20275:
+-			p += sprintf(p, "MBUltra133\n");
+-			break;
+-		case PCI_DEVICE_ID_PROMISE_20269:
+-			p += sprintf(p, "Ultra133 TX2\n");
+-			break;
+-		case PCI_DEVICE_ID_PROMISE_20268:
+-			p += sprintf(p, "Ultra100 TX2\n");
+-			break;
+-		case PCI_DEVICE_ID_PROMISE_20267:
+-			p += sprintf(p, "Ultra100\n");
+-			break;
+-		case PCI_DEVICE_ID_PROMISE_20265:
+-			p += sprintf(p, "Ultra100 on M/B\n");
+-			break;
+-		case PCI_DEVICE_ID_PROMISE_20262:
+-			p += sprintf(p, "Ultra66\n");
+-			break;
+-		case PCI_DEVICE_ID_PROMISE_20246:
+-			p += sprintf(p, "Ultra33\n");
+-			reg50h |= 0x0c00;
+-			break;
+-		default:
+-			p += sprintf(p, "Ultra Series\n");
+-			break;
+-	}
++	FORALL_DRIVES(interf) {
++		ide_drive_t *drv = &pdc_devs[interf].hwif[cable]->drives[drive];
++
++		if (drv->present) {
++			word88 = drv->id->dma_ultra;
++			for ( i = 7 ; i >= 0 ; i--)
++				if (word88 >> (i+8)) {
++					udmasel[hd] = i;	/* get select UDMA mode */
++					break;
++				}
++			piosel[hd] = (drv->id->eide_pio_modes >= 0x02) ? 4 : 3;
++		}
++		else
++			piosel[hd] = udmasel[hd] = 0;
++	} ENDFORALL_DRIVES
++
++	p += sprintf(p, "PROMISE Ultra series driver Ver %s %s Adapter: %s\n",
++			VERSION, VERDATE, pdc202xx_get_drive_class(dev));
++
++	/* not sure what this does; variable 'reg50h' does not seem to be used anywhere */
++	if (dev->device == PCI_DEVICE_ID_PROMISE_20246)
++		reg50h |= 0x0c00; /* this is unused */
+ 
+ 	p += sprintf(p, "--------------- Primary Channel ---------------- Secondary Channel -------------\n");
+ 	p += sprintf(p, "                %s                         %s\n",
+-		(c0&0x80)?"disabled":"enabled ",
+-		(c1&0x80)?"disabled":"enabled ");
++		(c0 & 0x80) ? "disabled":"enabled ",
++		(c1 & 0x80) ? "disabled":"enabled ");
+ 	p += sprintf(p, "66 Clocking     %s                         %s\n",
+-		(sc11&0x02)?"enabled ":"disabled",
+-		(sc11&0x08)?"enabled ":"disabled");
++		(sc11 & 0x02) ? "enabled ":"disabled",
++		(sc11 & 0x08) ? "enabled ":"disabled");
+ 	p += sprintf(p, "Mode            %s                           %s\n",
+ 		(sc1a & 0x01) ? "MASTER" : "PCI   ",
+ 		(sc1b & 0x01) ? "MASTER" : "PCI   ");
+-	p += sprintf(p, "--------------- drive0 --------- drive1 -------- drive0 ---------- drive1 ------\n");
+-	p += sprintf(p, "DMA enabled:    %s              %s             %s               %s\n",
+-		(id[0]!=NULL && (c0&0x20))?"yes":"no ",(id[1]!=NULL && (c0&0x40))?"yes":"no ",
+-		(id[2]!=NULL && (c1&0x20))?"yes":"no ",(id[3]!=NULL && (c1&0x40))?"yes":"no ");
+-	for( hd = 0; hd < 4 ; hd++) {
+-		if (id[hd] == NULL)
+-			continue;
+-		word88 = id[hd]->dma_ultra;
+-		for ( i = 7 ; i >= 0 ; i--)
+-			if (word88 >> (i+8)) {
+-				udmasel[hd] = i;	/* get select UDMA mode */
+-				break;
+-			}
+-		piosel[hd] = (id[hd]->eide_pio_modes >= 0x02) ? 4 : 3;
+-        }
+-	p += sprintf(p, "UDMA Mode:      %d                %d               %d                 %d\n",
+-		udmasel[0], udmasel[1], udmasel[2], udmasel[3]);
+-	p += sprintf(p, "PIO Mode:       %d                %d               %d                 %d\n",
+-		piosel[0], piosel[1], piosel[2], piosel[3]);
+-#if 0
+-	p += sprintf(p, "--------------- Can ATAPI DMA ---------------\n");
+-#endif
+-	return (char *)p;
++
++	p += sprintf(p, "--------------- ");
++	FORALL_DRIVES(interf) {
++		p += sprintf(p, "drive%d -------- ", (cable*MAX_DRIVES)+drive);
++	} ENDFORALL_DRIVES
++	*p++ = '\n';
++
++	p += sprintf(p, "DMA enabled:    ");
++	FORALL_DRIVES(interf) {
++		p += sprintf(p, "%3s             ", pdc_devs[interf].hwif[cable]->drives[drive].using_dma ? "yes" : "no ");
++	} ENDFORALL_DRIVES
++	*p++ = '\n';
++
++	p += sprintf(p, "DMA enabled:    ");
++	FORALL_DRIVES(interf) {
++		u8 *cp = (cable == 0) ? &c0 : &c1;
++		u8 bit = (drive == 0) ? 0x20 : 0x40;
++
++		p += sprintf(p, "%s                ",
++				(pdc_devs[interf].hwif[cable]->drives[drive].present && (*cp & bit)) ?
++				"yes":"no ");
++	} ENDFORALL_DRIVES
++	*p++ = '\n';
++
++	p += sprintf(p, "UDMA Mode:      ");
++	FORALL_DRIVES(interf) {
++		p += sprintf(p, "%d                ", udmasel[hd]);
++	} ENDFORALL_DRIVES
++	*p++ = '\n';
++
++	p += sprintf(p, "PIO Mode:       ");
++	FORALL_DRIVES(interf) {
++		p += sprintf(p, "%d                ", piosel[hd]);
++	} ENDFORALL_DRIVES
++	*p++ = '\n';
++
++	/* return number of characters written (note: should be x-y+1, but we dont count the trailing 0) */
++	return (p - buf);
+ }
+ 
+ static int pdc202xx_get_info (char *buffer, char **addr, off_t offset, int count)
+ {
+ 	char *p = buffer;
+-	
+-	p = pdc202xx_info(buffer, bmide_dev);
+-	return p-buffer;	/* => must be less than 4k! */
++	int interf, c, bufcount = 0;
++        const int totbufcount = 4096;
++	char localbuf[1024];
++
++	for(interf = 0; interf < nr_pdc_devs && interf < MAX_PDC_DEVS; interf++) {
++		/* return value count of characters written (excl terminating 0) */
++		c = pdc202xx_info(localbuf, interf);
++
++		if ((c + bufcount) < totbufcount) {
++			strcpy(p, localbuf);
++			bufcount += c;
++			p = &buffer[bufcount];
++		}
++		else 
++               		printk(KERN_INFO "pdc202xx: cannot display /proc/ide info available for dev %d.\n", interf);
++	}
++
++	return p-buffer;	/* => must be less than 4k! ( one drive is about 620 bytes ) */
+ }
+ #endif  /* defined(DISPLAY_PDC202XX_TIMINGS) && defined(CONFIG_PROC_FS) */
+ 
+ byte pdc202xx_proc = 0;
+ 
+ const char *pdc_quirk_drives[] = {
+@@ -347,13 +436,13 @@
+ static int pdc202xx_tune_chipset (ide_drive_t *drive, byte speed)
+ {
+ 	ide_hwif_t *hwif	= HWIF(drive);
+ 	struct pci_dev *dev	= hwif->pci_dev;
+ 
+ 	unsigned int		drive_conf;
+-	int			err = 0, i = 0, j = hwif->channel ? 2 : 0 ;
++	int			err = 0;
+ 	byte			drive_pci, AP, BP, CP, DP;
+ 	byte			TA = 0, TB = 0, TC = 0;
+ 
+ 	switch (drive->dn) {
+ 		case 0: drive_pci = 0x60; break;
+ 		case 1: drive_pci = 0x64; break;
+@@ -401,16 +490,12 @@
+ 	}
+ 
+ 	pci_read_config_byte(dev, (drive_pci), &AP);
+ 	pci_read_config_byte(dev, (drive_pci)|0x01, &BP);
+ 	pci_read_config_byte(dev, (drive_pci)|0x02, &CP);
+ 
+-	for ( i = 0; i < 2; i++)
+-		if (hwif->drives[i].present)
+-	  		id[i+j] = hwif->drives[i].id;	/* get identify structs */
+-
+ 	switch(speed) {
+ #ifdef CONFIG_BLK_DEV_IDEDMA
+ 		/* case XFER_UDMA_6: */
+ 		case XFER_UDMA_5:
+ 		case XFER_UDMA_4:	TB = 0x20; TC = 0x01; break;	/* speed 8 == UDMA mode 4 */
+ 		case XFER_UDMA_3:	TB = 0x40; TC = 0x02; break;	/* speed 7 == UDMA mode 3 */
+@@ -482,13 +567,13 @@
+ 	unsigned long high_16	= pci_resource_start(dev, 4);
+ 	unsigned long indexreg	= high_16 + (hwif->channel ? 0x09 : 0x01);
+ 	unsigned long datareg	= (indexreg + 2);
+ #endif /* CONFIG_BLK_DEV_IDEDMA */
+ 	byte thold		= 0x10;
+ 	byte adj		= (drive->dn%2) ? 0x08 : 0x00;
+-	int set_speed		= 0, i=0, j=hwif->channel ? 2:0;
++	int set_speed		= 0, interf;
+ 	int                     err;
+ 
+ 	/* Setting tHOLD bit to 0 if using UDMA mode 2 */
+ 	if (speed == XFER_UDMA_2) {
+ 		OUT_BYTE((thold + adj), indexreg);
+ 		OUT_BYTE((IN_BYTE(datareg) & 0x7f), datareg);
+@@ -497,28 +582,44 @@
+ 	/* We need to set ATA133 timing if ATA133 drives exist */
+ 	if (speed>=XFER_UDMA_6)
+ 		set_speed=1;
+ 
+ 	if (!drive->init_speed)
+ 		drive->init_speed = speed;
++                
+ #if PDC202XX_DEBUG_DRIVE_INFO
+ 	printk("%s: Before set_feature = %s, word88 = %#x\n",
+ 		drive->name, ide_xfer_verbose(speed), drive->id->dma_ultra );
+ #endif /* PDC202XX_DEBUG_DRIVE_INFO */
++                 
+ 	err = ide_config_drive_speed(drive, speed);
+ 	drive->current_speed = speed;	
+-	for ( i = 0 ; i < 2 ; i++)
+-		if (hwif->drives[i].present) {
+-	  		id[i+j] = hwif->drives[i].id;	/* get identify structs */
+-	 		speed_rate[i+j] = speed;	/* get current speed */
+-	 	}
++
++	for (interf = 0; interf < nr_pdc_devs; interf++)
++        {
++                if (hwif == pdc_devs[interf].hwif[0] || hwif == pdc_devs[interf].hwif[1])
++                        break;
++        }
++	if (interf == nr_pdc_devs)
++	{
++		printk(KERN_ERR "tune: passed drive %p => hwif %p, but not found in array\n", drive, hwif);
++		BUG();
++	}
++        
++	FORALL_DRIVES(interf) {
++		if (pdc_devs[interf].hwif[cable]->drives[drive].present)
++			pdc_devs[interf].speed_rate[cable][drive] = speed;
++		else
++			pdc_devs[interf].speed_rate[cable][drive] = 0;
++	} ENDFORALL_DRIVES
++
+ 	if (set_speed) {
+-		for (i=0; i<4; i++) {
+-			if (id[i]==NULL)
++		FORALL_DRIVES(interf) {
++			if (!pdc_devs[interf].hwif[cable]->drives[drive].present) 
+ 				continue;
+-			switch(speed_rate[i]) {
++			switch(pdc_devs[interf].speed_rate[cable][drive]) {
+ #ifdef CONFIG_BLK_DEV_IDEDMA
+ 				case XFER_UDMA_6:
+ 					OUT_BYTE((0x10 + adj), indexreg);
+ 					OUT_BYTE(0x1a, datareg);
+ 					OUT_BYTE((0x11 + adj), indexreg);
+ 					OUT_BYTE(0x01, datareg);
+@@ -631,13 +732,13 @@
+ 					OUT_BYTE(0x2b, datareg);
+ 					OUT_BYTE((0x13 + adj), indexreg);
+ 					OUT_BYTE(0xac, datareg);
+ 					break;
+ 				default:
+ 			}
+-		}
++		} ENDFORALL_DRIVES
+ 	}
+ 	return err;
+ }
+ 
+ /*   0    1    2    3    4    5    6   7   8
+  * 960, 480, 390, 300, 240, 180, 120, 90, 60
+@@ -684,13 +785,13 @@
+ 	byte CLKSPD		= 0;
+ 	byte clockreg		= high_16 + 0x11;
+ 	byte udma_33		= ultra;
+ 	byte udma_66		= ((eighty_ninty_three(drive)) && udma_33) ? 1 : 0;
+ 	byte udma_100		= 0;
+ 	byte udma_133		= 0;
+-	byte mask			= hwif->channel ? 0x08 : 0x02;
++	byte mask		= hwif->channel ? 0x08 : 0x02;
+ 	unsigned short c_mask	= hwif->channel ? (1<<11) : (1<<10);
+ 
+ 	byte ultra_66		= ((id->dma_ultra & 0x0010) ||
+ 				   (id->dma_ultra & 0x0008)) ? 1 : 0;
+ 	byte ultra_100		= ((id->dma_ultra & 0x0020) ||
+ 				   (ultra_66)) ? 1 : 0;
+@@ -744,22 +845,21 @@
+ 	 * somehow hooking the fops calls. It may also be possible to
+ 	 * leave the 66Mhz clock on and readjust the timing
+ 	 * parameters.
+ 	 */
+ 
+ 	if (((ultra_66) || (ultra_100) || (ultra_133)) && (cable)) {
+-#ifdef DEBUG
+-		printk("ULTRA66: %s channel of Ultra 66 requires an 80-pin cable for Ultra66 operation.\n", hwif->channel ? "Secondary" : "Primary");
+-		printk("         Switching to Ultra33 mode.\n");
+-#endif /* DEBUG */
++
++		printk("Warning:%s %s channel requires an 80-pin cable for high-speed operation.\n",
++				pdc202xx_get_drive_class(dev),
++				hwif->channel ? "Secondary":"Primary");
++		printk("%s reduced to Ultra33 mode.\n", drive->name);
++
+ 		/* Primary   : zero out second bit */
+ 		/* Secondary : zero out fourth bit */
+-		//if (!new_chip)
+ 		OUT_BYTE(CLKSPD & ~mask, clockreg);
+-		printk("Warning: %s channel requires an 80-pin cable for operation.\n", hwif->channel ? "Secondary":"Primary");
+-		printk("%s reduced to Ultra33 mode.\n", drive->name);
+ 		udma_66 = 0; udma_100 = 0; udma_133 = 0;
+ 	} else {
+ 		if ((ultra_66) || (ultra_100) || (ultra_133)) {
+ 			/*
+ 			 * check to make sure drive on same channel
+ 			 * is u66 capable
+@@ -1025,14 +1125,14 @@
+ void pdc202xx_reset (ide_drive_t *drive)
+ {
+ 	OUT_BYTE(0x04,IDE_CONTROL_REG);
+ 	mdelay(1000);
+ 	OUT_BYTE(0x00,IDE_CONTROL_REG);
+ 	mdelay(1000);
+-	printk("PDC202XX: %s channel reset.\n",
+-		HWIF(drive)->channel ? "Secondary" : "Primary");
++	printk("%s: PDC202xx %s channel reset.\n",
++		drive->name, HWIF(drive)->channel ? "Secondary" : "Primary");
+ }
+ 
+ /*
+  * Since SUN Cobalt is attempting to do this operation, I should disclose
+  * this has been a long time ago Thu Jul 27 16:40:57 2000 was the patch date
+  * HOTSWAP ATA Infrastructure.
+@@ -1062,12 +1162,14 @@
+ {
+ 	unsigned long high_16	= pci_resource_start(dev, 4);
+ 	byte udma_speed_flag	= IN_BYTE(high_16 + 0x001f);
+ 	byte primary_mode	= IN_BYTE(high_16 + 0x001a);
+ 	byte secondary_mode	= IN_BYTE(high_16 + 0x001b);
+ 
++	nr_pdc_devs = 0;
++
+ 	OUT_BYTE(udma_speed_flag | 0x10, high_16 + 0x001f);
+ 	mdelay(100);
+ 	OUT_BYTE(udma_speed_flag & ~0x10, high_16 + 0x001f);
+ 	mdelay(2000);	/* 2 seconds ?! */
+ 
+ 	if (dev->resource[PCI_ROM_RESOURCE].start) {
+@@ -1105,27 +1207,23 @@
+ 		OUT_BYTE(secondary_mode|1, high_16 + 0x001b);
+ 		printk("%s\n", (IN_BYTE(high_16 + 0x001b) & 1) ? "MASTER" : "PCI");
+ 	}
+ #endif /* CONFIG_PDC202XX_MASTER */
+ 
+ #if defined(DISPLAY_PDC202XX_TIMINGS) && defined(CONFIG_PROC_FS)
+-	if (!pdc202xx_proc) {
+-		pdc202xx_proc = 1;
+-		bmide_dev = dev;
+-		pdc202xx_display_info = &pdc202xx_get_info;
+-	}
++        pdc202xx_display_info = &pdc202xx_get_info;
+ #endif /* DISPLAY_PDC202XX_TIMINGS && CONFIG_PROC_FS */
+ 	return dev->irq;
+ }
+ 
+ unsigned int __init ata66_pdc202xx (ide_hwif_t *hwif)
+ {
+ 	unsigned short mask = (hwif->channel) ? (1<<11) : (1<<10);
+ 	unsigned short CIS;
+ 
+-        	switch(hwif->pci_dev->device) {
++       	switch(hwif->pci_dev->device) {
+ 		case PCI_DEVICE_ID_PROMISE_20276:
+ 		case PCI_DEVICE_ID_PROMISE_20275:
+ 		case PCI_DEVICE_ID_PROMISE_20269:
+ 		case PCI_DEVICE_ID_PROMISE_20268:
+ 		case PCI_DEVICE_ID_PROMISE_20270:
+ 			OUT_BYTE(0x0b, (hwif->dma_base + 1));
+@@ -1135,12 +1233,90 @@
+ 			pci_read_config_word(hwif->pci_dev, 0x50, &CIS);
+ 			return (!(CIS & mask));
+ 			/* check 80pin cable */
+ 	}
+ }
+ 
++/*
++ * Add this drive to the pdc_devs[] array, making
++ * sure we don't add a drive twice -- that would be bad :-)
++ *
++ * assumes that nr_pdc_devs has been setup in init()
++ */
++static int pdc202xx_setup_drive_data(ide_hwif_t *hwif)
++{
++	struct pci_dev *dev	= hwif->pci_dev;
++	int pdc, interf;
++
++	printk(KERN_INFO "pdc202xx: setup_drive_data: add interface @ %02d:%02d:%02d\n",
++			dev->bus->number, PCI_SLOT(dev->devfn), PCI_FUNC(dev->devfn));
++
++	/* check to make sure we're not adding interfaces more than once */
++	for (pdc = 0; pdc < nr_pdc_devs; pdc++)
++	{
++		struct pci_dev *dev2 = pdc_devs[pdc].hwif[0]->pci_dev; /* assume hwif & hwif-mate are on same chip */
++
++		if ((dev->bus->number == dev2->bus->number) && 
++		    (dev->devfn       == dev2->devfn))
++		{
++			printk(KERN_INFO "pdc202xx: setup_drive_data: tried to add interface "
++                 			"@ %02d:%02d:%02d twice\n",
++					dev->bus->number, PCI_SLOT(dev->devfn), PCI_FUNC(dev->devfn));
++			return 0;
++		}
++	}
++	if (nr_pdc_devs == MAX_PDC_DEVS) {
++		printk(KERN_INFO "pdc202xx: setup_drive_data: unable to add interface @ %02d:%02d (change MAX_PDC_DEVS?)\n",
++				dev->bus->number, PCI_SLOT(dev->devfn));
++		pdc202xx_print_drive_array();
++		return 0;
++	}
++	interf = nr_pdc_devs++;
++
++	if (hwif->channel == 0) {
++				/* this one is primary, mate should be secondary */
++		pdc_devs[interf].hwif[0] = hwif;
++		pdc_devs[interf].hwif[1] = hwif->mate;
++	}
++	else { 			/* assume mate is primary, this one is on secondary */
++		pdc_devs[interf].hwif[0] = hwif->mate;
++		pdc_devs[interf].hwif[1] = hwif;
++	}
++
++	/* set nr_cables for this interface (should be derivable from the chip type) */
++	pdc_devs[interf].nr_cables = pdc202xx_get_max_cables(dev);
++	pdc202xx_print_drive_array();
++
++	return 1;
++}
++
++#if 1 /* PDC202XX_DEBUG_DRIVE_INFO */
++/*
++ * print drive info
++ */
++static void pdc202xx_print_drive_array()
++{
++	int interf;
++	struct pci_dev *dev;
++
++	printk(KERN_INFO "%d interfaces\n", nr_pdc_devs);
++	for (interf = 0; interf < nr_pdc_devs; interf++)
++	{
++		printk(KERN_INFO "Interface %d:\n", interf);
++		FORALL_DRIVES(interf) {
++			printk(KERN_INFO "Cable %2d, Drive %d\n", cable, drive);
++			printk(KERN_INFO " Speed %d\n", pdc_devs[interf].speed_rate[cable][drive]);
++			printk(KERN_INFO " HWIF %p\n",  pdc_devs[interf].hwif[cable]);
++			printk(KERN_INFO " drive %p\n", &pdc_devs[interf].hwif[cable]->drives[drive]);
++			dev = pdc_devs[interf].hwif[0]->pci_dev;
++			printk(KERN_INFO " PCI %02d:%02d:%02d\n",  dev->bus->number, PCI_SLOT(dev->devfn), PCI_FUNC(dev->devfn));
++		} ENDFORALL_DRIVES
++	}
++}
++#endif
++
+ void __init ide_init_pdc202xx (ide_hwif_t *hwif)
+ {
+ 	hwif->tuneproc  = &pdc202xx_tune_drive;
+ 	hwif->quirkproc = &pdc202xx_quirkproc;
+ 	hwif->resetproc = &pdc202xx_reset;
+ 
+@@ -1182,7 +1358,9 @@
+ 	}
+ #else /* !CONFIG_BLK_DEV_IDEDMA */
+ 	hwif->drives[0].autotune = 1;
+ 	hwif->drives[1].autotune = 1;
+ 	hwif->autodma = 0;
+ #endif /* CONFIG_BLK_DEV_IDEDMA */
++                 
++	pdc202xx_setup_drive_data(hwif);
+ }[unhandled content-type:application/x-gzip]

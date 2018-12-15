@@ -1,0 +1,84 @@
+Date: Tue, 31 May 2005 19:09:44 -0400
+From: john cooper <>
+Subject: Re: RT and Cascade interrupts
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2005/5/31/249
+
+john cooper wrote:
+> Trond Myklebust wrote:
+> 
+>> I've appended a patch that
+>> should check for strict compliance of the above rules. Could you try it
+>> out and see if it triggers any Oopses?
+> 
+> 
+> Yes, the assert in rpc_delete_timer() occurs just before
+> the cascade list corruption.  This is consistent with
+> what I have seen.  ie: the timer in a released rpc_task
+> is still active.
+I've captured more data in the instrumentation and found
+the rpc_task's timer is being requeued by an application
+task which is preempting ksoftirqd when it wakes up in
+xprt_transmit().  This is what I had originally suspected
+but likely didn't communicate it effectively.
+The scenario unfolds as:
+                                          [high priority app task]
+                                              :
+                                          call_transmit()
+                                             xprt_transmit()
+                                             /* blocks in xprt_transmit() */
+ksoftirqd()
+     __run_timers()
+         list_del("rpc_task_X.timer") /* logically off cascade */
+         rpc_run_timer(data)
+             task->tk_timeout_fn(task)
+             /* ksoftirqd preempted */
+                                              :
+                                              ---------------------------------------------------------
+                                              /* Don't race with disconnect */
+                                              if (!xprt_connected(xprt))
+                                                  task->tk_status = -ENOTCONN;
+                                              else if (!req->rq_received)
+                                                  rpc_sleep_on(&xprt->pending, task, NULL, xprt_timer);
+                                              ---------------------------------------------------------
+                                                      __rpc_sleep_on()
+                                                          __mod_timer("rpc_task_X.timer")  /* requeued in cascade */
+                                              /* blocks */
+         /* rpc_run_timer resumes from preempt */
+         clear_bit(RPC_TASK_HAS_TIMER, "rpc_task_X.tk_runstate");
+         /* rpc_task_X.timer is now enqueued in cascade without
+            RPC_TASK_HAS_TIMER set and will not be dequeued
+            in rpc_release_task()/rpc_delete_timer() */
+The usage of "rpc_task_X.timer" indicates the same KVA
+observed for the timer struct at the associated points
+in the instrumented code.
+The above was gathered by logging usage of the
+kernel/timer.c primitives.  Thus I don't have more
+detailed state of the rpc_task in RPC context.
+However I did verify which of the three calls to
+rpc_sleep_on() in xprt_transmit() was being invoked
+(as above).
+So the root cause appears to be the rpc_task's timer
+being requeued in xprt_transmit() when rpc_run_timer
+is preempted.  From looking at the code I'm unsure
+if modifying xprt_transmit()/out_receive is appropriate
+to synchronize with rpc_release_task().  It seems
+allowing rpc_sleep_on() to occur is more natural and
+for rpc_release_task() to detect the pending timer and
+remove it before proceeding.  I'm still in the process
+of trying to digest the logic here but I thought there
+was enough information here to be of use.  Suggestions,
+warnings welcome.
+-john
+-- 
+john.cooper@timesys.com
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+More majordomo info at  
+http://vger.kernel.org/majordomo-info.html
+Please read the FAQ at  
+http://www.tux.org/lkml/

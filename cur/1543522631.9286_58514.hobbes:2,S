@@ -1,0 +1,210 @@
+Date: Wed, 19 Jan 2000 08:26:28 +0000 (GMT)
+From: Tigran Aivazian <>
+Subject: [patch-2.3.40-pre6] poll() with a chunk allocator.
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/1/19/103
+
+Dear Alan, Bill and All,
+Attached is my proposed solution to the poll() on many descriptors
+problem. Please consider it and let me know if there is something I can
+improve. I corrected the stuff that Bill noticed, except his suggestion to
+use linked lists (i.e. I still prefer chunk allocation)
+  
+http://www.ocston.org/~tigran/patches/pollfix.patch
+It passed only basic tests - I didn't write a more comprehensive test
+yesterday - perhaps will do today.
+Regards,
+Tigran
+--- select.c.0	Wed Jan 19 08:09:21 2000
++++ select.c	Wed Jan 19 08:05:44 2000
+@@ -8,6 +8,10 @@
+  *     COFF/ELF binary emulation. If the process has the STICKY_TIMEOUTS
+  *     flag set in its personality we do *not* modify the given timeout
+  *     parameter to reflect time remaining.
++ *
++ *  19 January 2000
++ *     Changed sys_poll()/do_poll() to use chunk-based allocation of fds to
++ *     overcome nfds < 16390 descriptors limit (Tigran Aivazian).
+  */
+ 
+ #include <linux/malloc.h>
+@@ -328,39 +332,51 @@
+ 	return ret;
+ }
+ 
+-static int do_poll(unsigned int nfds, struct pollfd *fds, poll_table *wait,
++#define POLL_PER_CHUNK		(1<<13)
++#define POLL_PER_CHUNK_BITS	(13)
++#define POLL_NCHUNKS		(16)
++
++static void do_pollfd(struct pollfd * fdp, poll_table * wait, int *count)
++{
++	int fd;
++	unsigned int mask;
++
++	mask = 0;
++	fd = fdp->fd;
++	if (fd >= 0) {
++		struct file * file = fget(fd);
++		mask = POLLNVAL;
++		if (file != NULL) {
++			mask = DEFAULT_POLLMASK;
++			if (file->f_op && file->f_op->poll)
++			mask = file->f_op->poll(file, wait);
++			mask &= fdp->events | POLLERR | POLLHUP;
++			fput(file);
++		}
++		if (mask) {
++			wait = NULL;
++			(*count)++;
++		}
++	}
++	fdp->revents = mask;
++}
++
++static int do_poll(unsigned int nfds, unsigned int nchunks, unsigned int nleft, struct pollfd *fds[], poll_table *wait,
+ 		   long timeout)
+ {
+ 	int count = 0;
+ 
+ 	for (;;) {
+-		unsigned int j;
++		unsigned int i, j;
+ 		struct pollfd * fdpnt;
+ 
+ 		set_current_state(TASK_INTERRUPTIBLE);
+-		for (fdpnt = fds, j = 0; j < nfds; j++, fdpnt++) {
+-			int fd;
+-			unsigned int mask;
+-
+-			mask = 0;
+-			fd = fdpnt->fd;
+-			if (fd >= 0) {
+-				struct file * file = fget(fd);
+-				mask = POLLNVAL;
+-				if (file != NULL) {
+-					mask = DEFAULT_POLLMASK;
+-					if (file->f_op && file->f_op->poll)
+-						mask = file->f_op->poll(file, wait);
+-					mask &= fdpnt->events | POLLERR | POLLHUP;
+-					fput(file);
+-				}
+-				if (mask) {
+-					wait = NULL;
+-					count++;
+-				}
+-			}
+-			fdpnt->revents = mask;
+-		}
++		for (i=0; i < nchunks; i++)
++			for (fdpnt = fds[i], j = 0; j < POLL_PER_CHUNK; j++, fdpnt++)
++				do_pollfd(fdpnt, wait, &count);
++		if (nleft)
++			for (fdpnt = fds[nchunks], j = 0; j < nleft; j++, fdpnt++)
++				do_pollfd(fdpnt, wait, &count);
+ 
+ 		wait = NULL;
+ 		if (count || !timeout || signal_pending(current))
+@@ -373,18 +389,17 @@
+ 
+ asmlinkage long sys_poll(struct pollfd * ufds, unsigned int nfds, long timeout)
+ {
+-	int i, fdcount, err, size;
+-	struct pollfd * fds, *fds1;
++	int i, j, fdcount, err;
++	struct pollfd * fds[POLL_NCHUNKS];
+ 	poll_table *wait_table = NULL, *wait = NULL;
++	int nchunks, nleft;
+ 
+-	lock_kernel();
+ 	/* Do a sanity check on nfds ... */
+-	err = -EINVAL;
+-	if (nfds > current->files->max_fds)
+-		goto out;
++	if (nfds > current->files->max_fds || nfds > POLL_PER_CHUNK*POLL_NCHUNKS)
++		return -EINVAL;
+ 
+ 	if (timeout) {
+-		/* Carefula about overflow in the intermediate values */
++		/* Careful about overflow in the intermediate values */
+ 		if ((unsigned long) timeout < MAX_SCHEDULE_TIMEOUT / HZ)
+ 			timeout = (unsigned long)(timeout*HZ+999)/1000+1;
+ 		else /* Negative or overflow */
+@@ -402,32 +417,57 @@
+ 		wait = wait_table;
+ 	}
+ 
+-	size = nfds * sizeof(struct pollfd);
+-	fds = (struct pollfd *) kmalloc(size, GFP_KERNEL);
+-	if (!fds)
+-		goto out;
++	nchunks = 0;
++	nleft = nfds;
++	while (nleft > POLL_PER_CHUNK) { /* allocate complete chunks */
++		fds[nchunks] = kmalloc(POLL_PER_CHUNK * sizeof(struct pollfd), GFP_KERNEL);
++		if (fds[nchunks] == NULL)
++			goto out_fds;
++		nchunks++;
++		nleft -= POLL_PER_CHUNK;
++	}
++	if (nleft) { /* allocate last chunk, incomplete = nleft elements */
++		fds[nchunks] = kmalloc(nleft * sizeof(struct pollfd), GFP_KERNEL);
++		if (fds[nchunks] == NULL)
++			goto out_fds;
++	}
+ 
+ 	err = -EFAULT;
+-	if (copy_from_user(fds, ufds, size))
+-		goto out_fds;
++	for (i=0; i < nchunks; i++) {
++		if (copy_from_user(fds[i], ufds + (i<<POLL_PER_CHUNK_BITS), 
++				POLL_PER_CHUNK * sizeof(struct pollfd)))
++			goto out_fds1;
++	}
++	if (nleft) {
++		if (copy_from_user(fds[nchunks], ufds + (nchunks<<POLL_PER_CHUNK_BITS), 
++				nleft * sizeof(struct pollfd)))
++			goto out_fds1;
++	}
+ 
+-	fdcount = do_poll(nfds, fds, wait, timeout);
++	lock_kernel();
++	fdcount = do_poll(nfds, nchunks, nleft, fds, wait, timeout);
++	unlock_kernel();
+ 
+ 	/* OK, now copy the revents fields back to user space. */
+-	fds1 = fds;
+-	for(i=0; i < (int)nfds; i++, ufds++, fds1++) {
+-		__put_user(fds1->revents, &ufds->revents);
++	for(i=0; i < nchunks; i++) {
++		struct pollfd *u;
++		u = ufds + (i<<POLL_PER_CHUNK_BITS);
++		for (j=0; j < POLL_PER_CHUNK; j++)
++			__put_user((fds[i] + j)->revents, &u->revents);
+ 	}
+ 
+ 	err = fdcount;
+ 	if (!fdcount && signal_pending(current))
+ 		err = -EINTR;
+ 
++out_fds1:
++	if (nleft)
++		kfree(fds[nchunks]);
+ out_fds:
+-	kfree(fds);
++	for (i=0; i < nchunks; i++)
++		kfree(fds[i]);
+ out:
+ 	if (wait)
+ 		free_wait(wait_table);
+-	unlock_kernel();
+ 	return err;
+ }
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

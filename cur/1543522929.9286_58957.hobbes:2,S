@@ -1,0 +1,516 @@
+Date: Fri, 21 Jan 2000 10:02:34 +0100
+From: "Davide Libenzi" <>
+Subject: Re: Scheduler patch recoding ...
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/1/21/182
+
+Hi Rik,
+Friday, January 21, 2000 6:00 AM
+Rik van Riel <riel@nl.linux.org> wrote :
+> Where can we download your current code?
+I tail the patch to this message.
+> No you don't. This patch needs to be tested under a
+> realistic system load. An overloaded webserver or a
+> `make -j' is fine, but an artificial benchmark most
+> certainly is not.
+As I've stated the patch perform equals in normal environments while
+perform better log(N) with high runqueue loads.
+> If benchmarking is the goal of your patch, I'll be
+> reading it for entertainment value only. OTOH, if
+> your patch is meant to make the scheduler more
+> scalable or better, then I'm willing to do something
+> more with it...
+If You get a better scaling You get a better benchmarks ;)
+The patch is for 2.3.5 and includes a wakeup patch that calculate the
+near-to-the-most
+tasks to free avoiding to release N processes to reschedule N-1 of them.
+Near-to-the-most is why we can't know which will be the processor that will
+reschedule that
+freed task in SMP, therefore the goodness calculation is not 100% precise.
+Anyway this patch is better then FIFO since it "tries" to free the best task
+( 100% precise in
+single processor environment ) and better then free all due to the peak of
+tasks overthrown
+on the scheduler.
+Cheers,
+    Davide.
+diff -U 3 -r linux-2_3_5/include/linux/sched.h
+linux-2_3_5.mod/include/linux/sched.h
+--- linux-2_3_5/include/linux/sched.h Fri Jun 11 10:11:06 1999
++++ linux-2_3_5.mod/include/linux/sched.h Fri Jun 11 17:28:34 1999
+@@ -313,7 +313,10 @@
+  sigset_t signal, blocked;
+  struct signal_queue *sigqueue, **sigqueue_tail;
+  unsigned long sas_ss_sp;
+- size_t sas_ss_size;
++        size_t sas_ss_size;
++/* task goodness slotizer */
++ struct task_struct *__next;
++ struct task_struct **__pprev;
+ };
+ /*
+@@ -380,6 +383,8 @@
+ /* files */ &init_files, \
+ /* mm */ &init_mm, \
+ /* signals */ SPIN_LOCK_UNLOCKED, &init_signals, {{0}}, {{0}}, NULL,
+&init_task.sigqueue, 0, 0, \
++/* task goodness slotizer */ \
++  NULL, NULL, \
+ }
+ #ifndef INIT_TASK_SIZE
+diff -U 3 -r linux-2_3_5/kernel/fork.c linux-2_3_5.mod/kernel/fork.c
+--- linux-2_3_5/kernel/fork.c Fri Jun 11 10:11:15 1999
++++ linux-2_3_5.mod/kernel/fork.c Fri Jun 11 17:28:15 1999
+@@ -642,6 +642,9 @@
+  p->swappable = 1;
+  p->exit_signal = clone_flags & CSIGNAL;
+  p->pdeath_signal = 0;
++        /* Task goodness slotizer. */
++ p->__next = NULL;
++ p->__pprev = NULL;
+  /*
+   * "share" dynamic priority between parent and child, thus the
+diff -U 3 -r linux-2_3_5/kernel/sched.c linux-2_3_5.mod/kernel/sched.c
+--- linux-2_3_5/kernel/sched.c Fri Jun 11 10:11:16 1999
++++ linux-2_3_5.mod/kernel/sched.c Fri Jun 11 17:50:29 1999
+@@ -15,6 +15,9 @@
+  *    Copyright (C) 1998  Andrea Arcangeli
+  *  1998-12-28  Implemented better SMP scheduling by Ingo Molnar
+  *  1999-03-10 Improved NTP compatibility by Ulrich Windl
++ *  1999-06-02  Added task goodness "slotizer" by Davide Libenzi
++ *  1999-06-09  Added __sem_wake_up() to release only one task by Davide
+Libenzi
++ *
+  */
+ /*
+@@ -124,6 +127,50 @@
+ #endif
++
++/*
++ * Task goodness slotizer ( begin ).
++ */
++#define MAX_GDS  48 /* Estimated maximum goodness value.
++     * All task with a greater one stay in (MAX_SLOTS - 1).
++     */
++#define SLOT_SHIFT 0 /* Shift factor for slot arithmetic. */
++#define GDS_STEP (1 << SLOT_SHIFT) /* Goodness step */
++#define MAX_SLOTS (MAX_GDS / GDS_STEP) /* Number of goodness slots */
++#define GDS_SLOT(c) ((c) >> SLOT_SHIFT)
++
++/* The -1 is because slots is incremented by 1 to keep slot 0 for processes
+really exhausted. */
++#define SLOT_GDS_BASE(s) (((s) - 1) << SLOT_SHIFT)
++
++/* This great value for goodness in slot (MAX_SLOTS - 1) ensure that al
+tasks
++ * in that slot ( commonly RT processes ) are totally tested before
+exiting.
++ */
++#define MAX_LINUX_GOODNESS 10000
++/* Maximum goodness possible in slot s */
++#define SLOT_GDS_MAX(s)  (((s) < (MAX_SLOTS - 1)) ? \
++    (SLOT_GDS_BASE(s) + ((1 << SLOT_SHIFT) - 1)) : MAX_LINUX_GOODNESS)
++
++#define OFFSET_OF(ty, fd) ((int) (((char *) &((ty *) 0)->fd) - ((char *)
+0)))
++#define TGDS_HEAD(s)  ((struct task_struct *) (((char *) &(s)->__next) - \
++     OFFSET_OF(struct task_struct, __next)))
++
++/* The order of this fields must be the same that ones in task_struct. */
++struct gds_slot_struct {
++ struct task_struct *__next;
++ struct task_struct **__pprev;
++};
++
++/*
++ * Task goodness slots.
++ * gds_slots[0] contain all exhausted processes and is skipped from scan in
+schedule().
++ */
++static struct gds_slot_struct gds_slots[MAX_SLOTS];
++static int start_gdslot; /* Index at which start iteration */
++/*
++ * Task goodness slotizer ( end ).
++ */
++
++
+ void scheduling_functions_start_here(void) { }
+ /*
+@@ -357,13 +404,100 @@
+  reschedule_idle_slow(p);
+ }
+-/*
+- * Careful!
+- *
+- * This has to add the process to the _beginning_ of the
+- * run-queue, not the end. See the comment about "This is
+- * subtle" in the scheduler proper..
++/*
++ * Task goodness slotizer ( begin ).
++ */
++/* Initialize goodness slots circular lists. */
++static void gds_init(void)
++{
++ int ii;
++
++ for (ii = 0; ii < MAX_SLOTS; ii++) {
++  gds_slots[ii].__pprev = &gds_slots[ii].__next;
++  gds_slots[ii].__next = TGDS_HEAD(&gds_slots[ii]);
++ }
++
++ start_gdslot = MAX_SLOTS - 1;
++}
++
++/* Add task to ( tail ) goodness slot ( want "runqueue_lock" ). */
++static inline void gds_tadd_task(struct task_struct * ts)
++{
++ /* It's important to compute the maximum goodness possible for ts,
++  * so that we can stop iterate in schedule() when we find a process
++  * that maintain his goodness promise.
++  */
++ int weight = goodness(ts, ts, ts->processor),
++  slot = 0;
++ struct task_struct * qh;
++ /* Exhausted processes fall in slot 0 to avoid to scan them in schedule().
+*/
++ if (weight > 0)
++ {
++  if ((slot = GDS_SLOT(weight)) < (MAX_SLOTS - 1))
++   ++slot; /* We keep slot 0 for really exhausted processes */
++  else
++   slot = MAX_SLOTS - 1;
++  if (slot > start_gdslot)
++   start_gdslot = slot; /* Update iteration start index. */
++ }
++ qh = TGDS_HEAD(&gds_slots[slot]);
++ ts->__pprev = qh->__pprev;
++ *qh->__pprev = ts;
++ qh->__pprev = &ts->__next;
++ ts->__next = qh;
++}
++
++/* Add task to ( head ) goodness slot ( want "runqueue_lock" ). */
++static inline void gds_hadd_task(struct task_struct * ts)
++{
++ /* It's important to compute the maximum goodness possible for ts,
++  * so that we can stop iterate in schedule() when we find a process
++  * that maintain his goodness promise.
++  */
++ int weight = goodness(ts, ts, ts->processor),
++  slot = 0;
++ struct task_struct * qh;
++ /* Exhausted processes fall in slot 0 to avoid to scan them in schedule().
+*/
++ if (weight > 0)
++ {
++  if ((slot = GDS_SLOT(weight)) < (MAX_SLOTS - 1))
++   ++slot; /* We keep slot 0 for really exhausted processes */
++  else
++   slot = MAX_SLOTS - 1;
++  if (slot > start_gdslot)
++   start_gdslot = slot; /* Update iteration start index. */
++ }
++ qh = TGDS_HEAD(&gds_slots[slot]);
++ qh = qh->__next;
++ ts->__pprev = qh->__pprev;
++ *qh->__pprev = ts;
++ qh->__pprev = &ts->__next;
++ ts->__next = qh;
++}
++
++/* Remove task to goodness slot ( want "runqueue_lock" ). */
++static inline int gds_remove_task(struct task_struct * ts)
++{
++ if (ts->__pprev) {
++  ts->__next->__pprev = ts->__pprev;
++  *ts->__pprev = ts->__next;
++  ts->__pprev = NULL;
++  return (1);
++ }
++ return (0);
++}
++
++/* Switch task from goodness slots ( want "runqueue_lock" ). */
++static inline void gds_switch(struct task_struct * ts)
++{
++ if (gds_remove_task(ts)) /* This check is very important to avoid to add
+not */
++  gds_tadd_task(ts); /* running tasks in runqueue. */
++}
++/*
++ * Task goodness slotizer ( end ).
+  */
++
++
+ static inline void add_to_runqueue(struct task_struct * p)
+ {
+  struct task_struct *next = init_task.next_run;
+@@ -373,6 +507,8 @@
+  p->next_run = next;
+  next->prev_run = p;
+  nr_running++;
++ /* Add task to goodness slot ( want "runqueue_lock" ). */
++ gds_hadd_task(p);
+ }
+ static inline void del_from_runqueue(struct task_struct * p)
+@@ -385,6 +521,8 @@
+  prev->next_run = next;
+  p->next_run = NULL;
+  p->prev_run = NULL;
++ /* Remove task to goodness slot ( want "runqueue_lock" ). */
++ gds_remove_task(p);
+ }
+ static inline void move_last_runqueue(struct task_struct * p)
+@@ -401,6 +539,9 @@
+  init_task.prev_run = p;
+  p->prev_run = prev;
+  prev->next_run = p;
++ /* Change task to goodness slot ( want "runqueue_lock" ). */
++ gds_remove_task(p);
++ gds_tadd_task(p);
+ }
+ static inline void move_first_runqueue(struct task_struct * p)
+@@ -417,6 +558,9 @@
+  init_task.next_run = p;
+  p->next_run = next;
+  next->prev_run = p;
++ /* Change task to goodness slot ( want "runqueue_lock" ). */
++ gds_remove_task(p);
++ gds_hadd_task(p);
+ }
+ /*
+@@ -687,7 +831,7 @@
+ {
+  struct schedule_data * sched_data;
+  struct task_struct *prev, *next, *p;
+- int this_cpu, c;
++ int this_cpu, c, ii, cslots;
+  if (tq_scheduler)
+   goto handle_tq_scheduler;
+@@ -714,6 +858,9 @@
+  spin_lock_irq(&runqueue_lock);
++ /* Change task goodness slot ( want "runqueue_lock" ). */
++ gds_switch(prev);
++
+  /* move an exhausted RR process to be last.. */
+  if (prev->policy == SCHED_RR)
+   goto move_rr_last;
+@@ -737,7 +884,6 @@
+   * this is the scheduler proper:
+   */
+- p = init_task.next_run;
+  /* Default process to select.. */
+  next = idle_task(this_cpu);
+  c = -1000;
+@@ -745,33 +891,39 @@
+   goto still_running;
+ still_running_back:
+- /*
+-  * This is subtle.
+-  * Note how we can enable interrupts here, even
+-  * though interrupts can add processes to the run-
+-  * queue. This is because any new processes will
+-  * be added to the front of the queue, so "p" above
+-  * is a safe starting point.
+-  * run-queue deletion and re-ordering is protected by
+-  * the scheduler lock
+-  */
+-/*
+- * Note! there may appear new tasks on the run-queue during this, as
+- * interrupts are enabled. However, they will be put on front of the
+- * list, so our list starting at "p" is essentially fixed.
+- */
+- while (p != &init_task) {
+-  if (can_schedule(p)) {
+-   int weight = goodness(prev, p, this_cpu);
+-   if (weight > c)
+-    c = weight, next = p;
++ /* Scan task goodness slots ( want "runqueue_lock" ).
++  * Note that "ii > 0" skip all exhausted processes in slot 0 .
++  */
++ for (ii = start_gdslot, cslots = 0; ii > 0; ii--) {
++  struct task_struct *qh = TGDS_HEAD(&gds_slots[ii]);
++  if ((p = qh->__next) != qh) {
++   int gdsmax = SLOT_GDS_MAX(ii); /* Max goodness in slot. */
++   if (!cslots) /* Remember iteration start index. */
++    start_gdslot = ii, ++cslots;
++   if (c >= gdsmax)
++    goto task_found;
++   do {
++    if (can_schedule(p)) {
++     int weight = goodness(prev, p, this_cpu);
++     if (weight > c) {
++      c = weight, next = p;
++      if (c >= gdsmax)
++       goto task_found;
++     }
++    }
++   } while ((p = p->__next) != qh);
+   }
+-  p = p->next_run;
++  /* Goodness promise has been maintained, we've found the President ! */
++  if (c >= SLOT_GDS_BASE(ii))
++   goto task_found;
+  }
+  /* Do we need to re-calculate counters? */
+- if (!c)
++ if ((c <= 0) && (nr_running > 0))
+   goto recalculate;
++
++task_found:
++
+  /*
+   * from this point on nothing can prevent us from
+   * switching to the next task, save this fact in
+@@ -831,12 +983,13 @@
+ recalculate:
+  {
+   struct task_struct *p;
+-  spin_unlock_irq(&runqueue_lock);
+   read_lock(&tasklist_lock);
+-  for_each_task(p)
++  for_each_task(p) {
+    p->counter = (p->counter >> 1) + p->priority;
++   /* Change task goodness slot ( want "runqueue_lock" ). */
++   gds_switch(p);
++                }
+   read_unlock(&tasklist_lock);
+-  spin_lock_irq(&runqueue_lock);
+   goto repeat_schedule;
+  }
+@@ -913,6 +1066,87 @@
+ }
+ /*
++ * This is the new code for semaphore wakeup.
++ * As You can see it release only the best waiting task except when
++ * all processes counters are exhausted.
++ * In that case I prefer to fall in the previous implementation and
++ * release all tasks instead of perform a recharge loop here.
++ * Anyway such situation rarely occur ( it is more rare higher is the
++ * number of waiting task and with few tasks the cost of a total release
++ * is not so high ).
++ */
++static inline void __sem_wake_up(wait_queue_head_t *q, unsigned int mode)
++{
++ struct list_head *tmp, *head;
++ struct task_struct *next = NULL, *p;
++ int c = 0, this_cpu = current->processor;
++ unsigned long flags;
++#if WAITQUEUE_DEBUG
++ wait_queue_t *wqnext = NULL;
++#endif
++
++        if (!q)
++  goto out;
++
++ wq_write_lock_irqsave(&q->lock, flags);
++
++#if WAITQUEUE_DEBUG
++ CHECK_MAGIC_WQHEAD(q);
++#endif
++
++ head = &q->task_list;
++#if WAITQUEUE_DEBUG
++        if (!head->next || !head->prev)
++                WQ_BUG();
++#endif
++ for (tmp = head->next; tmp != head; tmp = tmp->next) {
++                wait_queue_t *curr = list_entry(tmp, wait_queue_t,
+task_list);
++
++#if WAITQUEUE_DEBUG
++  CHECK_MAGIC(curr->__magic);
++#endif
++  p = curr->task;
++  if (p->state & mode) {
++   /* Search the best one to run */
++   if (can_schedule(p)) {
++    int weight = goodness(current, p, this_cpu);
++    if (weight > c) {
++     c = weight, next = p;
++#if WAITQUEUE_DEBUG
++     wqnext = curr;
++#endif
++    }
++   }
++  }
++ }
++ /* Found it ? */
++ if (next) {
++#if WAITQUEUE_DEBUG
++  wqnext->__waker = (long)__builtin_return_address(0);
++#endif
++  wake_up_process(next);
++ }
++ else {
++ /* Old way. Release all tasks ( sigh ! ) */
++  for (tmp = head->next; tmp != head; tmp = tmp->next) {
++   wait_queue_t *curr = list_entry(tmp, wait_queue_t, task_list);
++
++   p = curr->task;
++   if (p->state & mode) {
++#if WAITQUEUE_DEBUG
++    curr->__waker = (long)__builtin_return_address(0);
++#endif
++    wake_up_process(p);
++   }
++  }
++ }
++ wq_write_unlock_irqrestore(&q->lock, flags);
++out:
++ return;
++}
++
++
++/*
+  * Semaphores are implemented using a two-way counter:
+  * The "count" variable is decremented for each process
+  * that tries to sleep, while the "waking" variable is
+@@ -930,11 +1164,11 @@
+  * When __up() is called, the count was negative before
+  * incrementing it, and we need to wake up somebody.
+  *
+- * This routine adds one to the count of processes that need to
+- * wake up and exit.  ALL waiting processes actually wake up but
+- * only the one that gets to the "waking" field first will gate
+- * through and acquire the semaphore.  The others will go back
+- * to sleep.
++ * In most cases __sem_wake_up() free only the best task to run
++ * except when all counter of waiting processes are exhausted.
++ * In that case all tasks are released leaving the "recharge"
++ * loop in schedule() to do the work of recalculate counters
++ * and select the best one to run.
+  *
+  * Note that these functions are only called when there is
+  * contention on the lock, and as such all this is the
+@@ -945,7 +1179,7 @@
+ void __up(struct semaphore *sem)
+ {
+  wake_one_more(sem);
+- wake_up(&sem->wait);
++ __sem_wake_up(&sem->wait, TASK_UNINTERRUPTIBLE | TASK_INTERRUPTIBLE);
+ }
+ /*
+@@ -1004,7 +1238,7 @@
+ {
+  DOWN_VAR
+  DOWN_HEAD(TASK_UNINTERRUPTIBLE)
+- if (waking_non_zero(sem))
++ if (waking_non_zero(sem)) /* In most cases there are no conflict here. */
+   break;
+  schedule();
+  DOWN_TAIL(TASK_UNINTERRUPTIBLE)
+@@ -2056,4 +2290,5 @@
+  init_bh(TIMER_BH, timer_bh);
+  init_bh(TQUEUE_BH, tqueue_bh);
+  init_bh(IMMEDIATE_BH, immediate_bh);
++ gds_init();
+ }
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

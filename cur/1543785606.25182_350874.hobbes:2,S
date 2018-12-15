@@ -1,0 +1,221 @@
+Date: Thu, 15 Sep 2005 14:41:31 -0400
+From: Daniel Petrini <>
+Subject: [PATCH] Timertop - some improvements (3)
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2005/9/15/269
+
+Hi,
+Here we have a new and cleaned version of timertop. It now uses
+seq_file to get a more stable output.
+Timertop is a small utility that gets some information to be useful
+for dynamic-tick patch, it consists of a kernel patch and a perl
+script. The kernel patch gathers information from timer functions ans
+stores it in a proc entry (/proc/timer_info).
+The perl script parses it and shows in the screen the usage of timer
+functions in the system, including the timer count, pid and cmdline of
+the processes that started the timer. It shows also the Hz value (idea
+from pm-stats).
+The idea is to know which applications or drivers are consuming timers
+and try to optimize them in order to get lower HZ values and save more
+power, at least in theory. So it is applicable over the dyn-tick
+patch.
+The perl script has this output:
+Timer Top v0.9.3 
+Ticks: 236 HZ
+Address   Count    Freq(Hz)    Function         PID    Command
+c011f2b7 |38847164|  444.00|    process_timeout|6765  |cpufreq-applet  |
+c011f2b7 |38847164|  444.00|    process_timeout|20327 |timer_top.pl    |
+c011f2b7 |38847164|  444.00|    process_timeout|18304 |firefox-bin     |
+c01be3b8 |44840   |    4.00|     commit_timeout|783   |kjournald       |
+c011ad7b |5440294 |  172.00|         it_real_fn|5572  |Xorg            |
+c028f061 |323612  |   44.00| neigh_periodic_tim|X     |                |
+Some of the timers, of course, are only related to kernel so there is
+nothing in the process (PID and  Command) column.
+The System.map file must be in the script directory.
+The patch should apply over 2.6.13-mm1.
+We hope that this can be useful.
+We are open to comments, suggestions and review.
+Daniel Petrini
+---------------------
+10LE - Linux
+INdT - Manaus - Brazil
+diff -uprN linux-2.6.12-orig/kernel/Makefile linux-dyn-tick/kernel/Makefile
+--- linux-2.6.12-orig/kernel/Makefile	2005-08-05 09:33:24.000000000 -0400
++++ linux-dyn-tick/kernel/Makefile	2005-08-05 09:28:18.000000000 -0400
+@@ -30,7 +30,7 @@ obj-$(CONFIG_SYSFS) += ksysfs.o
+ obj-$(CONFIG_GENERIC_HARDIRQS) += irq/
+ obj-$(CONFIG_CRASH_DUMP) += crash_dump.o
+ obj-$(CONFIG_SECCOMP) += seccomp.o
+-obj-$(CONFIG_NO_IDLE_HZ) += dyn-tick.o
++obj-$(CONFIG_NO_IDLE_HZ) += dyn-tick.o timer_top.o
+ 
+ ifneq ($(CONFIG_SCHED_NO_NO_OMIT_FRAME_POINTER),y)
+ # According to Alan Modra <alan@linuxcare.com.au>, the -fno-omit-frame-pointer is
+diff -uprN linux-2.6.12-orig/kernel/timer.c linux-dyn-tick/kernel/timer.c
+--- linux-2.6.12-orig/kernel/timer.c	2005-08-05 09:33:31.000000000 -0400
++++ linux-dyn-tick/kernel/timer.c	2005-08-05 09:38:33.000000000 -0400
+@@ -508,6 +508,9 @@ static inline void __run_timers(tvec_bas
+ }
+ 
+ #ifdef CONFIG_NO_IDLE_HZ
++extern struct timer_top_info top_info;
++extern int account_timer(unsigned int function,
++	       		struct timer_top_info * top_info);
+ /*
+  * Find out when the next timer event is due to happen. This
+  * is used on S/390 to stop all activity when a cpus is idle.
+@@ -571,6 +574,7 @@ found:
+ 				expires = nte->expires;
+ 		}
+ 	}
++	account_timer((unsigned int)nte->function, &top_info);
+ 	spin_unlock(&base->t_base.lock);
+ 	return expires;
+ }
+diff -uprN linux-2.6.12-orig/kernel/timer_top.c linux-dyn-tick/kernel/timer_top.c
+--- linux-2.6.12-orig/kernel/timer_top.c	1969-12-31 20:00:00.000000000 -0400
++++ linux-dyn-tick/kernel/timer_top.c	2005-09-01 10:49:37.000000000 -0400
+@@ -0,0 +1,139 @@
++/*
++ * kernel/timer_top.c
++ *
++ * Export Timers information to /proc/timer_info
++ *
++ * Copyright (C) 2005 Instituto Nokia de Tecnologia - INdT - Manaus
++ * Written by Daniel Petrini <d.pensator@gmail.com>
++ *
++ * This utility should be used to get information from the system timers
++ * and maybe optimize the system once you know which timers are being used
++ * and the process which starts them.
++ * This is particular useful above dynamic tick implementation. One can 
++ * see who is starting timers and make the HZ value increase.
++ *
++ * We export the addresses and counting of timer functions being called,
++ * the pid and cmdline from the owner process if applicable.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++
++#include <linux/list.h>
++#include <linux/proc_fs.h>
++#include <linux/module.h>
++#include <linux/spinlock.h>
++#include <linux/sched.h>
++#include <linux/seq_file.h>
++
++#define VERSION		"Timer Top v0.9.3"
++
++static LIST_HEAD(timer_list);
++
++struct timer_top_info {
++	unsigned int		func_pointer;
++	unsigned long		counter;
++	pid_t			pid;
++	char 			comm[TASK_COMM_LEN];
++	struct list_head 	list;      	
++};
++
++struct timer_top_info top_info;
++
++static spinlock_t timer_lock = SPIN_LOCK_UNLOCKED;
++static unsigned long flags;
++
++
++int account_timer(unsigned long function, unsigned long data, struct timer_top_info * top_info)
++{
++	struct timer_top_info *top;
++	struct task_struct * task_info;
++	pid_t pid_info = 0;
++	char name[TASK_COMM_LEN] = "";
++	
++	spin_lock_irqsave(&timer_lock, flags);
++
++	if (data) { 
++	       	task_info = (struct task_struct *) data;
++		/* little sanity ... not enough yet */
++		if ((task_info->pid > 0) && (task_info->pid < PID_MAX_LIMIT)) {
++			pid_info = task_info->pid;
++			strncpy(name, task_info->comm, sizeof(task_info->comm));
++		}
++	}
++
++	list_for_each_entry(top, &timer_list, list) {
++		/* if it is in the list increment its count */
++		if (top->func_pointer == function) {
++			top->counter++;
++			top->pid = pid_info;
++			strncpy(top->comm, name, sizeof(name));
++			spin_unlock_irqrestore(&timer_lock, flags);
++			goto out;
++		}
++	}
++	
++	/* if you are here then it didnt find so inserts in the list */
++
++	top = kmalloc(sizeof(struct timer_top_info), GFP_ATOMIC);
++	if (!top) 
++		return -ENOMEM;
++	top->func_pointer = function;
++	top->counter = 1;
++	top->pid = pid_info;
++	strncpy(top->comm, name, sizeof(name));
++	list_add(&top->list, &timer_list);
++
++	spin_unlock_irqrestore(&timer_lock, flags);
++
++out:	
++	return 0;
++}
++
++EXPORT_SYMBOL(account_timer);
++
++/* PROC_FS_SECTION  */
++
++static struct proc_dir_entry *top_info_file;
++
++static int proc_read_top_info(struct seq_file *m, void *v)
++{
++	struct timer_top_info *top;
++	
++	seq_printf(m, "Function counter - %s\n", VERSION);
++
++	list_for_each_entry(top, &timer_list, list) {
++		seq_printf(m, "%x %lu %d %s\n", top->func_pointer, top->counter, top->pid, top->comm);
++	}
++
++	return 0;
++} 
++
++static int proc_timertop_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, proc_read_top_info, NULL);
++}
++
++static struct file_operations proc_timertop_operations = {
++	.open		= proc_timertop_open,
++	.read		= seq_read,
++	.llseek		= seq_lseek,
++	.release	= single_release,
++};
++
++static int init_top_info(void)
++{
++	top_info_file = create_proc_entry("timer_info", 0444, NULL);
++	if (top_info_file == NULL) {
++		return -ENOMEM;
++	}
++
++	top_info_file->proc_fops = &proc_timertop_operations;
++	
++	return 0;
++}
++
++module_init(init_top_info);
++//module_exit();
+[unhandled content-type:application/x-perl]

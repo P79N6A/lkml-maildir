@@ -1,0 +1,88 @@
+Date: Tue, 30 Aug 2005 11:00:39 -0400
+From: Steven Rostedt <>
+Subject: Re: [RFC] RT-patch update to remove the global pi_lock
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2005/8/30/132
+
+OK, I'm looking for a second set of eyes (or third or more :-) to see if
+there's a danger of a deadlock here.
+The task->pi_lock is dependent on the order of locking, which I said was
+proven to be true, otherwise there would be a deadlock.
+L1->P1->L2->P2-L3->P3 
+Where lock L1 is owned by P1 which is blocked on L2 and so on.
+The problem comes when we have to deal with this BKL.  This lock is
+special in that it can be grabbed and released and break this chain.
+Mainly with semaphores, since BKL shouldn't be released when scheduling
+where the old spin_locks were replaced.  But since we replaced
+semaphores with mutexes, the BKL starts to change the rules.
+(Ingo, my last patch is flawed since it only covers the case of
+semaphores, so please don't apply it, yet).
+Now we can have:
+BKL->P1->L1->P2->BKL
+Where there's a loop.  The good news is that this only happens when P1
+is about to release the BKL, otherwise it would be a real deadlock in
+the kernel and not with the PI.
+My fear of a deadlock is in the __up code.  Where we have the locking
+order of:  
+P2->BKL->P1
+Is there someplace that can cause this to deadlock?
+To deadlock, we need another process on another CPU to lock in the
+following order:
+P1->L1->P2->BKL
+Which I guess can happen and we would get a deadlock.  This task could
+be holding P1 and L1 and be waiting on P2 while the __up could have P2
+and BKL and be waiting on P1.
+So would this solve the problem with this deadlock?  This would be in
+pick_new_owner where the caller is the __up.  (the P2->BKL-P1 side) This
+is not a patch, but I put +'s at the added code.
+#ifdef CONFIG_SMP
+ try_again:
+#endif
+	trace_special_pid(waiter->ti->task->pid, waiter->ti->task->prio, 0);
+#ifdef ALL_TASKS_PI
+	check_pi_list_present(lock, waiter, old_owner);
+#endif
+	new_owner = waiter->ti;
+	/*
+	 * The new owner is still blocked on this lock, so we
+	 * must release the lock->wait_lock before grabing
+	 * the new_owner lock.
+	 */
+	__raw_spin_unlock(&lock->wait_lock);
+	__raw_spin_lock(&new_owner->task->pi_lock);
+	__raw_spin_lock(&lock->wait_lock);
+	/*
+	 * In this split second of releasing the lock, a high priority
+	 * process could have come along and blocked as well.
+	 */
+#ifdef CONFIG_SMP
+	waiter = plist_first_entry(&lock->wait_list, struct rt_mutex_waiter, list);
+	if (unlikely(waiter->ti != new_owner)) {
+		__raw_spin_unlock(&new_owner->task->pi_lock);
+		goto try_again;
+	}
++	/*
++	 * Once again the BKL comes to play.  Since the BKL can be grabbed and released
++	 * out of the normal P1->L1->P2 order, there's a chance that someone has the
++	 * BKL owner's lock and is waiting on the new owner lock.
++	 */
++	if (unlikely(lock == &kernel_sem.lock)) {
++		if (!__raw_spin_trylock(&old_owner->task->pi_lock)) {
++			__raw_spin_unlock(&lock->wait_lock);
++			__raw_spin_unlock(&new_owner->task->pi_lock);
++			goto try_again;
++		}
++	} else
+#endif
+		__raw_spin_lock(&old_owner->task->pi_lock);
+-- Steve
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.kernel.org
+More majordomo info at  
+http://vger.kernel.org/majordomo-info.html
+Please read the FAQ at  
+http://www.tux.org/lkml/

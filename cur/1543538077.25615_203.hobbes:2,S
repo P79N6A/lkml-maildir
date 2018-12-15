@@ -1,0 +1,186 @@
+Date: Sun, 2 Jul 2000 12:38:30 -0700 (PDT)
+From: Chris Lattner <>
+Subject: [PATCH #3,#4] printk stuff...
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/7/3/203
+
+Okay, here's two more tries at making printk a little more robust in the
+face of people being silly like me.  :)  Patch #3 has these benefits:
+1. The console_lock is held for a shorter period of time: ie other
+unrelated console stuff can be happening while vsprintf is
+"rasterizing" the string.
+2. Recursive printk's won't deadlock the code
+3. Recursive printk's count the number of missed messages and print that
+number out when possible.
+4. No extra kernel calls are made from within printk (except atomic
+operations, big deal... :)
+Personally, I think reason #1 is justification enough for this patch.  If
+people don't like this patch, then I offer up patch #4:
+1. "buf" is moved into printk as a static member, so that people can see
+that console_lock is protecting it.  This also means that when you look at
+a "buf" in the file, you can tell whether it's the global one or a
+parameter without looking too hard.
+Let me know if either of these are reasonable... :)
+-Chris
+*** printk.c~	Fri Jun 30 16:24:38 2000
+--- printk.c	Sun Jul  2 05:29:15 2000
+***************
+*** 25,32 ****
+  #define LOG_BUF_LEN	(16384)
+  #define LOG_BUF_MASK	(LOG_BUF_LEN-1)
+  
+- static char buf[1024];
+- 
+  /* printk's without a loglevel use this.. */
+  #define DEFAULT_MESSAGE_LOGLEVEL 4 /* KERN_WARNING */
+  
+--- 25,30 ----
+***************
+*** 253,258 ****
+--- 251,257 ----
+  
+  asmlinkage int printk(const char *fmt, ...)
+  {
++ 	static char buf[1024];
+  	va_list args;
+  	int i;
+  	char *msg, *p, *buf_end;
+*** printk.c~	Fri Jun 30 16:24:38 2000
+--- printk.c	Sun Jul  2 05:20:00 2000
+***************
+*** 19,32 ****
+  #include <linux/smp_lock.h>
+  #include <linux/console.h>
+  #include <linux/init.h>
+  
+  #include <asm/uaccess.h>
+  
+  #define LOG_BUF_LEN	(16384)
+  #define LOG_BUF_MASK	(LOG_BUF_LEN-1)
+  
+- static char buf[1024];
+- 
+  /* printk's without a loglevel use this.. */
+  #define DEFAULT_MESSAGE_LOGLEVEL 4 /* KERN_WARNING */
+  
+--- 19,31 ----
+  #include <linux/smp_lock.h>
+  #include <linux/console.h>
+  #include <linux/init.h>
++ #include <linux/slab.h>
+  
+  #include <asm/uaccess.h>
+  
+  #define LOG_BUF_LEN	(16384)
+  #define LOG_BUF_MASK	(LOG_BUF_LEN-1)
+  
+  /* printk's without a loglevel use this.. */
+  #define DEFAULT_MESSAGE_LOGLEVEL 4 /* KERN_WARNING */
+  
+***************
+*** 253,271 ****
+  
+  asmlinkage int printk(const char *fmt, ...)
+  {
+  	va_list args;
+  	int i;
+  	char *msg, *p, *buf_end;
+  	int line_feed;
+  	static signed char msg_level = -1;
+  	long flags;
+  
+  	va_start(args, fmt);
+  	i = vsprintf(buf + 3, fmt, args); /* hopefully i < sizeof(buf)-4 */
+  	buf_end = buf + 3 + i;
+  	va_end(args);
+! 	
+  	spin_lock_irqsave(&console_lock, flags);
+  	for (p = buf + 3; p < buf_end; p++) {
+  		msg = p;
+  		if (msg_level < 0) {
+--- 252,318 ----
+  
+  asmlinkage int printk(const char *fmt, ...)
+  {
++ 	static spinlock_t printk_buf_lock = SPIN_LOCK_UNLOCKED;
++ 	static struct task_struct *printk_buf_holder = 0;
++ 	static char printk_buf[1024];
++ 	static atomic_t lost_message = ATOMIC_INIT(0);
++ 
+  	va_list args;
+  	int i;
+  	char *msg, *p, *buf_end;
+  	int line_feed;
+  	static signed char msg_level = -1;
+  	long flags;
++ 	char *buf = printk_buf;
++ 
++ 	if (!spin_trylock(&printk_buf_lock)) {
++ 		/* Couldn't get spinlock... do we already have it? */
++ 		if (printk_buf_holder == current) {
++ 			/* We are already in printk... so we would be deadlocking
++ 			 * mark this as such and we'll print a message later...
++ 			 */
++ 			atomic_inc(&lost_message);
++ 			return 0;
++ 		} else {
++ 			/* Nope, wait for someone to release it... */
++ 			spin_lock(&printk_buf_lock);
++        	}
++ 	}
++ 
++ 	/* We are now the proud holders of the printk_buf_lock! :) */
++ 	printk_buf_holder = current;
++ 
++ 	if (atomic_read(&lost_message)) {
++ 		struct console *c = console_drivers;
++ 		int Count = atomic_read(&lost_message);
++ 		char dropped[] = 
++ 			"XX recursive printk's detected, message(s) lost\n";
++ 		/* Small window to lose message... not critical though */
++ 		atomic_set(&lost_message, 0);
++ 
++ 		if (Count < 100) {
++ 			if (Count > 9)
++ 				dropped[0] = (char)(Count / 10);
++ 			else
++ 				dropped[0] = ' ';
++ 
++ 			dropped[1] = Count % 10;
++ 		}
++ 
++ 		while(c) {
++ 			if ((c->flags & CON_ENABLED) && c->write)
++ 				c->write(c, dropped, 49);
++ 				c = c->next;
++ 		}
++ 	}
+  
+  	va_start(args, fmt);
+  	i = vsprintf(buf + 3, fmt, args); /* hopefully i < sizeof(buf)-4 */
+  	buf_end = buf + 3 + i;
+  	va_end(args);
+! 
+  	spin_lock_irqsave(&console_lock, flags);
++ 	
+  	for (p = buf + 3; p < buf_end; p++) {
+  		msg = p;
+  		if (msg_level < 0) {
+***************
+*** 308,315 ****
+--- 355,366 ----
+  		if (line_feed)
+  			msg_level = -1;
+  	}
++ 
+  	spin_unlock_irqrestore(&console_lock, flags);
+  	wake_up_interruptible(&log_wait);
++ 
++ 	spin_unlock(&printk_buf_lock);
++         
+  	return i;
+  }
+  

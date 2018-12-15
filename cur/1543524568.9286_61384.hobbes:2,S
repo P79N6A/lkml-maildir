@@ -1,0 +1,256 @@
+Date: Fri, 4 Feb 2000 04:06:28 +0100 (CET)
+From: Andrea Arcangeli <>
+Subject: 2.3.42 alpha updates
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/2/3/114
+
+I finished now to fixup the alpha port for 2.3.42 (the smp cpu map update
+part is from Jay Estabrook).
+I developed from scratch rw semaphores based on spinlocks. The overhead
+seems quite load by looking the code and they are at least quite obviously
+right ;). BTW, they are not architecture-dependent so other archs can cut
+and past if necessary.
+diff -urN ref/arch/alpha/kernel/alpha_ksyms.c alpha-compile/arch/alpha/kernel/alpha_ksyms.c
+--- ref/arch/alpha/kernel/alpha_ksyms.c	Fri Feb  4 04:04:42 2000
++++ alpha-compile/arch/alpha/kernel/alpha_ksyms.c	Thu Feb  3 22:20:21 2000
+@@ -164,7 +164,8 @@
+ EXPORT_SYMBOL(flush_tlb_range);
+ EXPORT_SYMBOL(smp_imb);
+ EXPORT_SYMBOL(cpu_data);
+-EXPORT_SYMBOL(cpu_number_map);
++EXPORT_SYMBOL(__cpu_number_map);
++EXPORT_SYMBOL(__cpu_logical_map);
+ EXPORT_SYMBOL(global_bh_lock);
+ EXPORT_SYMBOL(global_bh_count);
+ EXPORT_SYMBOL(synchronize_bh);
+diff -urN ref/arch/alpha/kernel/semaphore.c alpha-compile/arch/alpha/kernel/semaphore.c
+--- ref/arch/alpha/kernel/semaphore.c	Tue Sep 14 14:34:22 1999
++++ alpha-compile/arch/alpha/kernel/semaphore.c	Fri Feb  4 03:52:14 2000
+@@ -127,3 +127,39 @@
+ {
+ 	return waking_non_zero_trylock(sem);
+ }
++
++/* RW spinlock-based semaphores, 2000 Andrea Arcangeli <andrea@suse.de> */
++
++void down_read_failed(struct rw_semaphore * sem)
++{
++	struct task_struct *tsk = current;
++	DECLARE_WAITQUEUE(wait, tsk);
++
++	add_wait_queue_exclusive(&sem->wait, &wait);
++
++	do {
++		__set_task_state(tsk, TASK_UNINTERRUPTIBLE|TASK_EXCLUSIVE);
++		spin_unlock_irq(&sem->lock);
++		schedule();
++		spin_lock_irq(&sem->lock);
++	} while (sem->wr);
++
++	remove_wait_queue(&sem->wait, &wait);
++}
++
++void down_write_failed(struct rw_semaphore * sem)
++{
++	struct task_struct *tsk = current;
++	DECLARE_WAITQUEUE(wait, tsk);
++
++	add_wait_queue_exclusive(&sem->wait, &wait);
++
++	do {
++		__set_task_state(tsk, TASK_UNINTERRUPTIBLE|TASK_EXCLUSIVE);
++		spin_unlock_irq(&sem->lock);
++		schedule();
++		spin_lock_irq(&sem->lock);
++	} while (sem->rd || sem->wr);
++
++	remove_wait_queue(&sem->wait, &wait);
++}
+diff -urN ref/arch/alpha/kernel/smp.c alpha-compile/arch/alpha/kernel/smp.c
+--- ref/arch/alpha/kernel/smp.c	Fri Feb  4 04:04:42 2000
++++ alpha-compile/arch/alpha/kernel/smp.c	Thu Feb  3 22:20:21 2000
+@@ -71,7 +71,7 @@
+ int smp_threads_ready;		/* True once the per process idle is forked. */
+ cycles_t cacheflush_time;
+ 
+-int cpu_number_map[NR_CPUS];
++int __cpu_number_map[NR_CPUS];
+ int __cpu_logical_map[NR_CPUS];
+ 
+ extern void calibrate_delay(void);
+@@ -433,7 +433,7 @@
+ 
+ 	idle->processor = cpuid;
+ 	__cpu_logical_map[cpunum] = cpuid;
+-	cpu_number_map[cpuid] = cpunum;
++	__cpu_number_map[cpuid] = cpunum;
+ 	idle->has_cpu = 1; /* we schedule the first task manually */
+  
+ 	del_from_runqueue(idle);
+@@ -462,7 +462,7 @@
+ 
+ 	/* we must invalidate our stuff as we failed to boot the CPU */
+ 	__cpu_logical_map[cpunum] = -1;
+-	cpu_number_map[cpuid] = -1;
++	__cpu_number_map[cpuid] = -1;
+ 
+ 	/* the idle task is local to us so free it as we don't use it */
+ 	free_task_struct(idle);
+@@ -536,11 +536,11 @@
+ 	unsigned long bogosum;
+ 
+ 	/* Take care of some initial bookkeeping.  */
+-	memset(cpu_number_map, -1, sizeof(cpu_number_map));
++	memset(__cpu_number_map, -1, sizeof(__cpu_number_map));
+ 	memset(__cpu_logical_map, -1, sizeof(__cpu_logical_map));
+ 	memset(ipi_data, 0, sizeof(ipi_data));
+ 
+-	cpu_number_map[smp_boot_cpuid] = 0;
++	__cpu_number_map[smp_boot_cpuid] = 0;
+ 	__cpu_logical_map[0] = smp_boot_cpuid;
+ 	current->processor = smp_boot_cpuid;
+ 
+diff -urN ref/include/asm-alpha/semaphore.h alpha-compile/include/asm-alpha/semaphore.h
+--- ref/include/asm-alpha/semaphore.h	Thu Feb  3 22:21:25 2000
++++ alpha-compile/include/asm-alpha/semaphore.h	Fri Feb  4 04:00:34 2000
+@@ -6,6 +6,7 @@
+  *
+  * (C) Copyright 1996 Linus Torvalds
+  * (C) Copyright 1996 Richard Henderson
++ * (C) Copyright 2000 Andrea Arcangeli
+  */
+ 
+ #include <asm/current.h>
+@@ -265,5 +266,96 @@
+ 		: "m"(sem->count), "r"(pv)
+ 		: "$24", "$28", "memory");
+ }
++
++/* RW spinlock-based semaphores, 2000 Andrea Arcangeli <andrea@suse.de> */
++
++struct rw_semaphore
++{
++	spinlock_t lock;
++	int rd, wr;
++	wait_queue_head_t wait;
++#if WAITQUEUE_DEBUG
++	long __magic;
++#endif
++};
++
++#define __RWSEM_INITIALIZER(name, rd, wr)		\
++{							\
++	SPIN_LOCK_UNLOCKED,				\
++	(rd), (wr),					\
++	__WAIT_QUEUE_HEAD_INITIALIZER((name).wait)	\
++	__SEM_DEBUG_INIT(name)				\
++}
++
++#define __DECLARE_RWSEM_GENERIC(name, rd, wr) \
++	struct rw_semaphore name = __RWSEM_INITIALIZER(name, rd, wr)
++
++#define DECLARE_RWSEM(name) __DECLARE_RWSEM_GENERIC(name, 0, 0)
++#define DECLARE_RWSEM_READ_LOCKED(name) __DECLARE_RWSEM_GENERIC(name, 1, 0)
++#define DECLARE_RWSEM_WRITE_LOCKED(name) __DECLARE_RWSEM_GENERIC(name, 0, 1)
++
++extern inline void init_rwsem(struct rw_semaphore * sem)
++{
++	spin_lock_init(&sem->lock);
++	sem->rd = sem->wr = 0;
++	init_waitqueue_head(&sem->wait);
++#if WAITQUEUE_DEBUG
++	sem->__magic = (long)&sem->__magic;
++#endif
++}
++
++#ifndef CHECK_MAGIC
++#define CHECK_MAGIC(x)
++#endif
++
++extern void down_read_failed(struct rw_semaphore *);
++extern void down_write_failed(struct rw_semaphore *);
++
++extern inline void down_read(struct rw_semaphore * sem)
++{
++	CHECK_MAGIC(sem->__magic);
++
++	spin_lock_irq(&sem->lock);
++	if (sem->wr)
++		down_read_failed(sem);
++	sem->rd++;
++	spin_unlock_irq(&sem->lock);
++}
++
++extern inline void down_write(struct rw_semaphore * sem)
++{
++	CHECK_MAGIC(sem->__magic);
++
++	spin_lock(&sem->lock);
++	if (sem->rd || sem->wr)
++		down_write_failed(sem);
++	sem->wr = 1;
++	spin_unlock(&sem->lock);
++}
++
++#define up_read(sem)						\
++do {								\
++	unsigned long flags;					\
++								\
++	CHECK_MAGIC((sem)->__magic);				\
++								\
++	spin_lock_irqsave(&(sem)->lock, flags);			\
++	if (!--(sem)->rd && waitqueue_active(&(sem)->wait))	\
++		wake_up(&(sem)->wait);				\
++	spin_unlock_irqrestore(&(sem)->lock, flags);		\
++} while (0)
++
++#define up_write(sem)					\
++do {							\
++	unsigned long flags;				\
++							\
++	CHECK_MAGIC((sem)->__magic);			\
++							\
++	spin_lock_irqsave(&(sem)->lock, flags);		\
++	(sem)->wr = 0;					\
++	if (waitqueue_active(&(sem)->wait))		\
++		wake_up(&(sem)->wait);			\
++	spin_unlock_irqrestore(&(sem)->lock, flags);	\
++} while(0)
+ 
+ #endif
+diff -urN ref/include/asm-alpha/smp.h alpha-compile/include/asm-alpha/smp.h
+--- ref/include/asm-alpha/smp.h	Fri Feb  4 04:04:42 2000
++++ alpha-compile/include/asm-alpha/smp.h	Thu Feb  3 22:21:25 2000
+@@ -45,7 +45,8 @@
+ 
+ /* Map from cpu id to sequential logical cpu number.  This will only
+    not be idempotent when cpus failed to come on-line.  */
+-extern int cpu_number_map[NR_CPUS];
++extern int __cpu_number_map[NR_CPUS];
++#define cpu_number_map(cpu)  __cpu_number_map[cpu]
+ 
+ /* The reverse map from sequential logical cpu number to cpu id.  */
+ extern int __cpu_logical_map[NR_CPUS];
+diff -urN ref/include/asm-alpha/types.h alpha-compile/include/asm-alpha/types.h
+--- ref/include/asm-alpha/types.h	Mon Jan 18 02:27:22 1999
++++ alpha-compile/include/asm-alpha/types.h	Thu Feb  3 21:45:59 2000
+@@ -71,6 +71,10 @@
+ typedef unsigned long u64;
+ #define BITS_PER_LONG 64
+ 
++/* Dma addresses are 32-bits wide.  */
++
++typedef u32 dma_addr_t;
++
+ #endif
+ 
+ #endif /* __KERNEL__ */
+Andrea
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

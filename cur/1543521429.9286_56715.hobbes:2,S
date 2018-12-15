@@ -1,0 +1,158 @@
+Date: Sun, 09 Jan 2000 20:05:27 +0100
+From: Manfred Spraul <>
+Subject: [patch] smp_call_function() bugfix
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/1/9/94
+
+The patch below fixes smp_call_function() on i386:
+* panic() with a reboot-timeout doesn't lock-up anymore:
+the "smp_num_cpus" counter was not updated by smp_send_stop()
+* smp_call_function() now contains proper locking. The old code uses a
+semaphore for the locking, but flush_tlb_all() must not schedule() -->
+ugly loop in flush_tlb_all().
+The patch is tested on i386 SMP, but I have one more problem:
+The current code contains a lock-up detection [do not spin longer than
+one second], but no caller can handle a timeout: either they panic(), or
+they ignore the error.
+Any complains if I kill the lock-up detection?
+--
+	Manfred
+[I'll replace the spin_lock() with spin_lock_bh() before submitting the
+patch to Linus. IPI's from bottom half handlers seems safe.]// $Header$
+// Kernel Version:
+//  VERSION = 2
+//  PATCHLEVEL = 3
+//  SUBLEVEL = 38
+//  EXTRAVERSION =
+diff -r -u 2.3/arch/i386/kernel/smp.c build-2.3/arch/i386/kernel/smp.c
+--- 2.3/arch/i386/kernel/smp.c	Tue Dec 21 10:00:44 1999
++++ build-2.3/arch/i386/kernel/smp.c	Sun Jan  9 18:10:24 2000
+@@ -397,9 +397,7 @@
+ 
+ void flush_tlb_all(void)
+ {
+-	if (cpu_online_map ^ (1 << smp_processor_id()))
+-		while (smp_call_function (flush_tlb_all_ipi,0,0,1) == -EBUSY)
+-			mb();
++	smp_call_function (flush_tlb_all_ipi,0,1,1);
+ 
+ 	do_flush_tlb_all_local();
+ }
+@@ -438,32 +436,31 @@
+  * [SUMMARY] Run a function on all other CPUs.
+  * <func> The function to run. This must be fast and non-blocking.
+  * <info> An arbitrary pointer to pass to the function.
+- * <nonatomic> If true, we might schedule away to lock the mutex
++ * <nonatomic> currently unused.
+  * <wait> If true, wait (atomically) until function has completed on other CPUs.
+  * [RETURNS] 0 on success, else a negative status code. Does not return until
+  * remote CPUs are nearly ready to execute <<func>> or are or have executed.
++ *
++ * You must not call this function with disabled interrupts.
+  */
+ {
+ 	struct call_data_struct data;
+ 	int ret, cpus = smp_num_cpus-1;
+-	static DECLARE_MUTEX(lock);
++	static spinlock_t lock = SPIN_LOCK_UNLOCKED;
+ 	unsigned long timeout;
+ 
+-	if (nonatomic)
+-		down(&lock);
+-	else
+-		if (down_trylock(&lock))
+-			return -EBUSY;
++	if(cpus==0)
++		return 0;
+ 
+-	call_data = &data;
+ 	data.func = func;
+ 	data.info = info;
+ 	atomic_set(&data.started, 0);
+ 	data.wait = wait;
+ 	if (wait)
+ 		atomic_set(&data.finished, 0);
+-	mb();
+ 
++	spin_lock(&lock);
++	call_data = &data;
+ 	/* Send a message to all other CPUs and wait for them to respond */
+ 	send_IPI_allbutself(CALL_FUNCTION_VECTOR);
+ 
+@@ -473,15 +470,21 @@
+ 			&& time_before(jiffies, timeout))
+ 		barrier();
+ 	ret = -ETIMEDOUT;
+-	if (atomic_read(&data.started) != cpus)
++	if (atomic_read(&data.started) != cpus) {
++		/* FIXME: most caller will either panic() or ignore
++		 * if this function fails, perhaps we should just
++		 * BUG() ?
++		 */
++		printk(KERN_CRIT "smp_call_function(): lock-up detected, trying to continue.\n");
+ 		goto out;
++	}
+ 	ret = 0;
+ 	if (wait)
+ 		while (atomic_read(&data.finished) != cpus)
+ 			barrier();
+ out:
+ 	call_data = NULL;
+-	up(&lock);
++	spin_unlock(&lock);
+ 	return 0;
+ }
+ 
+@@ -489,6 +492,7 @@
+ {
+ 	/*
+ 	 * Remove this CPU:
++	 * FIXME: update smp_num_cpus.
+ 	 */
+ 	clear_bit(smp_processor_id(), &cpu_online_map);
+ 	__cli();
+@@ -506,9 +510,14 @@
+ {
+ 	unsigned long flags;
+ 
++	/* Deadlock country: we cannot send the ipi
++	 *	with disabled interrupts
++	 */
++        smp_call_function(stop_this_cpu, NULL, 1, 0);
++	smp_num_cpus = 1;
++
+ 	__save_flags(flags);
+ 	__cli();
+-        smp_call_function(stop_this_cpu, NULL, 1, 0);
+ 	disable_local_APIC();
+ 	__restore_flags(flags);
+ 
+@@ -834,21 +843,18 @@
+ 
+ void __init setup_APIC_clocks(void)
+ {
+-	unsigned long flags;
+-
+-	__save_flags(flags);
+ 	__cli();
+ 
+ 	calibration_result = calibrate_APIC_clock();
+-
+-	smp_call_function(setup_APIC_timer, (void *)calibration_result, 1, 1);
+-
+ 	/*
+ 	 * Now set up the timer for real.
+ 	 */
+ 	setup_APIC_timer((void *)calibration_result);
+ 
+-	__restore_flags(flags);
++	__sti();
++
++	/* and update all other cpus */
++	smp_call_function(setup_APIC_timer, (void *)calibration_result, 1, 1);
+ }
+ 
+ /*

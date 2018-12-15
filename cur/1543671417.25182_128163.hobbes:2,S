@@ -1,0 +1,174 @@
+Date: Sun, 27 Apr 2003 20:38:45 +0200 (MET DST)
+From: Bartlomiej Zolnierkiewicz <>
+Subject: [PATCH] 2.5.67-ac2 fix new PIO handlers
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2003/4/27/7
+
+Hi,
+During rewrite of bio walking patch to use rq->cbio instead
+of rq->hard_bio I've realized I had screwed orig 2.5.66 patches :\
+I somehow forgot to update task_map_rq(), it should use
+__bio_kmap_irq(rq->bio, current_idx, flags) instead of
+bio_kmap_irq(rq->bio, flags). The result is that you get
+bio corruption (-> data corruption) when using PIO multiple
+with sectors multiply > 8 (PAGE_SIZE == bio_vec size).
+Attached patch fixes it and fixes TASKFILE ioctl.
+Please apply to next -ac.
+--
+Bartlomiej
+# Fix PIO handlers (!).
+#
+# Detailed changelog:
+# - introduce proper task_(un)map_rq() - critical fix
+# - fix process_that_request_first() for rq->buffer (non-bio) based requests
+# - set rq->hard_nr_sectors and rq->hard_cur_sectors in ide_diag_taskfile()
+# - fix PIO handlers for rq->buffer based requests (TASKFILE ioctl)
+# - revert ->prehandler() handling for flagged taskfiles as they have their
+#   own PIO handlers
+#
+# Bartlomiej Zolnierkiewicz <bzolnier@elka.pw.edu.pl>
+diff -uNr linux-2.5.67-ac2/drivers/block/ll_rw_blk.c linux/drivers/block/ll_rw_blk.c
+--- linux-2.5.67-ac2/drivers/block/ll_rw_blk.c	Sun Apr 27 19:54:40 2003
++++ linux/drivers/block/ll_rw_blk.c	Sun Apr 27 19:54:58 2003
+@@ -2265,9 +2265,11 @@
+ 		nsect = min_t(unsigned int, req->current_nr_sectors,
+ 			      nr_sectors);
+ 		req->current_nr_sectors -= nsect;
+-		req->nr_bio_sectors -= nsect;
+ 		nr_sectors -= nsect;
+-		blk_rq_next_segment(req);
++		if (req->bio) {
++			req->nr_bio_sectors -= nsect;
++			blk_rq_next_segment(req);
++		}
+ 	}
+ 	return 1;
+ }
+diff -uNr linux-2.5.67-ac2/drivers/ide/ide-taskfile.c linux/drivers/ide/ide-taskfile.c
+--- linux-2.5.67-ac2/drivers/ide/ide-taskfile.c	Sun Apr 27 19:54:40 2003
++++ linux/drivers/ide/ide-taskfile.c	Sun Apr 27 19:58:41 2003
+@@ -59,9 +59,6 @@
+ #define DTF(x...)
+ #endif
+ 
+-#define task_map_rq(rq, flags)		ide_map_buffer((rq), (flags))
+-#define task_unmap_rq(rq, buf, flags)	ide_unmap_buffer((rq), (buf), (flags))
+-
+ static void ata_bswap_data (void *buffer, int wcount)
+ {
+ 	u16 *p = buffer;
+@@ -406,6 +403,11 @@
+ 	while (rq->hard_bio != rq->bio)
+ 		if (!DRIVER(drive)->end_request(drive, 1, bio_sectors(rq->hard_bio)))
+ 			return ide_stopped;
++	/* Complete rq->buffer based request (ioctls). */
++	if (!rq->bio && !rq->nr_sectors) {
++		ide_end_drive_cmd(drive, stat, HWIF(drive)->INB(IDE_ERROR_REG));
++		return ide_stopped;
++	}
+ 
+ 	rq->errors = 0;
+ 	task_sectors(drive, rq, 1, PIO_IN);
+@@ -452,6 +454,11 @@
+ 	while (rq->hard_bio != rq->bio)
+ 		if (!DRIVER(drive)->end_request(drive, 1, bio_sectors(rq->hard_bio)))
+ 			return ide_stopped;
++	/* Complete rq->buffer based request (ioctls). */
++	if (!rq->bio && !rq->nr_sectors) {
++		ide_end_drive_cmd(drive, stat, HWIF(drive)->INB(IDE_ERROR_REG));
++		return ide_stopped;
++	}
+ 
+ 	rq->errors = 0;
+ 	do {
+@@ -510,6 +517,11 @@
+ 	while (rq->hard_bio != rq->bio)
+ 		if (!DRIVER(drive)->end_request(drive, 1, bio_sectors(rq->hard_bio)))
+ 			return ide_stopped;
++	/* Complete rq->buffer based request (ioctls). */
++	if (!rq->bio && !rq->nr_sectors) {
++		ide_end_drive_cmd(drive, stat, HWIF(drive)->INB(IDE_ERROR_REG));
++		return ide_stopped;
++	}
+ 
+ 	/* Still data left to transfer. */
+ 	ide_set_handler(drive, &task_out_intr, WAIT_WORSTCASE, NULL);
+@@ -569,6 +581,11 @@
+ 	while (rq->hard_bio != rq->bio)
+ 		if (!DRIVER(drive)->end_request(drive, 1, bio_sectors(rq->hard_bio)))
+ 			return ide_stopped;
++	/* Complete rq->buffer based request (ioctls). */
++	if (!rq->bio && !rq->nr_sectors) {
++		ide_end_drive_cmd(drive, stat, HWIF(drive)->INB(IDE_ERROR_REG));
++		return ide_stopped;
++	}
+ 
+ 	/* Still data left to transfer. */
+ 	ide_set_handler(drive, &task_mulout_intr, WAIT_WORSTCASE, NULL);
+@@ -952,11 +969,12 @@
+ 	 */
+ 	if (args->command_type != IDE_DRIVE_TASK_NO_DATA) {
+ 		if (data_size == 0)
+-			rq.current_nr_sectors = rq.nr_sectors = (args->hobRegister[IDE_NSECTOR_OFFSET_HOB] << 8) | args->tfRegister[IDE_NSECTOR_OFFSET];
+-		/*	rq.hard_cur_sectors	*/
++			rq.nr_sectors = (args->hobRegister[IDE_NSECTOR_OFFSET_HOB] << 8) | args->tfRegister[IDE_NSECTOR_OFFSET];
+ 		else
+-			rq.current_nr_sectors = rq.nr_sectors = data_size / SECTOR_SIZE;
+-		/*	rq.hard_cur_sectors	*/
++			rq.nr_sectors = data_size / SECTOR_SIZE;
++
++		rq.hard_nr_sectors = rq.nr_sectors;
++		rq.hard_cur_sectors = rq.current_nr_sectors = rq.nr_sectors;
+ 	}
+ 
+ 	if (args->tf_out_flags.all == 0) {
+@@ -1549,14 +1567,10 @@
+  			if (task->handler == NULL)
+ 				return ide_stopped;
+ 
+-			if (task->prehandler != NULL) {
+-				hwif->OUTBSYNC(drive, taskfile->command, IDE_COMMAND_REG);
+-				ndelay(400);	/* FIXME */
+-				return task->prehandler(drive, HWGROUP(drive)->rq);
+-			}
+-
+ 			/* Issue the command */
+ 			ide_execute_command(drive, taskfile->command, task->handler, WAIT_WORSTCASE, NULL);
++			if (task->prehandler != NULL)
++				return task->prehandler(drive, HWGROUP(drive)->rq);
+ 	}
+ 
+ 	return ide_started;
+diff -uNr linux-2.5.67-ac2/include/linux/ide.h linux/include/linux/ide.h
+--- linux-2.5.67-ac2/include/linux/ide.h	Sun Apr 27 19:54:40 2003
++++ linux/include/linux/ide.h	Sun Apr 27 20:00:28 2003
+@@ -832,6 +832,26 @@
+ 	ide_startstop_t (*ide_dma_queued_start)(ide_drive_t *drive);
+ } ide_dma_ops_t;
+ 
++static inline void *task_map_rq(struct request *rq, unsigned long *flags)
++{
++	/*
++	 * fs request
++	 */
++	if (rq->bio)
++		return rq_map_buffer(rq, flags);
++
++	/*
++	 * task request
++	 */
++	return rq->buffer + blk_rq_offset(rq);
++}
++
++static inline void task_unmap_rq(struct request *rq, char *buffer, unsigned long *flags)
++{
++	if (rq->bio)
++		rq_unmap_buffer(buffer, flags);
++}
++
+ /*
+  * mapping stuff, prepare for highmem...
+  * 

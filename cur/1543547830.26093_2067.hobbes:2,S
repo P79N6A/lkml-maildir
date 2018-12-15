@@ -1,0 +1,1344 @@
+Date: Wed, 06 Sep 2000 00:29:52 -0700
+From: George Anzinger <>
+Subject: [patch]2.4.0-test6 "spinlock" preemption patch
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/2000/9/6/4
+
+This patch, for 2.4.0-test6, allows the kernel to be built with full
+preemption.  The patch relies on the spinlock mechanism to protect areas
+of code that should not be preempted.  The patch, by way of a small
+change to schedule(), allows preemption during times when current->state
+is not TASK_RUN. The measured context switch latencies with this patch
+have been as high as 12 ms, however, we are actively working to
+isolate and fix the areas of the system where this occurs.  Currently
+the patch works only for ix86 UP systems.  We are also
+actively working to expand the platform base for this work and to allow
+SMP systems to take advantage of the same improvements.  
+The times a kernel is not preemptable under this patch are:
+While handling interrupts.
+While doing "bottom half" processing.
+While holding a spinlock, writelock or readlock.
+At all other times the algorithm allows preemption.
+The file preempt.txt (available at
+ftp.mvista.com/pub/Real-Time/2.4.0-test6)
+discusses the patch in more detail.  This patch as well as a
+Real Time scheduler patch are also available at that site.
+George
+MontaVista Softwarediff -urP -X patch.exclude linux-2.4.0-test6-org/Documentation/Configure.help linux/Documentation/Configure.help
+--- linux-2.4.0-test6-org/Documentation/Configure.help	Wed Aug  9 13:49:28 2000
++++ linux/Documentation/Configure.help	Mon Sep  4 14:51:58 2000
+@@ -130,6 +130,15 @@
+   If you have system with several CPU's, you do not need to say Y
+   here: APIC will be used automatically.
+ 
++Preemptable Kernel
++CONFIG_PREEMPT
++  This option changes the kernel to be "usually" preemptable.  Currently
++  this option is incompatable with SMP.  The expected result of a 
++  preemptable kernel is much lower latency (or time) between a scheduling 
++  event (I/O completion interrupt, timer expiration, lock release) and the
++  actual rescheduling of the task waiting on the event.  The cost is a 
++  small overhead in maintaining the required locks and data structures.
++
+ Kernel math emulation
+ CONFIG_MATH_EMULATION
+   Linux can emulate a math coprocessor (used for floating point
+diff -urP -X patch.exclude linux-2.4.0-test6-org/arch/i386/config.in linux/arch/i386/config.in
+--- linux-2.4.0-test6-org/arch/i386/config.in	Mon Jul 31 19:36:10 2000
++++ linux/arch/i386/config.in	Mon Sep  4 14:51:58 2000
+@@ -148,6 +148,7 @@
+        define_bool CONFIG_X86_IO_APIC y
+        define_bool CONFIG_X86_LOCAL_APIC y
+     fi
++    bool 'Preemptable Kernel' CONFIG_PREEMPT
+ fi
+ if [ "$CONFIG_SMP" = "y" -a "$CONFIG_X86_CMPXCHG" = "y" ]; then
+     define_bool CONFIG_HAVE_DEC_LOCK y
+diff -urP -X patch.exclude linux-2.4.0-test6-org/arch/i386/kernel/entry.S linux/arch/i386/kernel/entry.S
+--- linux-2.4.0-test6-org/arch/i386/kernel/entry.S	Sun Aug  6 22:21:23 2000
++++ linux/arch/i386/kernel/entry.S	Mon Sep  4 14:51:58 2000
+@@ -47,6 +47,12 @@
+ #define ASSEMBLY
+ #include <asm/smp.h>
+ 
++#ifdef CONFIG_PREEMPT
++#define scheduleY preempt_schedule
++#else
++#define scheduleY schedule
++#endif
++
+ EBX		= 0x00
+ ECX		= 0x04
+ EDX		= 0x08
+@@ -72,7 +78,7 @@
+  * these are offsets into the task-struct.
+  */
+ state		=  0
+-flags		=  4
++preempt_count	=  4
+ sigpending	=  8
+ addr_limit	= 12
+ exec_domain	= 16
+@@ -80,8 +86,31 @@
+ tsk_ptrace	= 24
+ processor	= 52
+ 
++        /* These are offsets into the irq_stat structure
++         * There is one per cpu and it is aligned to 32
++         * byte boundry (we put that here as a shift count)
++         */
++irq_array_shift                 = 5
++
++irq_stat_softirq_active         = 0
++irq_stat_softirq_mask           = 4        
++irq_stat_local_irq_count        = 8
++irq_stat_local_bh_count         = 12
++
+ ENOSYS = 38
+ 
++#ifdef CONFIG_SMP
++#define GET_CPU_INDX	movl processor(%ebx),%eax;  \
++                        shll $irq_array_shift,%eax
++#define GET_CURRENT_CPU_INDX GET_CURRENT(%ebx); \
++                             GET_CPU_INDX
++#define CPU_INDX (,%eax)
++#else
++#define GET_CPU_INDX
++#define GET_CURRENT_CPU_INDX GET_CURRENT(%ebx)
++#define CPU_INDX
++#endif
++
+ 
+ #define SAVE_ALL \
+ 	cld; \
+@@ -202,35 +231,45 @@
+ 	jne tracesys
+ 	call *SYMBOL_NAME(sys_call_table)(,%eax,4)
+ 	movl %eax,EAX(%esp)		# save the return value
++
+ ENTRY(ret_from_sys_call)
+-#ifdef CONFIG_SMP
+-	movl processor(%ebx),%eax
+-	shll $5,%eax
+-	movl SYMBOL_NAME(irq_stat)(,%eax),%ecx		# softirq_active
+-	testl SYMBOL_NAME(irq_stat)+4(,%eax),%ecx	# softirq_mask
+-#else
+-	movl SYMBOL_NAME(irq_stat),%ecx		# softirq_active
+-	testl SYMBOL_NAME(irq_stat)+4,%ecx	# softirq_mask
++        GET_CPU_INDX
++#ifdef CONFIG_PREEMPT
++        cli
+ #endif
+-	jne   handle_softirq
+-	
+-ret_with_reschedule:
++	movl SYMBOL_NAME(irq_stat)+irq_stat_softirq_active CPU_INDX,%ecx
++	testl SYMBOL_NAME(irq_stat)+irq_stat_softirq_mask CPU_INDX,%ecx
++	jne   handle_softirq_user
++        
++softirq_user_rtn:       	
+ 	cmpl $0,need_resched(%ebx)
+-	jne reschedule
++	jne reschedule_user
++
++sched_locked:        
+ 	cmpl $0,sigpending(%ebx)
+ 	jne signal_return
++
+ restore_all:
+ 	RESTORE_ALL
+ 
+ 	ALIGN
+ signal_return:
+-	sti				# we can get here from an interrupt handler
++        testb $3,CS(%esp)       # No signals for rtns to system code
++        je  restore_all
++        
++	sti			# we can get here from an interrupt handler??
++
+ 	testl $(VM_MASK),EFLAGS(%esp)
+ 	movl %esp,%eax
+ 	jne v86_signal_return
++        
+ 	xorl %edx,%edx
+ 	call SYMBOL_NAME(do_signal)
+-	jmp restore_all
++	jmp ret_from_sys_call           # I think this should check for sched.
++#	jmp restore_all                 # but this line did not
++                                        # Nice, but no cigar.  In kernel mode 
++                                        # it does not clear the flag.  But we
++                                        # now don't call in kernel mode!
+ 
+ 	ALIGN
+ v86_signal_return:
+@@ -238,7 +277,8 @@
+ 	movl %eax,%esp
+ 	xorl %edx,%edx
+ 	call SYMBOL_NAME(do_signal)
+-	jmp restore_all
++	jmp ret_from_sys_call           # same as above
++#	jmp restore_all
+ 
+ 	ALIGN
+ tracesys:
+@@ -247,6 +287,7 @@
+ 	movl ORIG_EAX(%esp),%eax
+ 	cmpl $(NR_syscalls),%eax
+ 	jae tracesys_exit
++
+ 	call *SYMBOL_NAME(sys_call_table)(,%eax,4)
+ 	movl %eax,EAX(%esp)		# save the return value
+ tracesys_exit:
+@@ -257,36 +298,75 @@
+ 	jmp ret_from_sys_call
+ 
+ 	ALIGN
++handle_softirq_user:
++        sti
++        call SYMBOL_NAME(do_softirq)
++        jmp softirq_user_rtn
++
++	ALIGN
++reschedule_user:
++#ifdef CONFIG_PREEMPT
++        cmpl $0,preempt_count(%ebx)
++        jnz  sched_locked
++
++	incl preempt_count(%ebx)
++        sti
++#endif
++	call SYMBOL_NAME(scheduleY)
++
++	ALIGN
++ENTRY(ret_from_intr)
+ ret_from_exception:
+-#ifdef CONFIG_SMP
+-	GET_CURRENT(%ebx)
+-	movl processor(%ebx),%eax
+-	shll $5,%eax
+-	movl SYMBOL_NAME(irq_stat)(,%eax),%ecx		# softirq_active
+-	testl SYMBOL_NAME(irq_stat)+4(,%eax),%ecx	# softirq_mask
++        cli
++	GET_CURRENT_CPU_INDX
++#ifdef CONFIG_PREEMPT
++	decl preempt_count(%ebx)
++#endif
++        movl EFLAGS(%esp),%ecx		# mix EFLAGS and CS
++	movb CS(%esp),%cl
++	testl $(VM_MASK | 3),%ecx       # return to VM86 mode or 
++	jne ret_from_sys_call           # non-supervisor?
++        
++	movl SYMBOL_NAME(irq_stat)+irq_stat_softirq_active CPU_INDX,%ecx
++	testl SYMBOL_NAME(irq_stat)+irq_stat_softirq_mask CPU_INDX,%ecx
++        jz  preempt_test
++
++        movl SYMBOL_NAME(irq_stat)+irq_stat_local_bh_count CPU_INDX,%ecx
++        addl SYMBOL_NAME(irq_stat)+irq_stat_local_irq_count CPU_INDX,%ecx
++        jz handle_softirq_int
++        
++preempt_test:  
++#ifdef CONFIG_PREEMPT
++                                  # eax= cpu index=cpu*32 ,= ebx current
++        cmpl $0,preempt_count(%ebx)
++#ifdef CONFIG_DEBUG_PREEMPT
++        jns no_underflow
++
++        call SYMBOL_NAME(lock_count_underflow)
++no_underflow:
++#endif
++        jnz  restore_all
++        
++        cmpl $0,need_resched(%ebx)
++        jz   restore_all
++        
++	incl preempt_count(%ebx)
++        sti
++	call SYMBOL_NAME(scheduleY)    # test
++	jmp ret_from_intr
+ #else
+-	movl SYMBOL_NAME(irq_stat),%ecx		# softirq_active
+-	testl SYMBOL_NAME(irq_stat)+4,%ecx	# softirq_mask
++        jmp restore_all
+ #endif
+-	jne   handle_softirq
+ 
+-ENTRY(ret_from_intr)
+-	GET_CURRENT(%ebx)
+-	movl EFLAGS(%esp),%eax		# mix EFLAGS and CS
+-	movb CS(%esp),%al
+-	testl $(VM_MASK | 3),%eax	# return to VM86 mode or non-supervisor?
+-	jne ret_with_reschedule
+-	jmp restore_all
+ 
+ 	ALIGN
+-handle_softirq:
+-	call SYMBOL_NAME(do_softirq)
+-	jmp ret_from_intr
++handle_softirq_int:
++        sti
++        call SYMBOL_NAME(do_softirq)
++        cli
++	GET_CURRENT_CPU_INDX
++        jmp preempt_test
+ 	
+-	ALIGN
+-reschedule:
+-	call SYMBOL_NAME(schedule)    # test
+-	jmp ret_from_sys_call
+ 
+ ENTRY(divide_error)
+ 	pushl $0		# no error code
+@@ -314,6 +394,9 @@
+ 	movl %edx,%ds
+ 	movl %edx,%es
+ 	GET_CURRENT(%ebx)
++#ifdef CONFIG_PREEMPT
++        incl preempt_count(%ebx)
++#endif
+ 	call *%ecx
+ 	addl $8,%esp
+ 	jmp ret_from_exception
+@@ -333,6 +416,9 @@
+ 	SAVE_ALL
+ 	GET_CURRENT(%ebx)
+ 	pushl $ret_from_exception
++#ifdef CONFIG_PREEMPT
++        incl preempt_count(%ebx)
++#endif
+ 	movl %cr0,%eax
+ 	testl $0x4,%eax			# EM (math emulation bit)
+ 	je SYMBOL_NAME(math_state_restore)
+diff -urP -X patch.exclude linux-2.4.0-test6-org/include/asm-i386/atomic.h linux/include/asm-i386/atomic.h
+--- linux-2.4.0-test6-org/include/asm-i386/atomic.h	Wed Aug  9 18:57:54 2000
++++ linux/include/asm-i386/atomic.h	Mon Sep  4 15:23:42 2000
+@@ -8,7 +8,7 @@
+  * resource counting etc..
+  */
+ 
+-#ifdef CONFIG_SMP
++#if defined(CONFIG_SMP) || defined(CONFIG_PREEMPT)
+ #define LOCK "lock ; "
+ #else
+ #define LOCK ""
+@@ -21,7 +21,7 @@
+  */
+ #define __atomic_fool_gcc(x) (*(volatile struct { int a[100]; } *)x)
+ 
+-#ifdef CONFIG_SMP
++#if defined(CONFIG_SMP) || defined(CONFIG_PREEMPT)
+ typedef struct { volatile int counter; } atomic_t;
+ #else
+ typedef struct { int counter; } atomic_t;
+diff -urP -X patch.exclude linux-2.4.0-test6-org/include/asm-i386/bitops.h linux/include/asm-i386/bitops.h
+--- linux-2.4.0-test6-org/include/asm-i386/bitops.h	Wed Aug  9 18:57:54 2000
++++ linux/include/asm-i386/bitops.h	Mon Sep  4 15:23:42 2000
+@@ -15,7 +15,7 @@
+  * bit 0 is the LSB of addr; bit 32 is the LSB of (addr+1).
+  */
+ 
+-#ifdef CONFIG_SMP
++#if defined(CONFIG_SMP) || defined(CONFIG_PREEMPT)
+ #define LOCK_PREFIX "lock ; "
+ #else
+ #define LOCK_PREFIX ""
+diff -urP -X patch.exclude linux-2.4.0-test6-org/include/asm-i386/hw_irq.h linux/include/asm-i386/hw_irq.h
+--- linux-2.4.0-test6-org/include/asm-i386/hw_irq.h	Wed Aug  9 18:57:54 2000
++++ linux/include/asm-i386/hw_irq.h	Mon Sep  4 15:23:43 2000
+@@ -92,6 +92,15 @@
+ #define __STR(x) #x
+ #define STR(x) __STR(x)
+ 
++#ifdef CONFIG_PREEMPT
++#define BUMP_CONTEX_SWITCH_LOCK \
++                ); ++current->preempt_count.counter; \
++        __asm__( "\n\t"
++
++#else
++#define  BUMP_CONTEX_SWITCH_LOCK
++#endif 
++
+ #define SAVE_ALL \
+ 	"cld\n\t" \
+ 	"pushl %es\n\t" \
+@@ -105,7 +114,8 @@
+ 	"pushl %ebx\n\t" \
+ 	"movl $" STR(__KERNEL_DS) ",%edx\n\t" \
+ 	"movl %edx,%ds\n\t" \
+-	"movl %edx,%es\n\t"
++	"movl %edx,%es\n\t" \
++         BUMP_CONTEX_SWITCH_LOCK
+ 
+ #define IRQ_NAME2(nr) nr##_interrupt(void)
+ #define IRQ_NAME(nr) IRQ_NAME2(IRQ##nr)
+@@ -124,6 +134,7 @@
+ #define XBUILD_SMP_INTERRUPT(x,v)\
+ asmlinkage void x(void); \
+ asmlinkage void call_##x(void); \
++void dummy_call_##x(void){    \
+ __asm__( \
+ "\n"__ALIGN_STR"\n" \
+ SYMBOL_NAME_STR(x) ":\n\t" \
+@@ -131,12 +142,14 @@
+ 	SAVE_ALL \
+ 	SYMBOL_NAME_STR(call_##x)":\n\t" \
+ 	"call "SYMBOL_NAME_STR(smp_##x)"\n\t" \
+-	"jmp ret_from_intr\n");
++	"jmp ret_from_intr\n");   \
++        }
+ 
+ #define BUILD_SMP_TIMER_INTERRUPT(x,v) XBUILD_SMP_TIMER_INTERRUPT(x,v)
+ #define XBUILD_SMP_TIMER_INTERRUPT(x,v) \
+ asmlinkage void x(struct pt_regs * regs); \
+ asmlinkage void call_##x(void); \
++void dummy_call_##x(void){   \
+ __asm__( \
+ "\n"__ALIGN_STR"\n" \
+ SYMBOL_NAME_STR(x) ":\n\t" \
+@@ -147,17 +160,20 @@
+ 	SYMBOL_NAME_STR(call_##x)":\n\t" \
+ 	"call "SYMBOL_NAME_STR(smp_##x)"\n\t" \
+ 	"addl $4,%esp\n\t" \
+-	"jmp ret_from_intr\n");
++	"jmp ret_from_intr\n"); \
++}
+ 
+ #define BUILD_COMMON_IRQ() \
+ asmlinkage void call_do_IRQ(void); \
++void dummy_call_do_IRQ(void){      \
+ __asm__( \
+ 	"\n" __ALIGN_STR"\n" \
+ 	"common_interrupt:\n\t" \
+ 	SAVE_ALL \
+ 	"pushl $ret_from_intr\n\t" \
+ 	SYMBOL_NAME_STR(call_do_IRQ)":\n\t" \
+-	"jmp "SYMBOL_NAME_STR(do_IRQ));
++	"jmp "SYMBOL_NAME_STR(do_IRQ));  \
++}
+ 
+ /* 
+  * subtle. orig_eax is used by the signal code to distinct between
+diff -urP -X patch.exclude linux-2.4.0-test6-org/include/asm-i386/softirq.h linux/include/asm-i386/softirq.h
+--- linux-2.4.0-test6-org/include/asm-i386/softirq.h	Wed Aug  9 18:57:54 2000
++++ linux/include/asm-i386/softirq.h	Mon Sep  4 15:23:43 2000
+@@ -4,8 +4,8 @@
+ #include <asm/atomic.h>
+ #include <asm/hardirq.h>
+ 
+-#define cpu_bh_disable(cpu)	do { local_bh_count(cpu)++; barrier(); } while (0)
+-#define cpu_bh_enable(cpu)	do { barrier(); local_bh_count(cpu)--; } while (0)
++#define cpu_bh_disable(cpu)	do { ctx_sw_off(); local_bh_count(cpu)++; barrier(); } while (0)
++#define cpu_bh_enable(cpu)	do { barrier(); local_bh_count(cpu)--;ctx_sw_on(); } while (0)
+ 
+ #define local_bh_disable()	cpu_bh_disable(smp_processor_id())
+ #define local_bh_enable()	cpu_bh_enable(smp_processor_id())
+diff -urP -X patch.exclude linux-2.4.0-test6-org/include/asm-i386/spinlock.h linux/include/asm-i386/spinlock.h
+--- linux-2.4.0-test6-org/include/asm-i386/spinlock.h	Wed Aug  9 18:57:54 2000
++++ linux/include/asm-i386/spinlock.h	Mon Sep  4 15:23:43 2000
+@@ -5,6 +5,9 @@
+ #include <asm/rwlock.h>
+ #include <asm/page.h>
+ 
++#ifndef CONFIG_PREEMPT  /* For the preemptable kernel all 
++                              we want is the includes */
++
+ extern int printk(const char * fmt, ...)
+ 	__attribute__ ((format (printf, 1, 2)));
+ 
+@@ -172,5 +175,5 @@
+ 	atomic_add(RW_LOCK_BIAS, count);
+ 	return 0;
+ }
+-
++#endif /* CONFIG_PREEMPT */
+ #endif /* __ASM_SPINLOCK_H */
+diff -urP -X patch.exclude linux-2.4.0-test6-org/include/linux/brlock.h linux/include/linux/brlock.h
+--- linux-2.4.0-test6-org/include/linux/brlock.h	Wed Aug  9 18:57:55 2000
++++ linux/include/linux/brlock.h	Mon Sep  4 15:40:35 2000
+@@ -157,12 +157,19 @@
+ 	__br_write_unlock(idx);
+ }
+ 
++#else 	/* CONFIG_SMP */
++#ifdef CONFIG_PREEMPT
++# define br_read_lock(idx)	({ (void)(idx); ctx_sw_off(); })
++# define br_read_unlock(idx)	({ (void)(idx); ctx_sw_on(); })
++# define br_write_lock(idx)	({ (void)(idx); ctx_sw_off(); })
++# define br_write_unlock(idx)	({ (void)(idx); ctx_sw_on(); })
+ #else
+ # define br_read_lock(idx)	((void)(idx))
+ # define br_read_unlock(idx)	((void)(idx))
+ # define br_write_lock(idx)	((void)(idx))
+ # define br_write_unlock(idx)	((void)(idx))
+ #endif
++#endif	/* CONFIG_SMP */
+ 
+ /*
+  * Now enumerate all of the possible sw/hw IRQ protected
+diff -urP -X patch.exclude linux-2.4.0-test6-org/include/linux/interrupt.h linux/include/linux/interrupt.h
+--- linux-2.4.0-test6-org/include/linux/interrupt.h	Wed Aug  9 18:57:55 2000
++++ linux/include/linux/interrupt.h	Mon Sep  4 15:23:43 2000
+@@ -143,15 +143,31 @@
+ 
+ extern struct tasklet_head tasklet_vec[NR_CPUS];
+ extern struct tasklet_head tasklet_hi_vec[NR_CPUS];
+-
++#ifdef DEBUG_PREEMPT
++#define tst_cl_set(t) if (!test_bit(TASKLET_STATE_RUN, &(t)->state)){set_bit(TASKLET_STATE_RUN, &(t)->state);}else {PANIC("tasklet: already locked");}
++#define tst_set_cl(t) if (test_bit(TASKLET_STATE_RUN, &(t)->state)){clear_bit(TASKLET_STATE_RUN, &(t)->state);}else {PANIC("tasklet: already clear");}
++#else
++#define tst_cl_set(t)
++#define tst_set_cl(t)
++#endif
+ #ifdef CONFIG_SMP
+ #define tasklet_trylock(t) (!test_and_set_bit(TASKLET_STATE_RUN, &(t)->state))
+ #define tasklet_unlock_wait(t) while (test_bit(TASKLET_STATE_RUN, &(t)->state)) { /* NOTHING */ }
+ #define tasklet_unlock(t) clear_bit(TASKLET_STATE_RUN, &(t)->state)
+-#else
++#else  /* CONFIG_SMP */
++#ifdef CONFIG_PREEMPT
++/* It is not clear that we need this.  I think tasklets are always called from
++ * do_softirq which means that they are always run under local_bh_disable()
++ * which we also lock down.  We should verify this, but for now...
++ */
++#define tasklet_trylock(t) ({ctx_sw_off(); tst_cl_set(t);1;})
++#define tasklet_unlock_wait(t) do { } while (0)
++#define tasklet_unlock(t) do {tst_set_cl(t); ctx_sw_on();} while (0)
++#else  /* CONFIG_PREEMPT */
+ #define tasklet_trylock(t) 1
+ #define tasklet_unlock_wait(t) do { } while (0)
+ #define tasklet_unlock(t) do { } while (0)
++#endif
+ #endif
+ 
+ static inline void tasklet_schedule(struct tasklet_struct *t)
+diff -urP -X patch.exclude linux-2.4.0-test6-org/include/linux/sched.h linux/include/linux/sched.h
+--- linux-2.4.0-test6-org/include/linux/sched.h	Wed Aug  9 18:57:55 2000
++++ linux/include/linux/sched.h	Mon Sep  4 15:23:43 2000
+@@ -83,6 +83,7 @@
+ #define TASK_ZOMBIE		4
+ #define TASK_STOPPED		8
+ #define TASK_EXCLUSIVE		32
++#define TASK_PREEMPTING         64
+ 
+ #define __set_task_state(tsk, state_value)		\
+ 	do { (tsk)->state = (state_value); } while (0)
+@@ -267,7 +268,17 @@
+ 	 * offsets of these are hardcoded elsewhere - touch with care
+ 	 */
+ 	volatile long state;	/* -1 unrunnable, 0 runnable, >0 stopped */
++#ifdef CONFIG_PREEMPT
++        /*
++         * We want the preempt_count in this cache line, but we
++         * a) don't want to mess up the offsets in asm code and
++         * b) the alignment of the next line below so
++         * we move "flags" down
++         */
++	atomic_t preempt_count;          /* 0=> preemptable, < 0 => BUG */
++#else
+ 	unsigned long flags;	/* per process flags, defined below */
++#endif
+ 	int sigpending;
+ 	mm_segment_t addr_limit;	/* thread address space:
+ 					 	0-0xBFFFFFFF for user-thead
+@@ -295,9 +306,11 @@
+ 	 * that's just fine.)
+ 	 */
+ 	struct list_head run_list;
+-
+ 	struct task_struct *next_task, *prev_task;
+ 	struct mm_struct *active_mm;
++#ifdef CONFIG_PREEMPT
++	unsigned long flags;	/* per process flags, defined below */
++#endif
+ 
+ /* task state */
+ 	struct linux_binfmt *binfmt;
+diff -urP -X patch.exclude linux-2.4.0-test6-org/include/linux/smp.h linux/include/linux/smp.h
+--- linux-2.4.0-test6-org/include/linux/smp.h	Wed Aug  9 18:57:54 2000
++++ linux/include/linux/smp.h	Mon Sep  4 15:23:43 2000
+@@ -80,7 +80,9 @@
+ #define smp_processor_id()			0
+ #define hard_smp_processor_id()			0
+ #define smp_threads_ready			1
++#ifndef CONFIG_PREEMPT
+ #define kernel_lock()
++#endif
+ #define cpu_logical_map(cpu)			0
+ #define cpu_number_map(cpu)			0
+ #define smp_call_function(func,info,retry,wait)	({ 0; })
+diff -urP -X patch.exclude linux-2.4.0-test6-org/include/linux/smp_lock.h linux/include/linux/smp_lock.h
+--- linux-2.4.0-test6-org/include/linux/smp_lock.h	Wed Aug  9 18:57:55 2000
++++ linux/include/linux/smp_lock.h	Mon Sep  4 15:23:43 2000
+@@ -3,7 +3,20 @@
+ 
+ #include <linux/config.h>
+ 
+-#ifndef CONFIG_SMP
++#ifndef PANIC
++#define PANIC(x) do { panic("%s at %s:%d\n", x, __FILE__, __LINE__);} while (0)
++#endif
++#define PANIC2(x,y) do { panic(#x" at %s:%d\n", y, __FILE__, __LINE__);} while (0)
++#define ASSERT(x,y) do {if (!(x) )PANIC(y);} while (0)
++#ifdef CONFIG_SMP
++
++#include <asm/smplock.h>
++
++#else 	/* !CONFIG_SMP */
++
++#include <linux/spinlock.h>
++
++#if (DEBUG_SPINLOCKS < 3)
+ 
+ #define lock_kernel()				do { } while(0)
+ #define unlock_kernel()				do { } while(0)
+@@ -11,9 +24,52 @@
+ #define reacquire_kernel_lock(task)		do { } while(0)
+ #define kernel_locked() 1
+ 
++#else /* DEUBG_SPINLOCKS >= 3) */
++/* We protect the test on lock_depth and back it out if already locked
++ * Use switch_lock_count() to avoid the attendant tests sense we know
++ * it is already locked
++ */
++#ifdef DEBUG_PREEMPT
++#define PANICX(a,b) PANIC2(a,b)
+ #else
++#define PANICX(a,b)
++#endif
++#define lock_kernel() \
++do { \
++        ctx_sw_off(); \
++        if (++current->lock_depth) { \
++                --in_ctx_sw_off(); \
++        } \
++} while (0)
++#define unlock_kernel() \
++do { \
++        if (--current->lock_depth < 0) { \
++                ctx_sw_on(); \
++        } \
++        if (current->lock_depth < -1) { \
++                PANICX("===== lock_depth goes under -1: %d\n", current->lock_depth); \
++        } \
++} while (0)
++/* since release_kernel_lock() is used only in schedule() where we have
++ * a context switch lock already, use the short form here to avoid the
++ * redundant test for preeemption now code.
++ */
+ 
+-#include <asm/smplock.h>
++#define release_kernel_lock(task, cpu) \
++do { \
++        if (task->lock_depth >= 0) { \
++                --in_ctx_sw_off(); \
++        } \
++} while (0)
++#define reacquire_kernel_lock(task) \
++do { \
++        if (task->lock_depth >= 0) { \
++                ctx_sw_off(); \
++        } \
++} while (0)
++#define kernel_locked() 1
++
++#endif /* DEBUG_SPINLOCKS < 3 */
+ 
+ #endif /* CONFIG_SMP */
+ 
+diff -urP -X patch.exclude linux-2.4.0-test6-org/include/linux/spinlock.h linux/include/linux/spinlock.h
+--- linux-2.4.0-test6-org/include/linux/spinlock.h	Wed Aug  9 18:57:54 2000
++++ linux/include/linux/spinlock.h	Mon Sep  4 15:23:43 2000
+@@ -2,7 +2,9 @@
+ #define __LINUX_SPINLOCK_H
+ 
+ #include <linux/config.h>
+-
++#ifdef CONFIG_DEBUG_PREEMPT
++#define DEBUG_PREEMPT
++#endif
+ /*
+  * These are the generic versions of the spinlocks and read-write
+  * locks..
+@@ -31,12 +33,87 @@
+ #define write_unlock_irq(lock)			do { write_unlock(lock); local_irq_enable();       } while (0)
+ #define write_unlock_bh(lock)			do { write_unlock(lock); local_bh_enable();        } while (0)
+ 
++#ifndef DEBUG_PREEMPT
++#if (__GNUC__ > 2)
++  typedef struct { } rwlock_t;
++  #define RW_LOCK_UNLOCKED (rwlock_t) { }
++#else
++  typedef struct { int gcc_is_buggy; } rwlock_t;
++  #define RW_LOCK_UNLOCKED (rwlock_t) { 0 }
++#endif
++#endif
++/*
++ * Here are the basic preemption lock macros.
++ */
++#ifdef CONFIG_PREEMPT
++#include <asm/current.h>
++/* some forward declaration*/
++#include <asm/atomic.h>
++#include <asm/system.h>
++
++extern void preempt_schedule(void);
++/*
++ * This little type def allows the spinlock macros to be used before
++ * a full definition of task_struct is available.  If you can find a 
++ * way to fix the header files so this is not required, _PLEASE_ let
++ * me know (george@mvista.com).
++ */
++typedef struct {
++        int fill[1];
++        atomic_t preempt_count;
++        int fill2[3];
++        volatile long need_resched;
++} *pree;
++#define offsetofs(t,m) ((int)&((struct t *)0)->m)
++#define offsetofptr(t,m) ((int)&((t )0)->m)
++#define PREEMPT_TESTX(y) (offsetofs(task_struct,y) - offsetofptr(pree,y))
++#define PREEMPT_TEST1 PREEMPT_TESTX(preempt_count)
++#define PREEMPT_TEST2 PREEMPT_TESTX(need_resched)
++#define TEST_PREEMPT_HACK \
++  extern       int aSTRUCT_pree_IN_spinlock_h_MUST_MATCH_task_struct[PREEMPT_TEST1]; \
++  extern       int bSTRUCT_pree_IN_spinlock_h_MUST_MATCH_task_struct[-PREEMPT_TEST1]; \
++  extern       int cSTRUCT_pree_IN_spinlock_h_MUST_MATCH_task_struct[PREEMPT_TEST2]; \
++  extern       int dSTRUCT_pree_IN_spinlock_h_MUST_MATCH_task_struct[-PREEMPT_TEST2]; 
++#define switch_lock_count() ((pree)current)->preempt_count
++
++#define in_ctx_sw_off() (switch_lock_count().counter)
++#define atomic_ptr_in_ctx_sw_off() (&switch_lock_count())
++#define ctx_sw_off()  do { \
++                         atomic_inc( atomic_ptr_in_ctx_sw_off());  \
++                      } while (0)
++#define ctx_sw_on_no_preempt() \
++       do { \
++           atomic_dec(atomic_ptr_in_ctx_sw_off()); \
++        } while (0)
++#define ctx_sw_on() \
++       do { \
++           if (((in_ctx_sw_off()) == 1) && ((pree)current)->need_resched) \
++               preempt_schedule();   \
++           atomic_dec(atomic_ptr_in_ctx_sw_off()); \
++        } while (0)
++#define ctx_sw_off_region(a) do {ctx_sw_off(); a ctx_sw_on();} while (0)
++#else  /* CONFIG_PREEMPT */
++#define in_ctx_sw_off() do { } while (0)
++#define ctx_sw_off()    do { } while (0)
++#define ctx_sw_on_no_preempt()
++#define ctx_sw_on()     do { } while (0)
++#define ctx_sw_off_region(a) do { a } while (0)
++#endif  /* CONFIG_PREEMPT */
++
+ #ifdef CONFIG_SMP
+ #include <asm/spinlock.h>
+ 
+ #else /* !SMP */
+ 
+-#define DEBUG_SPINLOCKS	0	/* 0 == no debugging, 1 == maintain lock state, 2 == full debug */
++#ifdef CONFIG_PREEMPT
++/* 0 == no debugging, 1 == maintain lock state, 2 == full debug 
++ * 3 == preemptable kernel
++ */
++#define DEBUG_SPINLOCKS	3
++#else
++#define DEBUG_SPINLOCKS	0
++#endif
++
+ 
+ #if (DEBUG_SPINLOCKS < 1)
+ 
+@@ -77,7 +154,7 @@
+ #define spin_unlock_wait(x)	do { } while (0)
+ #define spin_unlock(x)		do { (x)->lock = 0; } while (0)
+ 
+-#else /* (DEBUG_SPINLOCKS >= 2) */
++#elif (DEBUG_SPINLOCKS < 3)
+ 
+ typedef struct {
+ 	volatile unsigned int lock;
+@@ -92,9 +169,152 @@
+ #define spin_is_locked(lock)	(test_bit(0,(lock)))
+ #define spin_trylock(lock)	(!test_and_set_bit(0,(lock)))
+ 
+-#define spin_lock(x)		do {unsigned long __spinflags; save_flags(__spinflags); cli(); if ((x)->lock&&(x)->babble) {printk("%s:%d: spin_lock(%s:%p) already locked\n", __BASE_FILE__,__LINE__, (x)->module, (x));(x)->babble--;} (x)->lock = 1; restore_flags(__spinflags);} while (0)
+-#define spin_unlock_wait(x)	do {unsigned long __spinflags; save_flags(__spinflags); cli(); if ((x)->lock&&(x)->babble) {printk("%s:%d: spin_unlock_wait(%s:%p) deadlock\n", __BASE_FILE__,__LINE__, (x)->module, (x));(x)->babble--;} restore_flags(__spinflags);} while (0)
+-#define spin_unlock(x)		do {unsigned long __spinflags; save_flags(__spinflags); cli(); if (!(x)->lock&&(x)->babble) {printk("%s:%d: spin_unlock(%s:%p) not locked\n", __BASE_FILE__,__LINE__, (x)->module, (x));(x)->babble--;} (x)->lock = 0; restore_flags(__spinflags);} while (0)
++#define spin_lock(x)		\
++         do {                    \
++             unsigned long __spinflags; \
++             save_flags(__spinflags);    \
++             cli();                       \
++             if ((x)->lock&&(x)->babble) {  \
++                 printk("%s:%d: spin_lock(%s:%p) already locked\n", \
++                         __BASE_FILE__,__LINE__,                     \
++                         (x)->module,                                 \
++                         (x));                                        \
++                (x)->babble--;                                         \
++             }                                                         \
++             (x)->lock = 1;                                            \
++             restore_flags(__spinflags);                                \
++         } while (0)
++#define spin_unlock_wait(x)	\
++      do {                   \
++            unsigned long __spinflags; \
++            save_flags(__spinflags); \
++            cli();  \
++            if ((x)->lock&&(x)->babble) { \
++                printk("%s:%d: spin_unlock_wait(%s:%p) deadlock\n", \
++                      __BASE_FILE__,__LINE__,  \
++                      (x)->module,  \
++                      (x)); \
++                (x)->babble--; \
++            }  \
++            restore_flags(__spinflags); \
++         } while (0)
++#define spin_unlock(x)		 \
++        do { \
++            unsigned long __spinflags; \
++            save_flags(__spinflags);  \
++            cli();  \
++            if (!(x)->lock&&(x)->babble) { \
++                 printk("%s:%d: spin_unlock(%s:%p) not locked\n", \
++                        __BASE_FILE__,__LINE__,  \
++                        (x)->module,  \
++                        (x)); \
++                 (x)->babble--; \
++            }  \
++            (x)->lock = 0;  \
++            restore_flags(__spinflags); \
++        } while (0)
++
++#else /* (DEBUG_SPINLOCKS >= 3) */
++#ifdef DEBUG_PREEMPT
++int myaddress(void);
++/* Wanted to get this from a header, but... 
++ * CAUTION this is a ix86 breakpoint!
++ */
++#define SPIN_BREAKPOINT asm("   int $3");
++#define debug_spin_lock(x)                                              \
++          do {unsigned long __spinflags;                                \
++              save_flags(__spinflags); cli();                           \
++              if ((x)->lock&&(x)->babble) {                             \
++                     printk("%s:%d: spin_lock(%s:%p) already locked\n", \
++                             __BASE_FILE__,__LINE__, (x)->module, (x));  \
++                     (x)->babble--;                                      \
++                     SPIN_BREAKPOINT;                                     \
++              }                                                            \
++              (x)->lock = myaddress();                                     \
++              (x)->who = current;                                          \
++              restore_flags(__spinflags);                                  \
++          } while (0)
++#define  debug_spin_unlock_wait(x)                                  \
++            do {unsigned long __spinflags;                           \
++                save_flags(__spinflags);                               \
++                cli();                                                 \
++                if ((x)->lock&&(x)->babble) {                           \
++                     printk("%s:%d: spin_unlock_wait(%s:%p) deadlock\n", \
++                            __BASE_FILE__,__LINE__, (x)->module, (x));   \
++                     (x)->babble--;                                       \
++                     SPIN_BREAKPOINT;                                          \
++                 }                                                        \
++                restore_flags(__spinflags);                               \
++            } while (0)
++#define  debug_spin_unlock(x)                                          \
++            do {unsigned long __spinflags;                              \
++                  save_flags(__spinflags);                               \
++                  cli();                                                 \
++                  if (!(x)->lock&&(x)->babble) {                         \
++                         printk("%s:%d: spin_unlock(%s:%p) not locked\n",\
++                              __BASE_FILE__,__LINE__, (x)->module, (x)); \
++                        (x)->babble--;                                   \
++                        SPIN_BREAKPOINT;                                      \
++                  }                                                      \
++                  (x)->lock = 0;                                         \
++                  restore_flags(__spinflags);                            \
++             } while (0)
++#define PREE_TEST(x)                                                        \
++          do{int save=in_ctx_sw_off();                                      \
++                x                                                           \
++                if (save != in_ctx_sw_off()){                                \
++                    PANICN(("Lost it: in=%d; out=%d\n",save,in_ctx_sw_off()));\
++                }                                                             \
++          }while (0)
++#define DEBUG_PRE_INIT(x) (x)->lock = 0;
++typedef struct {
++	volatile unsigned int lock;
++	volatile struct task_struct *who;
++	volatile unsigned int babble;
++	const char *module;
++} spinlock_t;
++#define SPIN_LOCK_UNLOCKED (spinlock_t) { 0, (struct task_struct *)0, 25, __BASE_FILE__ }
++  typedef struct {	
++          volatile unsigned int lock;
++          volatile struct task_struct *who;
++          volatile unsigned int babble;
++          const char *module;
++  } rwlock_t;
++  #define RW_LOCK_UNLOCKED (rwlock_t) {0, (struct task_struct *)0,25, __BASE_FILE__ }
++#else /* not debugging spinlocks preemption */
++#define debug_spin_lock(lock) (void)(lock)
++#define  debug_spin_unlock_wait(x)
++#define  debug_spin_unlock(x)
++#define PREE_TEST(x)  do{ x  }while (0)
++#define DEBUG_PRE_INIT(x) 
++#if (__GNUC__ > 2)
++  typedef struct { } spinlock_t;
++  #define SPIN_LOCK_UNLOCKED (spinlock_t) { }
++#else
++  typedef struct { int gcc_is_buggy; } spinlock_t;
++  #define SPIN_LOCK_UNLOCKED (spinlock_t) { 0 }
++#endif
++#endif
++/* some support marcros */
++#define PANIC_F_L printk("At: %s:%d\n", __FILE__, __LINE__)
++
++#ifndef PANIC
++#define PANIC(x) do { PANIC_F_L;panic( x );} while (0)
++#define PANICN(x) do { PANIC_F_L;panic x ;} while (0)
++
++#endif
++#define DEC_LOCK_COUNT() do {ctx_sw_on(); } while (0)
++#define INC_LOCK_COUNT() do {ctx_sw_off(); } while(0)
++
++#define spin_lock_init(lock)	do {DEBUG_PRE_INIT(lock) } while(0)
++#define spin_lock(lock)		do {ctx_sw_off();  debug_spin_lock(lock);} while(0)
++#define spin_is_locked(lock)	(0)	/* assuming caller does not hold it */
++#define spin_trylock(lock)	({ctx_sw_off(); debug_spin_lock(lock);1; })
++#define spin_unlock_wait(lock)	do { debug_spin_unlock_wait(lock);} while(0) /* assume caller doesn't hold it*/
++#define spin_unlock(lock) \
++        do { \
++                debug_spin_unlock(lock); ctx_sw_on();\
++        } while (0)
+ 
+ #endif	/* DEBUG_SPINLOCKS */
+ 
+@@ -110,19 +330,22 @@
+  *
+  * Most gcc versions have a nasty bug with empty initializers.
+  */
+-#if (__GNUC__ > 2)
+-  typedef struct { } rwlock_t;
+-  #define RW_LOCK_UNLOCKED (rwlock_t) { }
+-#else
+-  typedef struct { int gcc_is_buggy; } rwlock_t;
+-  #define RW_LOCK_UNLOCKED (rwlock_t) { 0 }
+-#endif
++#if (DEBUG_SPINLOCKS < 3)
+ 
+-#define rwlock_init(lock)	do { } while(0)
+ #define read_lock(lock)		(void)(lock) /* Not "unused variable". */
+ #define read_unlock(lock)	do { } while(0)
+ #define write_lock(lock)	(void)(lock) /* Not "unused variable". */
+ #define write_unlock(lock)	do { } while(0)
++#else	/* DEBUG_SPINLOCKS >= 3 */
++
++#define read_lock(lock)         ({ctx_sw_off(); (void)(lock);})
++#define read_unlock(lock)       ctx_sw_on()
++#define write_lock(lock)        ({ctx_sw_off(); (void)(lock);})
++#define write_unlock(lock)      ctx_sw_on()
++
++#endif	/* DEBUG_SPINLOCKS < 3 */
++
++#define rwlock_init(lock)	do { } while(0)
+ 
+ #endif /* !SMP */
+ 
+diff -urP -X patch.exclude linux-2.4.0-test6-org/init/main.c linux/init/main.c
+--- linux-2.4.0-test6-org/init/main.c	Sun Aug  6 11:43:16 2000
++++ linux/init/main.c	Mon Sep  4 14:51:58 2000
+@@ -500,7 +500,9 @@
+ /*
+  *	Activate the first processor.
+  */
+- 
++#ifdef CONFIG_PREEMPT
++        TEST_PREEMPT_HACK
++#endif 
+ asmlinkage void __init start_kernel(void)
+ {
+ 	char * command_line;
+@@ -510,6 +512,9 @@
+  * Interrupts are still disabled. Do necessary setups, then
+  * enable them
+  */
++#ifdef CONFIG_PREEMPT
++        printk("Preemption is on!\n");
++#endif
+ 	lock_kernel();
+ 	printk(linux_banner);
+ 	setup_arch(&command_line);
+diff -urP -X patch.exclude linux-2.4.0-test6-org/kernel/fork.c linux/kernel/fork.c
+--- linux-2.4.0-test6-org/kernel/fork.c	Wed Aug  9 11:42:56 2000
++++ linux/kernel/fork.c	Mon Sep  4 14:51:58 2000
+@@ -574,6 +574,12 @@
+ 	if (p->binfmt && p->binfmt->module)
+ 		__MOD_INC_USE_COUNT(p->binfmt->module);
+ 
++#ifdef CONFIG_PREEMPT
++        /* Since we are keeping the context switch off state as part
++         * of the context, make sure we start with it off.
++         */
++	p->preempt_count.counter = 1;
++#endif
+ 	p->did_exec = 0;
+ 	p->swappable = 0;
+ 	p->state = TASK_UNINTERRUPTIBLE;
+diff -urP -X patch.exclude linux-2.4.0-test6-org/kernel/panic.c linux/kernel/panic.c
+--- linux-2.4.0-test6-org/kernel/panic.c	Tue Jun 20 14:32:27 2000
++++ linux/kernel/panic.c	Mon Sep  4 14:51:58 2000
+@@ -42,6 +42,12 @@
+  *
+  *	This function never returns.
+  */
++#ifdef CONFIG_PREEMPT
++#ifdef CONFIG_KGDB
++extern int printk_unlocked(const char *fmt, ...);
++#define printk printk_unlocked
++#endif
++#endif
+  
+ NORET_TYPE void panic(const char * fmt, ...)
+ {
+diff -urP -X patch.exclude linux-2.4.0-test6-org/kernel/printk.c linux/kernel/printk.c
+--- linux-2.4.0-test6-org/kernel/printk.c	Wed Jul  5 11:00:21 2000
++++ linux/kernel/printk.c	Mon Sep  4 14:51:58 2000
+@@ -312,6 +312,64 @@
+ 	return i;
+ }
+ 
++#if defined(CONFIG_KGDB) && defined(CONFIG_PREEMPT)
++asmlinkage int printk_unlocked(const char *fmt, ...)
++{
++	va_list args;
++	int i;
++	char *msg, *p, *buf_end;
++	int line_feed;
++	static signed char msg_level = -1;
++
++	va_start(args, fmt);
++	i = vsprintf(buf + 3, fmt, args); /* hopefully i < sizeof(buf)-4 */
++	buf_end = buf + 3 + i;
++	va_end(args);
++	for (p = buf + 3; p < buf_end; p++) {
++		msg = p;
++		if (msg_level < 0) {
++			if (
++				p[0] != '<' ||
++				p[1] < '0' || 
++				p[1] > '7' ||
++				p[2] != '>'
++			) {
++				p -= 3;
++				p[0] = '<';
++				p[1] = default_message_loglevel + '0';
++				p[2] = '>';
++			} else
++				msg += 3;
++			msg_level = p[1] - '0';
++		}
++		line_feed = 0;
++		for (; p < buf_end; p++) {
++			log_buf[(log_start+log_size) & LOG_BUF_MASK] = *p;
++			if (log_size < LOG_BUF_LEN)
++				log_size++;
++			else
++				log_start++;
++
++			logged_chars++;
++			if (*p == '\n') {
++				line_feed = 1;
++				break;
++			}
++		}
++		if (msg_level < console_loglevel && console_drivers) {
++			struct console *c = console_drivers;
++			while(c) {
++				if ((c->flags & CON_ENABLED) && c->write)
++					c->write(c, msg, p - msg + line_feed);
++				c = c->next;
++			}
++		}
++		if (line_feed)
++			msg_level = -1;
++	}
++	return i;
++}
++#endif
+ void console_print(const char *s)
+ {
+ 	struct console *c;
+diff -urP -X patch.exclude linux-2.4.0-test6-org/kernel/sched.c linux/kernel/sched.c
+--- linux-2.4.0-test6-org/kernel/sched.c	Fri Aug  4 16:15:37 2000
++++ linux/kernel/sched.c	Tue Sep  5 17:43:24 2000
+@@ -4,12 +4,14 @@
+  *  Kernel scheduler and related syscalls
+  *
+  *  Copyright (C) 1991, 1992  Linus Torvalds
++ *  Preemption code  Copyright (C) 2000 MontaVista Software Inc.
+  *
+  *  1996-12-23  Modified by Dave Grothe to fix bugs in semaphores and
+  *              make semaphores SMP safe
+  *  1998-11-19	Implemented schedule_timeout() and related stuff
+  *		by Andrea Arcangeli
+  *  1998-12-28  Implemented better SMP scheduling by Ingo Molnar
++ *  2000-9-5    Preemption changes by George Anzinger george@mvista.com
+  */
+ 
+ /*
+@@ -29,6 +31,12 @@
+ #include <asm/uaccess.h>
+ #include <asm/mmu_context.h>
+ 
++#ifdef CONFIG_PREEMPT
++#ifdef DEBUG_PREEMPT
++int in_scheduler=0;
++#endif
++#endif
++
+ extern void timer_bh(void);
+ extern void tqueue_bh(void);
+ extern void immediate_bh(void);
+@@ -456,7 +464,11 @@
+ {
+ 	current->need_resched |= prev->need_resched;
+ #ifdef CONFIG_SMP
++#ifdef CONFIG_PREEMPT
++        if ((task_on_runqueue(p) &&
++#else
+ 	if ((prev->state == TASK_RUNNING) &&
++#endif
+ 			(prev != idle_task(smp_processor_id()))) {
+ 		unsigned long flags;
+ 
+@@ -472,6 +484,14 @@
+ 
+ void schedule_tail(struct task_struct *prev)
+ {
++#ifdef CONFIG_PREEMPT
++#ifdef DEBUG_PREEMPT
++	ASSERT(in_scheduler,
++		"in_scheduler == 0 in schedule_tail");
++	in_scheduler = 0; 
++#endif
++	ctx_sw_on();
++#endif
+ 	__schedule_tail(prev);
+ }
+ 
+@@ -492,6 +512,18 @@
+ 	struct list_head *tmp;
+ 	int this_cpu, c;
+ 
++#ifdef CONFIG_PREEMPT
++	ctx_sw_off(); 
++#ifdef DEBUG_PREEMPT
++        if ( in_scheduler || in_ctx_sw_off()<1){
++                printk("Recursive sched call, count=%d\n",in_ctx_sw_off());
++                printk("Called from 0x%x\n",(int)__builtin_return_address(0));
++        }
++	ASSERT(!in_scheduler++,
++		"in_scheduler == 1 in schedule()");
++#endif
++#endif
++
+ 	if (!current->active_mm) BUG();
+ 	if (tq_scheduler)
+ 		goto handle_tq_scheduler;
+@@ -526,10 +558,17 @@
+ 	switch (prev->state & ~TASK_EXCLUSIVE) {
+ 		case TASK_INTERRUPTIBLE:
+ 			if (signal_pending(prev)) {
++#ifdef CONFIG_PREEMPT
++                case TASK_PREEMPTING:
++#endif
+ 				prev->state = TASK_RUNNING;
+ 				break;
+ 			}
+ 		default:
++#ifdef CONFIG_PREEMPT
++                        if (prev->state & TASK_PREEMPTING )
++                                break;
++#endif
+ 			del_from_runqueue(prev);
+ 		case TASK_RUNNING:
+ 	}
+@@ -545,7 +584,11 @@
+ 	 */
+ 	next = idle_task(this_cpu);
+ 	c = -1000;
++#ifdef CONFIG_PREEMPT
++        if (task_on_runqueue(prev))
++#else
+ 	if (prev->state == TASK_RUNNING)
++#endif
+ 		goto still_running;
+ 
+ still_running_back:
+@@ -630,6 +673,15 @@
+ 		}
+ 	}
+ 
++#ifdef CONFIG_PREEMPT
++#ifdef DEBUG_PREEMPT
++        if (in_ctx_sw_off() < 1) {
++		current->comm[15] = 0;
++                PANIC2("inside schedule() : switch_off_count = %d, \n", 
++                       in_ctx_sw_off());
++        }
++#endif
++#endif
+ 	/*
+ 	 * This just switches the register state and the
+ 	 * stack.
+@@ -639,6 +691,14 @@
+ 
+ same_process:
+ 	reacquire_kernel_lock(current);
++#ifdef CONFIG_PREEMPT
++#ifdef DEBUG_PREEMPT
++	ASSERT(in_scheduler,
++		"in_scheduler == 0 in schedule_tail");
++	in_scheduler = 0; 
++#endif
++	ctx_sw_on_no_preempt(); 
++#endif
+ 	return;
+ 
+ recalculate:
+@@ -1018,9 +1078,9 @@
+ 	spin_lock_irq(&runqueue_lock);
+ 	if (current->policy == SCHED_OTHER)
+ 		current->policy |= SCHED_YIELD;
+-	current->need_resched = 1;
+ 	move_last_runqueue(current);
+ 	spin_unlock_irq(&runqueue_lock);
++        schedule();
+ 	return 0;
+ }
+ 
+@@ -1242,3 +1302,72 @@
+ 	atomic_inc(&init_mm.mm_count);
+ 	enter_lazy_tlb(&init_mm, current, cpu);
+ }
++#ifdef CONFIG_PREEMPT
++asmlinkage void preempt_schedule(void)
++{
++        current->state |= TASK_PREEMPTING;
++        schedule();
++        current->state &= ~TASK_PREEMPTING;
++}
++#ifdef DEBUG_PREEMPT
++#include <asm/kgdb.h>
++void lock_count_underflow(struct pt_regs regs)
++{
++        int saveit=in_ctx_sw_off();
++        int  ret=(int)__builtin_return_address(0);
++
++        in_ctx_sw_off()=1;
++        BREAKPOINT;
++        panic("lock_count_undeflow at 0x0%x, %d\n",ret,saveit );
++        return;
++}
++#include <asm/kgdb.h>
++int cs_on_flagY=1;
++int cs_on_flagX=1;
++asmlinkage void scheduleY(struct pt_regs regs)
++{
++        if ( in_ctx_sw_off() != 1){
++                BREAKPOINT;
++        }
++        if( !current->active_mm) {
++                printk("Switch error, !active_mm, from 0x%x\n",
++                       (int)__builtin_return_address(0));
++                BREAKPOINT;
++                current->need_resched = 0;
++                return;
++        }
++        if ( (regs.xcs & 3) == 3){  /* if not returning to kernel */
++                preempt_schedule();
++                return;
++        }
++        if ( !cs_on_flagY ){         /* This is the preemption call */
++                current->need_resched = 0;
++                return;
++        }
++        preempt_schedule();
++        return;
++}
++asmlinkage void scheduleX()  /* called from contex sw unlock */
++{
++        if ( in_ctx_sw_off() != 1){
++                BREAKPOINT;
++        }
++        if( !current->active_mm) {
++                printk("Switch error, !active_mm, from 0x%x\n",
++                       (int)__builtin_return_address(0));
++                BREAKPOINT;
++                goto return1;
++        }
++        if ( !cs_on_flagX ){         /* This is the preemption call */
++                goto return1;
++        }
++        preempt_schedule();
++ return1:
++        return;
++}
++int myaddress()
++{
++        return (int)__builtin_return_address(0);
++}
++#endif
++#endif
+diff -urP -X patch.exclude linux-2.4.0-test6-org/kernel/softirq.c linux/kernel/softirq.c
+--- linux-2.4.0-test6-org/kernel/softirq.c	Sun Aug  6 12:42:21 2000
++++ linux/kernel/softirq.c	Mon Sep  4 14:51:58 2000
+@@ -139,6 +139,10 @@
+ 			if (atomic_read(&t->count) == 0) {
+ 				clear_bit(TASKLET_STATE_SCHED, &t->state);
+ 
++#ifdef CONFIG_PREEMPT
++				ASSERT(in_interrupt() || in_ctx_sw_off(), 
++					" === wrong in tasklet_action\n");
++#endif
+ 				t->func(t->data);
+ 				tasklet_unlock(t);
+ 				continue;
+@@ -176,6 +180,10 @@
+ 			if (atomic_read(&t->count) == 0) {
+ 				clear_bit(TASKLET_STATE_SCHED, &t->state);
+ 
++#ifdef CONFIG_PREEMPT
++				ASSERT(in_interrupt() || in_ctx_sw_off(), 
++					" === wrong in tasklet_hi_action\n");
++#endif
+ 				t->func(t->data);
+ 				tasklet_unlock(t);
+ 				continue;
+diff -urP -X patch.exclude linux-2.4.0-test6-org/kernel/user.c linux/kernel/user.c
+--- linux-2.4.0-test6-org/kernel/user.c	Mon Aug  7 13:30:15 2000
++++ linux/kernel/user.c	Mon Sep  4 14:51:58 2000
+@@ -75,7 +75,7 @@
+  * the common case (not freeing anything) without having
+  * any locking.
+  */
+-#ifdef CONFIG_SMP
++#if defined(CONFIG_SMP) || defined(CONFIG_PREEMPT)
+   #define uid_hash_free(up)	(!atomic_read(&(up)->__count))
+ #else
+   #define uid_hash_free(up)	(1)
+diff -urP -X patch.exclude linux-2.4.0-test6-org/net/socket.c linux/net/socket.c
+--- linux-2.4.0-test6-org/net/socket.c	Wed Aug  9 13:51:09 2000
++++ linux/net/socket.c	Mon Sep  4 14:51:58 2000
+@@ -131,7 +131,7 @@
+ 
+ static struct net_proto_family *net_families[NPROTO];
+ 
+-#ifdef CONFIG_SMP
++#if defined(CONFIG_SMP) || defined(CONFIG_PREEMPT)
+ static atomic_t net_family_lockct = ATOMIC_INIT(0);
+ static spinlock_t net_family_lock = SPIN_LOCK_UNLOCKED;
+ 

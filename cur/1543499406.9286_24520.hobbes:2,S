@@ -1,0 +1,557 @@
+Date: Thu, 17 Jun 1999 17:12:19 -0400 (EDT)
+From: Chuck Lever <>
+Subject: dynamic hash table allocation
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/6/17/145
+
+based on my study of kernel hash table behavior, i've created a patch that
+dynamically allocates four of the main kernel hash tables: page, inode,
+dcache, and buffer.  table size scales with the physical memory size of
+the machine.  larger table sizes can improve overall system performance by
+up to 20%.  this patch is against 2.3.6, and has been tested on machines
+as small as 4M, and as large as 512M.
+i've included a simple shift-add replacement for the current buffer hash
+function.  the buffer hash logic is now like the other hashes; there
+seemed to be no good reason for it to be different.
+i'm interested in comments and suggestions for improvement.
+diff -ruN linux-2.3.6-ref/fs/buffer.c linux/fs/buffer.c
+--- linux-2.3.6-ref/fs/buffer.c	Wed Jun 16 20:15:15 1999
++++ linux/fs/buffer.c	Thu Jun 17 15:42:34 1999
+@@ -56,9 +56,9 @@
+ 					     number of unused buffer heads */
+ 
+ /*
+- * Hash table mask..
++ * Buffer cache hash metadata
+  */
+-static unsigned long bh_hash_mask = 0;
++static unsigned int bh_hash_size, bh_hash_mask, bh_hash_bits;
+ 
+ static int grow_buffers(int size);
+ 
+@@ -419,7 +419,8 @@
+ 	}
+ }
+ 
+-#define _hashfn(dev,block) (((unsigned)(HASHDEV(dev)^block)) & bh_hash_mask)
++#define _hashfn(dev,block) \
++		(((block) + ((block) >> bh_hash_bits)) & bh_hash_mask)
+ #define hash(dev,block) hash_table[_hashfn(dev,block)]
+ 
+ static inline void remove_from_hash_queue(struct buffer_head * bh)
+@@ -1496,43 +1497,57 @@
+ /* ===================== Init ======================= */
+ 
+ /*
+- * allocate the hash table and init the free list
++ * Allocate the hash table and init the free list
+  * Use gfp() for the hash table to decrease TLB misses, use
+  * SLAB cache for buffer heads.
+  */
+-void __init buffer_init(unsigned long memory_size)
++void __init buffer_init(void)
+ {
+-	int order;
+-	unsigned int nr_hash;
++	int order, size;
+ 
+-	/* we need to guess at the right sort of size for a buffer cache.
+-	   the heuristic from working with large databases and getting
+-	   fsync times (ext2) manageable, is the following */
+-
+-	memory_size >>= 20;
+-	for (order = 5; (1UL << order) < memory_size; order++);
+-
+-	/* try to allocate something until we get it or we're asking
+-           for something that is really too small */
++	/*
++	 *  Guess at a reasonable hash table size
++	 *
++	 *  The magic shift value "11" controls the
++	 *  break back points.
++	 */
++	size = num_physpages >> 11;
++	for (order = 0; size && (order < 6); order++)
++		size >>= 1;
+ 
++	/*
++	 *  Try to allocate our hash table; break back to a
++	 *  smaller table if we can't get the size we want
++	 */
+ 	do {
+-		nr_hash = (1UL << order) * PAGE_SIZE /
+-		    sizeof(struct buffer_head *);
+ 		hash_table = (struct buffer_head **)
+ 		    __get_free_pages(GFP_ATOMIC, order);
+-	} while (hash_table == NULL && --order > 4);
+-	
++	} while (hash_table == NULL && --order);
+ 	if (!hash_table)
+-		panic("Failed to allocate buffer hash table\n");
+-	memset(hash_table, 0, nr_hash * sizeof(struct buffer_head *));
+-	bh_hash_mask = nr_hash-1;
++		panic("buffer_init: failed to allocate buffer hash table\n");
++
++	/*
++	 *  Now set up our hash function parameters
++	 */
++	bh_hash_size = (1UL << (order + PAGE_SHIFT)) /
++					sizeof(struct buffer_head *);
++	bh_hash_mask = bh_hash_size - 1;
++	bh_hash_bits = 0;
++	for (order = bh_hash_size; order > 1; order >>= 1)
++		bh_hash_bits++;
++
++	/*
++	 *  And init the hash table buckets
++	 */
++	memset(hash_table, (int) NULL,
++			bh_hash_size * sizeof(struct buffer_head *));
+ 
+ 	bh_cachep = kmem_cache_create("buffer_head",
+ 				      sizeof(struct buffer_head),
+ 				      0,
+ 				      SLAB_HWCACHE_ALIGN, NULL, NULL);
+ 	if(!bh_cachep)
+-		panic("Cannot create buffer head SLAB cache\n");
++		panic("buffer_init: cannot create buffer head SLAB cache\n");
+ 	/*
+ 	 * Allocate the reserved buffer heads.
+ 	 */
+diff -ruN linux-2.3.6-ref/fs/dcache.c linux/fs/dcache.c
+--- linux-2.3.6-ref/fs/dcache.c	Wed Jun 16 20:15:15 1999
++++ linux/fs/dcache.c	Thu Jun 17 15:42:12 1999
+@@ -34,25 +34,18 @@
+ kmem_cache_t *dentry_cache; 
+ 
+ /*
+- * This is the single most critical data structure when it comes
+- * to the dcache: the hashtable for lookups. Somebody should try
+- * to make this good - I've just made it work.
+- *
+- * This hash-function tries to avoid losing too many bits of hash
+- * information, yet avoid using a prime hash-size or similar.
+- */
+-#define D_HASHBITS     10
+-#define D_HASHSIZE     (1UL << D_HASHBITS)
+-#define D_HASHMASK     (D_HASHSIZE-1)
++ * Dentry hash metadata
++ */
++static unsigned int d_hashbits, d_hashsize, d_hashmask;
++static struct list_head *dentry_hashtable = NULL;
+ 
+-static struct list_head dentry_hashtable[D_HASHSIZE];
+ static LIST_HEAD(dentry_unused);
+ 
+ struct {
+ 	int nr_dentry;
+ 	int nr_unused;
+-	int age_limit;		/* age in seconds */
+-	int want_pages;		/* pages requested by system */
++	int age_limit;		/* age in seconds -- not used */
++	int want_pages;		/* pages requested by system -- not used */
+ 	int dummy[2];
+ } dentry_stat = {0, 0, 45, 0,};
+ 
+@@ -63,11 +56,13 @@
+ 	if (dname_external(dentry)) 
+ 		kfree(dentry->d_name.name);
+ 	kmem_cache_free(dentry_cache, dentry); 
++	dentry_stat.nr_dentry--;
+ }
+ 
+ /*
+  * Release the dentry's inode, using the fileystem
+- * d_iput() operation if defined.
++ * d_iput() operation if defined.  As a side-effect,
++ * this turns a positive dentry into a negative dentry.
+  */
+ static inline void dentry_iput(struct dentry * dentry)
+ {
+@@ -333,6 +328,7 @@
+ 			continue;
+ 		list_del(tmp);
+ 		list_add(tmp, &dentry_unused);
++		dentry_stat.nr_unused++;
+ 	}
+ 
+ 	/*
+@@ -526,6 +522,9 @@
+ 	dentry->d_name.hash = name->hash;
+ 	dentry->d_op = NULL;
+ 	dentry->d_fsdata = NULL;
++	dentry->d_reftime = 0;
++
++	dentry_stat.nr_dentry++;
+ 	return dentry;
+ }
+ 
+@@ -564,8 +563,8 @@
+ static inline struct list_head * d_hash(struct dentry * parent, unsigned long hash)
+ {
+ 	hash += (unsigned long) parent;
+-	hash = hash ^ (hash >> D_HASHBITS) ^ (hash >> D_HASHBITS*2);
+-	return dentry_hashtable + (hash & D_HASHMASK);
++	hash = hash + (hash >> d_hashbits) + (hash >> d_hashbits*2);
++	return dentry_hashtable + (hash & d_hashmask);
+ }
+ 
+ struct dentry * d_lookup(struct dentry * parent, struct qstr * name)
+@@ -900,10 +899,58 @@
+ 	return ino;
+ }
+ 
++/*
++ *  Allocate the dcache hash table
++ *  Use get_free_pages to decrease TLB misses
++ */
+ void __init dcache_init(void)
+ {
+-	int i;
+-	struct list_head *d = dentry_hashtable;
++	int i, order, size;
++	struct list_head *d;
++
++	/*
++	 *  Guess at reasonable hash table size
++	 *
++	 *  The magic shift value "11" controls the
++	 *  break back points.
++	 */
++	size = num_physpages >> 11;
++	for (order = 0; size && (order < 6); ) {
++		order++;
++		size >>= 1;
++	}
++
++	/*
++	 *  Try to get our hash table; break back to a
++	 *  smaller table if we can't get the size we want
++	 */
++	do {
++		dentry_hashtable = (struct list_head *)
++					__get_free_pages(GFP_ATOMIC, order); 
++	} while (dentry_hashtable == NULL && --order);
++	if (dentry_hashtable == NULL)
++		panic("dcache_init: failed to allocate hash table\n");
++
++	/*
++	 *  Now set up our hash function parameters
++	 */
++	d_hashsize = (1UL << (order + PAGE_SHIFT)) / sizeof(struct list_head);
++	d_hashmask = d_hashsize - 1;
++
++	d_hashbits = 0;
++	for (order = d_hashsize; order > 1; order >>= 1)
++		d_hashbits++;
++
++	/*
++	 *  And init the hash table buckets
++	 */
++	i = d_hashsize;
++	d = dentry_hashtable;
++	do {
++		INIT_LIST_HEAD(d);
++		d++;
++		i--;
++	} while (i);
+ 
+ 	/* 
+ 	 * A constructor could be added for stable state like the lists,
+@@ -919,12 +966,5 @@
+ 					 SLAB_HWCACHE_ALIGN,
+ 					 NULL, NULL);
+ 	if (!dentry_cache)
+-		panic("Cannot create dentry cache");
+-
+-	i = D_HASHSIZE;
+-	do {
+-		INIT_LIST_HEAD(d);
+-		d++;
+-		i--;
+-	} while (i);
++		panic("dcache_init: cannot create dentry cache");
+ }
+diff -ruN linux-2.3.6-ref/fs/inode.c linux/fs/inode.c
+--- linux-2.3.6-ref/fs/inode.c	Wed Jun 16 20:14:52 1999
++++ linux/fs/inode.c	Thu Jun 17 16:07:10 1999
+@@ -25,12 +25,10 @@
+ /* #define INODE_DEBUG 1 */
+ 
+ /*
+- * Inode lookup is no longer as critical as it used to be:
+- * most of the lookups are going to be through the dcache.
++ * Inode hash metadata
+  */
+-#define HASH_BITS	8
+-#define HASH_SIZE	(1UL << HASH_BITS)
+-#define HASH_MASK	(HASH_SIZE-1)
++static unsigned int i_hashbits, i_hashsize, i_hashmask;
++static struct list_head *inode_hashtable = NULL;
+ 
+ /*
+  * Each inode can be on two separate lists. One is
+@@ -46,7 +44,6 @@
+ 
+ static LIST_HEAD(inode_in_use);
+ static LIST_HEAD(inode_unused);
+-static struct list_head inode_hashtable[HASH_SIZE];
+ 
+ /*
+  * A simple spinlock to protect the list manipulations.
+@@ -375,7 +372,7 @@
+ static void try_to_free_inodes(int goal)
+ {
+ 	/*
+-	 * First stry to just get rid of unused inodes.
++	 * First try to just get rid of unused inodes.
+ 	 *
+ 	 * If we can't reach our goal that way, we'll have
+ 	 * to try to shrink the dcache and sync existing
+@@ -637,8 +634,8 @@
+ static inline unsigned long hash(struct super_block *sb, unsigned long i_ino)
+ {
+ 	unsigned long tmp = i_ino | (unsigned long) sb;
+-	tmp = tmp + (tmp >> HASH_BITS) + (tmp >> HASH_BITS*2);
+-	return tmp & HASH_MASK;
++	tmp = tmp + (tmp >> i_hashbits) + (tmp >> i_hashbits*2);
++	return tmp & i_hashmask;
+ }
+ 
+ /* Yeah, I know about quadratic hash. Maybe, later. */
+@@ -790,14 +787,55 @@
+  * Initialize the hash tables and default
+  * value for max inodes
+  */
+-#define MAX_INODE (16384)
++#define MAX_INODE (65536)
+ 
++/*
++ *  Allocate the inode cache hash table
++ *  Use get_free_pages to decrease TLB misses
++ */
+ void __init inode_init(void)
+ {
+-	int i, max;
+-	struct list_head *head = inode_hashtable;
++	int i, max, order, size;
++	struct list_head *head;
++
++	/*
++	 *  Guess at reasonable hash table size
++	 *
++	 *  The magic shift value "13" controls the
++	 *  break back points. 
++	 */
++	size = num_physpages >> 13;
++	for (order = 0; size && (order < 6); ) { 
++		order++;
++		size >>= 1;
++	}
++
++	/*
++	 *  Try to get our hash table; break back to a
++	 *  smaller table if we can't get the size we want 
++	 */
++	do {
++		inode_hashtable = (struct list_head *)
++					__get_free_pages(GFP_ATOMIC, order); 
++	} while (inode_hashtable == NULL && --order);
++	if (inode_hashtable == NULL)
++		panic("inode_init: failed to allocate hash table\n");
++
++	/*
++	 *  Now set up our hash function parameters
++	 */
++	i_hashsize = (1UL << order) * PAGE_SIZE / sizeof(struct list_head);
++	i_hashmask = i_hashsize - 1;
++
++	i_hashbits = 0;
++	for (order = i_hashsize; order > 1; order >>= 1)
++		i_hashbits++;
+ 
+-	i = HASH_SIZE;
++	/*
++	 *  And init the hash table buckets
++	 */
++	i = i_hashsize;
++	head = inode_hashtable;
+ 	do {
+ 		INIT_LIST_HEAD(head);
+ 		head++;
+diff -ruN linux-2.3.6-ref/include/linux/fs.h linux/include/linux/fs.h
+--- linux-2.3.6-ref/include/linux/fs.h	Wed Jun 16 20:15:16 1999
++++ linux/include/linux/fs.h	Thu Jun 17 16:01:42 1999
+@@ -176,7 +176,7 @@
+ extern void update_atime (struct inode *);
+ #define UPDATE_ATIME(inode) update_atime (inode)
+ 
+-extern void buffer_init(unsigned long);
++extern void buffer_init(void);
+ extern void inode_init(void);
+ extern void file_table_init(void);
+ extern void dcache_init(void);
+diff -ruN linux-2.3.6-ref/include/linux/pagemap.h linux/include/linux/pagemap.h
+--- linux-2.3.6-ref/include/linux/pagemap.h	Wed Jun 16 20:15:16 1999
++++ linux/include/linux/pagemap.h	Thu Jun 17 16:01:42 1999
+@@ -12,6 +12,8 @@
+ #include <linux/mm.h>
+ #include <linux/fs.h>
+ 
++void page_cache_init(void);
++
+ static inline unsigned long page_address(struct page * page)
+ {
+ 	return PAGE_OFFSET + ((page - mem_map) << PAGE_SHIFT);
+@@ -39,11 +41,12 @@
+  */
+ #define page_cache_entry(x)	(mem_map + MAP_NR(x))
+ 
+-#define PAGE_HASH_BITS 12
+-#define PAGE_HASH_SIZE (1 << PAGE_HASH_BITS)
+-
++/*
++ *  Page cache hash metadata
++ */
++extern unsigned int page_hash_bits, page_hash_size, page_hash_mask;
++extern struct page ** page_hash_table;
+ extern unsigned long page_cache_size; /* # of pages currently in the hash table */
+-extern struct page * page_hash_table[PAGE_HASH_SIZE];
+ 
+ /*
+  * We use a power-of-two hash table to avoid a modulus,
+@@ -51,12 +54,14 @@
+  * inode pointer and offsets are distributed (ie, we
+  * roughly know which bits are "significant")
+  */
+-static inline unsigned long _page_hashfn(struct inode * inode, unsigned long offset)
++static inline unsigned long _page_hashfn(struct inode * inode,
++						unsigned long offset)
+ {
+-#define i (((unsigned long) inode)/(sizeof(struct inode) & ~ (sizeof(struct inode) - 1)))
++#define i (((unsigned long) inode) / \
++			(sizeof(struct inode) & ~ (sizeof(struct inode) - 1)))
+ #define o (offset >> PAGE_SHIFT)
+-#define s(x) ((x)+((x)>>PAGE_HASH_BITS))
+-	return s(i+o) & (PAGE_HASH_SIZE-1);
++#define s(x) ((x) + ((x) >> page_hash_bits))
++	return s(i + o) & (page_hash_mask);
+ #undef i
+ #undef o
+ #undef s
+diff -ruN linux-2.3.6-ref/init/main.c linux/init/main.c
+--- linux-2.3.6-ref/init/main.c	Wed Jun 16 20:15:10 1999
++++ linux/init/main.c	Thu Jun 17 15:51:39 1999
+@@ -23,6 +23,7 @@
+ #include <linux/smp_lock.h>
+ #include <linux/blk.h>
+ #include <linux/hdreg.h>
++#include <linux/pagemap.h>
+ 
+ #include <asm/io.h>
+ #include <asm/bugs.h>
+@@ -1178,6 +1179,7 @@
+ #endif
+ 	mem_init(memory_start,memory_end);
+ 	kmem_cache_sizes_init();
++	page_cache_init();
+ #ifdef CONFIG_PROC_FS
+ 	proc_root_init();
+ #endif
+@@ -1185,7 +1187,7 @@
+ 	filescache_init();
+ 	dcache_init();
+ 	vma_init();
+-	buffer_init(memory_end-memory_start);
++	buffer_init();
+ 	signals_init();
+ 	inode_init();
+ 	file_table_init();
+diff -ruN linux-2.3.6-ref/mm/filemap.c linux/mm/filemap.c
+--- linux-2.3.6-ref/mm/filemap.c	Wed Jun 16 20:15:10 1999
++++ linux/mm/filemap.c	Thu Jun 17 15:55:32 1999
+@@ -20,6 +20,7 @@
+ #include <linux/file.h>
+ #include <linux/swapctl.h>
+ #include <linux/slab.h>
++#include <linux/init.h>
+ 
+ #include <asm/pgtable.h>
+ #include <asm/uaccess.h>
+@@ -32,7 +33,8 @@
+  */
+ 
+ unsigned long page_cache_size = 0;
+-struct page * page_hash_table[PAGE_HASH_SIZE];
++unsigned int page_hash_bits, page_hash_size, page_hash_mask;
++struct page ** page_hash_table = NULL;
+ 
+ /* 
+  * Define a request structure for outstanding page write requests
+@@ -1521,6 +1523,51 @@
+ 		page_cache_free(page_cache);
+ out:
+ 	return written ? written : status;
++}
++
++/*
++ *  Allocate the page cache hash table
++ *  Use get_free_pages to decrease TLB misses
++ */
++void __init page_cache_init(void)
++{
++	int order, size;
++
++	/*
++	 *  Guess at a reasonable hash table size
++	 *
++	 *  The magic shift value "12" controls
++	 *  the break back points.
++	 */
++	size = num_physpages >> 12;
++	for (order = 0; size && (order < 6); order++)
++		size >>= 1;
++
++	/*
++	 *  Try to get our hash table; break back to a
++	 * smaller table if we can't get the size we want 
++	 */
++	do {
++		page_hash_table = (struct page **)
++					__get_free_pages(GFP_ATOMIC, order); 
++	} while (page_hash_table == NULL && --order);
++	if (page_hash_table == NULL)
++		panic("page_cache_init: failed to allocate hash table\n");
++
++	/*
++	 *  Now set up our hash function parameters
++	 */
++	page_hash_size = (1UL << (order + PAGE_SHIFT)) / sizeof(struct page *);
++	page_hash_mask = page_hash_size - 1;
++	page_hash_bits = 0;
++	for (order = page_hash_size; order > 1; order >>= 1)
++		page_hash_bits++;
++
++	/*
++	 *  And init the hash table buckets
++	 */
++	memset(page_hash_table, (int) NULL,
++				page_hash_size * sizeof(struct page *));
+ }
+ 
+ /*
+	- Chuck Lever
+--
+corporate:	<chuckl@netscape.com>
+personal:	<chucklever@netscape.net> or <cel@monkey.org>
+The Linux Scalability project:
+	
+http://www.citi.umich.edu/projects/linux-scalability/
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

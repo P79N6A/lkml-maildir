@@ -1,0 +1,276 @@
+Date: Sun, 11 Jul 1999 16:32:07 +0200 (MET DST)
+From: Mikael Pettersson <>
+Subject: Re: New kernel/resource.c
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/7/11/35
+
+On Sat, 10 Jul 1999, Linus Torvalds wrote:
+>On Sat, 10 Jul 1999, Mikael Pettersson wrote:
+>...
+>>    The patch below fixes this by adding a kfree() to __check_region(),
+>>    having __request_region() set a flag RSRC_AUTOFREE in the
+>>    resource struct, and letting __release_region() kfree the
+>>    struct if this flag is set. This way, legacy drivers will
+>>    continue to work without leaking memory.
+>
+>I want the "flags" field to be completely anonymous, ie usable for the
+>thing that uses the resource. The allocator and de-allocator should not
+>look at them.
+>...
+>release_region() should probably just unconditionally kfree() the area -
+>it's only legal to do a release_region() on something that did a
+>request_region() anyway, so the unconditional kfree() is always correct.
+Ok, I changed my patch so that both check_region and release_region
+unconditionally kfree the resource struct, and I no longer use
+a flag in the flags field.
+Since drivers that run before slab/kmalloc is initialised _must_
+be converted (or else their requests won't be recorded), I also
+added a debug printk to __request_region which will log the
+region parameters if kmalloc returns NULL. With this, the failure
+from vgacon gets logged as:
+kmem_alloc: NULL ptr (name=unknown)
+kmalloc failed in request_region(PCI IO, 0x3c0, 32, vga+)
+This should hopefully make it easy to identify any further
+request_region() calls that must be rewritten.
+>> 2. drivers/video/vgacon.c calls request_region() before the
+>>    slab allocator and kmalloc are initialised, causing request_region
+>>    to silently fail and a "NULL ptr" message in the kernel log.
+>>    The patch below fixes this (for vgacon only) by transparently
+>>    translating its request_region() calls to request_resource()
+>>    calls with static parameters. (The patch (ab)uses the pre-
+>>    processor. I kind of like it, but others may find it gross.)
+>
+>I'd prefer to rename it, so that people don't by mistake think that it
+>does a "real" request_region(). But other than that I don't think it is
+>gross - although I wonder if vgacon.c shouldn't just be using the native
+>stuff directly, the way I made the architecture setup files do it.
+I rewrote vgacon to use the native interface, and I also added
+proper release of the resources (as suggested by Jeff Garzik).
+Finally, to illustrate the new interface I rewrote the ftape driver
+(the old one included in the kernel) to use it. All in all, it
+worked out pretty well.
+/Mikael
+--- linux-2.3.11-pre1/kernel/resource.c.~1~	Sun Jul 11 12:50:28 1999
++++ linux-2.3.11-pre1/kernel/resource.c	Sun Jul 11 13:28:06 1999
+@@ -13,7 +13,7 @@
+ #include <linux/malloc.h>
+ 
+ struct resource pci_io_resource = { "PCI IO", 0x0000, 0xFFFF };
+-struct resource pci_mem_resource = { "PCI mem",	0x00000000, 0xFFFFFFFF };
++struct resource pci_mem_resource = { "PCI mem", 0x00000000, 0xFFFFFFFF };
+ 
+ /*
+  * This generates reports for /proc/ioports and /proc/memory
+@@ -105,6 +105,10 @@
+ {
+ 	struct resource *res = kmalloc(sizeof(*res), GFP_KERNEL);
+ 
++	/* temporary check to help locate drivers that need updates */
++	if (!res)
++		printk(KERN_WARNING "kmalloc failed in request_region(%s, %#lx, %lu, %s)\n",
++		       parent->name, start, n, name);
+ 	if (res) {
+ 		memset(res, 0, sizeof(*res));
+ 		res->name = name;
+@@ -135,6 +139,7 @@
+ 		return -EBUSY;
+ 
+ 	release_resource(res);
++	kfree(res);
+ 	return 0;
+ }
+ 
+@@ -153,6 +158,7 @@
+ 			break;
+ 		if (tmp->start == start && tmp->end == end) {
+ 			*p = tmp->sibling;
++			kfree(tmp);
+ 			break;
+ 		}
+ 		p = &tmp->sibling;
+--- linux-2.3.11-pre1/drivers/char/ftape/lowlevel/fdc-io.c.~1~	Fri May 14 21:19:11 1999
++++ linux-2.3.11-pre1/drivers/char/ftape/lowlevel/fdc-io.c	Sun Jul 11 15:12:00 1999
+@@ -83,6 +83,9 @@
+ static __u8 fdc_precomp = 0;	/* default precomp. value (nsec) */
+ static __u8 fdc_prec_code = 0;	/* fdc precomp. select code */
+ 
++#define FDC_REGIONS	2	/* we need up to two I/O regions */
++static struct resource *fdc_region[FDC_REGIONS] = { NULL, NULL };
++
+ static char ftape_id[] = "ftape";  /* used by request irq and free irq */
+ 
+ void fdc_catch_stray_interrupts(int count)
+@@ -1221,7 +1224,8 @@
+ 	TRACE_FUN(ft_t_flow);
+ 
+ 	if (ft_mach2 || ft_probe_fc10) {
+-		if (check_region(fdc.sra, 8) < 0) {
++		fdc_region[0] = request_region(fdc.sra, 8, "fdc (ft)");
++		if (!fdc_region[0]) {
+ #ifndef BROKEN_FLOPPY_DRIVER
+ 			TRACE_EXIT -EBUSY;
+ #else
+@@ -1229,33 +1233,31 @@
+ "address 0x%03x occupied (by floppy driver?), using it anyway", fdc.sra);
+ #endif
+ 		}
+-		request_region(fdc.sra, 8, "fdc (ft)");
+ 	} else {
+-		if (check_region(fdc.sra, 6) < 0 || 
+-		    check_region(fdc.dir, 1) < 0) {
++		fdc_region[0] = request_region(fdc.sra, 6, "fdc (ft)");
++		fdc_region[1] = request_region(fdc.sra+7, 1, "fdc (ft)");
++		if (!fdc_region[0] || !fdc_region[1]) {
+ #ifndef BROKEN_FLOPPY_DRIVER
++			fdc_release_regions();
+ 			TRACE_EXIT -EBUSY;
+ #else
+ 			TRACE(ft_t_warn,
+ "address 0x%03x occupied (by floppy driver?), using it anyway", fdc.sra);
+ #endif
+ 		}
+-		request_region(fdc.sra, 6, "fdc (ft)");
+-		request_region(fdc.sra + 7, 1, "fdc (ft)");
+ 	}
+ 	TRACE_EXIT 0;
+ }
+ 
+ void fdc_release_regions(void)
+ {
+-	TRACE_FUN(ft_t_flow);
++	int i;
+ 
+-	if (fdc.sra != 0) {
+-		if (fdc.dor2 != 0) {
+-			release_region(fdc.sra, 8);
+-		} else {
+-			release_region(fdc.sra, 6);
+-			release_region(fdc.dir, 1);
++	TRACE_FUN(ft_t_flow);
++	for(i = 0; i < FDC_REGIONS; ++i) {
++		if (fdc_region[i] != NULL) {
++			release_resource(fdc_region[i]);
++			fdc_region[i] = NULL;
+ 		}
+ 	}
+ 	TRACE_EXIT;
+--- linux-2.3.11-pre1/drivers/video/vgacon.c.~1~	Mon Jun 21 20:45:46 1999
++++ linux-2.3.11-pre1/drivers/video/vgacon.c	Sun Jul 11 14:31:26 1999
+@@ -115,6 +115,13 @@
+ static int	       vga_video_font_height;
+ static unsigned int    vga_rolled_over = 0;
+ 
++#define REGION(start,n,name) { name, start, start+n-1 }
++static struct resource ega_plus_region = REGION(0x3b0,16,"ega+");
++static struct resource mda_region_1 = REGION(0x3b0,12,"mda");
++static struct resource mda_region_2 = REGION(0x3bf,1,"mda");
++static struct resource ega_region = REGION(0x3c0,32,"ega");
++static struct resource vga_plus_region = REGION(0x3c0,32,"vga+");
++static struct resource cga_region = REGION(0x3d4,2,"cga");
+ 
+ void no_scroll(char *str, int *ints)
+ {
+@@ -159,7 +166,15 @@
+ 	restore_flags(flags);
+ }
+ 
+-__initfunc(static const char *vgacon_startup(void))
++static void __init vgacon_request_resource(struct resource *resource)
++{
++	int err = request_resource(&pci_io_resource, resource);
++	if (err)
++		printk(KERN_ERR "vgacon: unable to request resource %#lx-%#lx, %s: error %d\n",
++		       resource->start, resource->end, resource->name, err);
++}
++
++static const char * __init vgacon_startup(void)
+ {
+ 	const char *display_desc = NULL;
+ 	u16 saved1, saved2;
+@@ -189,15 +204,15 @@
+ 			vga_video_type = VIDEO_TYPE_EGAM;
+ 			vga_vram_end = 0xb8000;
+ 			display_desc = "EGA+";
+-			request_region(0x3b0,16,"ega");
++			vgacon_request_resource(&ega_plus_region);
+ 		}
+ 		else
+ 		{
+ 			vga_video_type = VIDEO_TYPE_MDA;
+ 			vga_vram_end = 0xb2000;
+ 			display_desc = "*MDA";
+-			request_region(0x3b0,12,"mda");
+-			request_region(0x3bf, 1,"mda");
++			vgacon_request_resource(&mda_region_1);
++			vgacon_request_resource(&mda_region_2);
+ 			vga_video_font_height = 14;
+ 		}
+ 	}
+@@ -216,11 +231,11 @@
+ 			if (!ORIG_VIDEO_ISVGA) {
+ 				vga_video_type = VIDEO_TYPE_EGAC;
+ 				display_desc = "EGA";
+-				request_region(0x3c0,32,"ega");
++				vgacon_request_resource(&ega_region);
+ 			} else {
+ 				vga_video_type = VIDEO_TYPE_VGAC;
+ 				display_desc = "VGA+";
+-				request_region(0x3c0,32,"vga+");
++				vgacon_request_resource(&vga_plus_region);
+ 
+ #ifdef VGA_CAN_DO_64KB
+ 				/*
+@@ -264,7 +279,7 @@
+ 			vga_video_type = VIDEO_TYPE_CGA;
+ 			vga_vram_end = 0xba000;
+ 			display_desc = "*CGA";
+-			request_region(0x3d4,2,"cga");
++			vgacon_request_resource(&cga_region);
+ 			vga_video_font_height = 8;
+ 		}
+ 	}
+@@ -334,6 +349,28 @@
+ 	write_vga(12, (c->vc_visible_origin-vga_vram_base)/2);
+ }
+ 
++static void vgacon_release_resources(void)
++{
++	switch (vga_video_type) {
++	case VIDEO_TYPE_EGAM:
++		release_resource(&ega_plus_region);
++		break;
++	case VIDEO_TYPE_MDA:
++		release_resource(&mda_region_1);
++		release_resource(&mda_region_2);
++		break;
++	case VIDEO_TYPE_EGAC:
++		release_resource(&ega_region);
++		break;
++	case VIDEO_TYPE_VGAC:
++		release_resource(&vga_plus_region);
++		break;
++	case VIDEO_TYPE_CGA:
++		release_resource(&cga_region);
++		break;
++	}
++}
++
+ static void vgacon_deinit(struct vc_data *c)
+ {
+ 	/* When closing the last console, reset video origin */
+@@ -341,6 +378,7 @@
+ 		c->vc_visible_origin = vga_vram_base;
+ 		vga_set_mem_top(c);
+ 		con_free_unimap(c->vc_num);
++		vgacon_release_resources();
+ 	}
+ 	c->vc_uni_pagedir_loc = &c->vc_uni_pagedir;
+ 	con_set_default_unimap(c->vc_num);
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/

@@ -1,0 +1,149 @@
+Date: Tue, 2 Mar 1999 20:48:56 +0100 (CET)
+From: Ingo Molnar <>
+Subject: Re: [patch] sleep_on() done with cli(), NetROM, 2.2.2
+Sender: linux-kernel-owner@vger.kernel.org
+Precedence: bulk
+List-ID: <linux-kernel.vger.kernel.org>
+X-Mailing-List: linux-kernel@vger.kernel.org
+X-Lkml-Link: https://lkml.org/lkml/1999/3/2/93
+
+On Tue, 2 Mar 1999, Linus Torvalds wrote:
+> Doing them as wait queues is the obvious answer: turning
+> 
+> 	cli();
+> 	if (cond)
+> 		sleep_on(&cond_list);
+> 
+> into
+> 	if (cond) {
+> 		current->state = TASK_UNINTERRUPTIBLE;
+> 		add_wait_queue(&wait, &cond_list);
+> 		if (cond)
+> 			schedule();
+> 		remove_wait_queue(..)
+> 	}
+ok, next try to fix this issue cleanly.
+i've attached a draft 'waiting for events' framework, and i've converted
+printk.c to the 'new' usage. This now is both raceless and doesnt lock up
+on SMP. The user-visible interface is:
+	wait_event(wq, condition);
+or
+	wait_async_event(wq, condition);
+or
+	error = wait_event_interruptible(wq, condition);
+or
+	error = wait_async_event_interruptible(wq, condition);
+which visibly simplifies usage. The downside is that these are macros. I
+tried to write them as safely as possible, but they are still very ugly
+and might be considered a showstopper? ... 
+the 'async' versions are really just calls to the 'simple' versions, they
+do a cli(); condition check; sti(); thing to ensure correctness of
+volatile conditions. Smarter code can still define arbitrary conditions
+similarly to the _async_ variants.
+this is now running on my box, and syslog works just like before.
+is this about the way how it should be done? I always found the explicit
+waitqueue manipulations to be a complexity overkill, and people stumble
+across this periodically. Also, if in the future we change the way we wait
+for events, we can just fix up the framework instead of all the usages. 
+-- mingo
+--- linux/kernel/printk.c.orig	Mon Mar  1 10:18:56 1999
++++ linux/kernel/printk.c	Tue Mar  2 20:33:45 1999
+@@ -137,15 +137,9 @@
+ 		error = verify_area(VERIFY_WRITE,buf,len);
+ 		if (error)
+ 			goto out;
+-		cli();
+-		error = -ERESTARTSYS;
+-		while (!log_size) {
+-			if (signal_pending(current)) {
+-				sti();
+-				goto out;
+-			}
+-			interruptible_sleep_on(&log_wait);
+-		}
++		error = wait_async_event_interruptible(log_wait, log_size);
++		if (error)
++			goto out;
+ 		i = 0;
+ 		while (log_size && i < len) {
+ 			c = *((char *) log_buf+log_start);
+--- linux/include/linux/sched.h.orig	Sun Feb 28 14:41:28 1999
++++ linux/include/linux/sched.h	Tue Mar  2 20:31:17 1999
+@@ -671,6 +671,72 @@
+ 	__remove_wait_queue(p, wait);
+ 	write_unlock_irqrestore(&waitqueue_lock, flags); 
+ }
++
++#define wait_event(wq, condition) 				\
++do {								\
++	struct wait_queue __wait;				\
++								\
++	if (condition)	 					\
++		break;						\
++								\
++	__wait.task = current;					\
++	add_wait_queue(&wq, &__wait);				\
++	for (;;) {						\
++		current->state = TASK_UNINTERRUPTIBLE;		\
++		if (condition)					\
++			break;					\
++		schedule();					\
++	}							\
++	current->state = TASK_RUNNING;				\
++	remove_wait_queue(&wq, &__wait);			\
++} while (0)
++	
++#define wait_async_event(wq, condition)				\
++	wait_event(wq,						\
++	({							\
++		int __ret;					\
++		cli();						\
++		__ret = condition;				\
++		sti();						\
++		__ret;						\
++	}))
++	
++#define wait_event_interruptible(wq, condition) 		\
++({								\
++	int __ret = 0;						\
++	struct wait_queue __wait;				\
++								\
++	if (condition)	 					\
++		goto __out;					\
++								\
++	__wait.task = current;					\
++	add_wait_queue(&wq, &__wait);				\
++	for (;;) {						\
++		current->state = TASK_INTERRUPTIBLE;		\
++		if (condition)					\
++			break;					\
++		if (signal_pending(current)) {			\
++			__ret = -ERESTARTSYS;			\
++			break;					\
++		}						\
++		schedule();					\
++	}							\
++	current->state = TASK_RUNNING;				\
++	remove_wait_queue(&wq, &__wait);			\
++__out:								\
++	__ret;							\
++})
++	
++#define wait_async_event_interruptible(wq, condition)		\
++	wait_event_interruptible(wq,				\
++	({							\
++		int __ret;					\
++		cli();						\
++		__ret = condition;				\
++		sti();						\
++		__ret;						\
++	}))
++	
+ 
+ #define REMOVE_LINKS(p) do { \
+ 	(p)->next_task->prev_task = (p)->prev_task; \
+-
+To unsubscribe from this list: send the line "unsubscribe linux-kernel" in
+the body of a message to majordomo@vger.rutgers.edu
+Please read the FAQ at 
+http://www.tux.org/lkml/
